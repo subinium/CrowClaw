@@ -225,7 +225,9 @@ describe('e2e node runtime integration', () => {
     expect(doctor.output).toContain('"deployment": "crowclaw-e2e"');
 
     const history = await runCliInputLine('/history', { sessionId: 'e2e-chat' }, { runtime });
-    expect(history.output).toContain('user: hello from e2e');
+    // /history now shows persistent CLI command history, not session chat history
+    expect(history.output).toMatch(/No command history|Last \d+ commands/);
+
 
     const memories = await runCliInputLine('/memories', { sessionId: 'e2e-chat' }, { runtime });
     expect(memories.output).toContain('remember this e2e fact');

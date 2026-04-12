@@ -62,43 +62,36 @@ describe('smart model routing', () => {
 });
 
 describe('credential pool', () => {
-  it('acquires and releases credentials with round_robin strategy', () => {
-    const pool = new CredentialPool([
-      { id: 'a', apiKey: 'key-a', provider: 'openai', requestCount: 0 },
-      { id: 'b', apiKey: 'key-b', provider: 'openai', requestCount: 0 }
-    ], 'round_robin');
+  it('acquires and releases credentials with round-robin strategy', () => {
+    const pool = new CredentialPool({ keys: ['key-a', 'key-b'], strategy: 'round-robin' });
 
-    const first = pool.acquire();
-    expect(first?.id).toBe('a');
+    const first = pool.getKey();
+    expect(first).toBe('key-a');
 
-    const second = pool.acquire();
-    expect(second?.id).toBe('b');
+    const second = pool.getKey();
+    expect(second).toBe('key-b');
 
-    const third = pool.acquire();
-    expect(third?.id).toBe('a');
+    const third = pool.getKey();
+    expect(third).toBe('key-a');
   });
 
   it('applies cooldown on rate limit errors', () => {
-    const pool = new CredentialPool([
-      { id: 'a', apiKey: 'key-a', provider: 'openai', requestCount: 0 },
-      { id: 'b', apiKey: 'key-b', provider: 'openai', requestCount: 0 }
-    ]);
+    const pool = new CredentialPool({ keys: ['key-a', 'key-b'] });
 
-    pool.reportError('a', 429);
-    const available = pool.getAvailable();
-    expect(available.map(c => c.id)).toEqual(['b']);
+    pool.reportFailure('key-a', 429);
+    // key-a is on cooldown, only key-b available
+    expect(pool.getKey()).toBe('key-b');
+    expect(pool.getKey()).toBe('key-b');
   });
 
   it('clears error state on success', () => {
-    const pool = new CredentialPool([
-      { id: 'a', apiKey: 'key-a', provider: 'openai', requestCount: 0 }
-    ]);
+    const pool = new CredentialPool({ keys: ['key-a'] });
 
-    pool.reportError('a', 429);
-    expect(pool.getAvailable()).toHaveLength(0);
+    pool.reportFailure('key-a', 429);
+    expect(() => pool.getKey()).toThrow('exhausted');
 
-    pool.reportSuccess('a');
-    expect(pool.getAvailable()).toHaveLength(1);
+    pool.reportSuccess('key-a');
+    expect(pool.getKey()).toBe('key-a');
   });
 });
 

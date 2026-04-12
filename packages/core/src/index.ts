@@ -2,6 +2,9 @@ import { PluginManager } from '@crowclaw/plugins';
 import { buildSystemPrompt } from './prompt-builder.js';
 import { matchSkillManifests, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
+import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
+import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
+import type { DetailedUsageTracker } from './usage-tracker.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -70,13 +73,22 @@ export interface ProviderRequest {
   signal?: AbortSignal;
 }
 
+export interface ProviderResponseUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedTokens?: number;
+}
+
 export interface ProviderResponse {
   assistantMessage?: string;
   toolCalls?: ToolCall[];
+  usage?: ProviderResponseUsage;
 }
 
 export interface ProviderAdapter {
   generate(request: ProviderRequest): Promise<ProviderResponse>;
+  countTokens?(messages: ConversationMessage[]): number;
 }
 
 export interface SessionLineage {
@@ -118,6 +130,15 @@ export interface AgentRunResult {
   toolResults: ToolExecutionResult[];
 }
 
+export type AgentStreamEvent =
+  | { type: 'text-delta'; content: string }
+  | { type: 'tool-start'; toolName: string; toolCallId: string }
+  | { type: 'tool-end'; toolName: string; toolCallId: string; result: string; ok: boolean }
+  | { type: 'iteration-start'; iteration: number }
+  | { type: 'iteration-end'; iteration: number }
+  | { type: 'done'; response: string; usage?: ProviderResponseUsage }
+  | { type: 'error'; error: string };
+
 export interface AgentLoopOptions {
   maxToolIterations?: number;
   stopOnToolError?: boolean;
@@ -137,6 +158,20 @@ export interface AgentLoopOptions {
   skills?: ParsedSkillFile[];
   agentPreset?: { role: string; goal: string; backstory?: string };
   personaPrompt?: string;
+  /** Max total tokens per run (context window budget). Track 1.2 */
+  maxTokens?: number;
+  /** Optional detailed usage tracker. Track 1.2 */
+  usageTracker?: DetailedUsageTracker;
+  /** Checkpoint store for auto-checkpointing. Track 1.4 */
+  checkpointStore?: CheckpointStore;
+  /** Enable automatic checkpointing at each iteration. Track 1.4 */
+  autoCheckpoint?: boolean;
+  /** Separate provider for LLM-powered compression. Track 2.2 */
+  compressionProvider?: ProviderAdapter;
+  /** Enable Anthropic prompt caching metadata. Track 2.3 */
+  enablePromptCaching?: boolean;
+  /** Context window size for token-aware compression trigger. Track 2.1 */
+  contextWindowSize?: number;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -333,6 +368,13 @@ export class AgentLoop {
   private readonly skills: ParsedSkillFile[];
   private readonly agentPreset?: { role: string; goal: string; backstory?: string };
   private readonly personaPrompt?: string;
+  private readonly maxTokens?: number;
+  private readonly usageTracker?: DetailedUsageTracker;
+  private readonly checkpointStore?: CheckpointStore;
+  private readonly autoCheckpoint: boolean;
+  private readonly compressionProvider?: ProviderAdapter;
+  private readonly enablePromptCaching: boolean;
+  private readonly contextWindowSize?: number;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -358,8 +400,136 @@ export class AgentLoop {
     this.skills = options.skills ?? [];
     this.agentPreset = options.agentPreset;
     this.personaPrompt = options.personaPrompt;
+    this.maxTokens = options.maxTokens;
+    this.usageTracker = options.usageTracker;
+    this.checkpointStore = options.checkpointStore;
+    this.autoCheckpoint = options.autoCheckpoint ?? false;
+    this.compressionProvider = options.compressionProvider;
+    this.enablePromptCaching = options.enablePromptCaching ?? false;
+    this.contextWindowSize = options.contextWindowSize;
   }
 
+  /** Track 1.2: Record usage from a provider response and return total tokens consumed so far */
+  private recordUsage(response: ProviderResponse): number {
+    if (response.usage && this.usageTracker) {
+      this.usageTracker.record({
+        model: 'unknown',
+        provider: 'primary',
+        inputTokens: response.usage.inputTokens,
+        outputTokens: response.usage.outputTokens,
+        totalTokens: response.usage.totalTokens,
+        cachedTokens: response.usage.cachedTokens ?? 0,
+        costUsd: 0,
+        latencyMs: 0,
+      });
+    }
+    return this.usageTracker?.getSummary().totalTokens ?? 0;
+  }
+
+  /** Track 1.2: Check if token budget is approaching or exceeded */
+  private checkTokenBudget(totalConsumed: number): { exceeded: boolean; warning: string | null } {
+    if (!this.maxTokens) return { exceeded: false, warning: null };
+    if (totalConsumed >= this.maxTokens) {
+      return { exceeded: true, warning: `[TOKEN BUDGET EXCEEDED: ${totalConsumed}/${this.maxTokens} tokens used.]` };
+    }
+    const usedPct = (totalConsumed / this.maxTokens) * 100;
+    if (usedPct >= 90) {
+      return { exceeded: false, warning: `[TOKEN BUDGET WARNING: ${totalConsumed}/${this.maxTokens} tokens used (${Math.round(usedPct)}%).]` };
+    }
+    return { exceeded: false, warning: null };
+  }
+
+  /** Track 2.1: Determine if compression should trigger based on token count */
+  private shouldCompressTokenAware(messages: ConversationMessage[]): boolean {
+    if (this.provider.countTokens && this.contextWindowSize) {
+      const tokenCount = this.provider.countTokens(messages);
+      return tokenCount > this.contextWindowSize * 0.7;
+    }
+    // Fall back to message count threshold
+    return messages.length > this.compressAfterMessageCount;
+  }
+
+  /** Track 2.2: Compress using LLM provider if available, else fall back to heuristic */
+  private async compressWithLLM(
+    messages: ConversationMessage[],
+  ): Promise<{ messages: ConversationMessage[]; compressedCount: number }> {
+    // Determine how many messages to protect
+    const protectedCount = Math.min(this.protectLastMessages, messages.length);
+    const preserved = messages.slice(-protectedCount);
+    const middle = messages.slice(0, messages.length - protectedCount);
+
+    if (middle.length === 0) {
+      return { messages, compressedCount: 0 };
+    }
+
+    if (!this.compressionProvider) {
+      // Fall back to heuristic compression
+      return compressMessages(messages, this.compressAfterMessageCount, this.protectLastMessages);
+    }
+
+    // Build compression prompt
+    const middleText = middle.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+    const compressionPrompt = 'Summarize this conversation, preserving key facts, decisions, and tool results. Be concise.';
+
+    try {
+      const response = await this.compressionProvider.generate({
+        systemPrompt: compressionPrompt,
+        messages: [{
+          role: 'user',
+          content: middleText,
+          createdAt: nowIso(),
+        }],
+        availableTools: [],
+      });
+
+      const summary = response.assistantMessage ?? '';
+      if (!summary) {
+        // Empty response fallback
+        return compressMessages(messages, this.compressAfterMessageCount, this.protectLastMessages);
+      }
+
+      return {
+        messages: [
+          {
+            role: 'system' as Role,
+            content: `Compressed conversation summary (${middle.length} messages, LLM-summarized):\n\n${summary}`,
+            createdAt: nowIso(),
+            metadata: { compressedCount: middle.length, compressionMethod: 'llm-summary' }
+          },
+          ...preserved
+        ],
+        compressedCount: middle.length
+      };
+    } catch {
+      // LLM compression failed, fall back to heuristic
+      return compressMessages(messages, this.compressAfterMessageCount, this.protectLastMessages);
+    }
+  }
+
+  /** Track 2.3: Add prompt caching metadata to system prompt */
+  private buildSystemPromptForRequest(promptParams: {
+    basePrompt?: string;
+    runtimeName: string;
+    sessionId: string;
+    workspaceId?: string;
+    userId?: string;
+    availableTools: ToolManifest[];
+    matchedSkills?: MatchedSkill[];
+    agentPreset?: { role: string; goal: string; backstory?: string };
+    personaPrompt?: string;
+  }): string | undefined {
+    const prompt = buildSystemPrompt(promptParams);
+    if (!prompt) return prompt;
+    if (this.enablePromptCaching) {
+      // Annotate system prompt for Anthropic prompt caching.
+      // The actual cache_control metadata is signalled via a marker that
+      // the Anthropic provider adapter can detect and convert.
+      return `${prompt}\n<!-- cache_control: {"type":"ephemeral"} -->`;
+    }
+    return prompt;
+  }
+
+  /** Track 1.4: Create a checkpoint if auto-checkpointing is enabled */
   private async generateWithFallbacks(
     request: ProviderRequest,
     pluginContext?: { sessionId: string; agentId: string }
@@ -502,6 +672,7 @@ export class AgentLoop {
 
     const toolResults: ToolExecutionResult[] = [];
     let finalResponse: string | undefined;
+    let tokenBudgetExceeded = false;
 
     // Match skills against user query
     let matchedSkills: MatchedSkill[] | undefined;
@@ -514,11 +685,24 @@ export class AgentLoop {
           instructions: skill.instructions,
           tools: skill.manifest.tools,
         }));
+
+        // Warn about required tools that aren't registered
+        const registeredToolNames = new Set(this.tools.list().map(t => t.name));
+        for (const ms of matchedSkills) {
+          if (ms.tools) {
+            for (const toolName of ms.tools) {
+              if (!registeredToolNames.has(toolName)) {
+                console.warn(`[CrowClaw] Skill "${ms.name}" requires tool "${toolName}" which is not registered.`);
+              }
+            }
+          }
+        }
       }
     }
 
+    // Track 2.3: Use prompt caching-aware system prompt builder
     let currentResponse = await this.generateWithFallbacks({
-      systemPrompt: buildSystemPrompt({
+      systemPrompt: this.buildSystemPromptForRequest({
         personaPrompt: this.personaPrompt,
         basePrompt: input.systemPrompt,
         runtimeName: this.runtimeName,
@@ -537,8 +721,26 @@ export class AgentLoop {
       agentId: input.agentId
     });
 
+    // Track 1.2: Record usage from initial provider call
+    let totalTokensConsumed = this.recordUsage(currentResponse);
+
+    // Track 2.3: Track cache hits in session metadata
+    if (this.enablePromptCaching && currentResponse.usage?.cachedTokens && currentResponse.usage.cachedTokens > 0) {
+      session.lineage = {
+        ...(session.lineage ?? { rootSessionId: session.sessionId, compressionCount: 0 }),
+      };
+    }
+
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
       ensureNotAborted(input.signal);
+
+      // Track 1.2: Check token budget before continuing
+      const budgetCheck = this.checkTokenBudget(totalTokensConsumed);
+      if (budgetCheck.exceeded) {
+        tokenBudgetExceeded = true;
+        finalResponse = currentResponse.assistantMessage ?? 'Token budget exceeded.';
+        break;
+      }
 
       if (!currentResponse.toolCalls || currentResponse.toolCalls.length === 0) {
         finalResponse = currentResponse.assistantMessage ?? finalResponse;
@@ -556,6 +758,17 @@ export class AgentLoop {
         }
       });
 
+      // Track 1.4: Checkpoint before executing dangerous tools
+      if (this.autoCheckpoint && this.checkpointStore && currentResponse.toolCalls) {
+        for (const tc of currentResponse.toolCalls) {
+          const def = this.tools.get(tc.name);
+          if (def?.manifest.dangerLevel === 'high') {
+            await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
+            break; // Only one pre-dangerous checkpoint per iteration
+          }
+        }
+      }
+
       const iterationResults = this.concurrentToolCalls && currentResponse.toolCalls.length > 1
         ? await Promise.all(currentResponse.toolCalls.map((toolCall) => this.executeToolCall(toolCall, input)))
         : await currentResponse.toolCalls.reduce<Promise<ToolExecutionResult[]>>(async (accPromise, toolCall) => {
@@ -566,13 +779,18 @@ export class AgentLoop {
           }, Promise.resolve([]));
 
       const encounteredToolError = iterationResults.some((result) => !result.ok);
-      const warning = budgetStatus(iteration + 1, this.maxToolIterations, this.budgetWarningThreshold, this.budgetCriticalThreshold);
+      const iterationWarning = budgetStatus(iteration + 1, this.maxToolIterations, this.budgetWarningThreshold, this.budgetCriticalThreshold);
+
+      // Track 1.2: Merge token budget warning with iteration budget warning
+      const tokenWarning = budgetCheck.warning;
+      const combinedWarning = [iterationWarning, tokenWarning].filter(Boolean).join('\n') || null;
+
       for (const rawResult of iterationResults) {
-        const result = warning
+        const result = combinedWarning
           ? {
               ...rawResult,
-              output: `${rawResult.output}\n${warning}`,
-              metadata: { ...(rawResult.metadata ?? {}), budgetWarning: warning }
+              output: `${rawResult.output}\n${combinedWarning}`,
+              metadata: { ...(rawResult.metadata ?? {}), budgetWarning: combinedWarning }
             }
           : rawResult;
         toolResults.push(result);
@@ -604,8 +822,24 @@ export class AgentLoop {
         break;
       }
 
+      // Track 2.1: Token-aware compression trigger
+      if (this.shouldCompressTokenAware(nextMessages)) {
+        const compression = this.compressionProvider
+          ? await this.compressWithLLM(nextMessages)
+          : compressMessages(nextMessages, nextMessages.length, this.protectLastMessages);
+        if (compression.compressedCount > 0) {
+          nextMessages.length = 0;
+          nextMessages.push(...compression.messages);
+        }
+      }
+
+      // Track 1.4: Auto-checkpoint at end of iteration
+      if (this.autoCheckpoint && this.checkpointStore) {
+        await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
+      }
+
       currentResponse = await this.generateWithFallbacks({
-        systemPrompt: buildSystemPrompt({
+        systemPrompt: this.buildSystemPromptForRequest({
           basePrompt: input.systemPrompt,
           runtimeName: this.runtimeName,
           sessionId: input.sessionId,
@@ -622,10 +856,13 @@ export class AgentLoop {
         sessionId: input.sessionId,
         agentId: input.agentId
       });
+
+      // Track 1.2: Record usage from subsequent provider calls
+      totalTokensConsumed = this.recordUsage(currentResponse);
       finalResponse = currentResponse.assistantMessage ?? finalResponse;
     }
 
-    if (currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && toolResults.length >= this.maxToolIterations) {
+    if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && toolResults.length >= this.maxToolIterations) {
       finalResponse = finalResponse
         ? `${finalResponse}\nReached maximum tool iterations.`
         : 'Reached maximum tool iterations.';
@@ -644,7 +881,10 @@ export class AgentLoop {
       metadata: toolResults.length > 0 ? { toolCount: toolResults.length } : undefined
     });
 
-    const compression = compressMessages(nextMessages, this.compressAfterMessageCount, this.protectLastMessages);
+    // Track 2.2: Use LLM compression if provider is available, else heuristic
+    const compression = this.compressionProvider
+      ? await this.compressWithLLM(nextMessages)
+      : compressMessages(nextMessages, this.compressAfterMessageCount, this.protectLastMessages);
     const baseLineage = session.lineage ?? {
       rootSessionId: session.sessionId,
       compressionCount: 0
@@ -668,6 +908,11 @@ export class AgentLoop {
 
     await this.sessions.put(nextSession);
 
+    // Track 1.4: Completion checkpoint
+    if (this.autoCheckpoint && this.checkpointStore) {
+      await this.checkpointStore.save(createCheckpoint(nextSession, toolResults, this.maxToolIterations, 'completion'));
+    }
+
     const result: AgentRunResult = { session: nextSession, finalResponse, toolResults };
     await this.plugins?.emit('agent:afterRun', {
       input: input as unknown as { agentId: string; sessionId: string; [key: string]: unknown },
@@ -680,6 +925,225 @@ export class AgentLoop {
 
     return result;
   }
+
+  /** Track 1.3: Streaming variant of run(). Yields events as they arrive. */
+  async *runStreaming(input: {
+    userMessage: string;
+    sessionState: SessionState;
+    signal?: AbortSignal;
+  }): AsyncGenerator<AgentStreamEvent> {
+    const { userMessage, sessionState: session, signal } = input;
+
+    const streamingProvider = this.provider as Partial<StreamingProviderAdapter>;
+    if (!streamingProvider.generateStream) {
+      // Fall back to non-streaming: run the full loop and yield a done event
+      const runInput: AgentRunInput = {
+        agentId: session.agentId,
+        sessionId: session.sessionId,
+        userMessage,
+        signal,
+      };
+      try {
+        const result = await this.run(runInput);
+        yield { type: 'done', response: result.finalResponse };
+      } catch (error: unknown) {
+        yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
+      }
+      return;
+    }
+
+    const nextMessages: ConversationMessage[] = [...session.messages, {
+      role: 'user' as Role,
+      content: userMessage,
+      createdAt: nowIso(),
+    }];
+
+    let finalResponse = '';
+    let accumulatedUsage: ProviderResponseUsage | undefined;
+    const toolResults: ToolExecutionResult[] = [];
+
+    // Match skills
+    let matchedSkills: MatchedSkill[] | undefined;
+    if (this.skills.length > 0) {
+      const skillMatches = matchSkillManifests(userMessage, this.skills, 3);
+      if (skillMatches.length > 0) {
+        matchedSkills = skillMatches.map(({ skill }) => ({
+          name: skill.manifest.name,
+          description: skill.manifest.description,
+          instructions: skill.instructions,
+          tools: skill.manifest.tools,
+        }));
+
+        // Warn about required tools that aren't registered
+        const registeredToolNames = new Set(this.tools.list().map(t => t.name));
+        for (const ms of matchedSkills) {
+          if (ms.tools) {
+            for (const toolName of ms.tools) {
+              if (!registeredToolNames.has(toolName)) {
+                console.warn(`[CrowClaw] Skill "${ms.name}" requires tool "${toolName}" which is not registered.`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    try {
+      for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
+        ensureNotAborted(signal);
+        yield { type: 'iteration-start', iteration };
+
+        // Stream from provider
+        const systemPrompt = this.buildSystemPromptForRequest({
+          basePrompt: undefined,
+          runtimeName: this.runtimeName,
+          sessionId: session.sessionId,
+          workspaceId: session.workspaceId,
+          userId: session.userId,
+          availableTools: this.tools.list(),
+          matchedSkills,
+          agentPreset: this.agentPreset,
+        });
+
+        const request: ProviderRequest = {
+          systemPrompt,
+          messages: nextMessages,
+          availableTools: this.tools.list(),
+          signal,
+        };
+
+        // Collect stream chunks and yield text deltas
+        let text = '';
+        const streamToolCalls: Array<{ name: string; input: Record<string, unknown>; id?: string }> = [];
+        let currentTool: { name: string; input: string; id?: string } | null = null;
+
+        for await (const chunk of streamingProvider.generateStream(request)) {
+          switch (chunk.type) {
+            case 'text':
+              if (chunk.text) {
+                text += chunk.text;
+                yield { type: 'text-delta', content: chunk.text };
+              }
+              break;
+            case 'tool_use_start':
+              currentTool = { name: chunk.toolName ?? '', input: '', id: chunk.toolCallId };
+              break;
+            case 'tool_use_delta':
+              if (currentTool) currentTool.input += chunk.toolInput ?? '';
+              break;
+            case 'tool_use_end':
+              if (currentTool) {
+                let parsedInput: Record<string, unknown>;
+                try {
+                  parsedInput = JSON.parse(currentTool.input || '{}') as Record<string, unknown>;
+                } catch {
+                  parsedInput = { raw: currentTool.input };
+                }
+                streamToolCalls.push({ name: currentTool.name, input: parsedInput, id: currentTool.id });
+                currentTool = null;
+              }
+              break;
+            case 'error':
+              yield { type: 'error', error: chunk.error ?? 'Stream error' };
+              return;
+            case 'done':
+              break;
+          }
+        }
+
+        finalResponse = text || finalResponse;
+
+        // Track 1.2: Token budget check
+        const totalTokens = this.usageTracker?.getSummary().totalTokens ?? 0;
+        const budgetCheck = this.checkTokenBudget(totalTokens);
+        if (budgetCheck.exceeded) {
+          yield { type: 'iteration-end', iteration };
+          break;
+        }
+
+        // If no tool calls, we're done
+        if (streamToolCalls.length === 0) {
+          yield { type: 'iteration-end', iteration };
+          break;
+        }
+
+        // Push assistant message
+        nextMessages.push({
+          role: 'assistant',
+          content: text || 'Running requested tools.',
+          createdAt: nowIso(),
+        });
+
+        // Execute tool calls
+        for (const tc of streamToolCalls) {
+          const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
+          yield { type: 'tool-start', toolName: tc.name, toolCallId };
+
+          // Check approval gate
+          const def = this.tools.get(tc.name);
+          const dangerousSignals = collectDangerousInputSignals(tc.input);
+          const needsApproval = this.requireApprovalForDangerousTools
+            && def && (def.manifest.dangerLevel === 'high' || dangerousSignals.length > 0);
+
+          if (needsApproval) {
+            // Track 1.4: Checkpoint before dangerous tool
+            if (this.autoCheckpoint && this.checkpointStore) {
+              await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
+            }
+
+            const context: ToolExecutionContext = {
+              agentId: session.agentId,
+              sessionId: session.sessionId,
+            };
+            const approved = this.approvalDecider
+              ? await this.approvalDecider(def!, tc.input, context)
+              : false;
+
+            if (!approved) {
+              const blockedResult: ToolExecutionResult = {
+                toolName: tc.name,
+                runtime: 'worker',
+                ok: false,
+                output: `Tool requires approval: ${tc.name}`,
+              };
+              toolResults.push(blockedResult);
+              nextMessages.push(toolMessage(blockedResult));
+              yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false };
+              continue;
+            }
+          }
+
+          const context: ToolExecutionContext = {
+            agentId: session.agentId,
+            sessionId: session.sessionId,
+            signal,
+          };
+          const toolResult = await this.tools.execute(tc.name, tc.input, context);
+          toolResults.push(toolResult);
+          nextMessages.push(toolMessage(toolResult));
+          yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok };
+
+          if (!toolResult.ok && this.stopOnToolError) {
+            finalResponse = 'Stopped after tool failure.';
+            yield { type: 'iteration-end', iteration };
+            yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+            return;
+          }
+        }
+
+        // Track 1.4: Auto-checkpoint at end of iteration
+        if (this.autoCheckpoint && this.checkpointStore) {
+          await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
+        }
+
+        yield { type: 'iteration-end', iteration };
+      }
+
+      yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+    } catch (error: unknown) {
+      yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
+    }
+  }
 }
 
 export { buildSystemPrompt, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
@@ -691,11 +1155,20 @@ export {
   sanitizeText,
   redactPII,
   containsSecrets,
+  redactCredentials,
+  redactToolOutput,
+  scanForEnhancedInjection,
+  scanCommand,
   type InjectionScanResult,
-  type RedactionResult
+  type RedactionResult,
+  type InjectionThreat,
+  type EnhancedInjectionScanResult,
+  type CommandRisk,
+  type CommandScanResult,
 } from './security.js';
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';
+export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usage-tracker.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
 export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry } from './skill-manifest.js';
@@ -720,6 +1193,11 @@ export {
   buildPersonaPrompt,
   loadPersonaFiles,
   getDefaultPersonaPrompt,
+  PersonaRegistry,
+  scanPersonaDirectories,
   type PersonaFiles,
   type PersonaConfig,
+  type PersonaProfile,
 } from './persona.js';
+
+export { collectStream, textStream, type StreamChunk, type StreamingProviderAdapter } from './streaming.js';

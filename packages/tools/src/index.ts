@@ -35,6 +35,7 @@ const backgroundProcesses = new Map<number, BackgroundProcessRecord>();
 
 async function loadChildProcessModule(): Promise<{
   exec(command: string, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+  execFile(file: string, args: string[], options: { cwd?: string; maxBuffer?: number }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
   spawn(command: string, args: string[], options: { stdio: 'ignore'; detached: boolean }): {
     pid?: number;
     kill(signal?: string): boolean;
@@ -44,6 +45,7 @@ async function loadChildProcessModule(): Promise<{
 }> {
   return import('node:child_process') as Promise<{
     exec(command: string, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+    execFile(file: string, args: string[], options: { cwd?: string; maxBuffer?: number }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
     spawn(command: string, args: string[], options: { stdio: 'ignore'; detached: boolean }): {
       pid?: number;
       kill(signal?: string): boolean;
@@ -51,6 +53,19 @@ async function loadChildProcessModule(): Promise<{
       unref?(): void;
     };
   }>;
+}
+
+async function runGitCommand(args: string[], cwd?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const cp = await loadChildProcessModule();
+  return new Promise((resolve) => {
+    cp.execFile('git', args, { cwd, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      resolve({
+        ok: !error,
+        stdout: stdout ?? '',
+        stderr: stderr ?? ''
+      });
+    });
+  });
 }
 
 function normalizeScope(input: Record<string, unknown>): 'session' | 'user' | 'workspace' | undefined {
@@ -1529,6 +1544,306 @@ export function createMcpCallTool(client: McpClient): ToolDefinition {
   };
 }
 
+export function createGitStatusTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'git.status',
+      description: 'Show git repository status (staged, modified, untracked files)',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Working directory path (optional)' }
+        }
+      }
+    },
+    async execute(input) {
+      const cwd = typeof input.path === 'string' ? input.path : undefined;
+      const result = await runGitCommand(['status', '--porcelain', '-b'], cwd);
+      if (!result.ok) {
+        return {
+          toolName: 'git.status',
+          runtime: 'worker',
+          ok: false,
+          output: result.stderr.trim() || 'Not a git repository or git is not installed.'
+        };
+      }
+      const lines = result.stdout.split('\n').filter(Boolean);
+      const branchLine = lines.find((l) => l.startsWith('##'));
+      const branch = branchLine ? branchLine.replace('## ', '') : 'unknown';
+      const staged: string[] = [];
+      const modified: string[] = [];
+      const untracked: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith('##')) continue;
+        const x = line[0];
+        const y = line[1];
+        const file = line.slice(3);
+        if (x === '?' && y === '?') {
+          untracked.push(file);
+        } else {
+          if (x && x !== ' ' && x !== '?') staged.push(file);
+          if (y && y !== ' ' && y !== '?') modified.push(file);
+        }
+      }
+      return {
+        toolName: 'git.status',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify({ branch, staged, modified, untracked }, null, 2),
+        metadata: { branch, stagedCount: staged.length, modifiedCount: modified.length, untrackedCount: untracked.length }
+      };
+    }
+  };
+}
+
+export function createGitDiffTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'git.diff',
+      description: 'Show changes in working directory or between commits',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          staged: { type: 'boolean', description: 'Show staged changes only' },
+          path: { type: 'string', description: 'Specific file path' },
+          ref: { type: 'string', description: 'Commit ref to diff against' }
+        }
+      }
+    },
+    async execute(input) {
+      const args = ['diff'];
+      if (input.staged === true) {
+        args.push('--staged');
+      }
+      if (typeof input.ref === 'string' && input.ref) {
+        args.push(input.ref);
+      }
+      if (typeof input.path === 'string' && input.path) {
+        args.push('--', input.path);
+      }
+      const result = await runGitCommand(args);
+      if (!result.ok) {
+        return {
+          toolName: 'git.diff',
+          runtime: 'worker',
+          ok: false,
+          output: result.stderr.trim() || 'Failed to run git diff.'
+        };
+      }
+      return {
+        toolName: 'git.diff',
+        runtime: 'worker',
+        ok: true,
+        output: result.stdout || '(no changes)'
+      };
+    }
+  };
+}
+
+export function createGitLogTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'git.log',
+      description: 'Show recent commit history',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          count: { type: 'number', description: 'Number of commits (default 10)' },
+          oneline: { type: 'boolean', description: 'One line per commit' },
+          path: { type: 'string', description: 'Filter by file path' }
+        }
+      }
+    },
+    async execute(input) {
+      const count = typeof input.count === 'number' && input.count > 0 ? input.count : 10;
+      const args = ['log', `-${count}`];
+      if (input.oneline === true) {
+        args.push('--oneline');
+      } else {
+        args.push('--format=%H %s (%an, %ar)');
+      }
+      if (typeof input.path === 'string' && input.path) {
+        args.push('--', input.path);
+      }
+      const result = await runGitCommand(args);
+      if (!result.ok) {
+        return {
+          toolName: 'git.log',
+          runtime: 'worker',
+          ok: false,
+          output: result.stderr.trim() || 'Failed to run git log.'
+        };
+      }
+      return {
+        toolName: 'git.log',
+        runtime: 'worker',
+        ok: true,
+        output: result.stdout.trim() || '(no commits)',
+        metadata: { count }
+      };
+    }
+  };
+}
+
+export function createGitCommitTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'git.commit',
+      description: 'Stage and commit changes',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'Commit message (required)' },
+          files: { type: 'array', items: { type: 'string' }, description: 'Files to stage (default: all modified)' },
+          all: { type: 'boolean', description: 'Stage all changes (-a flag)' }
+        },
+        required: ['message']
+      }
+    },
+    async execute(input) {
+      const message = typeof input.message === 'string' ? input.message : '';
+      if (!message) {
+        return {
+          toolName: 'git.commit',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing commit message.'
+        };
+      }
+
+      // Stage files
+      const files = Array.isArray(input.files) ? input.files.filter((f): f is string => typeof f === 'string') : [];
+      if (files.length > 0) {
+        const addResult = await runGitCommand(['add', ...files]);
+        if (!addResult.ok) {
+          return {
+            toolName: 'git.commit',
+            runtime: 'worker',
+            ok: false,
+            output: `Failed to stage files: ${addResult.stderr.trim()}`
+          };
+        }
+      } else if (input.all === true) {
+        const addResult = await runGitCommand(['add', '-A']);
+        if (!addResult.ok) {
+          return {
+            toolName: 'git.commit',
+            runtime: 'worker',
+            ok: false,
+            output: `Failed to stage files: ${addResult.stderr.trim()}`
+          };
+        }
+      }
+
+      // Commit
+      const commitResult = await runGitCommand(['commit', '-m', message]);
+      if (!commitResult.ok) {
+        return {
+          toolName: 'git.commit',
+          runtime: 'worker',
+          ok: false,
+          output: commitResult.stderr.trim() || commitResult.stdout.trim() || 'Failed to commit.'
+        };
+      }
+      return {
+        toolName: 'git.commit',
+        runtime: 'worker',
+        ok: true,
+        output: commitResult.stdout.trim(),
+        metadata: { message }
+      };
+    }
+  };
+}
+
+export function createGitBranchTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'git.branch',
+      description: 'List branches or create a new branch',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'New branch name (omit to list)' },
+          checkout: { type: 'boolean', description: 'Switch to the new branch' }
+        }
+      }
+    },
+    async execute(input) {
+      const branchName = typeof input.name === 'string' ? input.name : '';
+      if (!branchName) {
+        // List branches
+        const result = await runGitCommand(['branch', '--list']);
+        if (!result.ok) {
+          return {
+            toolName: 'git.branch',
+            runtime: 'worker',
+            ok: false,
+            output: result.stderr.trim() || 'Failed to list branches.'
+          };
+        }
+        return {
+          toolName: 'git.branch',
+          runtime: 'worker',
+          ok: true,
+          output: result.stdout.trim() || '(no branches)'
+        };
+      }
+
+      // Create branch
+      const args = input.checkout === true
+        ? ['checkout', '-b', branchName]
+        : ['branch', branchName];
+      const result = await runGitCommand(args);
+      if (!result.ok) {
+        return {
+          toolName: 'git.branch',
+          runtime: 'worker',
+          ok: false,
+          output: result.stderr.trim() || `Failed to create branch: ${branchName}`
+        };
+      }
+      return {
+        toolName: 'git.branch',
+        runtime: 'worker',
+        ok: true,
+        output: result.stdout.trim() || `Branch '${branchName}' created.${input.checkout === true ? ' Switched to it.' : ''}`,
+        metadata: { name: branchName, checkout: input.checkout === true }
+      };
+    }
+  };
+}
+
 export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createEchoTool());
   registry.register(createTimeTool());
@@ -1549,6 +1864,11 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createImageGenerateToolImpl());
   registry.register(createTextPatchTool());
   registry.register(createLinePatchTool());
+  registry.register(createGitStatusTool());
+  registry.register(createGitDiffTool());
+  registry.register(createGitLogTool());
+  registry.register(createGitCommitTool());
+  registry.register(createGitBranchTool());
   registry.register(createToolListTool(registry));
   return registry;
 }
@@ -1657,8 +1977,8 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   },
   devops: {
     name: 'devops',
-    description: 'DevOps workflow — terminal, files, web fetch, process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch'],
+    description: 'DevOps workflow — terminal, files, web fetch, git, process management',
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch'],
   },
   creative: {
     name: 'creative',

@@ -11,13 +11,48 @@ export function createImageGenerateTool(options?: ImageGenerationOptions): ToolD
   return {
     manifest: {
       name: 'image.generate',
-      description: 'Generates an image from a text prompt using an image generation API.',
+      description: 'Generates an image from a text prompt using a DALL-E or compatible image generation API.',
       runtime: 'worker',
       streaming: false,
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: true,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: {
+            type: 'string',
+            description: 'Text description of the image to generate.',
+          },
+          size: {
+            type: 'string',
+            description: 'Image dimensions (e.g., "1024x1024", "1792x1024"). Defaults to "1024x1024".',
+          },
+          quality: {
+            type: 'string',
+            description: 'Image quality: "standard" or "hd". Defaults to "standard".',
+            enum: ['standard', 'hd'],
+          },
+          n: {
+            type: 'number',
+            description: 'Number of images to generate. Defaults to 1.',
+          },
+          providerBaseUrl: {
+            type: 'string',
+            description: 'Override the OpenAI-compatible API base URL.',
+          },
+          apiKey: {
+            type: 'string',
+            description: 'Override the API key for this request.',
+          },
+          model: {
+            type: 'string',
+            description: 'Override the model name (default: dall-e-3).',
+          },
+        },
+        required: ['prompt'],
+      },
     },
     async execute(input, context): Promise<ToolExecutionResult> {
       const prompt = typeof input.prompt === 'string' ? input.prompt : '';
@@ -34,9 +69,9 @@ export function createImageGenerateTool(options?: ImageGenerationOptions): ToolD
         };
       }
 
-      const apiKey = options?.apiKey;
-      const baseUrl = options?.providerBaseUrl ?? 'https://api.openai.com/v1';
-      const model = options?.model ?? 'dall-e-3';
+      const apiKey = (typeof input.apiKey === 'string' ? input.apiKey : undefined) ?? options?.apiKey;
+      const baseUrl = (typeof input.providerBaseUrl === 'string' ? input.providerBaseUrl : undefined) ?? options?.providerBaseUrl ?? 'https://api.openai.com/v1';
+      const model = (typeof input.model === 'string' ? input.model : undefined) ?? options?.model ?? 'dall-e-3';
 
       if (!apiKey) {
         return {

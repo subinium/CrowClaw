@@ -15,7 +15,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Git Commit Workflow\n\nStandard git workflow for committing and pushing changes.'
+    markdown: '# Git Commit Workflow\n\nStandard git workflow for committing and pushing changes.',
+    requiredTools: ['terminal.exec', 'git.status', 'git.diff', 'git.commit']
   },
   {
     slug: 'code-review',
@@ -33,7 +34,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Code Review\n\nSystematic code review process.'
+    markdown: '# Code Review\n\nSystematic code review process.',
+    requiredTools: ['workspace.read', 'workspace.search', 'git.diff']
   },
   {
     slug: 'debug-error',
@@ -51,7 +53,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Debug Error\n\nSystematic debugging approach.'
+    markdown: '# Debug Error\n\nSystematic debugging approach.',
+    requiredTools: ['workspace.read', 'workspace.search', 'terminal.exec']
   },
   {
     slug: 'project-setup-nextjs',
@@ -68,7 +71,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Next.js Project Setup\n\nQuickstart for new Next.js projects.'
+    markdown: '# Next.js Project Setup\n\nQuickstart for new Next.js projects.',
+    requiredTools: ['terminal.exec', 'workspace.write', 'workspace.read']
   },
   {
     slug: 'api-endpoint',
@@ -85,7 +89,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Create API Endpoint\n\nStandard pattern for REST API endpoints.'
+    markdown: '# Create API Endpoint\n\nStandard pattern for REST API endpoints.',
+    requiredTools: ['workspace.read', 'workspace.write', 'terminal.exec']
   },
   {
     slug: 'database-migration',
@@ -102,7 +107,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Database Migration\n\nSafe database migration workflow.'
+    markdown: '# Database Migration\n\nSafe database migration workflow.',
+    requiredTools: ['workspace.write', 'workspace.read', 'terminal.exec']
   },
   {
     slug: 'deploy-vercel',
@@ -119,7 +125,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Deploy to Vercel\n\nVercel deployment checklist.'
+    markdown: '# Deploy to Vercel\n\nVercel deployment checklist.',
+    requiredTools: ['terminal.exec', 'workspace.read']
   },
   {
     slug: 'write-tests',
@@ -137,7 +144,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Write Tests\n\nSystematic test writing approach.'
+    markdown: '# Write Tests\n\nSystematic test writing approach.',
+    requiredTools: ['workspace.read', 'workspace.write', 'terminal.exec']
   },
   {
     slug: 'refactor-module',
@@ -154,7 +162,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Refactor Module\n\nSafe refactoring workflow.'
+    markdown: '# Refactor Module\n\nSafe refactoring workflow.',
+    requiredTools: ['workspace.read', 'workspace.write', 'workspace.search', 'terminal.exec']
   },
   {
     slug: 'docker-setup',
@@ -171,7 +180,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Docker Setup\n\nDockerization workflow.'
+    markdown: '# Docker Setup\n\nDockerization workflow.',
+    requiredTools: ['workspace.write', 'workspace.read', 'terminal.exec']
   },
   {
     slug: 'security-audit',
@@ -189,7 +199,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Security Audit\n\nSecurity review checklist.'
+    markdown: '# Security Audit\n\nSecurity review checklist.',
+    requiredTools: ['workspace.read', 'workspace.search', 'terminal.exec']
   },
   {
     slug: 'performance-optimization',
@@ -207,7 +218,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Performance Optimization\n\nPerformance analysis workflow.'
+    markdown: '# Performance Optimization\n\nPerformance analysis workflow.',
+    requiredTools: ['workspace.read', 'workspace.search', 'terminal.exec']
   },
   {
     slug: 'web-scraping',
@@ -224,7 +236,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Web Scraping\n\nWeb data extraction workflow.'
+    markdown: '# Web Scraping\n\nWeb data extraction workflow.',
+    requiredTools: ['web.fetch', 'web.crawl', 'web.search']
   },
   {
     slug: 'github-pr-workflow',
@@ -241,7 +254,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# GitHub PR Workflow\n\nPull request creation workflow.'
+    markdown: '# GitHub PR Workflow\n\nPull request creation workflow.',
+    requiredTools: ['terminal.exec', 'git.status', 'git.diff']
   },
   {
     slug: 'env-setup',
@@ -258,7 +272,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Environment Setup\n\nDevelopment environment configuration.'
+    markdown: '# Environment Setup\n\nDevelopment environment configuration.',
+    requiredTools: ['terminal.exec', 'workspace.read', 'workspace.write']
   },
 
   // ── Apple / macOS ───────────────────────────────────────────────────
@@ -361,7 +376,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Create GitHub Issue\n\nCreate well-structured GitHub issues with proper labels and descriptions.'
+    markdown: '# Create GitHub Issue\n\nCreate well-structured GitHub issues with proper labels and descriptions.',
+    requiredTools: ['terminal.exec']
   },
   {
     slug: 'github-pr-review',
@@ -380,7 +396,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# GitHub PR Review\n\nSystematic pull request review workflow.'
+    markdown: '# GitHub PR Review\n\nSystematic pull request review workflow.',
+    requiredTools: ['terminal.exec', 'workspace.read', 'git.diff']
   },
   {
     slug: 'github-repo-setup',
@@ -706,7 +723,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# End-to-End Tests\n\nWrite Playwright-based end-to-end tests for web applications.'
+    markdown: '# End-to-End Tests\n\nWrite Playwright-based end-to-end tests for web applications.',
+    requiredTools: ['workspace.read', 'workspace.write', 'terminal.exec']
   },
   {
     slug: 'test-api',
@@ -725,7 +743,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# API Integration Tests\n\nWrite integration tests for REST API endpoints.'
+    markdown: '# API Integration Tests\n\nWrite integration tests for REST API endpoints.',
+    requiredTools: ['workspace.read', 'workspace.write', 'terminal.exec']
   },
   {
     slug: 'test-component',
@@ -744,7 +763,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# React Component Tests\n\nWrite component tests using React Testing Library.'
+    markdown: '# React Component Tests\n\nWrite component tests using React Testing Library.',
+    requiredTools: ['workspace.read', 'workspace.write', 'terminal.exec']
   },
 
   // ── Documentation ──────────────────────────────────────────────────
@@ -1051,7 +1071,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# CI Pipeline Setup\n\nCreate CI/CD pipeline configuration for automated workflows.'
+    markdown: '# CI Pipeline Setup\n\nCreate CI/CD pipeline configuration for automated workflows.',
+    requiredTools: ['workspace.write', 'workspace.read', 'terminal.exec']
   },
   {
     slug: 'auth-implementation',
@@ -1070,7 +1091,8 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     ],
     sourceMessages: 0,
     status: 'published',
-    markdown: '# Authentication Implementation\n\nImplement authentication with security best practices.'
+    markdown: '# Authentication Implementation\n\nImplement authentication with security best practices.',
+    requiredTools: ['workspace.read', 'workspace.write', 'terminal.exec']
   },
   {
     slug: 'email-template',

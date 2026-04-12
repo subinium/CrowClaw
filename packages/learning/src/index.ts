@@ -23,6 +23,12 @@ export interface StoredSkillDraft extends SkillDraft {
   createdAt: string;
   updatedAt: string;
   markdown: string;
+  version?: number;
+  ratings?: { helpful: number; unhelpful: number };
+  pitfalls?: string[];
+  verificationSteps?: string[];
+  /** Tool names this skill needs (e.g., ['web.search', 'workspace.read']) */
+  requiredTools?: string[];
 }
 
 export interface SkillStore {
@@ -288,17 +294,42 @@ export { getBuiltInSkills, loadBuiltInSkills } from './built-in-skills.js';
 export { SkillRegistry, type SkillSource, type SkillRegistryOptions } from './skill-registry.js';
 
 import { SkillRegistry } from './skill-registry.js';
+import type { SkillExtractionProvider } from './refinement.js';
+
+export interface LearningPipelineOptions {
+  extractionProvider?: SkillExtractionProvider;
+  /** Number of unhelpful ratings before auto-unpublishing. Default: 3. */
+  unpublishThreshold?: number;
+}
 
 export class LearningPipeline {
   private registry?: SkillRegistry;
+  private readonly extractionProvider?: SkillExtractionProvider;
+  private readonly unpublishThreshold: number;
 
-  constructor(private readonly store: SkillStore) {}
+  constructor(
+    private readonly store: SkillStore,
+    options?: LearningPipelineOptions,
+  ) {
+    this.extractionProvider = options?.extractionProvider;
+    this.unpublishThreshold = options?.unpublishThreshold ?? 3;
+  }
 
   setRegistry(registry: SkillRegistry): void {
     this.registry = registry;
   }
 
   async captureDraft(messages: ConversationMessage[], title: string): Promise<StoredSkillDraft> {
+    // Use LLM extraction if provider is available
+    if (this.extractionProvider) {
+      const llmDraft = await this.extractionProvider.extractSkill(messages);
+      if (llmDraft) {
+        await this.store.save(llmDraft);
+        return llmDraft;
+      }
+    }
+
+    // Fall back to heuristic extraction
     const draft = extractSkillDraft(messages, title);
     const now = new Date().toISOString();
     const stored: StoredSkillDraft = {
@@ -308,6 +339,8 @@ export class LearningPipeline {
       createdAt: now,
       updatedAt: now,
       markdown: renderSkillMarkdown(draft),
+      version: 1,
+      ratings: { helpful: 0, unhelpful: 0 },
     };
     await this.store.save(stored);
     return stored;
@@ -341,6 +374,31 @@ export class LearningPipeline {
     await this.store.save(unpublished);
     this.registry?.removeLearnedSkill(unpublished.slug);
     return unpublished;
+  }
+
+  async rateSkill(slug: string, rating: 'helpful' | 'unhelpful'): Promise<void> {
+    const all = await this.store.list();
+    const skill = all.find((s) => s.slug === slug);
+    if (!skill) {
+      throw new Error(`Skill not found: ${slug}`);
+    }
+
+    const ratings = skill.ratings ?? { helpful: 0, unhelpful: 0 };
+    ratings[rating] += 1;
+
+    const updated: StoredSkillDraft = {
+      ...skill,
+      ratings,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Auto-unpublish if unhelpful ratings exceed threshold
+    if (updated.status === 'published' && ratings.unhelpful >= this.unpublishThreshold) {
+      updated.status = 'draft';
+      this.registry?.removeLearnedSkill(updated.slug);
+    }
+
+    await this.store.save(updated);
   }
 
   async autoCapture(messages: ConversationMessage[], title?: string): Promise<StoredSkillDraft | null> {
@@ -382,3 +440,11 @@ export {
   type TrajectoryToolUsage,
   type TrajectoryExportOptions,
 } from './trajectory.js';
+
+export {
+  buildExtractionPrompt,
+  buildRefinementPrompt,
+  parseSkillResponse,
+  createLlmSkillExtractor,
+  type SkillExtractionProvider,
+} from './refinement.js';

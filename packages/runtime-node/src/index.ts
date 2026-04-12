@@ -1,4 +1,4 @@
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
 import {
   buildDiscordDispatch,
   buildDiscordEditPayload,
@@ -49,13 +49,13 @@ import {
   type GatewayPlatform,
 } from '@crowclaw/gateway';
 import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry } from '@crowclaw/learning';
-import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription } from '@crowclaw/mcp';
+import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { MemoryService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { EchoProvider, OpenAICompatibleProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@crowclaw/tools';
-import { InMemoryWorkspaceStore } from '@crowclaw/workspace';
+import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
 import { InMemorySchedulerStore, SchedulerExecutor, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markIntervalJobRun } from '@crowclaw/scheduler';
 import { RuntimeConfigStore } from './config-store.js';
 import type { CodeBridgeSession } from './bridge-state.js';
@@ -83,7 +83,9 @@ export interface NodeRuntimeOptions {
   tools?: ToolRegistry;
   sessionStore?: InMemorySessionStore;
   memoryStore?: InMemoryMemoryStore;
-  workspaceStore?: InMemoryWorkspaceStore;
+  workspaceStore?: WorkspaceStore;
+  /** If provided, use FileWorkspaceStore backed by this directory. Ignored if workspaceStore is set. */
+  workspaceDir?: string;
   schedulerStore?: InMemorySchedulerStore;
   skillStore?: InMemorySkillStore;
   mcpClient?: McpClient;
@@ -100,6 +102,8 @@ export interface NodeRuntimeOptions {
   personaDir?: string;
   /** Filesystem adapter for loading persona files. Required if personaDir is set. */
   personaFs?: { readFile(path: string): Promise<string>; joinPath(...parts: string[]): string };
+  /** Optional usage tracker for cost/token tracking. Created automatically if not provided. */
+  usageTracker?: DetailedUsageTracker;
 }
 
 function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
@@ -458,7 +462,10 @@ function renderBrowserClickRefResult(url: string, ref: string) {
 export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const store = options.sessionStore ?? new InMemorySessionStore();
   const memoryStore = options.memoryStore ?? new InMemoryMemoryStore();
-  const workspaceStore = options.workspaceStore ?? new InMemoryWorkspaceStore();
+  const workspaceStore = options.workspaceStore
+    ?? (options.workspaceDir
+      ? new FileWorkspaceStore(options.workspaceDir)
+      : new InMemoryWorkspaceStore());
   const schedulerStore = options.schedulerStore ?? new InMemorySchedulerStore();
   const skillStore = options.skillStore ?? new InMemorySkillStore();
   const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
@@ -482,6 +489,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const codeBridgeSessions = new Map<string, CodeBridgeSession>();
   const bridgeProcesses = new Map<string, BridgeProcessRecord>();
   const browserSessions = new Map<string, BrowserSessionState>();
+  const usageTracker = options.usageTracker ?? new DetailedUsageTracker();
   const deploymentName = options.deploymentName ?? 'crowclaw-node';
   const version = options.version ?? '0.1.0';
 
@@ -517,6 +525,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     );
   }
 
+  // Persona registry — supports runtime persona switching
+  const personaRegistry = new PersonaRegistry();
+
   // Load persona files if personaDir option or CROWCLAW_PERSONA_DIR env var is set
   const envPersonaDir = (globalThis as Record<string, unknown>).process
     ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env.CROWCLAW_PERSONA_DIR
@@ -525,7 +536,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   let personaPrompt: string | undefined;
   if (personaDir && options.personaFs) {
     void loadPersonaFiles(personaDir, options.personaFs).then(
-      (files) => { personaPrompt = buildPersonaPrompt(files) || undefined; },
+      (files) => {
+        personaPrompt = buildPersonaPrompt(files) || undefined;
+        // Also register as 'default' in the registry (overrides built-in default)
+        if (personaPrompt) {
+          personaRegistry.register('default', files);
+        }
+      },
       () => { /* Persona directory doesn't exist or is invalid — silently ignore */ }
     );
   }
@@ -623,12 +640,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
 
   function createConfiguredAgent(overrides?: ExecutionOverrides): AgentLoop {
+    // Use persona registry's active prompt, falling back to the legacy personaPrompt
+    const activePersonaPrompt = personaRegistry.getActive().prompt || personaPrompt;
     return new AgentLoop(resolveProvider(overrides), buildConfiguredToolRegistry(overrides), store, {
       plugins,
       runtimeName: 'node',
       skills: buildConfiguredSkillManifests(overrides),
       agentPreset: resolveConfiguredAgentPreset(overrides),
-      personaPrompt,
+      personaPrompt: activePersonaPrompt,
     });
   }
 
@@ -752,6 +771,54 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     plugins,
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
+
+      // Auth verification endpoint
+      if (request.method === 'POST' && url.pathname === '/api/auth/verify') {
+        const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
+        if (!dashToken) {
+          return Response.json({ ok: true, bypass: true });
+        }
+        const body = (await request.json()) as { token?: string };
+        return Response.json({ ok: body.token === dashToken });
+      }
+
+      // Auth middleware for /api/* routes
+      const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
+      if (dashToken && url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/events') {
+        const authHeader = request.headers.get('authorization');
+        const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (token !== dashToken) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401 });
+        }
+      }
+
+      // Session rename
+      const renameMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/rename$/);
+      if (request.method === 'POST' && renameMatch) {
+        const sessionId = renameMatch[1];
+        const body = (await request.json()) as { name: string };
+        return Response.json({ ok: true, sessionId, name: body.name });
+      }
+
+      // Session delete
+      const deleteSessionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
+      if (request.method === 'DELETE' && deleteSessionMatch) {
+        const sessionId = deleteSessionMatch[1];
+        if (typeof (store as unknown as { delete?: unknown }).delete === 'function') {
+          await (store as unknown as { delete(id: string): Promise<void> }).delete(sessionId);
+        }
+        return Response.json({ ok: true, sessionId });
+      }
+
+      // Memory delete
+      const deleteMemoryMatch = url.pathname.match(/^\/api\/memories\/([^/]+)$/);
+      if (request.method === 'DELETE' && deleteMemoryMatch) {
+        const memoryId = deleteMemoryMatch[1];
+        if (typeof (memoryStore as unknown as { delete?: unknown }).delete === 'function') {
+          await (memoryStore as unknown as { delete(id: string): Promise<void> }).delete(memoryId);
+        }
+        return Response.json({ ok: true, memoryId });
+      }
 
       // Dashboard — serve web UI at root and /dashboard
       if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
@@ -1090,6 +1157,34 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           toolsets: listToolsetPresets(),
           mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) }))
         });
+      }
+
+      // --- Persona API ---
+
+      if (request.method === 'GET' && url.pathname === routePaths.personas.list) {
+        return Response.json({ personas: personaRegistry.list() });
+      }
+
+      if (request.method === 'GET' && url.pathname === routePaths.personas.active) {
+        const active = personaRegistry.getActive();
+        const identity = active.files.identity ? parseIdentity(active.files.identity) : {};
+        return Response.json({ name: active.name, identity });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.personas.switch) {
+        const body = await request.json() as { name?: string };
+        if (!body.name) {
+          return Response.json({ ok: false, error: 'Missing persona name' }, { status: 400 });
+        }
+        try {
+          const profile = personaRegistry.switchTo(body.name);
+          // Update the legacy personaPrompt variable so createConfiguredAgent picks it up
+          personaPrompt = profile.prompt || undefined;
+          return Response.json({ ok: true, active: profile.name });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ ok: false, error: msg }, { status: 400 });
+        }
       }
 
       if (request.method === 'GET' && url.pathname === '/api/gateway/status') {
@@ -2200,6 +2295,25 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json(await mcpClient.callTool(body.name, body.arguments ?? {}));
       }
 
+      if (request.method === 'POST' && url.pathname === '/api/mcp/verify') {
+        const dynamicClient = mcpClient as unknown as { verify?: (options?: { timeoutMs?: number }) => Promise<unknown> };
+        if (dynamicClient.verify) {
+          return Response.json(await dynamicClient.verify());
+        }
+        return Response.json({ ok: false, error: 'verify not supported on this client', latencyMs: 0 });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/presets/status') {
+        const names = listMcpPresetNames();
+        const results = await Promise.all(
+          names.map(async (name) => {
+            const result = await verifyPresetAvailability(name);
+            return { name, ...result };
+          })
+        );
+        return Response.json(results);
+      }
+
       if (request.method === 'GET' && url.pathname === '/api/learning/drafts') {
         return Response.json(await learning.listDrafts());
       }
@@ -2466,6 +2580,60 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, source: body.source ?? 'session', results });
         }
 
+        if (action === 'stream') {
+          const body = (await request.json()) as { message: string; userId?: string; workspaceId?: string };
+          if (!body.message) return Response.json({ error: 'Missing message' }, { status: 400 });
+
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            async start(controller) {
+              try {
+                const loop = createConfiguredAgent();
+                const existingSession = await store.get(sessionId);
+                const sessionState: SessionState = existingSession ?? {
+                  agentId: options.agentId ?? 'crowclaw',
+                  sessionId,
+                  messages: [],
+                  updatedAt: new Date().toISOString(),
+                  userId: body.userId,
+                  workspaceId: body.workspaceId,
+                };
+
+                if (typeof loop.runStreaming === 'function') {
+                  for await (const event of loop.runStreaming({
+                    userMessage: body.message,
+                    sessionState,
+                  })) {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                  }
+                } else {
+                  const result = await runConfiguredAgent({
+                    sessionId,
+                    userMessage: body.message,
+                    userId: body.userId,
+                    workspaceId: body.workspaceId,
+                    systemPrompt: 'You are CrowClaw running in a generic Node runtime.'
+                  });
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', response: result.finalResponse })}\n\n`));
+                }
+              } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`));
+              }
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              'content-type': 'text/event-stream',
+              'cache-control': 'no-cache',
+              'connection': 'keep-alive',
+            },
+          });
+        }
+
         const body = (await request.json()) as { userMessage: string; userId?: string; workspaceId?: string };
         const result = await runConfiguredAgent({
           sessionId,
@@ -2483,6 +2651,74 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'POST' && url.pathname === '/api/config') {
         await request.json();
         return Response.json({ ok: true, config: configStore.snapshot() });
+      }
+
+      // Provider config save
+      if (request.method === 'POST' && url.pathname === routePaths.config.provider) {
+        const body = await request.json() as { apiKey?: string; baseUrl?: string; model?: string; provider?: string };
+        if (body.apiKey) process.env.OPENROUTER_API_KEY = body.apiKey;
+        if (body.baseUrl) process.env.OPENROUTER_BASE_URL = body.baseUrl;
+        if (body.model) process.env.OPENROUTER_MODEL = body.model;
+        return Response.json({ ok: true, model: body.model, provider: body.provider || 'openrouter' });
+      }
+
+      // Provider connection test (onboarding)
+      if (request.method === 'POST' && url.pathname === routePaths.config.providerTest) {
+        const body = await request.json() as { apiKey?: string; baseUrl?: string; provider?: string };
+        const apiKey = body.apiKey;
+        const baseUrl = body.baseUrl || 'https://openrouter.ai/api/v1';
+        const providerName = body.provider || 'openrouter';
+        if (!apiKey) return Response.json({ ok: false, error: 'Missing API key' }, { status: 400 });
+        try {
+          let testUrl: string;
+          const headers: Record<string, string> = {};
+          if (providerName === 'anthropic') {
+            testUrl = baseUrl.replace(/\/$/, '') + '/v1/messages';
+            headers['x-api-key'] = apiKey;
+            headers['anthropic-version'] = '2023-06-01';
+            headers['content-type'] = 'application/json';
+            const testResp = await fetch(testUrl, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ model: 'claude-haiku-4', max_tokens: 1, messages: [{ role: 'user', content: 'test' }] }),
+            });
+            if (testResp.ok || testResp.status === 400) {
+              return Response.json({ ok: true, provider: providerName, models: ['claude-sonnet-4', 'claude-4', 'claude-haiku-4'] });
+            }
+            const errBody = await testResp.text();
+            return Response.json({ ok: false, error: `HTTP ${testResp.status}: ${errBody.slice(0, 200)}` });
+          } else {
+            testUrl = baseUrl.replace(/\/$/, '') + '/chat/completions';
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            headers['content-type'] = 'application/json';
+            const testResp = await fetch(testUrl, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: 1, messages: [{ role: 'user', content: 'test' }] }),
+            });
+            if (testResp.ok) {
+              let modelList: string[] = [];
+              try {
+                const modelsResp = await fetch(baseUrl.replace(/\/$/, '') + '/models', {
+                  headers: { 'Authorization': `Bearer ${apiKey}` },
+                });
+                if (modelsResp.ok) {
+                  const modelsData = await modelsResp.json() as { data?: Array<{ id: string }> };
+                  modelList = (modelsData.data || []).slice(0, 20).map((m) => m.id);
+                }
+              } catch { /* model list is optional */ }
+              return Response.json({ ok: true, provider: providerName, models: modelList });
+            }
+            if (testResp.status === 401) {
+              return Response.json({ ok: false, error: 'Invalid API key' });
+            }
+            const errBody = await testResp.text();
+            return Response.json({ ok: false, error: `HTTP ${testResp.status}: ${errBody.slice(0, 200)}` });
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ ok: false, error: msg });
+        }
       }
 
       if (request.method === 'POST' && url.pathname.match(/^\/api\/skills\/([^/]+)\/toggle$/)) {
@@ -2609,6 +2845,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             Object.keys(snapshot.gatewayConfigs as Record<string, unknown>).map((k) => [k, { configured: true }])
           ),
         });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/usage') {
+        return Response.json(usageTracker.getSummary());
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/usage/reset') {
+        usageTracker.reset();
+        return Response.json({ ok: true });
       }
 
       return new Response('Not found', { status: 404 });
