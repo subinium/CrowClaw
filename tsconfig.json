@@ -1,0 +1,62 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/shared"
+    },
+    {
+      "path": "./packages/core"
+    },
+    {
+      "path": "./packages/providers"
+    },
+    {
+      "path": "./packages/storage"
+    },
+    {
+      "path": "./packages/tools"
+    },
+    {
+      "path": "./packages/sandbox-executor"
+    },
+    {
+      "path": "./packages/mcp"
+    },
+    {
+      "path": "./packages/scheduler"
+    },
+    {
+      "path": "./packages/learning"
+    },
+    {
+      "path": "./packages/plugins"
+    },
+    {
+      "path": "./packages/workspace"
+    },
+    {
+      "path": "./packages/runtime-node"
+    },
+    {
+      "path": "./packages/runtime-cloudflare"
+    },
+    {
+      "path": "./packages/memory"
+    },
+    {
+      "path": "./packages/gateway"
+    },
+    {
+      "path": "./packages/web"
+    },
+    {
+      "path": "./packages/cli"
+    },
+    {
+      "path": "./packages/acp"
+    },
+    {
+      "path": "./packages/mcp-server"
+    }
+  ]
+}

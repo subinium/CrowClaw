@@ -1,0 +1,10 @@
+tests/
+docs/
+.omx/
+.github/
+*.test.ts
+vitest.config.ts
+wrangler.jsonc
+tsconfig.base.json
+RELEASE_CANDIDATE.md
+RELEASE_CHECKLIST.md

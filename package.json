@@ -1,0 +1,41 @@
+{
+  "name": "crowclaw",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A self-improving TypeScript agent framework that learns from every conversation.",
+  "bin": {
+    "crowclaw": "packages/cli/dist/index.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "packages/*/dist"
+  ],
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/link-workspaces.mjs",
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "cli": "node packages/cli/dist/index.js",
+    "preflight": "npm run typecheck && npm test",
+    "release:check": "npm run preflight",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "^0.8.9"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "@cloudflare/workers-types": "^4.20260411.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4",
+    "wrangler": "^4.81.1"
+  }
+}

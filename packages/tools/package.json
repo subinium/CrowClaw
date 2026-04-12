@@ -1,0 +1,26 @@
+{
+  "name": "@crowclaw/tools",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@crowclaw/core": "0.1.0",
+    "@crowclaw/gateway": "0.1.0",
+    "@crowclaw/storage": "0.1.0",
+    "@crowclaw/workspace": "0.1.0"
+  }
+}

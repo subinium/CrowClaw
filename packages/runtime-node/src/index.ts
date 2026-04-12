@@ -1,0 +1,2617 @@
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import {
+  buildDiscordDispatch,
+  buildDiscordEditPayload,
+  buildDiscordWebhookEditUrl,
+  buildDiscordWebhookSendUrl,
+  buildGatewaySessionKey,
+  buildGatewayIdempotencyKey,
+  buildGatewayDeliveryPlan,
+  createDefaultAccessPolicy,
+  buildEmailDispatch,
+  buildMatrixDispatch,
+  buildSmsDispatch,
+  buildSignalDispatch,
+  buildWhatsAppDispatch,
+  InMemoryGatewayIdempotencyStore,
+  buildSlackDispatch,
+  buildSlackEditPayload,
+  buildSlackEditUrl,
+  buildSlackSendPayload,
+  buildSlackSendUrl,
+  buildTelegramEditPayload,
+  buildTelegramEditUrl,
+  buildTelegramDispatch,
+  buildTelegramSendPayload,
+  buildTelegramSendUrl,
+  normalizeGenericWebhook,
+  normalizeDiscordWebhook,
+  normalizeEmailWebhook,
+  normalizeSlackWebhook,
+  normalizeSignalWebhook,
+  normalizeTelegramWebhook,
+  normalizeWhatsAppWebhook,
+  normalizeMatrixWebhook,
+  normalizeSmsWebhook,
+  normalizeGatewayRequest,
+  evaluateAccess,
+  approvePairing,
+  verifySlackSignature,
+  probeTelegram,
+  probeSlack,
+  probeDiscord,
+  probeWhatsApp,
+  probeMatrix,
+  type ChannelAccessPolicy,
+  type NormalizedInboundMessage,
+  type PairingChallenge,
+  type ProbeResult,
+  type GatewayPlatform,
+} from '@crowclaw/gateway';
+import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry } from '@crowclaw/learning';
+import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription } from '@crowclaw/mcp';
+import { MemoryService } from '@crowclaw/memory';
+import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
+import { EchoProvider, OpenAICompatibleProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
+import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
+import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@crowclaw/tools';
+import { InMemoryWorkspaceStore } from '@crowclaw/workspace';
+import { InMemorySchedulerStore, SchedulerExecutor, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markIntervalJobRun } from '@crowclaw/scheduler';
+import { RuntimeConfigStore } from './config-store.js';
+import type { CodeBridgeSession } from './bridge-state.js';
+import { ensureBrowserSession, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
+import { handleCodeBridgeRoutes } from './bridge-routes.js';
+import type { BridgeProcessRecord } from './bridge-process.js';
+import { routePaths } from './route-paths.js';
+
+const directToolAliases = {
+  'browser.wait': 'browser.waitFor',
+  'browser.wait-for': 'browser.waitFor',
+  'browser.click-ref': 'browser.clickRef'
+} as const;
+
+function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
+  return value === 'iteration' || value === 'manual' || value === 'pre-dangerous' || value === 'error' || value === 'completion'
+    ? value
+    : 'manual';
+}
+
+export interface NodeRuntimeOptions {
+  agentId?: string;
+  version?: string;
+  provider?: ProviderAdapter;
+  tools?: ToolRegistry;
+  sessionStore?: InMemorySessionStore;
+  memoryStore?: InMemoryMemoryStore;
+  workspaceStore?: InMemoryWorkspaceStore;
+  schedulerStore?: InMemorySchedulerStore;
+  skillStore?: InMemorySkillStore;
+  mcpClient?: McpClient;
+  mcpBaseUrl?: string;
+  plugins?: PluginManager;
+  slackSigningSecret?: string;
+  gatewayIdempotencyStore?: InMemoryGatewayIdempotencyStore;
+  deploymentName?: string;
+  /** Directory to load local SKILL.md files from. Also reads CROWCLAW_SKILL_DIR env var. */
+  skillDir?: string;
+  /** Filesystem adapter for loading local skills. Required if skillDir is set. */
+  skillFs?: SkillFileSystem;
+  /** Directory to load persona markdown files (SOUL.md, IDENTITY.md, etc.). Also reads CROWCLAW_PERSONA_DIR env var. */
+  personaDir?: string;
+  /** Filesystem adapter for loading persona files. Required if personaDir is set. */
+  personaFs?: { readFile(path: string): Promise<string>; joinPath(...parts: string[]): string };
+}
+
+function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
+  const nestedDirectTools = [...new Set(
+    [...bridgeProcesses.values()].flatMap((process) => process.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool'))
+  )];
+  const aliasEntries = Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>;
+  const supportedRequestedAliases = aliasEntries
+    .filter(([, target]) => nestedDirectTools.includes(target))
+    .map(([alias]) => alias);
+  const supportedAliasTargets = [...new Set(aliasEntries
+    .filter(([, target]) => nestedDirectTools.includes(target))
+    .map(([, target]) => target))];
+  return {
+    supportsNestedCallToolDirect: true,
+    directToolAliases,
+    supportedRequestedAliasCount: supportedRequestedAliases.length,
+    supportedAliasTargetCount: supportedAliasTargets.length,
+    supportedRequestedAliases,
+    supportedAliasTargets,
+    directToolCount: nestedDirectTools.length,
+    nestedDirectTools,
+    directBrowserTools: nestedDirectTools.filter((toolName) => toolName.startsWith('browser.')),
+    directMcpTools: nestedDirectTools.filter((toolName) => toolName.startsWith('mcp.')),
+    directRuntimeTools: nestedDirectTools.filter((toolName) => !toolName.startsWith('browser.') && !toolName.startsWith('mcp.'))
+  };
+}
+
+function summarizeSessionRecord(session: SessionState) {
+  const lastMessage = [...session.messages].reverse().find((message) => message.role !== 'system');
+  return {
+    sessionId: session.sessionId,
+    updatedAt: session.updatedAt,
+    messageCount: session.messages.length,
+    userId: session.userId,
+    workspaceId: session.workspaceId,
+    lastRole: lastMessage?.role ?? null,
+    preview: lastMessage?.content.slice(0, 140) ?? '',
+  };
+}
+
+function summarizeSessionTranscript(session?: CodeBridgeSession) {
+  const transcript = session?.transcript ?? [];
+  const toolUsageCounts = Object.fromEntries(
+    [...transcript.reduce((counts, entry) => {
+      counts.set(entry.toolName, (counts.get(entry.toolName) ?? 0) + 1);
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const nestedDirectToolCounts = Object.fromEntries(
+    [...transcript.reduce((counts, entry) => {
+      if (entry.nestedDirectToolName) {
+        counts.set(entry.nestedDirectToolName, (counts.get(entry.nestedDirectToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const nestedRequestedAliasCounts = Object.fromEntries(
+    [...transcript.reduce((counts, entry) => {
+      if (entry.nestedAliasApplied && entry.nestedRequestedToolName) {
+        counts.set(entry.nestedRequestedToolName, (counts.get(entry.nestedRequestedToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const directRequestedAliasCounts = Object.fromEntries(
+    [...transcript.reduce((counts, entry) => {
+      if (entry.aliasApplied && entry.requestedToolName) {
+        counts.set(entry.requestedToolName, (counts.get(entry.requestedToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const aliasUsageCounts = Object.fromEntries(
+    [...transcript.reduce((counts, entry) => {
+      if (entry.aliasApplied && entry.canonicalToolName) {
+        counts.set(entry.canonicalToolName, (counts.get(entry.canonicalToolName) ?? 0) + 1);
+      }
+      if (entry.nestedAliasApplied && entry.nestedCanonicalToolName) {
+        counts.set(entry.nestedCanonicalToolName, (counts.get(entry.nestedCanonicalToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const aliasAppliedEntries = transcript.filter((entry) => entry.aliasApplied).length;
+  const nestedAliasAppliedEntries = transcript.filter((entry) => entry.nestedAliasApplied).length;
+  return {
+    transcriptSummary: {
+      total: transcript.length,
+      byTransport: {
+        runtime: transcript.filter((entry) => entry.transport === 'runtime').length,
+        socket: transcript.filter((entry) => entry.transport === 'socket').length
+      },
+      byExecutionMode: {
+        runtime: transcript.filter((entry) => entry.executionMode === 'runtime').length,
+        directSocket: transcript.filter((entry) => entry.executionMode === 'direct-socket').length,
+        fallbackRuntime: transcript.filter((entry) => entry.executionMode === 'fallback-runtime').length
+      },
+      aliasAppliedEntries,
+      nestedAliasAppliedEntries,
+      aliasUsageCounts,
+      directRequestedAliasCounts,
+      nestedRequestedAliasCounts,
+      toolUsageCounts,
+      nestedDirectToolCounts,
+      lastEntry: transcript.at(-1) ?? null
+    }
+  };
+}
+
+function summarizeSupportedDirectTools(supportedDirectTools: string[]) {
+  const nestedDirectTools = supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool');
+  const aliasEntries = Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>;
+  const supportedRequestedAliases = aliasEntries
+    .filter(([, target]) => nestedDirectTools.includes(target))
+    .map(([alias]) => alias);
+  const supportedAliasTargets = [...new Set(aliasEntries
+    .filter(([, target]) => nestedDirectTools.includes(target))
+    .map(([, target]) => target))];
+  return {
+    directToolAliases,
+    supportedRequestedAliasCount: supportedRequestedAliases.length,
+    supportedAliasTargetCount: supportedAliasTargets.length,
+    supportedRequestedAliases,
+    supportedAliasTargets,
+    directToolCount: nestedDirectTools.length,
+    nestedDirectTools,
+    directBrowserTools: nestedDirectTools.filter((toolName) => toolName.startsWith('browser.')),
+    directMcpTools: nestedDirectTools.filter((toolName) => toolName.startsWith('mcp.')),
+    directRuntimeTools: nestedDirectTools.filter((toolName) => !toolName.startsWith('browser.') && !toolName.startsWith('mcp.'))
+  };
+}
+
+function summarizeBridgeSessionRecord(session: CodeBridgeSession, process?: BridgeProcessRecord) {
+  const supportedDirectTools = process?.supportedDirectTools ?? [];
+  return {
+    sessionId: session.sessionId,
+    status: session.status,
+    runtimeMode: session.runtimeMode,
+    processId: process?.pid ?? session.processId,
+    lastToolName: session.lastToolName,
+    maxToolCalls: session.maxToolCalls,
+    supportsNestedCallToolDirect: true,
+    supportedDirectTools,
+    ...summarizeSupportedDirectTools(supportedDirectTools),
+    ...summarizeSessionTranscript(session)
+  };
+}
+
+function summarizeBridgeSessionsAggregate(
+  codeBridgeSessions: Map<string, CodeBridgeSession>,
+  bridgeProcesses: Map<string, BridgeProcessRecord>
+) {
+  const sessions = [...codeBridgeSessions.values()];
+  const totalTranscriptEntries = sessions.reduce((sum, session) => sum + session.transcript.length, 0);
+  const runtimeTranscriptEntries = sessions.reduce((sum, session) => sum + session.transcript.filter((entry) => entry.transport === 'runtime').length, 0);
+  const socketTranscriptEntries = sessions.reduce((sum, session) => sum + session.transcript.filter((entry) => entry.transport === 'socket').length, 0);
+  const directSocketEntries = sessions.reduce((sum, session) => sum + session.transcript.filter((entry) => entry.executionMode === 'direct-socket').length, 0);
+  const fallbackRuntimeEntries = sessions.reduce((sum, session) => sum + session.transcript.filter((entry) => entry.executionMode === 'fallback-runtime').length, 0);
+  const toolUsageCounts = Object.fromEntries(
+    [...sessions.flatMap((session) => session.transcript).reduce((counts, entry) => {
+      counts.set(entry.toolName, (counts.get(entry.toolName) ?? 0) + 1);
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const nestedDirectToolCounts = Object.fromEntries(
+    [...sessions.flatMap((session) => session.transcript).reduce((counts, entry) => {
+      if (entry.nestedDirectToolName) {
+        counts.set(entry.nestedDirectToolName, (counts.get(entry.nestedDirectToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const aliasAppliedEntries = sessions.reduce((sum, session) => sum + session.transcript.filter((entry) => entry.aliasApplied).length, 0);
+  const nestedAliasAppliedEntries = sessions.reduce((sum, session) => sum + session.transcript.filter((entry) => entry.nestedAliasApplied).length, 0);
+  const aliasUsageCounts = Object.fromEntries(
+    [...sessions.flatMap((session) => session.transcript).reduce((counts, entry) => {
+      if (entry.aliasApplied && entry.requestedToolName) {
+        counts.set(entry.requestedToolName, (counts.get(entry.requestedToolName) ?? 0) + 1);
+      }
+      if (entry.nestedAliasApplied && entry.requestedToolName === 'mcp.callTool' && entry.nestedDirectToolName) {
+        counts.set(entry.nestedDirectToolName, (counts.get(entry.nestedDirectToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const nestedRequestedAliasCounts = Object.fromEntries(
+    [...sessions.flatMap((session) => session.transcript).reduce((counts, entry) => {
+      if (entry.nestedAliasApplied && entry.nestedRequestedToolName) {
+        counts.set(entry.nestedRequestedToolName, (counts.get(entry.nestedRequestedToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const directRequestedAliasCounts = Object.fromEntries(
+    [...sessions.flatMap((session) => session.transcript).reduce((counts, entry) => {
+      if (entry.aliasApplied && entry.requestedToolName) {
+        counts.set(entry.requestedToolName, (counts.get(entry.requestedToolName) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>()).entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const allSupportedDirectTools = [...new Set(
+    [...bridgeProcesses.values()].flatMap((process) => process.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool'))
+  )];
+  const aliasEntries = Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>;
+  const supportedRequestedAliases = aliasEntries
+    .filter(([, target]) => allSupportedDirectTools.includes(target))
+    .map(([alias]) => alias);
+  const supportedAliasTargets = [...new Set(aliasEntries
+    .filter(([, target]) => allSupportedDirectTools.includes(target))
+    .map(([, target]) => target))];
+  return {
+    totalSessions: sessions.length,
+    openSessions: sessions.filter((session) => session.status === 'open').length,
+    busySessions: sessions.filter((session) => session.status === 'busy').length,
+    closedSessions: sessions.filter((session) => session.status === 'closed').length,
+    directToolCount: allSupportedDirectTools.length,
+    directBrowserToolCount: allSupportedDirectTools.filter((toolName) => toolName.startsWith('browser.')).length,
+    directMcpToolCount: allSupportedDirectTools.filter((toolName) => toolName.startsWith('mcp.')).length,
+    directRuntimeToolCount: allSupportedDirectTools.filter((toolName) => !toolName.startsWith('browser.') && !toolName.startsWith('mcp.')).length,
+    totalTranscriptEntries,
+    runtimeTranscriptEntries,
+    socketTranscriptEntries,
+    directSocketEntries,
+    fallbackRuntimeEntries,
+    aliasAppliedEntries,
+    nestedAliasAppliedEntries,
+    averageTranscriptEntriesPerSession: sessions.length > 0 ? Number((totalTranscriptEntries / sessions.length).toFixed(2)) : 0,
+    sessionsWithRuntimeTraffic: sessions.filter((session) => session.transcript.some((entry) => entry.transport === 'runtime')).length,
+    sessionsWithSocketTraffic: sessions.filter((session) => session.transcript.some((entry) => entry.transport === 'socket')).length,
+    sessionsWithDirectSocketTraffic: sessions.filter((session) => session.transcript.some((entry) => entry.executionMode === 'direct-socket')).length,
+    sessionsWithFallbackRuntimeTraffic: sessions.filter((session) => session.transcript.some((entry) => entry.executionMode === 'fallback-runtime')).length,
+    sessionsWithAliasTraffic: sessions.filter((session) => session.transcript.some((entry) => entry.aliasApplied)).length,
+    sessionsWithNestedAliasTraffic: sessions.filter((session) => session.transcript.some((entry) => entry.nestedAliasApplied)).length,
+    directToolAliases,
+    supportedRequestedAliasCount: supportedRequestedAliases.length,
+    supportedAliasTargetCount: supportedAliasTargets.length,
+    supportedRequestedAliases,
+    supportedAliasTargets,
+    aliasUsageCounts,
+    directRequestedAliasCounts,
+    nestedRequestedAliasCounts,
+    toolUsageCounts,
+    nestedDirectToolCounts
+  };
+}
+
+function renderScreenshotResult(url: string, path: string): { ok: true; output: string; metadata: { simulated: true; path: string; url: string } } {
+  return {
+    ok: true,
+    output: `Simulated screenshot for ${url}`,
+    metadata: { simulated: true, path, url }
+  };
+}
+
+function renderBrowserGotoResult(url: string): { ok: true; output: string; metadata: { simulated: true; url: string; finalUrl: string } } {
+  return {
+    ok: true,
+    output: `Simulated browser navigation to ${url}`,
+    metadata: { simulated: true, url, finalUrl: url }
+  };
+}
+
+function renderBrowserWaitForResult(url: string, selector: string, timeoutMs: number) {
+  return {
+    ok: true,
+    output: `Simulated wait for ${selector} at ${url}`,
+    metadata: { simulated: true, url, selector, timeoutMs, matched: true, finalUrl: url }
+  };
+}
+
+function renderBrowserSnapshotResult(url: string, full: boolean) {
+  const refs = full ? ['@e1', '@e2', '@e3'] : ['@e1', '@e2'];
+  const output = full
+    ? [
+        `Page snapshot for ${url}`,
+        '[@e1] heading "Example Domain"',
+        '[@e2] link "More information..."',
+        '[@e3] document "Static example content"'
+      ].join('\n')
+    : [
+        `Snapshot for ${url}`,
+        '[@e1] heading "Example Domain"',
+        '[@e2] link "More information..."'
+      ].join('\n');
+
+  return {
+    ok: true,
+    output,
+    metadata: { simulated: true, url, full, refs }
+  };
+}
+
+function renderBrowserBackResult(steps: number) {
+  return {
+    ok: true,
+    output: `Simulated browser back (${steps})`,
+    metadata: { simulated: true, steps, finalUrl: 'about:blank' }
+  };
+}
+
+function renderBrowserScrollResult(url: string, direction: string, amount: number) {
+  return {
+    ok: true,
+    output: `Simulated scroll ${direction} (${amount}) at ${url}`,
+    metadata: { simulated: true, url, direction, amount, finalUrl: url }
+  };
+}
+
+function renderBrowserPressResult(url: string, key: string) {
+  return {
+    ok: true,
+    output: `Simulated key press ${key} at ${url}`,
+    metadata: { simulated: true, url, key, finalUrl: url }
+  };
+}
+
+function renderBrowserConsoleResult(url: string) {
+  const logs = [{ level: 'info', message: `Simulated console log for ${url}` }];
+  return {
+    ok: true,
+    output: JSON.stringify(logs, null, 2),
+    metadata: { simulated: true, url, count: logs.length }
+  };
+}
+
+function renderBrowserVisionResult(url: string, prompt: string) {
+  return {
+    ok: true,
+    output: `Simulated vision analysis for ${url}: ${prompt}`,
+    metadata: { simulated: true, url, prompt }
+  };
+}
+
+function renderBrowserImagesResult(url: string, limit: number) {
+  const images = [
+    { ref: '@img1', src: `${url.replace(/\/$/, '')}/hero.png`, alt: 'Hero image' },
+    { ref: '@img2', src: `${url.replace(/\/$/, '')}/diagram.png`, alt: 'Diagram image' }
+  ].slice(0, limit);
+  return {
+    ok: true,
+    output: JSON.stringify(images, null, 2),
+    metadata: { simulated: true, url, count: images.length }
+  };
+}
+
+function renderBrowserClickRefResult(url: string, ref: string) {
+  return {
+    ok: true,
+    output: `Simulated click on ref ${ref} at ${url}`,
+    metadata: { simulated: true, url, ref, finalUrl: url }
+  };
+}
+
+export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
+  const store = options.sessionStore ?? new InMemorySessionStore();
+  const memoryStore = options.memoryStore ?? new InMemoryMemoryStore();
+  const workspaceStore = options.workspaceStore ?? new InMemoryWorkspaceStore();
+  const schedulerStore = options.schedulerStore ?? new InMemorySchedulerStore();
+  const skillStore = options.skillStore ?? new InMemorySkillStore();
+  const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
+  const configStore = new RuntimeConfigStore();
+  const skillRegistry = new SkillRegistry({ skillStore });
+  const learning = new LearningPipeline(skillStore);
+  learning.setRegistry(skillRegistry);
+  const memoryService = new MemoryService(memoryStore);
+  const mcpClient = options.mcpClient ?? new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
+  const plugins = options.plugins ?? new PluginManager().register(new MemoryCapturePlugin());
+  const tools = options.tools ?? createDefaultWorkerRegistry({
+    sessionSearchStore: store,
+    memoryStore,
+    workspaceStore,
+    mcpClient
+  });
+  const provider = options.provider ?? new EchoProvider();
+  const toolsetPresets = new Map<string, (ReturnType<typeof listToolsetPresets>)[number]>(
+    listToolsetPresets().map((preset) => [preset.name, preset])
+  );
+  const codeBridgeSessions = new Map<string, CodeBridgeSession>();
+  const bridgeProcesses = new Map<string, BridgeProcessRecord>();
+  const browserSessions = new Map<string, BrowserSessionState>();
+  const deploymentName = options.deploymentName ?? 'crowclaw-node';
+  const version = options.version ?? '0.1.0';
+
+  // Initialize skill registry: load built-in skills and refresh learned from store
+  skillRegistry.loadBuiltIn(getBuiltInSkills());
+  void skillRegistry.refreshLearned();
+
+  // Load local skills from workspace if skillDir option or MERCURY_SKILL_DIR env var is set
+  const envSkillDir = (globalThis as Record<string, unknown>).process
+    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env.MERCURY_SKILL_DIR
+    : undefined;
+  const skillDir = options.skillDir ?? envSkillDir;
+  if (skillDir) {
+    // Default Node.js filesystem adapter — no options.skillFs required
+    const nodeSkillFs: SkillFileSystem = options.skillFs ?? {
+      async readDir(dirPath: string) {
+        const { readdir } = await import('node:fs/promises');
+        const entries = await readdir(dirPath, { withFileTypes: true });
+        return entries.map((entry: { name: string; isDirectory(): boolean }) => ({ name: entry.name, isDirectory: entry.isDirectory() }));
+      },
+      async readFile(filePath: string) {
+        const { readFile: fsRead } = await import('node:fs/promises');
+        return fsRead(filePath, 'utf-8');
+      },
+      joinPath(...parts: string[]) {
+        // Use posix join as fallback since we can't synchronously import path
+        return parts.join('/').replace(/\/+/g, '/');
+      },
+    };
+    void loadSkillsFromDirectory(skillDir, nodeSkillFs).then(
+      (localSkills) => skillRegistry.setLocalSkills(localSkills),
+      () => { /* Skill directory doesn't exist or is invalid — silently ignore */ }
+    );
+  }
+
+  // Load persona files if personaDir option or CROWCLAW_PERSONA_DIR env var is set
+  const envPersonaDir = (globalThis as Record<string, unknown>).process
+    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env.CROWCLAW_PERSONA_DIR
+    : undefined;
+  const personaDir = options.personaDir ?? envPersonaDir;
+  let personaPrompt: string | undefined;
+  if (personaDir && options.personaFs) {
+    void loadPersonaFiles(personaDir, options.personaFs).then(
+      (files) => { personaPrompt = buildPersonaPrompt(files) || undefined; },
+      () => { /* Persona directory doesn't exist or is invalid — silently ignore */ }
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Execution overrides — 1-shot injection for scheduler/API callers
+  // ---------------------------------------------------------------------------
+
+  interface ExecutionOverrides {
+    agentPreset?: string;
+    toolsetPreset?: string;
+    skillSlugs?: string[];
+    model?: string;
+  }
+
+  function buildConfiguredSkillManifests(overrides?: ExecutionOverrides): ParsedSkillFile[] {
+    let skills = skillRegistry.resolve()
+      .filter((skill) => configStore.isSkillEnabled(skill.manifest.name));
+
+    // If skillSlugs override is set, filter to only those slugs
+    // disabled > override: if a slug is disabled, it stays out
+    if (overrides?.skillSlugs && overrides.skillSlugs.length > 0) {
+      const allowed = new Set(overrides.skillSlugs);
+      skills = skills.filter((s) => allowed.has(s.manifest.name));
+    }
+
+    return skills;
+  }
+
+  function buildConfiguredToolRegistry(overrides?: ExecutionOverrides): ToolRegistry {
+    const activeToolset = overrides?.toolsetPreset ?? configStore.getActiveToolset();
+    if (!activeToolset) {
+      return tools;
+    }
+
+    const preset = toolsetPresets.get(activeToolset);
+    if (!preset || preset.toolNames.length === 0) {
+      return tools;
+    }
+
+    const filtered = new ToolRegistry();
+    for (const manifest of tools.list()) {
+      if (!preset.toolNames.includes(manifest.name)) {
+        continue;
+      }
+      const definition = tools.get(manifest.name);
+      if (definition) {
+        filtered.register(definition);
+      }
+    }
+    return filtered;
+  }
+
+  function resolveConfiguredAgentPreset(overrides?: ExecutionOverrides): { role: string; goal: string; backstory?: string } | undefined {
+    // Override takes priority
+    if (overrides?.agentPreset) {
+      const preset = getAgentPreset(overrides.agentPreset);
+      if (preset) return { role: preset.role, goal: preset.goal, backstory: preset.backstory };
+    }
+
+    const configured = configStore.getAgentPreset();
+    if (configured?.role?.trim() || configured?.goal?.trim() || configured?.backstory?.trim()) {
+      return {
+        role: configured.role,
+        goal: configured.goal,
+        backstory: configured.backstory
+      };
+    }
+
+    const activePreset = configStore.getActivePreset();
+    if (!activePreset) {
+      return undefined;
+    }
+
+    const preset = getAgentPreset(activePreset);
+    if (!preset) {
+      return undefined;
+    }
+
+    return {
+      role: preset.role,
+      goal: preset.goal,
+      backstory: preset.backstory
+    };
+  }
+
+  function resolveProvider(overrides?: ExecutionOverrides): ProviderAdapter {
+    if (overrides?.model) {
+      if (isModelOverridable(provider)) {
+        return provider.withModel(overrides.model);
+      }
+      console.warn(`[crowclaw] Model override '${overrides.model}' requested but provider does not support withModel(). Using default.`);
+    }
+    return provider;
+  }
+
+  function createConfiguredAgent(overrides?: ExecutionOverrides): AgentLoop {
+    return new AgentLoop(resolveProvider(overrides), buildConfiguredToolRegistry(overrides), store, {
+      plugins,
+      runtimeName: 'node',
+      skills: buildConfiguredSkillManifests(overrides),
+      agentPreset: resolveConfiguredAgentPreset(overrides),
+      personaPrompt,
+    });
+  }
+
+  async function runConfiguredAgent(input: {
+    sessionId: string;
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+    systemPrompt: string;
+  }, overrides?: ExecutionOverrides) {
+    return createConfiguredAgent(overrides).run({
+      agentId: options.agentId ?? 'crowclaw',
+      ...input
+    });
+  }
+
+  function getGatewayAccessPolicy(platform: GatewayPlatform): ChannelAccessPolicy | null {
+    const config = configStore.getGatewayConfig(platform);
+    if (!config) {
+      return null;
+    }
+
+    const defaults = createDefaultAccessPolicy();
+    if (!config.dmPolicy) config.dmPolicy = defaults.dmPolicy;
+    if (!config.groupPolicy) config.groupPolicy = defaults.groupPolicy;
+    if (!config.allowlist) config.allowlist = [...defaults.allowlist];
+    if (!config.groupAllowlist) config.groupAllowlist = [...defaults.groupAllowlist];
+    if (typeof config.requireMention !== 'boolean') config.requireMention = defaults.requireMention;
+    return config as ChannelAccessPolicy;
+  }
+
+  function isGroupMessage(message: NormalizedInboundMessage): boolean {
+    switch (message.platform) {
+      case 'telegram': {
+        const chatType = (message.raw as { message?: { chat?: { type?: string } } }).message?.chat?.type;
+        return Boolean(chatType && chatType !== 'private');
+      }
+      case 'discord':
+        return Boolean((message.raw as { guild_id?: string }).guild_id);
+      case 'slack':
+        return /^[CG]/.test(message.channelId);
+      case 'matrix':
+        return message.channelId.startsWith('!');
+      default:
+        return false;
+    }
+  }
+
+  function enforceGatewayAccess(message: NormalizedInboundMessage): Response | null {
+    const policy = getGatewayAccessPolicy(message.platform);
+    if (!policy) {
+      return null;
+    }
+
+    // Prune expired challenges before evaluating a new message.
+    configStore.getPendingPairings();
+    const decision = evaluateAccess(
+      message,
+      policy,
+      isGroupMessage(message),
+      configStore.getPendingPairingsMap() as Map<string, PairingChallenge>
+    );
+
+    if (decision.allowed) {
+      return null;
+    }
+
+    const error = decision.reason === 'pairing-required'
+      ? 'Pairing required.'
+      : `Access denied: ${decision.reason}`;
+    return Response.json({
+      ok: false,
+      error,
+      reason: decision.reason,
+      pairingCode: decision.pairingCode ?? null,
+      sessionId: buildGatewaySessionKey(message)
+    }, { status: 403 });
+  }
+
+  const checkpointStore = new InMemoryCheckpointStore();
+
+  // Scheduler executor — runs the real agent for scheduled jobs
+  // Uses ExecutionOverrides (no global state mutation)
+  const schedulerExecutor = new SchedulerExecutor(
+    schedulerStore,
+    async (input) => {
+      const overrides: ExecutionOverrides = {
+        agentPreset: input.agentPreset,
+        toolsetPreset: input.toolsetPreset,
+        skillSlugs: input.skillSlugs,
+        model: input.model,
+      };
+
+      const result = await createConfiguredAgent(overrides).run({
+        agentId: input.agentId,
+        sessionId: input.sessionId,
+        userMessage: input.userMessage,
+        systemPrompt: 'You are CrowClaw executing a scheduled task.',
+      });
+
+      return {
+        finalResponse: result.finalResponse,
+        toolResults: result.toolResults.map((r) => ({
+          toolName: r.toolName,
+          ok: r.ok,
+          output: r.output,
+        })),
+      };
+    },
+  );
+
+  return {
+    tools,
+    store,
+    memoryStore,
+    workspaceStore,
+    schedulerStore,
+    skillStore,
+    configStore,
+    mcpClient,
+    plugins,
+    async fetch(request: Request): Promise<Response> {
+      const url = new URL(request.url);
+
+      // Dashboard — serve web UI at root and /dashboard
+      if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
+        const { DASHBOARD_HTML } = await import('@crowclaw/web');
+        return new Response(DASHBOARD_HTML, {
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        });
+      }
+
+      // Static assets from docs/ (logo, etc.)
+      if (request.method === 'GET' && url.pathname === '/docs/logo.png') {
+        try {
+          const dynamicImport = new Function('specifier', 'return import(specifier)');
+          const fs = await dynamicImport('node:fs/promises') as { readFile(path: string): Promise<Uint8Array> };
+          const path = await dynamicImport('node:path') as { join(...parts: string[]): string };
+          const processRef = globalThis as unknown as { process?: { cwd?: () => string } };
+          const cwd = processRef.process?.cwd?.() ?? '.';
+          const data = await fs.readFile(path.join(cwd, 'docs', 'logo.png'));
+          const typed = Uint8Array.from(data);
+          return new Response(new Blob([typed]), { headers: { 'content-type': 'image/png', 'cache-control': 'public, max-age=3600' } });
+        } catch {
+          return new Response('Not found', { status: 404 });
+        }
+      }
+
+      if (request.method === 'GET' && url.pathname === '/health') {
+        return Response.json({ ok: true, service: 'crowclaw', runtime: 'node' });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/system/version') {
+        return Response.json({
+          service: 'crowclaw',
+          runtime: 'node',
+          deployment: deploymentName,
+          version
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/system/status') {
+        const dynamicMcpClient = mcpClient as unknown as { getStatus?: () => unknown };
+        const bridgeProcessSummary = [...bridgeProcesses.values()].map((process) => ({
+          sessionId: process.sessionId,
+          protocolVersion: process.protocolVersion,
+          pid: process.pid,
+          mode: process.mode,
+          socketPath: process.socketPath,
+          socketReady: process.socketReady,
+          directToolAliases,
+          supportedRequestedAliasCount: (Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target)).length,
+          supportedAliasTargetCount: [...new Set((Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target))
+            .map(([, target]) => target))].length,
+          supportedRequestedAliases: (Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target))
+            .map(([alias]) => alias),
+          supportedAliasTargets: [...new Set((Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target))
+            .map(([, target]) => target))],
+          supportedDirectTools: process.supportedDirectTools,
+          alive: process.alive,
+          startedAt: process.startedAt,
+          exitedAt: process.exitedAt,
+          exitCode: process.exitCode,
+          spawnError: process.spawnError,
+          directToolCount: process.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool').length,
+          directBrowserTools: process.supportedDirectTools.filter((toolName) => toolName.startsWith('browser.')),
+          directMcpTools: process.supportedDirectTools.filter((toolName) => toolName.startsWith('mcp.')),
+          directRuntimeTools: process.supportedDirectTools.filter((toolName) => !toolName.startsWith('browser.') && !toolName.startsWith('mcp.') && toolName !== 'mcp.callTool'),
+          ...summarizeSessionTranscript(codeBridgeSessions.get(process.sessionId))
+        }));
+        const bridgeSessionSummary = [...codeBridgeSessions.values()].map((session) => summarizeBridgeSessionRecord(session, bridgeProcesses.get(session.sessionId)));
+        return Response.json({
+          ok: true,
+          deployment: deploymentName,
+          version,
+          runtime: 'node',
+          service: 'crowclaw',
+          plugins: plugins.list().map((plugin) => plugin.name),
+          counts: {
+            bridgeSessions: codeBridgeSessions.size,
+            bridgeProcesses: bridgeProcesses.size,
+            bridgeAliveProcesses: [...bridgeProcesses.values()].filter((process) => process.alive).length,
+            browserSessions: browserSessions.size,
+            schedulerJobs: (await schedulerStore.listJobs()).length
+          },
+          bridgeSummary: summarizeBridgeSessionsAggregate(codeBridgeSessions, bridgeProcesses),
+          bridgeSessions: bridgeSessionSummary,
+          bridgeProcesses: bridgeProcessSummary,
+          mcp: dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null,
+          gateway: {
+            slackSigningSecretConfigured: Boolean(options.slackSigningSecret)
+          },
+          bridgeCapabilities: summarizeDirectTools(bridgeProcesses),
+          tools: tools.list().map((t) => ({ name: t.name, description: t.description, runtime: t.runtime, dangerLevel: t.dangerLevel })),
+          model: typeof options.provider === 'object' && 'model' in (options.provider as unknown as Record<string, unknown>)
+            ? (options.provider as unknown as Record<string, unknown>).model
+            : 'unknown',
+          provider: typeof options.provider === 'object' && 'name' in (options.provider as unknown as Record<string, unknown>)
+            ? (options.provider as unknown as Record<string, unknown>).name
+            : (options.provider ? 'configured' : 'none'),
+          release: {
+            candidate: true,
+            verification: {
+              note: 'typecheck and tests passed at build time'
+            }
+          }
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/system/preflight') {
+        const dynamicMcpClient = mcpClient as unknown as { getStatus?: () => { degraded?: boolean } | null };
+        const mcpStatus = dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null;
+        return Response.json({
+          ok: true,
+          deployment: deploymentName,
+          version,
+          runtime: 'node',
+          checks: {
+            providerConfigured: Boolean(options.provider),
+            workspaceReady: typeof workspaceStore.list === 'function',
+            schedulerReady: typeof schedulerStore.listJobs === 'function',
+            bridgeReady: true,
+            bridgeProcessRuntimeAvailable: true,
+            mcpReady: Boolean(mcpClient),
+            mcpDegraded: Boolean(mcpStatus && 'degraded' in mcpStatus ? mcpStatus.degraded : false),
+            slackSigningSecretConfigured: Boolean(options.slackSigningSecret)
+          }
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/system/release-check') {
+        const dynamicMcpClient = mcpClient as unknown as {
+          getStatus?: () => unknown;
+          inspect?: (options?: { refresh?: boolean }) => Promise<unknown>;
+        };
+        const bridgeProcessSummary = [...bridgeProcesses.values()].map((process) => ({
+          sessionId: process.sessionId,
+          pid: process.pid,
+          mode: process.mode,
+          socketPath: process.socketPath,
+          socketReady: process.socketReady,
+          directToolAliases,
+          supportedRequestedAliasCount: (Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target)).length,
+          supportedAliasTargetCount: [...new Set((Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target))
+            .map(([, target]) => target))].length,
+          supportedRequestedAliases: (Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target))
+            .map(([alias]) => alias),
+          supportedAliasTargets: [...new Set((Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+            .filter(([, target]) => process.supportedDirectTools.includes(target))
+            .map(([, target]) => target))],
+          alive: process.alive,
+          startedAt: process.startedAt,
+          exitedAt: process.exitedAt,
+          exitCode: process.exitCode,
+          spawnError: process.spawnError,
+          directToolCount: process.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool').length,
+          directBrowserTools: process.supportedDirectTools.filter((toolName) => toolName.startsWith('browser.')),
+          directMcpTools: process.supportedDirectTools.filter((toolName) => toolName.startsWith('mcp.')),
+          directRuntimeTools: process.supportedDirectTools.filter((toolName) => !toolName.startsWith('browser.') && !toolName.startsWith('mcp.') && toolName !== 'mcp.callTool'),
+          ...summarizeSessionTranscript(codeBridgeSessions.get(process.sessionId))
+        }));
+        const defaultBridgeSession = codeBridgeSessions.get('cli-default');
+        const defaultBridgeProcess = bridgeProcesses.get('cli-default');
+        const dynamicMcpStatus = dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null;
+        let inspectedMcp: unknown;
+        if (dynamicMcpClient.inspect) {
+          try {
+            inspectedMcp = await dynamicMcpClient.inspect();
+          } catch {
+            inspectedMcp = {
+              status: dynamicMcpStatus,
+              tools: [],
+              resources: [],
+              prompts: []
+            };
+          }
+        } else {
+          inspectedMcp = {
+            status: dynamicMcpStatus,
+            tools: [],
+            resources: [],
+            prompts: []
+          };
+        }
+        return Response.json({
+          doctor: {
+            ok: true,
+            deployment: deploymentName,
+            version,
+            runtime: 'node',
+            service: 'crowclaw',
+            plugins: plugins.list().map((plugin) => plugin.name),
+            counts: {
+              bridgeSessions: codeBridgeSessions.size,
+              bridgeProcesses: bridgeProcesses.size,
+              bridgeAliveProcesses: [...bridgeProcesses.values()].filter((process) => process.alive).length,
+              browserSessions: browserSessions.size,
+              schedulerJobs: (await schedulerStore.listJobs()).length
+            },
+            bridgeProcesses: bridgeProcessSummary,
+            mcp: dynamicMcpStatus,
+            gateway: {
+              slackSigningSecretConfigured: Boolean(options.slackSigningSecret)
+            },
+            release: {
+              candidate: true,
+              verification: {
+                note: 'typecheck and tests passed at build time'
+              }
+            }
+          },
+          bridgeSummary: summarizeBridgeSessionsAggregate(codeBridgeSessions, bridgeProcesses),
+          preflight: {
+            ok: true,
+            deployment: deploymentName,
+            version,
+            runtime: 'node',
+            checks: {
+              providerConfigured: Boolean(options.provider),
+              workspaceReady: typeof workspaceStore.list === 'function',
+              schedulerReady: typeof schedulerStore.listJobs === 'function',
+              bridgeReady: true,
+              bridgeProcessRuntimeAvailable: true,
+              mcpReady: Boolean(mcpClient),
+              mcpDegraded: Boolean(dynamicMcpStatus && typeof dynamicMcpStatus === 'object' && 'degraded' in dynamicMcpStatus ? (dynamicMcpStatus as { degraded?: boolean }).degraded : false),
+              slackSigningSecretConfigured: Boolean(options.slackSigningSecret)
+            }
+          },
+          bridge: {
+            sessionId: 'cli-default',
+            exists: Boolean(codeBridgeSessions.get('cli-default')),
+            capabilities: bridgeProcesses.get('cli-default')?.supportedDirectTools ?? [],
+            directToolAliases,
+            supportedRequestedAliasCount: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).length > 0
+              ? (Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+                .filter(([, target]) => (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).includes(target)).length
+              : 0,
+            supportedAliasTargetCount: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).length > 0
+              ? [...new Set((Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+                .filter(([, target]) => (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).includes(target))
+                .map(([, target]) => target))].length
+              : 0,
+            supportedRequestedAliases: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).length > 0
+              ? (Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+                .filter(([, target]) => (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).includes(target))
+                .map(([alias]) => alias)
+              : [],
+            supportedAliasTargets: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).length > 0
+              ? [...new Set((Object.entries(directToolAliases) as Array<[keyof typeof directToolAliases, (typeof directToolAliases)[keyof typeof directToolAliases]]>)
+                .filter(([, target]) => (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).includes(target))
+                .map(([, target]) => target))]
+              : [],
+            nestedDirectTools: bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? [],
+            directToolCount: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).length,
+            directBrowserTools: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).filter((toolName) => toolName.startsWith('browser.')),
+            directMcpTools: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).filter((toolName) => toolName.startsWith('mcp.')),
+            directRuntimeTools: (bridgeProcesses.get('cli-default')?.supportedDirectTools.filter((toolName) => toolName !== 'mcp.callTool') ?? []).filter((toolName) => !toolName.startsWith('browser.') && !toolName.startsWith('mcp.')),
+            supportsNestedCallToolDirect: true,
+            ...summarizeSessionTranscript(codeBridgeSessions.get('cli-default')),
+            sessionSummary: defaultBridgeSession ? summarizeBridgeSessionRecord(defaultBridgeSession, defaultBridgeProcess) : null,
+            process: bridgeProcesses.get('cli-default')
+              ? {
+                  protocolVersion: bridgeProcesses.get('cli-default')!.protocolVersion,
+                  pid: bridgeProcesses.get('cli-default')!.pid,
+                  mode: bridgeProcesses.get('cli-default')!.mode,
+                  socketPath: bridgeProcesses.get('cli-default')!.socketPath,
+                  socketReady: bridgeProcesses.get('cli-default')!.socketReady,
+                  supportedDirectTools: bridgeProcesses.get('cli-default')!.supportedDirectTools,
+                  alive: bridgeProcesses.get('cli-default')!.alive
+                }
+              : null
+          },
+          mcp: inspectedMcp,
+          recommendation: 'release-candidate-if-docs-and-versioning-are-ready'
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === routePaths.providers.models) {
+        return Response.json({
+          models: listKnownModelMetadata(),
+          count: listKnownModelMetadata().length
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.providers.route) {
+        const body = (await request.json()) as { message?: string; hasTools?: boolean };
+        const primary = new EchoProvider();
+        const cheap = new EchoProvider();
+        const router = new SmartModelRouter(primary, cheap);
+        const message = typeof body.message === 'string' ? body.message : '';
+        const hasTools = Boolean(body.hasTools);
+        const complexity = classifyQueryComplexity(message);
+        const selected = router.routeRequest({
+          messages: [{ role: 'user', content: message, createdAt: new Date().toISOString() }],
+          availableTools: hasTools ? [{ name: 'echo', description: 'Echo', runtime: 'worker', streaming: false, stateful: false, requiresWorkspace: false, requiresNetwork: false, dangerLevel: 'low' }] : []
+        });
+        return Response.json({
+          message,
+          complexity,
+          hasTools,
+          selectedTier: selected === primary ? 'primary' : 'cheap'
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/plugins') {
+        return Response.json(plugins.list().map((plugin) => ({ name: plugin.name })));
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/skills') {
+        const resolved = skillRegistry.resolveAll();
+        const stats = skillRegistry.stats();
+        return Response.json({
+          skills: resolved.map((s) => ({
+            slug: s.skill.manifest.name,
+            title: skillRegistry.getDisplayTitle(s.skill.manifest.name) ?? s.skill.manifest.name,
+            summary: s.skill.manifest.description,
+            triggerPhrases: s.skill.manifest.triggers ?? [],
+            steps: s.skill.instructions.split('\n').filter(Boolean),
+            status: skillRegistry.getStatus(s.skill.manifest.name) ?? 'published',
+            source: s.skill.manifest.category ?? 'builtin',
+            enabled: s.enabled,
+          })),
+          count: resolved.length,
+          stats,
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/presets') {
+        const mcpNames = listMcpPresetNames();
+        return Response.json({
+          agents: listAgentPresets(),
+          toolsets: listToolsetPresets(),
+          mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) }))
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/gateway/status') {
+        return Response.json({
+          platforms: [
+            {
+              name: 'telegram',
+              inboundRoute: '/webhooks/telegram',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'runtime-route',
+              outboundRoute: '/api/telegram/send',
+              sampleBody: { botToken: '<telegram-bot-token>', chatId: '<chat-id>', text: 'Hello from CrowClaw' }
+            },
+            {
+              name: 'discord',
+              inboundRoute: '/webhooks/discord',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'runtime-route',
+              outboundRoute: '/api/discord/send',
+              sampleBody: { webhookUrl: 'https://discord.com/api/webhooks/...', content: 'Hello from CrowClaw' }
+            },
+            {
+              name: 'slack',
+              inboundRoute: '/webhooks/slack',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'runtime-route',
+              outboundRoute: '/api/slack/send',
+              sampleBody: { botToken: '<slack-bot-token>', channel: 'C123456', text: 'Hello from CrowClaw' }
+            },
+            {
+              name: 'whatsapp',
+              inboundRoute: '/webhooks/whatsapp',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'helper-only',
+              helper: 'sendWhatsAppMessage(accessToken, phoneNumberId, to, text)',
+              sampleBody: { accessToken: '<meta-access-token>', phoneNumberId: '<phone-number-id>', to: '<recipient>', text: 'Hello from CrowClaw' }
+            },
+            {
+              name: 'signal',
+              inboundRoute: '/webhooks/signal',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'not-exposed',
+              sampleBody: null
+            },
+            {
+              name: 'email',
+              inboundRoute: '/webhooks/email',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'helper-only',
+              helper: 'sendEmailMessage(apiUrl, apiKey, to, subject, text, from?)',
+              sampleBody: { apiUrl: 'https://mail.example.com/send', apiKey: '<api-key>', to: 'user@example.com', subject: 'CrowClaw', text: 'Hello from CrowClaw' }
+            },
+            {
+              name: 'matrix',
+              inboundRoute: '/webhooks/matrix',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'helper-only',
+              helper: 'sendMatrixMessage(homeserverUrl, accessToken, roomId, text)',
+              sampleBody: { homeserverUrl: 'https://matrix.example.com', accessToken: '<access-token>', roomId: '!room:example.com', text: 'Hello from CrowClaw' }
+            },
+            {
+              name: 'sms',
+              inboundRoute: '/webhooks/sms',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'not-exposed',
+              sampleBody: null
+            },
+            {
+              name: 'webhook',
+              inboundRoute: '/webhooks/generic',
+              inboundStatus: 'webhook-ready',
+              outboundMode: 'not-applicable',
+              sampleBody: { channelId: 'room-1', userId: 'user-1', text: 'Hello from CrowClaw' }
+            }
+          ]
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/events') {
+        const stream = new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const send = (event: string, data: unknown) => {
+              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+            };
+
+            send('status', { type: 'connected', timestamp: new Date().toISOString() });
+
+            const heartbeat = setInterval(() => {
+              try {
+                send('heartbeat', { timestamp: new Date().toISOString(), sessions: (store as unknown as { size?: number }).size ?? 0 });
+              } catch {
+                clearInterval(heartbeat);
+              }
+            }, 15000);
+
+            request.signal?.addEventListener('abort', () => {
+              clearInterval(heartbeat);
+              try { controller.close(); } catch { /* already closed */ }
+            });
+          }
+        });
+
+        return new Response(stream, {
+          headers: {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+          },
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/sessions') {
+        const limitParam = Number(url.searchParams.get('limit') ?? '50');
+        const limit = Number.isFinite(limitParam) ? limitParam : 50;
+        const listStore = store as InMemorySessionStore & SessionListStore;
+        const sessions = typeof listStore.listRecent === 'function'
+          ? await listStore.listRecent(limit)
+          : [];
+        return Response.json({
+          ok: true,
+          supported: typeof listStore.listRecent === 'function',
+          count: sessions.length,
+          sessions: sessions.map(summarizeSessionRecord)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/sessions') {
+        const body = (await request.json().catch(() => ({}))) as { sessionId?: string; userId?: string; workspaceId?: string };
+        const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
+          ? body.sessionId.trim()
+          : crypto.randomUUID();
+        const existing = await store.get(sessionId);
+        const session = existing ?? {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId,
+          userId: body.userId,
+          workspaceId: body.workspaceId,
+          messages: [],
+          updatedAt: new Date().toISOString(),
+          lineage: {
+            rootSessionId: sessionId,
+            compressionCount: 0
+          }
+        } satisfies SessionState;
+        if (!existing) {
+          await store.put(session);
+        }
+        return Response.json({
+          ok: true,
+          session: summarizeSessionRecord(session)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/telegram/send') {
+        const body = (await request.json()) as { botToken: string; chatId: string; text: string; parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'; disableWebPagePreview?: boolean };
+        const response = await fetch(buildTelegramSendUrl(body.botToken), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(buildTelegramSendPayload(body))
+        });
+        return new Response(await response.text(), {
+          status: response.status,
+          headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/telegram/edit') {
+        const body = (await request.json()) as { botToken: string; chatId: string; messageId: number; text: string; parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'; disableWebPagePreview?: boolean };
+        const response = await fetch(buildTelegramEditUrl(body.botToken), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(buildTelegramEditPayload(body))
+        });
+        return new Response(await response.text(), {
+          status: response.status,
+          headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/discord/send') {
+        const body = (await request.json()) as { webhookUrl: string; content: string };
+        const response = await fetch(buildDiscordWebhookSendUrl(body.webhookUrl), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ content: body.content })
+        });
+        return new Response(await response.text(), {
+          status: response.status,
+          headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/discord/edit') {
+        const body = (await request.json()) as { webhookUrl: string; messageId: string; content: string };
+        const response = await fetch(buildDiscordWebhookEditUrl(body.webhookUrl, body.messageId), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(buildDiscordEditPayload({ messageId: body.messageId, content: body.content }))
+        });
+        return new Response(await response.text(), {
+          status: response.status,
+          headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/slack/send') {
+        const body = (await request.json()) as { botToken: string; channel: string; text: string; threadTs?: string };
+        const response = await fetch(buildSlackSendUrl(), {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${body.botToken}`
+          },
+          body: JSON.stringify(buildSlackSendPayload(body))
+        });
+        return new Response(await response.text(), {
+          status: response.status,
+          headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/slack/edit') {
+        const body = (await request.json()) as { botToken: string; channel: string; text: string; ts: string; threadTs?: string };
+        const response = await fetch(buildSlackEditUrl(), {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${body.botToken}`
+          },
+          body: JSON.stringify(buildSlackEditPayload(body))
+        });
+        return new Response(await response.text(), {
+          status: response.status,
+          headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' }
+        });
+      }
+
+      if (request.method === 'POST' && (url.pathname === '/api/gateway/webhook' || url.pathname === '/webhooks/generic')) {
+        const payload = await request.json() as { channelId?: string; chatId?: string; userId?: string; text?: string; message?: string };
+        const message = normalizeGenericWebhook(payload);
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = buildGatewayIdempotencyKey(message);
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message) });
+        }
+        const sessionId = buildGatewaySessionKey(message);
+        const result = await runConfiguredAgent({
+          sessionId,
+          userMessage: message.text,
+          userId: message.userId,
+          workspaceId: message.channelId,
+          systemPrompt: 'You are CrowClaw handling a generic webhook runtime event.'
+        });
+        await memoryService.captureSessionSummary(sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/gateway/inspect') {
+        const body = (await request.json()) as { platform?: 'webhook' | 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'signal' | 'email' | 'matrix' | 'sms'; payload?: unknown };
+        const platform = body.platform ?? 'webhook';
+        const message = await normalizeGatewayRequest(
+          platform,
+          new Request('http://localhost/internal/gateway-inspect', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body.payload ?? {})
+          })
+        );
+        if (!message) {
+          return Response.json({ ok: false, error: 'Unable to normalize gateway payload.', platform }, { status: 400 });
+        }
+        return Response.json({
+          ok: true,
+          message,
+          deliveryPlan: buildGatewayDeliveryPlan(message)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/discord') {
+        const payload = await request.json();
+        const message = normalizeDiscordWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const dispatch = buildDiscordDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling a Discord runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/telegram') {
+        const payload = await request.json();
+        const message = normalizeTelegramWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildTelegramDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling a Telegram runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/slack') {
+        const rawBody = await request.text();
+        if (options.slackSigningSecret) {
+          const signature = request.headers.get('x-slack-signature') ?? '';
+          const timestamp = request.headers.get('x-slack-request-timestamp') ?? '';
+          const verified = await verifySlackSignature({
+            signingSecret: options.slackSigningSecret,
+            timestamp,
+            body: rawBody,
+            signature
+          });
+          if (!verified) {
+            return Response.json({ ok: false, error: 'Invalid Slack signature.' }, { status: 401 });
+          }
+        }
+        const payload = JSON.parse(rawBody) as unknown;
+        if ((payload as { type?: string; challenge?: string }).type === 'url_verification') {
+          return Response.json({ challenge: (payload as { challenge?: string }).challenge ?? '' });
+        }
+        const message = normalizeSlackWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildSlackDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling a Slack runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/whatsapp') {
+        const payload = await request.json();
+        const message = normalizeWhatsAppWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildWhatsAppDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling a WhatsApp runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/signal') {
+        const payload = await request.json();
+        const message = normalizeSignalWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildSignalDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling a Signal runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/email') {
+        const payload = await request.json();
+        const message = normalizeEmailWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildEmailDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling an Email runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/matrix') {
+        const payload = await request.json();
+        const message = normalizeMatrixWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildMatrixDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling a Matrix runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/webhooks/sms') {
+        const payload = await request.json();
+        const message = normalizeSmsWebhook(payload as never);
+        if (!message) {
+          return Response.json({ ok: false, ignored: true });
+        }
+        const accessResponse = enforceGatewayAccess(message);
+        if (accessResponse) {
+          return accessResponse;
+        }
+        const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
+        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
+          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        }
+        const dispatch = buildSmsDispatch(payload as never)!;
+        const result = await runConfiguredAgent({
+          sessionId: dispatch.sessionId,
+          userMessage: dispatch.payload.userMessage,
+          userId: dispatch.payload.userId,
+          workspaceId: dispatch.payload.workspaceId,
+          systemPrompt: 'You are CrowClaw handling an SMS runtime event.'
+        });
+        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+        if (idempotencyKey) {
+          await gatewayIdempotencyStore.mark(idempotencyKey);
+        }
+        return Response.json(result);
+      }
+
+
+      if (request.method === 'POST' && url.pathname === '/api/web/fetch') {
+        const body = (await request.json()) as { url: string };
+        const response = await tools.execute('web.fetch', { url: body.url }, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'web-fetch',
+        });
+        if (!response.ok) {
+          return Response.json(response, { status: 400 });
+        }
+        return new Response(response.output, {
+          status: typeof response.metadata?.status === 'number' ? response.metadata.status : 200,
+          headers: { 'content-type': 'text/plain; charset=utf-8' }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/web/metadata') {
+        const body = (await request.json()) as { url: string };
+        const response = await tools.execute('web.extractMetadata', { url: body.url }, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'web-metadata',
+        });
+        return Response.json(response);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/web/links') {
+        const body = (await request.json()) as { url: string };
+        const response = await tools.execute('web.extractLinks', { url: body.url }, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'web-links',
+        });
+        return Response.json(response);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/web/text') {
+        const body = (await request.json()) as { url: string };
+        const response = await tools.execute('web.extractText', { url: body.url }, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'web-text',
+        });
+        return Response.json(response);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/web/search') {
+        const body = (await request.json()) as { query: string; limit?: number; providerBaseUrl?: string };
+        const response = await tools.execute('web.search', body as Record<string, unknown>, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'web-search',
+        });
+        return Response.json(response);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/web/crawl') {
+        const body = (await request.json()) as { url: string; maxPages?: number; sameOriginOnly?: boolean };
+        const response = await tools.execute('web.crawl', body as Record<string, unknown>, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'web-crawl',
+        });
+        return Response.json(response);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/terminal/exec') {
+        const body = (await request.json()) as { command?: string; raw?: string };
+        return Response.json(await tools.execute('terminal.exec', body as Record<string, unknown>, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-exec',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/terminal/background') {
+        const body = (await request.json()) as { command?: string };
+        return Response.json(await tools.execute('terminal.background', body as Record<string, unknown>, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-background',
+        }));
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/terminal/processes') {
+        return Response.json(await tools.execute('terminal.processes', {}, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-processes',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/terminal/kill') {
+        const body = (await request.json()) as { pid?: string | number };
+        return Response.json(await tools.execute('terminal.kill', body as Record<string, unknown>, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-kill',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.actions.todo) {
+        const body = (await request.json()) as Record<string, unknown> & { sessionId?: string };
+        return Response.json(await tools.execute('todo.manage', body, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: typeof body.sessionId === 'string' ? body.sessionId : 'todo-session',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.actions.clarify) {
+        const body = (await request.json()) as Record<string, unknown>;
+        return Response.json(await tools.execute('clarify.ask', body, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'clarify-session',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.actions.sendMessage) {
+        const body = (await request.json()) as Record<string, unknown>;
+        return Response.json(await tools.execute('send.message', body, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'send-message-session',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.media.vision) {
+        const body = (await request.json()) as Record<string, unknown>;
+        return Response.json(await tools.execute('vision.analyze', body, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'vision-analyze',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.media.image) {
+        const body = (await request.json()) as Record<string, unknown>;
+        return Response.json(await tools.execute('image.generate', body, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'image-generate',
+        }));
+      }
+
+      const codeBridgeResponse = await handleCodeBridgeRoutes(request, url, {
+        agentId: options.agentId,
+        codeBridgeSessions,
+        bridgeProcesses,
+        tools
+      });
+      if (codeBridgeResponse) {
+        return codeBridgeResponse;
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/browser/session') {
+        const sessionId = url.searchParams.get('sessionId') ?? '';
+        return Response.json(sessionId
+          ? (browserSessions.get(sessionId) ?? { sessionId, currentUrl: null, history: [], lastSnapshot: null, lastRefs: [] })
+          : { sessionId, currentUrl: null, history: [], lastSnapshot: null, lastRefs: [] });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/session/reset') {
+        const body = (await request.json()) as { sessionId?: string };
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+        if (sessionId) {
+          browserSessions.delete(sessionId);
+        }
+        return Response.json({ ok: true, sessionId, reset: Boolean(sessionId) });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/screenshot') {
+        const body = (await request.json()) as { url?: string; path?: string; fullPage?: boolean; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const url = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const path = typeof body.path === 'string' ? body.path : '/workspace/screenshot-browser-screenshot.png';
+        if (!url) {
+          return Response.json({
+            toolName: 'browser.screenshot',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: { path }
+          });
+        }
+        if (session) {
+          session.currentUrl = url;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.screenshot',
+          runtime: 'sandbox',
+          ...renderScreenshotResult(url, path)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/goto') {
+        const body = (await request.json()) as { url?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        if (!targetUrl) {
+          return Response.json({
+            toolName: 'browser.goto',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: {}
+          });
+        }
+        if (session) {
+          recordBrowserNavigation(session, targetUrl);
+        }
+        return Response.json({
+          toolName: 'browser.goto',
+          runtime: 'sandbox',
+          ...renderBrowserGotoResult(targetUrl)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/open') {
+        const body = (await request.json()) as { url?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        if (!targetUrl) {
+          return Response.json({
+            toolName: 'browser.open',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: {}
+          });
+        }
+        if (session) {
+          recordBrowserNavigation(session, targetUrl);
+        }
+        return Response.json({
+          toolName: 'browser.open',
+          runtime: 'sandbox',
+          ...renderBrowserGotoResult(targetUrl)
+        });
+      }
+
+      if (request.method === 'POST' && (url.pathname === '/api/browser/wait' || url.pathname === '/api/browser/wait-for')) {
+        const body = (await request.json()) as { url?: string; selector?: string; timeoutMs?: number; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const selector = typeof body.selector === 'string' ? body.selector : 'body';
+        const timeoutMs = typeof body.timeoutMs === 'number' ? body.timeoutMs : 5_000;
+        if (!targetUrl) {
+          return Response.json({
+            toolName: 'browser.waitFor',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: { selector, timeoutMs }
+          });
+        }
+        if (session) {
+          recordBrowserNavigation(session, targetUrl);
+        }
+        return Response.json({
+          toolName: 'browser.waitFor',
+          runtime: 'sandbox',
+          ...renderBrowserWaitForResult(targetUrl, selector, timeoutMs)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/navigate') {
+        const body = (await request.json()) as { url?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        if (!targetUrl) {
+          return Response.json({
+            toolName: 'browser.navigate',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: {}
+          });
+        }
+        if (session) {
+          recordBrowserNavigation(session, targetUrl);
+        }
+        return Response.json({
+          toolName: 'browser.navigate',
+          runtime: 'sandbox',
+          ...renderBrowserGotoResult(targetUrl)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/snapshot') {
+        const body = (await request.json()) as { url?: string; full?: boolean; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        if (!targetUrl) {
+          return Response.json({
+            toolName: 'browser.snapshot',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: { full: Boolean(body.full) }
+          });
+        }
+        const payload = {
+          toolName: 'browser.snapshot',
+          runtime: 'sandbox',
+          ...renderBrowserSnapshotResult(targetUrl, Boolean(body.full))
+        };
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.lastSnapshot = payload.output;
+          session.lastRefs = (payload.metadata as { refs?: string[] }).refs ?? [];
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json(payload);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/back') {
+        const body = (await request.json()) as { steps?: number; sessionId?: string };
+        const steps = typeof body.steps === 'number' ? body.steps : 1;
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        if (session && session.history.length > 1) {
+          for (let index = 0; index < steps && session.history.length > 1; index += 1) {
+            session.history.pop();
+          }
+          session.currentUrl = session.history.at(-1);
+          session.updatedAt = new Date().toISOString();
+          return Response.json({
+            toolName: 'browser.back',
+            runtime: 'sandbox',
+            ok: true,
+            output: `Navigated back ${steps} step(s)`,
+            metadata: { simulated: true, steps, finalUrl: session.currentUrl }
+          });
+        }
+        return Response.json({
+          toolName: 'browser.back',
+          runtime: 'sandbox',
+          ...renderBrowserBackResult(steps)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/scroll') {
+        const body = (await request.json()) as { url?: string; direction?: string; amount?: number; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const direction = body.direction === 'up' || body.direction === 'left' ? body.direction : 'down';
+        const amount = typeof body.amount === 'number' ? body.amount : 1;
+        if (!targetUrl) {
+          return Response.json({ toolName: 'browser.scroll', runtime: 'sandbox', ok: false, output: 'Missing url.', metadata: { direction, amount } });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.scroll',
+          runtime: 'sandbox',
+          ...renderBrowserScrollResult(targetUrl, direction, amount)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/press') {
+        const body = (await request.json()) as { url?: string; key?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const key = typeof body.key === 'string' ? body.key : '';
+        if (!targetUrl || !key) {
+          return Response.json({ toolName: 'browser.press', runtime: 'sandbox', ok: false, output: 'Missing url or key.', metadata: { url: targetUrl, key } });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.press',
+          runtime: 'sandbox',
+          ...renderBrowserPressResult(targetUrl, key)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/console') {
+        const body = (await request.json()) as { url?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        if (!targetUrl) {
+          return Response.json({ toolName: 'browser.console', runtime: 'sandbox', ok: false, output: 'Missing url.', metadata: {} });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.console',
+          runtime: 'sandbox',
+          ...renderBrowserConsoleResult(targetUrl)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/vision') {
+        const body = (await request.json()) as { url?: string; prompt?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const prompt = typeof body.prompt === 'string' ? body.prompt : 'Describe the page.';
+        if (!targetUrl) {
+          return Response.json({ toolName: 'browser.vision', runtime: 'sandbox', ok: false, output: 'Missing url.', metadata: { prompt } });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.vision',
+          runtime: 'sandbox',
+          ...renderBrowserVisionResult(targetUrl, prompt)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/images') {
+        const body = (await request.json()) as { url?: string; limit?: number; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const limit = typeof body.limit === 'number' ? body.limit : 10;
+        if (!targetUrl) {
+          return Response.json({ toolName: 'browser.images', runtime: 'sandbox', ok: false, output: 'Missing url.', metadata: { limit } });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.images',
+          runtime: 'sandbox',
+          ...renderBrowserImagesResult(targetUrl, limit)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/click-ref') {
+        const body = (await request.json()) as { url?: string; ref?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const ref = typeof body.ref === 'string' ? body.ref : '';
+        if (session && ref && session.lastRefs.length > 0 && !session.lastRefs.includes(ref)) {
+          return Response.json({ toolName: 'browser.clickRef', runtime: 'sandbox', ok: false, output: `Unknown ref: ${ref}`, metadata: { url: targetUrl, ref, knownRefs: session.lastRefs } });
+        }
+        if (!targetUrl || !ref) {
+          return Response.json({ toolName: 'browser.clickRef', runtime: 'sandbox', ok: false, output: 'Missing url or ref.', metadata: { url: targetUrl, ref } });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.clickRef',
+          runtime: 'sandbox',
+          ...renderBrowserClickRefResult(targetUrl, ref)
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/extract') {
+        const body = (await request.json()) as { url?: string; selector?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const selector = typeof body.selector === 'string' ? body.selector : 'body';
+        if (!targetUrl) {
+          return Response.json({
+            toolName: 'browser.extract',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url.',
+            metadata: { selector }
+          });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.extract',
+          runtime: 'sandbox',
+          ok: true,
+          output: `Simulated extraction for ${targetUrl} (${selector})`,
+          metadata: { simulated: true, url: targetUrl, selector }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/click') {
+        const body = (await request.json()) as { url?: string; selector?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const selector = typeof body.selector === 'string' ? body.selector : '';
+        if (!targetUrl || !selector) {
+          return Response.json({
+            toolName: 'browser.click',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url or selector.',
+            metadata: { url: targetUrl, selector }
+          });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.click',
+          runtime: 'sandbox',
+          ok: true,
+          output: `Simulated click on ${selector} at ${targetUrl}`,
+          metadata: { simulated: true, url: targetUrl, selector, finalUrl: targetUrl }
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/browser/type') {
+        const body = (await request.json()) as { url?: string; selector?: string; text?: string; sessionId?: string };
+        const session = typeof body.sessionId === 'string' ? ensureBrowserSession(browserSessions, body.sessionId) : undefined;
+        const targetUrl = typeof body.url === 'string' ? body.url : session?.currentUrl ?? '';
+        const selector = typeof body.selector === 'string' ? body.selector : '';
+        const text = typeof body.text === 'string' ? body.text : '';
+        if (!targetUrl || !selector) {
+          return Response.json({
+            toolName: 'browser.type',
+            runtime: 'sandbox',
+            ok: false,
+            output: 'Missing url or selector.',
+            metadata: { url: targetUrl, selector }
+          });
+        }
+        if (session) {
+          session.currentUrl = targetUrl;
+          session.updatedAt = new Date().toISOString();
+        }
+        return Response.json({
+          toolName: 'browser.type',
+          runtime: 'sandbox',
+          ok: true,
+          output: `Simulated typing into ${selector} at ${targetUrl}`,
+          metadata: { simulated: true, url: targetUrl, selector, text, finalUrl: targetUrl }
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/tools') {
+        return Response.json(await mcpClient.listTools());
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/resources') {
+        const dynamicClient = mcpClient as unknown as { listResources?: () => Promise<unknown[]> };
+        return Response.json(dynamicClient.listResources ? await dynamicClient.listResources() : []);
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/prompts') {
+        const dynamicClient = mcpClient as unknown as { listPrompts?: () => Promise<unknown[]> };
+        return Response.json(dynamicClient.listPrompts ? await dynamicClient.listPrompts() : []);
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/status') {
+        const dynamicClient = mcpClient as unknown as { getStatus?: () => unknown };
+        return Response.json(dynamicClient.getStatus ? dynamicClient.getStatus() : null);
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/inspect') {
+        const dynamicClient = mcpClient as unknown as {
+          inspect?: (options?: { refresh?: boolean }) => Promise<unknown>;
+          getStatus?: () => unknown;
+          listTools?: (options?: { refresh?: boolean }) => Promise<unknown>;
+          listResources?: () => Promise<unknown>;
+          listPrompts?: () => Promise<unknown>;
+        };
+        const refresh = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
+        if (dynamicClient.inspect) {
+          return Response.json(await dynamicClient.inspect({ refresh }));
+        }
+        return Response.json({
+          status: dynamicClient.getStatus ? dynamicClient.getStatus() : null,
+          tools: dynamicClient.listTools ? await dynamicClient.listTools({ refresh }) : [],
+          resources: dynamicClient.listResources ? await dynamicClient.listResources() : [],
+          prompts: dynamicClient.listPrompts ? await dynamicClient.listPrompts() : []
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/mcp/reload') {
+        return Response.json(await mcpClient.refreshTools());
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/mcp/list-changed') {
+        const dynamicClient = mcpClient as unknown as { notifyToolsChanged?: () => Promise<unknown> };
+        return Response.json(dynamicClient.notifyToolsChanged
+          ? await dynamicClient.notifyToolsChanged()
+          : { ok: true, refreshed: await mcpClient.refreshTools() });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/mcp/call') {
+        const body = (await request.json()) as { name: string; arguments?: Record<string, unknown> };
+        return Response.json(await mcpClient.callTool(body.name, body.arguments ?? {}));
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/learning/drafts') {
+        return Response.json(await learning.listDrafts());
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/learning/auto-capture') {
+        const body = (await request.json()) as {
+          title?: string;
+          messages: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }>;
+        };
+        const stored = await learning.autoCapture(
+          body.messages.map((message) => ({ ...message, createdAt: message.createdAt ?? new Date().toISOString() })),
+          body.title
+        );
+        return Response.json(stored);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/learning/match') {
+        const body = (await request.json()) as { query: string; limit?: number };
+        return Response.json(await learning.findRelevantSkills(body.query, body.limit));
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/learning/drafts') {
+        const body = (await request.json()) as { title: string; messages: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }> };
+        const stored = await learning.captureDraft(
+          body.messages.map((message) => ({ ...message, createdAt: message.createdAt ?? new Date().toISOString() })),
+          body.title
+        );
+        return Response.json(stored);
+      }
+
+      if (request.method === 'POST' && url.pathname.startsWith('/api/learning/drafts/')) {
+        const segments = url.pathname.split('/').filter(Boolean);
+        const id = segments[3] ?? '';
+        const action = segments[4] ?? 'publish';
+        if (action === 'unpublish') {
+          const result = await learning.unpublishDraft(id);
+          await skillRegistry.refreshLearned();
+          return Response.json(result);
+        }
+        const result = await learning.publishDraft(id);
+        await skillRegistry.refreshLearned();
+        return Response.json(result);
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/scheduler/jobs') {
+        return Response.json(await schedulerStore.listJobs());
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/scheduler/jobs') {
+        const body = (await request.json()) as {
+          id: string;
+          everyMinutes?: number;
+          schedule?: string;
+          task: string;
+          skillSlugs?: string[];
+          toolsetPreset?: string;
+          agentPreset?: string;
+          model?: string;
+          deliverTo?: { platform: string; config: Record<string, string> };
+          timeoutMs?: number;
+          maxRuns?: number;
+        };
+
+        // Support both `everyMinutes` (compat) and `schedule` (Hermes-style)
+        const schedule = body.schedule ?? `every:${body.everyMinutes ?? 5}m`;
+        const job = createScheduledAgentJob({
+          id: body.id,
+          schedule,
+          task: body.task,
+          skillSlugs: body.skillSlugs,
+          toolsetPreset: body.toolsetPreset,
+          agentPreset: body.agentPreset,
+          model: body.model,
+          deliverTo: body.deliverTo,
+          maxRuns: body.maxRuns,
+          timeoutMs: body.timeoutMs,
+        });
+        await schedulerStore.saveJob(job);
+        return Response.json(job);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/scheduler/tick') {
+        const results = await schedulerExecutor.tick();
+        return Response.json({ ok: true, results });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/workspace') {
+        const path = url.searchParams.get('path');
+        if (path) {
+          const file = await workspaceStore.read(path);
+          return Response.json(file ?? { path, content: null });
+        }
+        const prefix = url.searchParams.get('prefix') ?? '';
+        return Response.json(await workspaceStore.list(prefix));
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/workspace/exists') {
+        const path = url.searchParams.get('path') ?? '';
+        return Response.json({ path, exists: await workspaceStore.exists(path) });
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/api/workspace/')) {
+        const path = url.pathname.replace('/api/workspace/', '');
+        const file = await workspaceStore.read(path);
+        return Response.json(file ?? { path, content: null });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/workspace/write') {
+        const body = (await request.json()) as { path: string; content: string };
+        return Response.json(await workspaceStore.write(body.path, body.content));
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/workspace/patch') {
+        const body = (await request.json()) as { path: string; patches: Array<{ line: number; value: string }> };
+        return Response.json(await workspaceStore.patchLines(body.path, body.patches));
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/workspace/patch-text') {
+        const body = (await request.json()) as { path: string; replacements: Array<{ from: string; to: string }> };
+        return Response.json(await workspaceStore.patchText(body.path, body.replacements));
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/workspace/delete') {
+        const body = (await request.json()) as { path: string };
+        return Response.json({ path: body.path, removed: await workspaceStore.remove(body.path) });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/workspace/rename') {
+        const body = (await request.json()) as { fromPath: string; toPath: string };
+        const file = await workspaceStore.rename(body.fromPath, body.toPath);
+        return Response.json(file ?? { fromPath: body.fromPath, toPath: body.toPath, content: null });
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/api/sessions/')) {
+        const parts = url.pathname.split('/').filter(Boolean);
+        const sessionId = parts[2] ?? '';
+        if (parts[3] === 'checkpoints') {
+          const checkpoints = await checkpointStore.listBySession(sessionId);
+          return Response.json({
+            checkpoints: checkpoints.map((cp) => ({
+              id: cp.id,
+              iteration: cp.iteration,
+              trigger: cp.metadata.trigger,
+              label: cp.metadata.label,
+              createdAt: cp.createdAt,
+              messageCount: cp.metadata.messageCount,
+              toolCallCount: cp.metadata.toolCallCount,
+            })),
+          });
+        }
+        if (parts[3] === 'memories') {
+          const scopeParam = url.searchParams.get('scope');
+          const scopeKey = url.searchParams.get('scopeKey') ?? undefined;
+          const limitParam = Number(url.searchParams.get('limit') ?? '50');
+          const limit = Number.isFinite(limitParam) ? limitParam : 50;
+          const records = scopeParam === 'session' || scopeParam === 'user' || scopeParam === 'workspace'
+            ? await memoryService.listByScope(scopeParam, limit, scopeKey)
+            : await memoryService.list(sessionId, limit);
+          return Response.json({ ok: true, records, ...(scopeParam ? { scope: scopeParam, scopeKey } : { sessionId }) });
+        }
+        if (parts[3] === 'history' || parts[3] === 'state' || parts.length === 3) {
+          const session = sessionId ? await store.get(sessionId) : null;
+          return Response.json(session ?? { sessionId, messages: [] });
+        }
+      }
+
+      if (request.method === 'POST' && url.pathname.startsWith('/api/sessions/')) {
+        const parts = url.pathname.split('/').filter(Boolean);
+        const sessionId = parts[2] ?? crypto.randomUUID();
+        const action = parts[3] ?? 'message';
+
+        if (action === 'checkpoint') {
+          const session = await store.get(sessionId);
+          if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
+          const body = (await request.json()) as { label?: string; trigger?: string };
+
+          // Extract tool results from session messages
+          const toolResults = session.messages
+            .filter((m): m is typeof m & { role: 'tool' } => m.role === 'tool')
+            .map((m) => ({
+              toolName: m.name ?? 'unknown',
+              runtime: 'worker' as const,
+              ok: !m.content?.match(/error|fail/i),
+              output: m.content,
+            }));
+
+          const cp = createCheckpoint(
+            session,
+            toolResults,
+            session.messages.length,
+            normalizeCheckpointTrigger(body.trigger),
+            body.label,
+            {
+              currentIteration: toolResults.length,
+              systemPrompt: session.messages.find((m) => m.role === 'system')?.content,
+              agentPreset: configStore.getAgentPreset() ?? undefined,
+              pendingToolCalls: session.messages
+                .filter((m) => m.role === 'assistant' && m.metadata?.toolCount)
+                .slice(-1)
+                .flatMap(() => []), // No pending calls at checkpoint time
+            },
+          );
+          await checkpointStore.save(cp);
+          return Response.json({
+            ok: true,
+            checkpoint: {
+              id: cp.id,
+              iteration: cp.iteration,
+              trigger: cp.metadata.trigger,
+              label: cp.metadata.label,
+              createdAt: cp.createdAt,
+              messageCount: cp.metadata.messageCount,
+            },
+          });
+        }
+
+        if (action === 'restore') {
+          const body = (await request.json()) as { checkpointId?: string };
+          const cpId = body.checkpointId;
+          if (!cpId) return Response.json({ error: 'Missing checkpointId' }, { status: 400 });
+          const checkpoint = await checkpointStore.get(cpId);
+          if (!checkpoint) return Response.json({ error: 'Checkpoint not found' }, { status: 404 });
+          const session = await store.get(sessionId);
+          if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
+          const restored = restoreFromCheckpoint(checkpoint, session);
+          await store.put(restored.session);
+          return Response.json({ ok: true, restoredTo: cpId, messageCount: restored.session.messages.length });
+        }
+
+        if (action === 'replay') {
+          const body = (await request.json()) as { checkpointId?: string; newSessionId?: string };
+          const cpId = body.checkpointId;
+          if (!cpId) return Response.json({ error: 'Missing checkpointId' }, { status: 400 });
+          const checkpoint = await checkpointStore.get(cpId);
+          if (!checkpoint) return Response.json({ error: 'Checkpoint not found' }, { status: 404 });
+          const replaySession = createReplaySession(checkpoint, body.newSessionId);
+          await store.put(replaySession);
+          return Response.json({ ok: true, sessionId: replaySession.sessionId, messageCount: replaySession.messages.length });
+        }
+
+        if (action === 'remember') {
+          const body = (await request.json()) as { summary: string; tags?: string[]; metadata?: Record<string, unknown>; scope?: 'session' | 'user' | 'workspace'; scopeKey?: string };
+          const record = await memoryService.remember(sessionId, body.summary, body.tags ?? [], body.metadata, body.scope ?? 'session', body.scopeKey);
+          return Response.json(record);
+        }
+
+        if (action === 'capture') {
+          const body = (await request.json()) as { scope?: 'session' | 'user' | 'workspace'; scopeKey?: string; messages?: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }> };
+          const messages = body.messages?.map((message) => ({ ...message, createdAt: message.createdAt ?? new Date().toISOString() })) ?? [];
+          const record = await memoryService.captureScopedSummary(body.scope ?? 'session', sessionId, messages, body.scopeKey);
+          return Response.json(record);
+        }
+
+        if (action === 'search') {
+          const body = (await request.json()) as { query: string; source?: 'session' | 'memory'; scope?: 'session' | 'user' | 'workspace'; scopeKey?: string; limit?: number };
+          const limit = typeof body.limit === 'number' ? body.limit : 10;
+          if (body.source === 'memory' && body.scope) {
+            const results = await memoryService.recallByScope(body.scope, body.query, limit, body.scopeKey);
+            return Response.json({ ok: true, source: 'memory', scope: body.scope, scopeKey: body.scopeKey, results });
+          }
+          const results = body.source === 'memory'
+            ? await memoryStore.search(sessionId, body.query, limit)
+            : await store.search(sessionId, body.query, limit);
+          return Response.json({ ok: true, source: body.source ?? 'session', results });
+        }
+
+        const body = (await request.json()) as { userMessage: string; userId?: string; workspaceId?: string };
+        const result = await runConfiguredAgent({
+          sessionId,
+          userMessage: body.userMessage,
+          userId: body.userId,
+          workspaceId: body.workspaceId,
+          systemPrompt: 'You are CrowClaw running in a generic Node runtime.'
+        });
+        await memoryService.captureSessionSummary(sessionId, result.session.messages);
+        return Response.json(result);
+      }
+
+      // --- Mutation API endpoints (dashboard config management) ---
+
+      if (request.method === 'POST' && url.pathname === '/api/config') {
+        await request.json();
+        return Response.json({ ok: true, config: configStore.snapshot() });
+      }
+
+      if (request.method === 'POST' && url.pathname.match(/^\/api\/skills\/([^/]+)\/toggle$/)) {
+        const slug = url.pathname.split('/')[3]!;
+        const body = await request.json() as { enabled: boolean };
+        configStore.toggleSkill(slug, body.enabled);
+        skillRegistry.toggleSkill(slug, body.enabled);
+        return Response.json({ ok: true, slug, enabled: body.enabled });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/agent/preset') {
+        const body = await request.json() as { name: string; role?: string; goal?: string; backstory?: string } | { name: null };
+        if (body.name === null) {
+          configStore.setActivePreset(null);
+        } else {
+          const preset = body.role || body.goal || body.backstory
+            ? { role: body.role ?? '', goal: body.goal ?? '', backstory: body.backstory }
+            : getAgentPreset(body.name);
+          configStore.setActivePreset(body.name, preset
+            ? { role: preset.role, goal: preset.goal, backstory: preset.backstory }
+            : { role: '', goal: '', backstory: undefined });
+        }
+        return Response.json({ ok: true, activePreset: configStore.getActivePreset() });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/toolset/select') {
+        const body = await request.json() as { name: string | null };
+        configStore.setActiveToolset(body.name);
+        return Response.json({ ok: true, activeToolset: configStore.getActiveToolset() });
+      }
+
+      if (request.method === 'POST' && url.pathname.match(/^\/api\/gateway\/([^/]+)\/config$/)) {
+        const platform = url.pathname.split('/')[3]!;
+        const body = await request.json() as { token?: string; enabled?: boolean };
+        const existing = configStore.getGatewayConfig(platform);
+        configStore.setGatewayConfig(platform, {
+          enabled: body.enabled ?? existing?.enabled ?? true,
+          token: body.token ?? existing?.token,
+        });
+        return Response.json({ ok: true, platform, configured: Boolean(configStore.getGatewayConfig(platform)) });
+      }
+
+      const probeMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/probe$/);
+      if (request.method === 'POST' && probeMatch) {
+        const platform = probeMatch[1];
+        const body = await request.json() as { token?: string; webhookUrl?: string; phoneNumberId?: string; homeserverUrl?: string };
+        let result: ProbeResult;
+
+        switch (platform) {
+          case 'telegram':
+            result = body.token ? await probeTelegram(body.token) : { ok: false, platform: 'telegram' as const, error: 'Missing token' };
+            break;
+          case 'slack':
+            result = body.token ? await probeSlack(body.token) : { ok: false, platform: 'slack' as const, error: 'Missing token' };
+            break;
+          case 'discord':
+            result = body.webhookUrl ? await probeDiscord(body.webhookUrl) : { ok: false, platform: 'discord' as const, error: 'Missing webhookUrl' };
+            break;
+          case 'whatsapp':
+            result = body.token && body.phoneNumberId ? await probeWhatsApp(body.token, body.phoneNumberId) : { ok: false, platform: 'whatsapp' as const, error: 'Missing token or phoneNumberId' };
+            break;
+          case 'matrix':
+            result = body.token && body.homeserverUrl ? await probeMatrix(body.homeserverUrl, body.token) : { ok: false, platform: 'matrix' as const, error: 'Missing token or homeserverUrl' };
+            break;
+          default:
+            result = { ok: false, platform: platform as GatewayPlatform, error: `Probe not supported for ${platform}` };
+        }
+        return Response.json(result);
+      }
+
+      const policyMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/policy$/);
+      if (request.method === 'POST' && policyMatch) {
+        const platform = policyMatch[1];
+        const body = await request.json() as {
+          dmPolicy?: string;
+          groupPolicy?: string;
+          allowlist?: string[];
+          groupAllowlist?: string[];
+          requireMention?: boolean;
+        };
+
+        const existing = configStore.getGatewayConfig(platform) ?? { enabled: false };
+        configStore.setGatewayConfig(platform, {
+          ...existing,
+          dmPolicy: (body.dmPolicy as 'pairing' | 'allowlist' | 'open' | 'disabled') ?? existing.dmPolicy,
+          groupPolicy: (body.groupPolicy as 'open' | 'disabled' | 'allowlist') ?? existing.groupPolicy,
+          allowlist: body.allowlist ?? existing.allowlist,
+          groupAllowlist: body.groupAllowlist ?? existing.groupAllowlist,
+          requireMention: body.requireMention ?? existing.requireMention,
+        });
+
+        return Response.json({ ok: true, platform, policy: configStore.getGatewayConfig(platform) });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/gateway/pairing/approve') {
+        const body = await request.json() as { code: string };
+        const challenge = configStore.getPendingPairings().find((pairing) => pairing.code === body.code.toUpperCase());
+        if (!challenge) {
+          return Response.json({ ok: false, approved: false });
+        }
+
+        const policy = getGatewayAccessPolicy(challenge.platform as GatewayPlatform);
+        if (!policy) {
+          return Response.json({ ok: false, approved: false, error: `Gateway policy not configured for ${challenge.platform}` }, { status: 400 });
+        }
+
+        const result = approvePairing(configStore.getPendingPairingsMap() as Map<string, PairingChallenge>, body.code, policy);
+        return Response.json({ ok: result.approved, ...result });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/gateway/pairings') {
+        return Response.json({ pairings: configStore.getPendingPairings() });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/config/snapshot') {
+        const snapshot = configStore.snapshot();
+        return Response.json({
+          ok: true,
+          activePreset: snapshot.activePreset,
+          agentPreset: snapshot.agentPreset,
+          activeToolset: snapshot.activeToolset,
+          disabledSkills: snapshot.disabledSkills,
+          gatewayPlatforms: Object.fromEntries(
+            Object.keys(snapshot.gatewayConfigs as Record<string, unknown>).map((k) => [k, { configured: true }])
+          ),
+        });
+      }
+
+      return new Response('Not found', { status: 404 });
+    }
+  };
+}

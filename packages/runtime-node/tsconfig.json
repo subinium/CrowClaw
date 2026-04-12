@@ -1,0 +1,40 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["@cloudflare/workers-types", "node"]
+  },
+  "references": [
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../providers"
+    },
+    {
+      "path": "../storage"
+    },
+    {
+      "path": "../tools"
+    },
+    {
+      "path": "../workspace"
+    },
+    {
+      "path": "../scheduler"
+    },
+    {
+      "path": "../learning"
+    },
+    {
+      "path": "../mcp"
+    },
+    {
+      "path": "../plugins"
+    }
+  ],
+  "include": [
+    "src/**/*.ts"
+  ]
+}

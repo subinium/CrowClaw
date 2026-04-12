@@ -1,0 +1,1685 @@
+import type { ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
+import { validateFetchUrl } from '@crowclaw/core';
+
+export { createDelegateTool, type DelegateToolOptions } from './delegate.js';
+export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js';
+import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision.js';
+export { createImageGenerateTool, type ImageGenerationOptions } from './image-gen.js';
+import { createImageGenerateTool as createImageGenerateToolImpl } from './image-gen.js';
+export { createTtsTool, createTranscriptionTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
+export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
+import {
+  buildDiscordSendPayload,
+  buildSlackSendPayload,
+  buildSlackSendUrl,
+  buildTelegramSendPayload,
+  buildTelegramSendUrl
+} from '@crowclaw/gateway';
+import type { McpClient } from '@crowclaw/mcp';
+import type { MemoryStore, SessionSearchStore } from '@crowclaw/storage';
+import type { WorkspaceStore } from '@crowclaw/workspace';
+
+type BackgroundProcessRecord = {
+  pid: number;
+  command: string;
+  startedAt: string;
+  status: 'running' | 'exited' | 'killed';
+  exitCode?: number | null;
+  handle: {
+    kill(signal?: string): boolean;
+    on?(event: string, cb: (code: number | null) => void): void;
+  };
+};
+
+const backgroundProcesses = new Map<number, BackgroundProcessRecord>();
+
+async function loadChildProcessModule(): Promise<{
+  exec(command: string, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+  spawn(command: string, args: string[], options: { stdio: 'ignore'; detached: boolean }): {
+    pid?: number;
+    kill(signal?: string): boolean;
+    on?(event: string, cb: (code: number | null) => void): void;
+    unref?(): void;
+  };
+}> {
+  return import('node:child_process') as Promise<{
+    exec(command: string, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+    spawn(command: string, args: string[], options: { stdio: 'ignore'; detached: boolean }): {
+      pid?: number;
+      kill(signal?: string): boolean;
+      on?(event: string, cb: (code: number | null) => void): void;
+      unref?(): void;
+    };
+  }>;
+}
+
+function normalizeScope(input: Record<string, unknown>): 'session' | 'user' | 'workspace' | undefined {
+  return input.scope === 'session' || input.scope === 'user' || input.scope === 'workspace'
+    ? input.scope
+    : undefined;
+}
+
+function defaultScopeKey(scope: 'session' | 'user' | 'workspace' | undefined, context: ToolExecutionContext): string | undefined {
+  if (scope === 'session') {
+    return context.sessionId;
+  }
+  if (scope === 'workspace') {
+    return context.workspaceId;
+  }
+  return undefined;
+}
+
+export class ToolRegistry implements ToolCatalog, ToolExecutor {
+  private readonly tools = new Map<string, ToolDefinition>();
+
+  register(definition: ToolDefinition): this {
+    this.tools.set(definition.manifest.name, definition);
+    return this;
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
+  }
+
+  list(): ToolManifest[] {
+    return [...this.tools.values()].map((tool) => tool.manifest);
+  }
+
+  get(name: string): ToolDefinition | undefined {
+    return this.tools.get(name);
+  }
+
+  async execute(name: string, input: Record<string, unknown>, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    const tool = this.get(name);
+    if (!tool) {
+      return {
+        toolName: name,
+        runtime: 'worker',
+        ok: false,
+        output: `Unknown tool: ${name}`,
+        metadata: { knownTools: [...this.tools.keys()] }
+      };
+    }
+
+    return tool.execute(input, context);
+  }
+}
+
+export function createEchoTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'echo',
+      description: 'Echoes the input payload back to the caller.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { message: { type: 'string', description: 'The message to echo back' } }, required: ['message'] }
+    },
+    async execute(input) {
+      return {
+        toolName: 'echo',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(input)
+      };
+    }
+  };
+}
+
+export function createTimeTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'time',
+      description: 'Returns the current ISO timestamp.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
+    },
+    async execute() {
+      return {
+        toolName: 'time',
+        runtime: 'worker',
+        ok: true,
+        output: new Date().toISOString()
+      };
+    }
+  };
+}
+
+export function createWebFetchTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'web.fetch',
+      description: 'Fetches text content from a URL over HTTP.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The URL to fetch' } }, required: ['url'] }
+    },
+    async execute(input, context) {
+      const url = typeof input.url === 'string' ? input.url : '';
+      if (!url) {
+        return {
+          toolName: 'web.fetch',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing url.'
+        };
+      }
+
+      const urlCheck = validateFetchUrl(url);
+      if (!urlCheck.safe) {
+        return { toolName: 'web.fetch', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
+      }
+
+      const response = await fetch(url, { signal: context.signal });
+      const text = await response.text();
+      return {
+        toolName: 'web.fetch',
+        runtime: 'worker',
+        ok: response.ok,
+        output: text,
+        metadata: { status: response.status, url }
+      };
+    }
+  };
+}
+
+export function createTerminalExecTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.exec',
+      description: 'Executes a shell command locally and returns stdout/stderr.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'high'
+    },
+    async execute(input) {
+      const command = typeof input.command === 'string' ? input.command : typeof input.raw === 'string' ? input.raw : '';
+      if (!command) {
+        return { toolName: 'terminal.exec', runtime: 'worker', ok: false, output: 'Missing command.' };
+      }
+      const childProcess = await loadChildProcessModule();
+      return await new Promise<ToolExecutionResult>((resolve) => {
+        childProcess.exec(command, (error, stdout, stderr) => {
+          resolve({
+            toolName: 'terminal.exec',
+            runtime: 'worker',
+            ok: !error,
+            output: [stdout, stderr].filter(Boolean).join('').trim() || (error ? String(error.message) : ''),
+            metadata: {
+              command,
+              exitCode: error ? 1 : 0,
+              stdout,
+              stderr
+            }
+          });
+        });
+      });
+    }
+  };
+}
+
+export function createTerminalBackgroundTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.background',
+      description: 'Starts a shell command in the background.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'high'
+    },
+    async execute(input) {
+      const command = typeof input.command === 'string' ? input.command : '';
+      if (!command) {
+        return { toolName: 'terminal.background', runtime: 'worker', ok: false, output: 'Missing command.' };
+      }
+      const childProcess = await loadChildProcessModule();
+      const child = childProcess.spawn('/bin/sh', ['-lc', command], {
+        stdio: 'ignore',
+        detached: true
+      });
+      child.unref?.();
+      const pid = child.pid ?? Math.floor(Math.random() * 100000);
+      const record: BackgroundProcessRecord = {
+        pid,
+        command,
+        startedAt: new Date().toISOString(),
+        status: 'running',
+        handle: child
+      };
+      child.on?.('exit', (code) => {
+        record.status = record.status === 'killed' ? 'killed' : 'exited';
+        record.exitCode = code;
+      });
+      backgroundProcesses.set(pid, record);
+      return {
+        toolName: 'terminal.background',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify({ pid, command }, null, 2),
+        metadata: { pid, command }
+      };
+    }
+  };
+}
+
+export function createTerminalProcessesTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.processes',
+      description: 'Lists tracked background shell processes.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      const processes = [...backgroundProcesses.values()].map((record) => ({
+        pid: record.pid,
+        command: record.command,
+        status: record.status,
+        startedAt: record.startedAt,
+        exitCode: record.exitCode
+      }));
+      return {
+        toolName: 'terminal.processes',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(processes, null, 2),
+        metadata: { count: processes.length }
+      };
+    }
+  };
+}
+
+export function createTerminalKillTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.kill',
+      description: 'Stops a tracked background shell process.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'high'
+    },
+    async execute(input) {
+      const pid = typeof input.pid === 'number' ? input.pid : Number(input.pid);
+      if (!pid || Number.isNaN(pid)) {
+        return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: 'Missing pid.' };
+      }
+      const record = backgroundProcesses.get(pid);
+      if (!record) {
+        return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: `Unknown pid: ${pid}` };
+      }
+      record.handle.kill('SIGTERM');
+      record.status = 'killed';
+      return {
+        toolName: 'terminal.kill',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify({ pid, status: 'killed' }, null, 2),
+        metadata: { pid }
+      };
+    }
+  };
+}
+
+function extractTag(html: string, pattern: RegExp): string | null {
+  const match = html.match(pattern);
+  return match?.[1]?.trim() ?? null;
+}
+
+function extractReadableText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<\/(p|div|section|article|h[1-6]|li|br)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function resolveHref(baseUrl: string, href: string): string | null {
+  const trimmed = href.trim();
+  if (!trimmed || trimmed.startsWith('#')) {
+    return null;
+  }
+
+  try {
+    const resolved = new URL(trimmed, baseUrl);
+    if (!['http:', 'https:'].includes(resolved.protocol)) {
+      return null;
+    }
+    resolved.hash = '';
+    return resolved.href;
+  } catch {
+    return null;
+  }
+}
+
+export function createWebExtractMetadataTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'web.extractMetadata',
+      description: 'Fetches a web page and extracts title/description metadata.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The URL to extract metadata from' } }, required: ['url'] }
+    },
+    async execute(input, context) {
+      const url = typeof input.url === 'string' ? input.url : '';
+      if (!url) {
+        return {
+          toolName: 'web.extractMetadata',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing url.'
+        };
+      }
+
+      const urlCheck = validateFetchUrl(url);
+      if (!urlCheck.safe) {
+        return { toolName: 'web.extractMetadata', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
+      }
+
+      const response = await fetch(url, { signal: context.signal });
+      const html = await response.text();
+      const title = extractTag(html, /<title[^>]*>([^<]+)<\/title>/i)
+        ?? extractTag(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:title["'][^>]*>/i);
+      const description = extractTag(html, /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+name=["']twitter:description["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:description["'][^>]*>/i);
+      const canonicalHref = extractTag(html, /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["'][^>]*>/i);
+      const imageHref = extractTag(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image:secure_url["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+name=["']twitter:image:src["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+        ?? extractTag(html, /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image:src["'][^>]*>/i);
+      const canonicalUrl = canonicalHref ? (resolveHref(url, canonicalHref) ?? canonicalHref) : null;
+      const image = imageHref ? (resolveHref(url, imageHref) ?? imageHref) : null;
+
+      return {
+        toolName: 'web.extractMetadata',
+        runtime: 'worker',
+        ok: response.ok,
+        output: JSON.stringify({ title, description, canonicalUrl, image }, null, 2),
+        metadata: { status: response.status, url, title, description, canonicalUrl, image }
+      };
+    }
+  };
+}
+
+export function createWebExtractLinksTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'web.extractLinks',
+      description: 'Fetches a web page and extracts anchor hrefs.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The URL to extract links from' } }, required: ['url'] }
+    },
+    async execute(input, context) {
+      const url = typeof input.url === 'string' ? input.url : '';
+      if (!url) {
+        return {
+          toolName: 'web.extractLinks',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing url.'
+        };
+      }
+
+      const urlCheck = validateFetchUrl(url);
+      if (!urlCheck.safe) {
+        return { toolName: 'web.extractLinks', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
+      }
+
+      const response = await fetch(url, { signal: context.signal });
+      const html = await response.text();
+      const hrefs = [...new Set(
+        [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
+          .map((match) => resolveHref(url, match[1]))
+          .filter((href): href is string => Boolean(href))
+      )];
+      return {
+        toolName: 'web.extractLinks',
+        runtime: 'worker',
+        ok: response.ok,
+        output: JSON.stringify(hrefs, null, 2),
+        metadata: { status: response.status, url, count: hrefs.length }
+      };
+    }
+  };
+}
+
+export function createWebExtractTextTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'web.extractText',
+      description: 'Fetches a web page and extracts readable text content.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The URL to extract text from' } }, required: ['url'] }
+    },
+    async execute(input, context) {
+      const url = typeof input.url === 'string' ? input.url : '';
+      if (!url) {
+        return {
+          toolName: 'web.extractText',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing url.'
+        };
+      }
+
+      const urlCheck = validateFetchUrl(url);
+      if (!urlCheck.safe) {
+        return { toolName: 'web.extractText', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
+      }
+
+      const response = await fetch(url, { signal: context.signal });
+      const html = await response.text();
+      const text = extractReadableText(html);
+      return {
+        toolName: 'web.extractText',
+        runtime: 'worker',
+        ok: response.ok,
+        output: text,
+        metadata: { status: response.status, url, length: text.length }
+      };
+    }
+  };
+}
+
+export function createWebSearchTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'web.search',
+      description: 'Searches the web using DuckDuckGo and returns result candidates with titles, URLs, and snippets.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'The search query' }, limit: { type: 'number', description: 'Max results to return (default: 5)' } }, required: ['query'] }
+    },
+    async execute(input, context) {
+      const query = typeof input.query === 'string' ? input.query : '';
+      const limit = typeof input.limit === 'number' ? input.limit : 5;
+      const providerBaseUrl = typeof input.providerBaseUrl === 'string'
+        ? input.providerBaseUrl
+        : 'https://duckduckgo.com/html/';
+      if (!query) {
+        return {
+          toolName: 'web.search',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing query.'
+        };
+      }
+
+      const searchUrl = new URL(providerBaseUrl);
+      searchUrl.searchParams.set('q', query);
+      const searchUrlCheck = validateFetchUrl(searchUrl.toString());
+      if (!searchUrlCheck.safe) {
+        return { toolName: 'web.search', runtime: 'worker', ok: false, output: `URL blocked: ${searchUrlCheck.reason}` };
+      }
+
+      const response = await fetch(searchUrl, { signal: context.signal });
+      const html = await response.text();
+      const results = [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
+        .map((match) => {
+          const href = resolveHref(searchUrl.toString(), match[1]) ?? match[1];
+          const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          return href && title ? {
+            title,
+            url: href,
+            snippet: title
+          } : null;
+        })
+        .filter((value): value is { title: string; url: string; snippet: string } => Boolean(value))
+        .slice(0, limit);
+
+      return {
+        toolName: 'web.search',
+        runtime: 'worker',
+        ok: response.ok,
+        output: JSON.stringify(results, null, 2),
+        metadata: { status: response.status, query, count: results.length, providerBaseUrl }
+      };
+    }
+  };
+}
+
+export function createWebCrawlTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'web.crawl',
+      description: 'Crawls a page and linked pages with same-origin filtering.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The seed URL to start crawling from' }, maxPages: { type: 'number', description: 'Max pages to crawl (default: 5)' } }, required: ['url'] }
+    },
+    async execute(input, context) {
+      const url = typeof input.url === 'string' ? input.url : '';
+      const maxPages = typeof input.maxPages === 'number' ? input.maxPages : 3;
+      const sameOriginOnly = input.sameOriginOnly !== false;
+      if (!url) {
+        return {
+          toolName: 'web.crawl',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing url.'
+        };
+      }
+
+      const seedUrlCheck = validateFetchUrl(url);
+      if (!seedUrlCheck.safe) {
+        return { toolName: 'web.crawl', runtime: 'worker', ok: false, output: `URL blocked: ${seedUrlCheck.reason}` };
+      }
+
+      const origin = new URL(url).origin;
+      const queue = [url];
+      const visited = new Set<string>();
+      const pages: Array<{ url: string; excerpt: string; links: string[] }> = [];
+
+      while (queue.length > 0 && pages.length < maxPages) {
+        const current = queue.shift()!;
+        if (visited.has(current)) continue;
+        visited.add(current);
+
+        const crawlUrlCheck = validateFetchUrl(current);
+        if (!crawlUrlCheck.safe) continue;
+
+        const response = await fetch(current, { signal: context.signal });
+        const html = await response.text();
+        const text = extractReadableText(html);
+        const links = [...new Set(
+          [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
+            .map((match) => resolveHref(current, match[1]))
+            .filter((href): href is string => Boolean(href))
+            .filter((href) => !sameOriginOnly || new URL(href).origin === origin)
+        )];
+        pages.push({
+          url: current,
+          excerpt: text.slice(0, 280),
+          links
+        });
+        for (const link of links) {
+          if (!visited.has(link) && queue.length + pages.length < maxPages * 3) {
+            queue.push(link);
+          }
+        }
+      }
+
+      return {
+        toolName: 'web.crawl',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(pages, null, 2),
+        metadata: { count: pages.length, maxPages, sameOriginOnly }
+      };
+    }
+  };
+}
+
+export function createTextPatchTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'text.patch',
+      description: 'Applies deterministic text replacements to an input string.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const text = typeof input.text === 'string' ? input.text : '';
+      const replacements = Array.isArray(input.replacements)
+        ? input.replacements as Array<{ from?: string; to?: string }>
+        : [];
+
+      let output = text;
+      for (const replacement of replacements) {
+        if (typeof replacement?.from !== 'string' || typeof replacement?.to !== 'string') {
+          continue;
+        }
+        output = output.split(replacement.from).join(replacement.to);
+      }
+
+      return {
+        toolName: 'text.patch',
+        runtime: 'worker',
+        ok: true,
+        output,
+        metadata: { replacements: replacements.length }
+      };
+    }
+  };
+}
+
+export function createLinePatchTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'text.patchLines',
+      description: 'Applies line-oriented replacements to text by line number.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const text = typeof input.text === 'string' ? input.text : '';
+      const patches = Array.isArray(input.patches)
+        ? input.patches as Array<{ line?: number; value?: string }>
+        : [];
+      const lines = text.split('\n');
+
+      for (const patch of patches) {
+        if (typeof patch?.line !== 'number' || typeof patch?.value !== 'string') {
+          continue;
+        }
+        const index = patch.line - 1;
+        if (index >= 0 && index < lines.length) {
+          lines[index] = patch.value;
+        }
+      }
+
+      return {
+        toolName: 'text.patchLines',
+        runtime: 'worker',
+        ok: true,
+        output: lines.join('\n'),
+        metadata: { patches: patches.length }
+      };
+    }
+  };
+}
+
+export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.read',
+      description: 'Reads a file from the runtime-neutral workspace store.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const path = typeof input.path === 'string' ? input.path : '';
+      const file = await workspace.read(path);
+      return {
+        toolName: 'workspace.read',
+        runtime: 'worker',
+        ok: Boolean(file),
+        output: file?.content ?? 'Workspace file not found.',
+        metadata: file ? { path: file.path, updatedAt: file.updatedAt } : { path }
+      };
+    }
+  };
+}
+
+export function createWorkspaceListTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.list',
+      description: 'Lists files from the runtime-neutral workspace store.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const prefix = typeof input.prefix === 'string' ? input.prefix : '';
+      const files = await workspace.list(prefix);
+      return {
+        toolName: 'workspace.list',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(files, null, 2),
+        metadata: { count: files.length, prefix }
+      };
+    }
+  };
+}
+
+export function createWorkspaceSearchFilesTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.searchFiles',
+      description: 'Searches workspace file paths and contents using substring or regex matching.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const query = typeof input.query === 'string' ? input.query : '';
+      const prefix = typeof input.prefix === 'string' ? input.prefix : '';
+      const limit = typeof input.limit === 'number' ? input.limit : 20;
+      const mode = input.mode === 'regex' ? 'regex' : 'substring';
+      if (!query) {
+        return {
+          toolName: 'workspace.searchFiles',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing query.',
+          metadata: { query, prefix, mode }
+        };
+      }
+
+      const files = await workspace.list(prefix);
+      const matcher = mode === 'regex'
+        ? (() => {
+            try {
+              return new RegExp(query, 'i');
+            } catch {
+              return null;
+            }
+          })()
+        : null;
+      if (mode === 'regex' && !matcher) {
+        return {
+          toolName: 'workspace.searchFiles',
+          runtime: 'worker',
+          ok: false,
+          output: `Invalid regex query: ${query}`,
+          metadata: { query, prefix, mode }
+        };
+      }
+
+      const lowered = query.toLowerCase();
+      const results = files
+        .map((file) => {
+          const pathMatch = mode === 'regex'
+            ? matcher!.test(file.path)
+            : file.path.toLowerCase().includes(lowered);
+          const contentMatch = mode === 'regex'
+            ? matcher!.test(file.content)
+            : file.content.toLowerCase().includes(lowered);
+          if (!pathMatch && !contentMatch) {
+            return null;
+          }
+          const snippetSource = contentMatch ? file.content : file.path;
+          const index = mode === 'regex'
+            ? Math.max(snippetSource.search(matcher!), 0)
+            : Math.max(snippetSource.toLowerCase().indexOf(lowered), 0);
+          const snippet = snippetSource.slice(Math.max(index - 20, 0), Math.min(index + 120, snippetSource.length)).replace(/\n/g, '\\n');
+          return {
+            path: file.path,
+            match: pathMatch ? 'path' : 'content',
+            snippet,
+            updatedAt: file.updatedAt
+          };
+        })
+        .filter((value): value is { path: string; match: 'path' | 'content'; snippet: string; updatedAt: string } => Boolean(value))
+        .slice(0, limit);
+
+      return {
+        toolName: 'workspace.searchFiles',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(results, null, 2),
+        metadata: { count: results.length, query, prefix, mode, limit }
+      };
+    }
+  };
+}
+
+export function createWorkspaceWriteTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.write',
+      description: 'Writes a file into the runtime-neutral workspace store.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const path = typeof input.path === 'string' ? input.path : '';
+      const content = typeof input.content === 'string' ? input.content : '';
+      const file = await workspace.write(path, content);
+      return {
+        toolName: 'workspace.write',
+        runtime: 'worker',
+        ok: true,
+        output: file.content,
+        metadata: { path: file.path, updatedAt: file.updatedAt }
+      };
+    }
+  };
+}
+
+export function createWorkspaceExistsTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.exists',
+      description: 'Checks whether a file exists in the runtime-neutral workspace store.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const path = typeof input.path === 'string' ? input.path : '';
+      const exists = await workspace.exists(path);
+      return {
+        toolName: 'workspace.exists',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify({ path, exists }),
+        metadata: { path, exists }
+      };
+    }
+  };
+}
+
+export function createWorkspacePatchTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.patchLines',
+      description: 'Applies line-based patches to a workspace file.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const path = typeof input.path === 'string' ? input.path : '';
+      const patches = Array.isArray(input.patches)
+        ? input.patches.filter((patch): patch is { line: number; value: string } => typeof patch?.line === 'number' && typeof patch?.value === 'string')
+        : [];
+      const file = await workspace.patchLines(path, patches);
+      return {
+        toolName: 'workspace.patchLines',
+        runtime: 'worker',
+        ok: true,
+        output: file.content,
+        metadata: { path: file.path, updatedAt: file.updatedAt, patches: patches.length }
+      };
+    }
+  };
+}
+
+export function createWorkspacePatchTextTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.patchText',
+      description: 'Applies deterministic text replacements to a workspace file.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const path = typeof input.path === 'string' ? input.path : '';
+      const replacements = Array.isArray(input.replacements)
+        ? input.replacements.filter((replacement): replacement is { from: string; to: string } => typeof replacement?.from === 'string' && typeof replacement?.to === 'string')
+        : [];
+      const file = await workspace.patchText(path, replacements);
+      return {
+        toolName: 'workspace.patchText',
+        runtime: 'worker',
+        ok: true,
+        output: file.content,
+        metadata: { path: file.path, updatedAt: file.updatedAt, replacements: replacements.length }
+      };
+    }
+  };
+}
+
+export function createWorkspaceDeleteTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.delete',
+      description: 'Deletes a file from the runtime-neutral workspace store.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const path = typeof input.path === 'string' ? input.path : '';
+      const removed = await workspace.remove(path);
+      return {
+        toolName: 'workspace.delete',
+        runtime: 'worker',
+        ok: removed,
+        output: removed ? `Deleted ${path}` : `Workspace file not found: ${path}`,
+        metadata: { path, removed }
+      };
+    }
+  };
+}
+
+export function createWorkspaceRenameTool(workspace: WorkspaceStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'workspace.rename',
+      description: 'Renames or moves a file inside the runtime-neutral workspace store.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: true,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const fromPath = typeof input.fromPath === 'string' ? input.fromPath : '';
+      const toPath = typeof input.toPath === 'string' ? input.toPath : '';
+      const file = await workspace.rename(fromPath, toPath);
+      return {
+        toolName: 'workspace.rename',
+        runtime: 'worker',
+        ok: Boolean(file),
+        output: file ? file.content : `Workspace file not found: ${fromPath}`,
+        metadata: file ? { fromPath, toPath, updatedAt: file.updatedAt } : { fromPath, toPath }
+      };
+    }
+  };
+}
+
+export function createToolListTool(registry: ToolRegistry): ToolDefinition {
+  return {
+    manifest: {
+      name: 'tool.list',
+      description: 'Lists the currently registered tools and runtimes.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      return {
+        toolName: 'tool.list',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(registry.list(), null, 2),
+        metadata: { count: registry.list().length }
+      };
+    }
+  };
+}
+
+export function createTodoTool(): ToolDefinition {
+  const todos = new Map<string, Array<{ id: string; text: string; done: boolean; createdAt: string; updatedAt: string }>>();
+  return {
+    manifest: {
+      name: 'todo.manage',
+      description: 'Creates, updates, lists, and removes session-scoped todo items.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { action: { type: 'string', enum: ['add', 'complete', 'remove', 'list'], description: 'The action to perform' }, text: { type: 'string', description: 'Todo text (for add)' }, id: { type: 'string', description: 'Todo ID (for complete/remove)' } }, required: ['action'] }
+    },
+    async execute(input, context) {
+      const action = typeof input.action === 'string' ? input.action : 'list';
+      const list = todos.get(context.sessionId) ?? [];
+      if (action === 'add') {
+        const text = typeof input.text === 'string' ? input.text.trim() : '';
+        if (!text) {
+          return { toolName: 'todo.manage', runtime: 'worker', ok: false, output: 'Missing todo text.' };
+        }
+        const item = { id: crypto.randomUUID(), text, done: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+        list.push(item);
+        todos.set(context.sessionId, list);
+        return { toolName: 'todo.manage', runtime: 'worker', ok: true, output: JSON.stringify(item, null, 2), metadata: { action, count: list.length } };
+      }
+      if (action === 'complete' || action === 'remove') {
+        const id = typeof input.id === 'string' ? input.id : '';
+        const index = list.findIndex((item) => item.id === id);
+        if (index < 0) {
+          return { toolName: 'todo.manage', runtime: 'worker', ok: false, output: `Todo not found: ${id}` };
+        }
+        if (action === 'remove') {
+          const [removed] = list.splice(index, 1);
+          todos.set(context.sessionId, list);
+          return { toolName: 'todo.manage', runtime: 'worker', ok: true, output: JSON.stringify(removed, null, 2), metadata: { action, count: list.length } };
+        }
+        list[index] = { ...list[index]!, done: true, updatedAt: new Date().toISOString() };
+        todos.set(context.sessionId, list);
+        return { toolName: 'todo.manage', runtime: 'worker', ok: true, output: JSON.stringify(list[index], null, 2), metadata: { action, count: list.length } };
+      }
+      return {
+        toolName: 'todo.manage',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(list, null, 2),
+        metadata: { action: 'list', count: list.length }
+      };
+    }
+  };
+}
+
+export function createClarifyTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'clarify.ask',
+      description: 'Produces a concise clarification question with rationale.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { topic: { type: 'string', description: 'The topic to clarify' }, question: { type: 'string', description: 'The specific question to ask' }, unknowns: { type: 'array', items: { type: 'string' }, description: 'List of unknown aspects' } }, required: ['topic'] }
+    },
+    async execute(input) {
+      const topic = typeof input.topic === 'string' ? input.topic : 'the task';
+      const unknowns = Array.isArray(input.unknowns) ? input.unknowns.map(String).filter(Boolean) : [];
+      const question = typeof input.question === 'string' && input.question.trim()
+        ? input.question.trim()
+        : `Can you clarify ${topic}${unknowns.length ? ` (${unknowns.join(', ')})` : ''}?`;
+      return {
+        toolName: 'clarify.ask',
+        runtime: 'worker',
+        ok: true,
+        output: question,
+        metadata: { topic, unknowns }
+      };
+    }
+  };
+}
+
+export function createSendMessageTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'send.message',
+      description: 'Builds an outbound cross-platform message payload for operator delivery.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const platform = typeof input.platform === 'string' ? input.platform : 'webhook';
+      const channel = typeof input.channel === 'string' ? input.channel : '';
+      const text = typeof input.text === 'string' ? input.text : '';
+      if (!channel || !text) {
+        return {
+          toolName: 'send.message',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing channel or text.'
+        };
+      }
+      const metadata = typeof input.metadata === 'object' && input.metadata ? input.metadata as Record<string, unknown> : undefined;
+      const payload = (() => {
+        if (platform === 'telegram') {
+          const botToken = typeof input.botToken === 'string' ? input.botToken : '';
+          return {
+            platform,
+            url: botToken ? buildTelegramSendUrl(botToken) : null,
+            payload: buildTelegramSendPayload({ chatId: channel, text })
+          };
+        }
+        if (platform === 'slack') {
+          return {
+            platform,
+            url: buildSlackSendUrl(),
+            payload: buildSlackSendPayload({
+              channel,
+              text,
+              threadTs: typeof input.threadId === 'string' ? input.threadId : undefined
+            })
+          };
+        }
+        if (platform === 'discord') {
+          return {
+            platform,
+            payload: buildDiscordSendPayload({ content: text }),
+            webhookUrl: typeof input.webhookUrl === 'string' ? input.webhookUrl : null
+          };
+        }
+        return {
+          platform,
+          channel,
+          text,
+          threadId: typeof input.threadId === 'string' ? input.threadId : undefined,
+          metadata
+        };
+      })();
+      return {
+        toolName: 'send.message',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(payload, null, 2),
+        metadata: { platform, channel }
+      };
+    }
+  };
+}
+
+export function createSessionSearchTool(search: SessionSearchStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'session.search',
+      description: 'Searches indexed session transcripts.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input, context) {
+      const query = typeof input.query === 'string' ? input.query : '';
+      const limit = typeof input.limit === 'number' ? input.limit : 10;
+      const results = await search.search(context.sessionId, query, limit);
+      return {
+        toolName: 'session.search',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(results, null, 2),
+        metadata: { count: results.length }
+      };
+    }
+  };
+}
+
+export function createMemoryRememberTool(memoryStore: MemoryStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'memory.remember',
+      description: 'Stores a memory record for the current session.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input, context) {
+      const scope = normalizeScope(input) ?? 'session';
+      const scopeKey = typeof input.scopeKey === 'string' ? input.scopeKey : defaultScopeKey(scope, context);
+      const record = {
+        id: crypto.randomUUID(),
+        sessionId: context.sessionId,
+        scope,
+        scopeKey,
+        summary: typeof input.summary === 'string' ? input.summary : '',
+        tags: Array.isArray(input.tags) ? input.tags.map(String) : [],
+        createdAt: new Date().toISOString(),
+        metadata: typeof input.metadata === 'object' && input.metadata ? input.metadata as Record<string, unknown> : undefined
+      };
+      await memoryStore.write(record);
+      return {
+        toolName: 'memory.remember',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(record, null, 2)
+      };
+    }
+  };
+}
+
+export function createMemorySearchTool(memoryStore: MemoryStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'memory.search',
+      description: 'Searches memory records for the current session.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input, context) {
+      const query = typeof input.query === 'string' ? input.query : '';
+      const limit = typeof input.limit === 'number' ? input.limit : 10;
+      const scope = normalizeScope(input);
+      const scopeKey = typeof input.scopeKey === 'string' ? input.scopeKey : defaultScopeKey(scope, context);
+      const results = scope
+        ? await memoryStore.searchByScope(scope, query, limit, scopeKey)
+        : await memoryStore.search(context.sessionId, query, limit);
+      return {
+        toolName: 'memory.search',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(results, null, 2),
+        metadata: { count: results.length, ...(scope ? { scope, scopeKey } : {}) }
+      };
+    }
+  };
+}
+
+export function createMemoryListTool(memoryStore: MemoryStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'memory.list',
+      description: 'Lists memory records for the current session or a specific scope.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input, context) {
+      const limit = typeof input.limit === 'number' ? input.limit : 50;
+      const scope = normalizeScope(input);
+      const scopeKey = typeof input.scopeKey === 'string' ? input.scopeKey : defaultScopeKey(scope, context);
+      const results = scope
+        ? await memoryStore.listByScope(scope, limit, scopeKey)
+        : await memoryStore.list(context.sessionId);
+      return {
+        toolName: 'memory.list',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(results.slice(0, limit), null, 2),
+        metadata: { count: Math.min(results.length, limit), ...(scope ? { scope, scopeKey } : {}) }
+      };
+    }
+  };
+}
+
+export function createMcpListToolsTool(client: McpClient): ToolDefinition {
+  return {
+    manifest: {
+      name: 'mcp.listTools',
+      description: 'Lists tools exposed by the configured MCP server.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      const tools = await client.listTools();
+      return {
+        toolName: 'mcp.listTools',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(tools, null, 2),
+        metadata: { count: tools.length }
+      };
+    }
+  };
+}
+
+export function createMcpListResourcesTool(client: McpClient): ToolDefinition {
+  return {
+    manifest: {
+      name: 'mcp.listResources',
+      description: 'Lists resources exposed by the configured MCP server(s).',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      const resources = await client.listResources();
+      return {
+        toolName: 'mcp.listResources',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(resources, null, 2),
+        metadata: { count: resources.length }
+      };
+    }
+  };
+}
+
+export function createMcpListPromptsTool(client: McpClient): ToolDefinition {
+  return {
+    manifest: {
+      name: 'mcp.listPrompts',
+      description: 'Lists prompts exposed by the configured MCP server(s).',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      const prompts = await client.listPrompts();
+      return {
+        toolName: 'mcp.listPrompts',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(prompts, null, 2),
+        metadata: { count: prompts.length }
+      };
+    }
+  };
+}
+
+export function createMcpStatusTool(client: McpClient): ToolDefinition {
+  return {
+    manifest: {
+      name: 'mcp.status',
+      description: 'Reports MCP client status and capability support.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      const status = client.getStatus();
+      return {
+        toolName: 'mcp.status',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(status, null, 2),
+        metadata: { ...status }
+      };
+    }
+  };
+}
+
+export function createMcpInspectTool(client: McpClient): ToolDefinition {
+  return {
+    manifest: {
+      name: 'mcp.inspect',
+      description: 'Returns MCP status, tools, resources, and prompts in one response.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute(input) {
+      const refresh = Boolean(input.refresh);
+      const inspected = await client.inspect({ refresh });
+      return {
+        toolName: 'mcp.inspect',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(inspected, null, 2),
+        metadata: {
+          refresh,
+          tools: inspected.tools.length,
+          resources: inspected.resources.length,
+          prompts: inspected.prompts.length,
+          degraded: inspected.status.degraded
+        }
+      };
+    }
+  };
+}
+
+export function createMcpCallTool(client: McpClient): ToolDefinition {
+  return {
+    manifest: {
+      name: 'mcp.callTool',
+      description: 'Calls a tool exposed by the configured MCP server.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: true,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const name = typeof input.name === 'string' ? input.name : '';
+      const arguments_ = typeof input.arguments === 'object' && input.arguments
+        ? input.arguments as Record<string, unknown>
+        : {};
+      if (!name) {
+        return {
+          toolName: 'mcp.callTool',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing MCP tool name.'
+        };
+      }
+      const result = await client.callTool(name, arguments_);
+      return {
+        toolName: 'mcp.callTool',
+        runtime: 'worker',
+        ok: result.ok && !result.isError,
+        output: JSON.stringify(result.content, null, 2),
+        metadata: { name, isError: result.isError ?? false }
+      };
+    }
+  };
+}
+
+export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
+  registry.register(createEchoTool());
+  registry.register(createTimeTool());
+  registry.register(createTerminalExecTool());
+  registry.register(createTerminalBackgroundTool());
+  registry.register(createTerminalProcessesTool());
+  registry.register(createTerminalKillTool());
+  registry.register(createTodoTool());
+  registry.register(createClarifyTool());
+  registry.register(createSendMessageTool());
+  registry.register(createWebFetchTool());
+  registry.register(createWebExtractMetadataTool());
+  registry.register(createWebExtractLinksTool());
+  registry.register(createWebExtractTextTool());
+  registry.register(createWebSearchTool());
+  registry.register(createWebCrawlTool());
+  registry.register(createVisionAnalyzeToolImpl());
+  registry.register(createImageGenerateToolImpl());
+  registry.register(createTextPatchTool());
+  registry.register(createLinePatchTool());
+  registry.register(createToolListTool(registry));
+  return registry;
+}
+
+export function registerSearchAndMemoryTools(
+  registry: ToolRegistry,
+  sessionSearchStore: SessionSearchStore,
+  memoryStore: MemoryStore
+): ToolRegistry {
+  registry.register(createSessionSearchTool(sessionSearchStore));
+  registry.register(createMemoryRememberTool(memoryStore));
+  registry.register(createMemorySearchTool(memoryStore));
+  registry.register(createMemoryListTool(memoryStore));
+  return registry;
+}
+
+export function registerMcpTools(registry: ToolRegistry, client: McpClient): ToolRegistry {
+  registry.register(createMcpListToolsTool(client));
+  registry.register(createMcpListResourcesTool(client));
+  registry.register(createMcpListPromptsTool(client));
+  registry.register(createMcpStatusTool(client));
+  registry.register(createMcpInspectTool(client));
+  registry.register(createMcpCallTool(client));
+  return registry;
+}
+
+export function registerWorkspaceTools(registry: ToolRegistry, workspace: WorkspaceStore): ToolRegistry {
+  registry.register(createWorkspaceReadTool(workspace));
+  registry.register(createWorkspaceListTool(workspace));
+  registry.register(createWorkspaceSearchFilesTool(workspace));
+  registry.register(createWorkspaceWriteTool(workspace));
+  registry.register(createWorkspaceExistsTool(workspace));
+  registry.register(createWorkspacePatchTool(workspace));
+  registry.register(createWorkspacePatchTextTool(workspace));
+  registry.register(createWorkspaceDeleteTool(workspace));
+  registry.register(createWorkspaceRenameTool(workspace));
+  return registry;
+}
+
+export function createDefaultWorkerRegistry(options?: {
+  sessionSearchStore?: SessionSearchStore;
+  memoryStore?: MemoryStore;
+  workspaceStore?: WorkspaceStore;
+  mcpClient?: McpClient;
+}): ToolRegistry {
+  const registry = registerCoreTools(new ToolRegistry());
+  if (options?.sessionSearchStore && options.memoryStore) {
+    registerSearchAndMemoryTools(registry, options.sessionSearchStore, options.memoryStore);
+  }
+  if (options?.workspaceStore) {
+    registerWorkspaceTools(registry, options.workspaceStore);
+  }
+  if (options?.mcpClient) {
+    registerMcpTools(registry, options.mcpClient);
+  }
+  return registry;
+}
+
+/**
+ * Toolset Presets — Named tool bundles inspired by Hermes Agent's toolset distributions.
+ * Each preset defines which tool categories to include.
+ */
+export type ToolsetPresetName = 'minimal' | 'web' | 'terminal' | 'workspace' | 'memory' | 'mcp' | 'full' | 'research' | 'devops' | 'creative';
+
+export interface ToolsetPreset {
+  name: ToolsetPresetName;
+  description: string;
+  toolNames: string[];
+}
+
+export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
+  minimal: {
+    name: 'minimal',
+    description: 'Core utilities only — echo, time, tool list',
+    toolNames: ['echo', 'time', 'tool.list'],
+  },
+  web: {
+    name: 'web',
+    description: 'Web interaction — search, fetch, crawl, extract',
+    toolNames: ['echo', 'time', 'tool.list', 'web.fetch', 'web.search', 'web.crawl', 'web.extractMetadata', 'web.extractLinks', 'web.extractText'],
+  },
+  terminal: {
+    name: 'terminal',
+    description: 'Shell execution — terminal commands and process management',
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.processes', 'terminal.kill'],
+  },
+  workspace: {
+    name: 'workspace',
+    description: 'File operations — read, write, search, patch files',
+    toolNames: ['echo', 'time', 'tool.list', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.exists', 'workspace.delete', 'workspace.rename', 'workspace.patchLines', 'workspace.patchText', 'workspace.searchFiles'],
+  },
+  memory: {
+    name: 'memory',
+    description: 'Memory and session — remember, recall, search across sessions',
+    toolNames: ['echo', 'time', 'tool.list', 'memory.remember', 'memory.search', 'memory.list', 'session.search'],
+  },
+  mcp: {
+    name: 'mcp',
+    description: 'MCP integration — list, call, inspect MCP server tools',
+    toolNames: ['echo', 'time', 'tool.list', 'mcp.listTools', 'mcp.listResources', 'mcp.listPrompts', 'mcp.status', 'mcp.inspect', 'mcp.call'],
+  },
+  research: {
+    name: 'research',
+    description: 'Research workflow — web search, fetch, crawl, memory, session search',
+    toolNames: ['echo', 'time', 'tool.list', 'web.search', 'web.fetch', 'web.crawl', 'web.extractText', 'web.extractLinks', 'memory.remember', 'memory.search', 'session.search'],
+  },
+  devops: {
+    name: 'devops',
+    description: 'DevOps workflow — terminal, files, web fetch, process management',
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch'],
+  },
+  creative: {
+    name: 'creative',
+    description: 'Creative workflow — web search, files, text patching, memory',
+    toolNames: ['echo', 'time', 'tool.list', 'web.search', 'web.fetch', 'workspace.read', 'workspace.write', 'text.patch', 'text.patchLines', 'memory.remember', 'memory.search', 'todo.manage'],
+  },
+  full: {
+    name: 'full',
+    description: 'All available tools',
+    toolNames: [], // Empty means "register everything"
+  },
+};
+
+export function getToolsetPreset(name: ToolsetPresetName): ToolsetPreset {
+  return TOOLSET_PRESETS[name];
+}
+
+export function listToolsetPresets(): ToolsetPreset[] {
+  return Object.values(TOOLSET_PRESETS);
+}
+
+export function listToolsetPresetNames(): ToolsetPresetName[] {
+  return Object.keys(TOOLSET_PRESETS) as ToolsetPresetName[];
+}

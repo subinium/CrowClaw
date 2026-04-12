@@ -1,0 +1,48 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../providers"
+    },
+    {
+      "path": "../sandbox-executor"
+    },
+    {
+      "path": "../shared"
+    },
+    {
+      "path": "../storage"
+    },
+    {
+      "path": "../tools"
+    },
+    {
+      "path": "../memory"
+    },
+    {
+      "path": "../workspace"
+    },
+    {
+      "path": "../learning"
+    },
+    {
+      "path": "../mcp"
+    },
+    {
+      "path": "../scheduler"
+    },
+    {
+      "path": "../plugins"
+    }
+  ],
+  "include": [
+    "src/**/*.ts"
+  ]
+}

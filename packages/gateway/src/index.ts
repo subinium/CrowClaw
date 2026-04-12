@@ -1,0 +1,1362 @@
+export type GatewayPlatform = 'webhook' | 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'signal' | 'email' | 'matrix' | 'sms';
+
+// Inline URL safety check (gateway is zero-dep, cannot import from @crowclaw/core)
+function validateFetchUrl(url: string): { safe: boolean; reason?: string } {
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return { safe: false, reason: `Disallowed protocol: ${parsed.protocol}` };
+    const h = parsed.hostname;
+    if (/^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|169\.254\.|localhost$|.*\.local$|.*\.internal$)/i.test(h)) return { safe: false, reason: 'Private network' };
+    if (/^(fc00:|fe80:|::1$)/i.test(h)) return { safe: false, reason: 'Private network' };
+    return { safe: true };
+  } catch { return { safe: false, reason: 'Invalid URL' }; }
+}
+
+export interface NormalizedInboundMessage {
+  platform: GatewayPlatform;
+  channelId: string;
+  userId?: string;
+  text: string;
+  raw: unknown;
+  receivedAt: string;
+  externalChatId: string;
+  externalUserId?: string;
+  deliveryId?: string;
+}
+
+// --- Access Policy System (inspired by OpenClaw) ---
+
+export type DmPolicy = 'pairing' | 'allowlist' | 'open' | 'disabled';
+export type GroupPolicy = 'open' | 'disabled' | 'allowlist';
+
+export interface ChannelAccessPolicy {
+  dmPolicy: DmPolicy;
+  groupPolicy: GroupPolicy;
+  allowlist: string[];       // Allowed sender IDs
+  groupAllowlist: string[];  // Allowed group IDs
+  requireMention: boolean;   // For groups: only respond when @mentioned
+}
+
+export interface PairingChallenge {
+  code: string;
+  platform: GatewayPlatform;
+  senderId: string;
+  senderName?: string;
+  channelId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface AccessDecision {
+  allowed: boolean;
+  reason: 'allowed' | 'allowlisted' | 'open-policy' | 'pairing-required' | 'denied' | 'disabled' | 'not-in-allowlist' | 'group-disabled' | 'mention-required';
+  pairingCode?: string;
+}
+
+const PAIRING_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No O/0/I/1
+
+export function generatePairingCode(length = 8): string {
+  let code = '';
+  const array = new Uint8Array(length);
+  crypto.getRandomValues(array);
+  for (const byte of array) {
+    code += PAIRING_ALPHABET[byte % PAIRING_ALPHABET.length];
+  }
+  return code;
+}
+
+export function createDefaultAccessPolicy(): ChannelAccessPolicy {
+  return {
+    dmPolicy: 'pairing',
+    groupPolicy: 'open',
+    allowlist: [],
+    groupAllowlist: [],
+    requireMention: true,
+  };
+}
+
+export function evaluateAccess(
+  message: NormalizedInboundMessage,
+  policy: ChannelAccessPolicy,
+  isGroup: boolean,
+  pendingPairings: Map<string, PairingChallenge>,
+  isMentioned = true
+): AccessDecision {
+  // Group messages
+  if (isGroup) {
+    if (policy.groupPolicy === 'disabled') {
+      return { allowed: false, reason: 'group-disabled' };
+    }
+    if (policy.groupPolicy === 'allowlist') {
+      const groupAllowed = policy.groupAllowlist.includes(message.channelId) ||
+                           policy.groupAllowlist.includes('*');
+      if (!groupAllowed) {
+        return { allowed: false, reason: 'not-in-allowlist' };
+      }
+    }
+    // Mention gating for groups
+    if (policy.requireMention && !isMentioned) {
+      return { allowed: false, reason: 'mention-required' };
+    }
+    // Group policy 'open' or allowlisted
+    return { allowed: true, reason: policy.groupPolicy === 'allowlist' ? 'allowlisted' : 'open-policy' };
+  }
+
+  // DM messages
+  switch (policy.dmPolicy) {
+    case 'disabled':
+      return { allowed: false, reason: 'disabled' };
+
+    case 'open':
+      return { allowed: true, reason: 'open-policy' };
+
+    case 'allowlist': {
+      const senderId = message.externalUserId ?? message.userId ?? '';
+      const allowed = policy.allowlist.includes(senderId) || policy.allowlist.includes('*');
+      return allowed
+        ? { allowed: true, reason: 'allowlisted' }
+        : { allowed: false, reason: 'not-in-allowlist' };
+    }
+
+    case 'pairing': {
+      const senderId = message.externalUserId ?? message.userId ?? '';
+      // Check if already allowlisted
+      if (policy.allowlist.includes(senderId)) {
+        return { allowed: true, reason: 'allowlisted' };
+      }
+      // Check for existing pending pairing
+      const existingPairing = pendingPairings.get(`${message.platform}:${senderId}`);
+      if (existingPairing && new Date(existingPairing.expiresAt) > new Date()) {
+        return { allowed: false, reason: 'pairing-required', pairingCode: existingPairing.code };
+      }
+      // Generate new pairing code
+      const code = generatePairingCode();
+      const now = new Date();
+      const challenge: PairingChallenge = {
+        code,
+        platform: message.platform,
+        senderId,
+        senderName: undefined,
+        channelId: message.channelId,
+        createdAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString(), // 1 hour
+      };
+      pendingPairings.set(`${message.platform}:${senderId}`, challenge);
+      return { allowed: false, reason: 'pairing-required', pairingCode: code };
+    }
+
+    default:
+      return { allowed: false, reason: 'denied' };
+  }
+}
+
+export function approvePairing(
+  pendingPairings: Map<string, PairingChallenge>,
+  code: string,
+  policy: ChannelAccessPolicy
+): { approved: boolean; senderId?: string; platform?: GatewayPlatform } {
+  for (const [key, challenge] of pendingPairings) {
+    if (challenge.code === code.toUpperCase()) {
+      pendingPairings.delete(key);
+      if (!policy.allowlist.includes(challenge.senderId)) {
+        policy.allowlist.push(challenge.senderId);
+      }
+      return { approved: true, senderId: challenge.senderId, platform: challenge.platform };
+    }
+  }
+  return { approved: false };
+}
+
+export interface GenericWebhookPayload {
+  channelId?: string;
+  chatId?: string;
+  userId?: string;
+  text?: string;
+  message?: string;
+  [key: string]: unknown;
+}
+
+export interface TelegramUpdate {
+  update_id?: number;
+  message?: {
+    message_id?: number;
+    date?: number;
+    text?: string;
+    from?: { id?: number; username?: string };
+    chat?: { id?: number | string; type?: string };
+  };
+}
+
+export interface DiscordInteractionPayload {
+  channel_id?: string;
+  member?: { user?: { id?: string } };
+  user?: { id?: string };
+  data?: { name?: string; options?: Array<{ name?: string; value?: string }> };
+}
+
+export interface SlackEventPayload {
+  type?: string;
+  challenge?: string;
+  event?: {
+    channel?: string;
+    user?: string;
+    text?: string;
+    ts?: string;
+    thread_ts?: string;
+    subtype?: string;
+  };
+}
+
+export interface WhatsAppWebhookPayload {
+  entry?: Array<{
+    changes?: Array<{
+      value?: {
+        metadata?: { phone_number_id?: string };
+        messages?: Array<{
+          id?: string;
+          from?: string;
+          timestamp?: string;
+          text?: { body?: string };
+        }>;
+      };
+    }>;
+  }>;
+}
+
+export interface SignalWebhookPayload {
+  envelope?: {
+    sourceNumber?: string;
+    sourceUuid?: string;
+    timestamp?: number;
+    dataMessage?: {
+      message?: string;
+    };
+  };
+}
+
+export interface EmailWebhookPayload {
+  messageId?: string;
+  from?: string;
+  to?: string;
+  subject?: string;
+  text?: string;
+  body?: string;
+  inboxId?: string;
+}
+
+export interface MatrixWebhookPayload {
+  eventId?: string;
+  roomId?: string;
+  sender?: string;
+  content?: {
+    body?: string;
+    msgtype?: string;
+  };
+  timestamp?: number;
+}
+
+export interface SmsWebhookPayload {
+  messageId?: string;
+  from?: string;
+  to?: string;
+  text?: string;
+  body?: string;
+  conversationId?: string;
+  timestamp?: number;
+}
+
+export interface GatewayBinding {
+  platform: GatewayPlatform;
+  route: string;
+}
+
+export interface TelegramWebhookRouteResult {
+  ok: boolean;
+  sessionKey?: string;
+  message?: NormalizedInboundMessage;
+}
+
+export interface TelegramWebhookDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface DiscordDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface SlackDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface WhatsAppDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface SignalDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface EmailDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface MatrixDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface SmsDispatch {
+  sessionId: string;
+  payload: {
+    userMessage: string;
+    userId?: string;
+    workspaceId?: string;
+  };
+}
+
+export interface GatewayRetryPolicy {
+  maxAttempts: number;
+  baseDelayMs: number;
+}
+
+export interface GatewayDeliveryPlan {
+  platform: GatewayPlatform;
+  sessionId: string;
+  retryPolicy: GatewayRetryPolicy;
+  idempotencyKey: string | null;
+  userMessage: string;
+  userId?: string;
+  workspaceId?: string;
+}
+
+export interface GatewayIdempotencyStore {
+  has(key: string): Promise<boolean>;
+  mark(key: string): Promise<void>;
+}
+
+export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore {
+  private readonly keys = new Set<string>();
+
+  async has(key: string): Promise<boolean> {
+    return this.keys.has(key);
+  }
+
+  async mark(key: string): Promise<void> {
+    this.keys.add(key);
+  }
+}
+
+export interface DiscordSendPayload {
+  content: string;
+}
+
+export interface DiscordEditPayload {
+  messageId: string;
+  content: string;
+}
+
+export interface TelegramSendPayload {
+  chat_id: string;
+  text: string;
+  parse_mode?: 'Markdown' | 'MarkdownV2' | 'HTML';
+  disable_web_page_preview?: boolean;
+}
+
+export interface TelegramEditPayload extends TelegramSendPayload {
+  message_id: number;
+}
+
+export interface SlackSendPayload {
+  channel: string;
+  text: string;
+  thread_ts?: string;
+}
+
+export interface SlackEditPayload extends SlackSendPayload {
+  ts: string;
+}
+
+export interface SlackSignatureInput {
+  signingSecret: string;
+  timestamp: string;
+  body: string;
+  signature: string;
+}
+
+export const workerFirstGateways: GatewayBinding[] = [
+  { platform: 'telegram', route: '/webhooks/telegram' },
+  { platform: 'discord', route: '/webhooks/discord' },
+  { platform: 'slack', route: '/webhooks/slack' },
+  { platform: 'whatsapp', route: '/webhooks/whatsapp' },
+  { platform: 'signal', route: '/webhooks/signal' },
+  { platform: 'email', route: '/webhooks/email' },
+  { platform: 'matrix', route: '/webhooks/matrix' },
+  { platform: 'sms', route: '/webhooks/sms' },
+  { platform: 'webhook', route: '/api/sessions/:id' }
+];
+
+export function buildGatewaySessionKey(message: NormalizedInboundMessage): string {
+  return `${message.platform}:${message.channelId}`;
+}
+
+export function normalizeGenericWebhook(payload: GenericWebhookPayload): NormalizedInboundMessage {
+  const text = typeof payload.text === 'string'
+    ? payload.text
+    : typeof payload.message === 'string'
+      ? payload.message
+      : '';
+  const channelId = typeof payload.channelId === 'string'
+    ? payload.channelId
+    : typeof payload.chatId === 'string'
+      ? payload.chatId
+      : 'anonymous';
+  const userId = typeof payload.userId === 'string' ? payload.userId : undefined;
+
+  return {
+    platform: 'webhook',
+    channelId,
+    userId,
+    text,
+    raw: payload,
+    receivedAt: new Date().toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId,
+    deliveryId: typeof payload.deliveryId === 'string' ? payload.deliveryId : undefined
+  };
+}
+
+export function normalizeTelegramWebhook(update: TelegramUpdate): NormalizedInboundMessage | null {
+  const message = update.message;
+  if (!message?.chat?.id || !message.text) {
+    return null;
+  }
+
+  const channelId = String(message.chat.id);
+  const userId = message.from?.id ? String(message.from.id) : undefined;
+  return {
+    platform: 'telegram',
+    channelId,
+    userId,
+    text: message.text,
+    raw: update,
+    receivedAt: new Date((message.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId,
+    deliveryId: update.update_id ? String(update.update_id) : undefined
+  };
+}
+
+export function normalizeDiscordWebhook(payload: DiscordInteractionPayload): NormalizedInboundMessage | null {
+  const channelId = payload.channel_id ? String(payload.channel_id) : '';
+  const userId = payload.member?.user?.id ?? payload.user?.id;
+  const commandName = payload.data?.name ?? '';
+  const args = payload.data?.options?.map((option) => option?.value).filter(Boolean).join(' ') ?? '';
+  const text = [commandName, args].filter(Boolean).join(' ').trim();
+  if (!channelId || !text) {
+    return null;
+  }
+
+  return {
+    platform: 'discord',
+    channelId,
+    userId,
+    text,
+    raw: payload,
+    receivedAt: new Date().toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId
+  };
+}
+
+export function normalizeSlackWebhook(payload: SlackEventPayload): NormalizedInboundMessage | null {
+  if (payload.type === 'url_verification') {
+    return null;
+  }
+
+  const event = payload.event;
+  if (!event?.channel || !event.text || event.subtype === 'bot_message') {
+    return null;
+  }
+
+  return {
+    platform: 'slack',
+    channelId: event.channel,
+    userId: event.user,
+    text: event.text,
+    raw: payload,
+    receivedAt: new Date().toISOString(),
+    externalChatId: event.channel,
+    externalUserId: event.user,
+    deliveryId: event.ts
+  };
+}
+
+export function normalizeWhatsAppWebhook(payload: WhatsAppWebhookPayload): NormalizedInboundMessage | null {
+  const message = payload.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  const metadata = payload.entry?.[0]?.changes?.[0]?.value?.metadata;
+  const text = message?.text?.body;
+  const channelId = metadata?.phone_number_id;
+  if (!message?.from || !text || !channelId) {
+    return null;
+  }
+
+  return {
+    platform: 'whatsapp',
+    channelId,
+    userId: message.from,
+    text,
+    raw: payload,
+    receivedAt: new Date(Number(message.timestamp ?? Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+    externalChatId: channelId,
+    externalUserId: message.from,
+    deliveryId: message.id
+  };
+}
+
+export function normalizeSignalWebhook(payload: SignalWebhookPayload): NormalizedInboundMessage | null {
+  const envelope = payload.envelope;
+  const text = envelope?.dataMessage?.message;
+  const userId = envelope?.sourceNumber ?? envelope?.sourceUuid;
+  const channelId = userId;
+  if (!text || !channelId) {
+    return null;
+  }
+
+  return {
+    platform: 'signal',
+    channelId,
+    userId,
+    text,
+    raw: payload,
+    receivedAt: new Date(envelope?.timestamp ?? Date.now()).toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId,
+    deliveryId: envelope?.timestamp ? String(envelope.timestamp) : undefined
+  };
+}
+
+export function normalizeEmailWebhook(payload: EmailWebhookPayload): NormalizedInboundMessage | null {
+  const userId = payload.from;
+  const channelId = payload.inboxId ?? payload.to ?? payload.from;
+  const body = typeof payload.text === 'string'
+    ? payload.text
+    : typeof payload.body === 'string'
+      ? payload.body
+      : '';
+  const subject = typeof payload.subject === 'string' && payload.subject.trim()
+    ? `Subject: ${payload.subject.trim()}\n`
+    : '';
+  const text = `${subject}${body}`.trim();
+  if (!channelId || !text) {
+    return null;
+  }
+
+  return {
+    platform: 'email',
+    channelId,
+    userId,
+    text,
+    raw: payload,
+    receivedAt: new Date().toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId,
+    deliveryId: payload.messageId
+  };
+}
+
+export function normalizeMatrixWebhook(payload: MatrixWebhookPayload): NormalizedInboundMessage | null {
+  const channelId = payload.roomId;
+  const userId = payload.sender;
+  const text = payload.content?.body;
+  if (!channelId || !text) {
+    return null;
+  }
+
+  return {
+    platform: 'matrix',
+    channelId,
+    userId,
+    text,
+    raw: payload,
+    receivedAt: new Date(payload.timestamp ?? Date.now()).toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId,
+    deliveryId: payload.eventId
+  };
+}
+
+export function normalizeSmsWebhook(payload: SmsWebhookPayload): NormalizedInboundMessage | null {
+  const userId = payload.from;
+  const channelId = payload.conversationId ?? payload.to ?? payload.from;
+  const text = typeof payload.text === 'string'
+    ? payload.text
+    : typeof payload.body === 'string'
+      ? payload.body
+      : '';
+  if (!channelId || !text) {
+    return null;
+  }
+
+  return {
+    platform: 'sms',
+    channelId,
+    userId,
+    text,
+    raw: payload,
+    receivedAt: new Date(payload.timestamp ?? Date.now()).toISOString(),
+    externalChatId: channelId,
+    externalUserId: userId,
+    deliveryId: payload.messageId
+  };
+}
+
+export function routeTelegramWebhook(update: TelegramUpdate): TelegramWebhookRouteResult {
+  const message = normalizeTelegramWebhook(update);
+  if (!message) {
+    return { ok: false };
+  }
+
+  return {
+    ok: true,
+    message,
+    sessionKey: buildGatewaySessionKey(message)
+  };
+}
+
+export function buildTelegramDispatch(update: TelegramUpdate): TelegramWebhookDispatch | null {
+  const routed = routeTelegramWebhook(update);
+  if (!routed.ok || !routed.message || !routed.sessionKey) {
+    return null;
+  }
+
+  return {
+    sessionId: routed.sessionKey,
+    payload: {
+      userMessage: routed.message.text,
+      userId: routed.message.userId,
+      workspaceId: routed.message.channelId
+    }
+  };
+}
+
+export function buildDiscordDispatch(payload: DiscordInteractionPayload): DiscordDispatch | null {
+  const message = normalizeDiscordWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildSlackDispatch(payload: SlackEventPayload): SlackDispatch | null {
+  const message = normalizeSlackWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildWhatsAppDispatch(payload: WhatsAppWebhookPayload): WhatsAppDispatch | null {
+  const message = normalizeWhatsAppWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildSignalDispatch(payload: SignalWebhookPayload): SignalDispatch | null {
+  const message = normalizeSignalWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildEmailDispatch(payload: EmailWebhookPayload): EmailDispatch | null {
+  const message = normalizeEmailWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildMatrixDispatch(payload: MatrixWebhookPayload): MatrixDispatch | null {
+  const message = normalizeMatrixWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildSmsDispatch(payload: SmsWebhookPayload): SmsDispatch | null {
+  const message = normalizeSmsWebhook(payload);
+  if (!message) {
+    return null;
+  }
+
+  return {
+    sessionId: buildGatewaySessionKey(message),
+    payload: {
+      userMessage: message.text,
+      userId: message.userId,
+      workspaceId: message.channelId
+    }
+  };
+}
+
+export function buildGatewayRetryPolicy(platform: GatewayPlatform): GatewayRetryPolicy {
+  switch (platform) {
+    case 'slack':
+      return { maxAttempts: 3, baseDelayMs: 1_000 };
+    case 'whatsapp':
+      return { maxAttempts: 4, baseDelayMs: 1_500 };
+    case 'telegram':
+      return { maxAttempts: 2, baseDelayMs: 750 };
+    case 'matrix':
+      return { maxAttempts: 3, baseDelayMs: 1_000 };
+    case 'sms':
+      return { maxAttempts: 3, baseDelayMs: 1_250 };
+    default:
+      return { maxAttempts: 2, baseDelayMs: 500 };
+  }
+}
+
+export function buildGatewayIdempotencyKey(message: NormalizedInboundMessage): string | null {
+  if (!message.deliveryId) {
+    return null;
+  }
+  return `${message.platform}:${message.channelId}:${message.deliveryId}`;
+}
+
+export function buildGatewayDeliveryPlan(message: NormalizedInboundMessage): GatewayDeliveryPlan {
+  return {
+    platform: message.platform,
+    sessionId: buildGatewaySessionKey(message),
+    retryPolicy: buildGatewayRetryPolicy(message.platform),
+    idempotencyKey: buildGatewayIdempotencyKey(message),
+    userMessage: message.text,
+    userId: message.userId,
+    workspaceId: message.channelId
+  };
+}
+
+export function buildDiscordSendPayload(input: { content: string }): DiscordSendPayload {
+  return { content: input.content };
+}
+
+export function buildDiscordEditPayload(input: { messageId: string; content: string }): DiscordEditPayload {
+  return { messageId: input.messageId, content: input.content };
+}
+
+export function buildDiscordWebhookSendUrl(webhookUrl: string): string {
+  return webhookUrl;
+}
+
+export function buildDiscordWebhookEditUrl(webhookUrl: string, messageId: string): string {
+  return `${webhookUrl.replace(/\/$/, '')}/messages/${messageId}`;
+}
+
+export function buildTelegramSendPayload(input: {
+  chatId: string;
+  text: string;
+  parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML';
+  disableWebPagePreview?: boolean;
+}): TelegramSendPayload {
+  return {
+    chat_id: input.chatId,
+    text: input.text,
+    ...(input.parseMode ? { parse_mode: input.parseMode } : {}),
+    ...(typeof input.disableWebPagePreview === 'boolean'
+      ? { disable_web_page_preview: input.disableWebPagePreview }
+      : {})
+  };
+}
+
+export function buildTelegramEditPayload(input: {
+  chatId: string;
+  messageId: number;
+  text: string;
+  parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML';
+  disableWebPagePreview?: boolean;
+}): TelegramEditPayload {
+  return {
+    ...buildTelegramSendPayload({
+      chatId: input.chatId,
+      text: input.text,
+      parseMode: input.parseMode,
+      disableWebPagePreview: input.disableWebPagePreview
+    }),
+    message_id: input.messageId
+  };
+}
+
+export function buildSlackSendPayload(input: { channel: string; text: string; threadTs?: string }): SlackSendPayload {
+  return {
+    channel: input.channel,
+    text: input.text,
+    ...(input.threadTs ? { thread_ts: input.threadTs } : {})
+  };
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+function timingSafeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  let mismatch = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return mismatch === 0;
+}
+
+export async function buildSlackSignature(signingSecret: string, timestamp: string, body: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(signingSecret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const payload = encoder.encode(`v0:${timestamp}:${body}`);
+  const signature = await crypto.subtle.sign('HMAC', key, payload);
+  return `v0=${bytesToHex(new Uint8Array(signature))}`;
+}
+
+export async function verifySlackSignature(input: SlackSignatureInput): Promise<boolean> {
+  if (!input.signingSecret || !input.timestamp || !input.body || !input.signature) {
+    return false;
+  }
+
+  const expected = await buildSlackSignature(input.signingSecret, input.timestamp, input.body);
+  return timingSafeEqual(expected, input.signature);
+}
+
+export function buildSlackEditPayload(input: { channel: string; text: string; ts: string; threadTs?: string }): SlackEditPayload {
+  return {
+    ...buildSlackSendPayload(input),
+    ts: input.ts
+  };
+}
+
+export function buildSlackSendUrl(): string {
+  return 'https://slack.com/api/chat.postMessage';
+}
+
+export function buildSlackEditUrl(): string {
+  return 'https://slack.com/api/chat.update';
+}
+
+export function buildTelegramApiBase(botToken: string): string {
+  return `https://api.telegram.org/bot${botToken}`;
+}
+
+export function buildTelegramSendUrl(botToken: string): string {
+  return `${buildTelegramApiBase(botToken)}/sendMessage`;
+}
+
+export function buildTelegramEditUrl(botToken: string): string {
+  return `${buildTelegramApiBase(botToken)}/editMessageText`;
+}
+
+// --- Outbound Message Sending ---
+
+export interface GatewaySendResult {
+  ok: boolean;
+  platform: GatewayPlatform;
+  messageId?: string;
+  error?: string;
+  raw?: unknown;
+}
+
+/**
+ * Send a message via Telegram Bot API.
+ */
+export async function sendTelegramMessage(
+  botToken: string,
+  chatId: string,
+  text: string,
+  options?: { parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML' }
+): Promise<GatewaySendResult> {
+  const url = buildTelegramSendUrl(botToken);
+  const payload = buildTelegramSendPayload({
+    chatId,
+    text,
+    parseMode: options?.parseMode,
+  });
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json() as { ok?: boolean; result?: { message_id?: number }; description?: string };
+    return {
+      ok: data.ok === true,
+      platform: 'telegram',
+      messageId: data.result?.message_id ? String(data.result.message_id) : undefined,
+      error: data.ok ? undefined : (data.description ?? 'Unknown Telegram error'),
+      raw: data,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      platform: 'telegram',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Send a message via Discord webhook.
+ */
+export async function sendDiscordMessage(
+  webhookUrl: string,
+  content: string
+): Promise<GatewaySendResult> {
+  // Validate webhook URL to prevent SSRF
+  const urlCheck = validateFetchUrl(webhookUrl);
+  if (!urlCheck.safe) {
+    return { ok: false, platform: 'discord', error: `URL blocked: ${urlCheck.reason}` };
+  }
+  const payload = buildDiscordSendPayload({ content });
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.status === 204) {
+      return { ok: true, platform: 'discord' };
+    }
+
+    const data = await response.json() as { id?: string; message?: string };
+    return {
+      ok: response.ok,
+      platform: 'discord',
+      messageId: data.id,
+      error: response.ok ? undefined : (data.message ?? `HTTP ${response.status}`),
+      raw: data,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      platform: 'discord',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Send a message via Slack Web API (chat.postMessage).
+ */
+export async function sendSlackMessage(
+  botToken: string,
+  channel: string,
+  text: string,
+  options?: { threadTs?: string }
+): Promise<GatewaySendResult> {
+  const url = buildSlackSendUrl();
+  const payload = buildSlackSendPayload({ channel, text, threadTs: options?.threadTs });
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${botToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json() as { ok?: boolean; ts?: string; error?: string };
+    return {
+      ok: data.ok === true,
+      platform: 'slack',
+      messageId: data.ts,
+      error: data.ok ? undefined : (data.error ?? 'Unknown Slack error'),
+      raw: data,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      platform: 'slack',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Send a message via WhatsApp Cloud API.
+ */
+export async function sendWhatsAppMessage(
+  accessToken: string,
+  phoneNumberId: string,
+  to: string,
+  text: string
+): Promise<GatewaySendResult> {
+  const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        type: 'text',
+        text: { body: text },
+      }),
+    });
+    const data = await response.json() as { messages?: Array<{ id?: string }>; error?: { message?: string } };
+    return {
+      ok: response.ok,
+      platform: 'whatsapp',
+      messageId: data.messages?.[0]?.id,
+      error: response.ok ? undefined : (data.error?.message ?? `HTTP ${response.status}`),
+      raw: data,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      platform: 'whatsapp',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Send a message via Matrix client-server API.
+ */
+export async function sendMatrixMessage(
+  homeserverUrl: string,
+  accessToken: string,
+  roomId: string,
+  text: string
+): Promise<GatewaySendResult> {
+  const txnId = crypto.randomUUID();
+  const url = `${homeserverUrl.replace(/\/$/, '')}/_matrix/client/r0/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        msgtype: 'm.text',
+        body: text,
+      }),
+    });
+    const data = await response.json() as { event_id?: string; errcode?: string; error?: string };
+    return {
+      ok: response.ok,
+      platform: 'matrix',
+      messageId: data.event_id,
+      error: response.ok ? undefined : (data.error ?? `HTTP ${response.status}`),
+      raw: data,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      platform: 'matrix',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Send an email via a generic SMTP relay API (e.g., SendGrid, Mailgun).
+ * This uses a webhook-style HTTP API, not raw SMTP.
+ */
+export async function sendEmailMessage(
+  apiUrl: string,
+  apiKey: string,
+  to: string,
+  subject: string,
+  text: string,
+  from?: string
+): Promise<GatewaySendResult> {
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        to,
+        from: from ?? 'agent@crowclaw.dev',
+        subject,
+        text,
+      }),
+    });
+    const data = await response.json() as { id?: string; error?: string; message?: string };
+    return {
+      ok: response.ok,
+      platform: 'email',
+      messageId: data.id,
+      error: response.ok ? undefined : (data.error ?? data.message ?? `HTTP ${response.status}`),
+      raw: data,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      platform: 'email',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+// --- Platform Probes (token validation) ---
+
+export interface ProbeResult {
+  ok: boolean;
+  platform: GatewayPlatform;
+  identity?: string;       // Bot username, app name, etc.
+  details?: Record<string, unknown>;
+  error?: string;
+}
+
+/**
+ * Probe Telegram bot token by calling getMe.
+ */
+export async function probeTelegram(botToken: string): Promise<ProbeResult> {
+  try {
+    const url = `${buildTelegramApiBase(botToken)}/getMe`;
+    const res = await fetch(url);
+    const data = await res.json() as { ok?: boolean; result?: { username?: string; first_name?: string; id?: number } };
+    if (data.ok && data.result) {
+      return {
+        ok: true,
+        platform: 'telegram',
+        identity: `@${data.result.username ?? 'unknown'}`,
+        details: { id: data.result.id, firstName: data.result.first_name, username: data.result.username },
+      };
+    }
+    return { ok: false, platform: 'telegram', error: 'Invalid bot token' };
+  } catch (error: unknown) {
+    return { ok: false, platform: 'telegram', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Probe Slack bot token by calling auth.test.
+ */
+export async function probeSlack(botToken: string): Promise<ProbeResult> {
+  try {
+    const res = await fetch('https://slack.com/api/auth.test', {
+      method: 'POST',
+      headers: { 'authorization': `Bearer ${botToken}`, 'content-type': 'application/json' },
+    });
+    const data = await res.json() as { ok?: boolean; user?: string; team?: string; team_id?: string; user_id?: string; error?: string };
+    if (data.ok) {
+      return {
+        ok: true,
+        platform: 'slack',
+        identity: `${data.user}@${data.team}`,
+        details: { user: data.user, team: data.team, teamId: data.team_id, userId: data.user_id },
+      };
+    }
+    return { ok: false, platform: 'slack', error: data.error ?? 'Invalid token' };
+  } catch (error: unknown) {
+    return { ok: false, platform: 'slack', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Probe Discord webhook by calling the webhook URL.
+ */
+export async function probeDiscord(webhookUrl: string): Promise<ProbeResult> {
+  // Validate webhook URL to prevent SSRF
+  const urlCheck = validateFetchUrl(webhookUrl);
+  if (!urlCheck.safe) {
+    return { ok: false, platform: 'discord', error: `URL blocked: ${urlCheck.reason}` };
+  }
+  try {
+    const res = await fetch(webhookUrl);
+    if (!res.ok) {
+      return { ok: false, platform: 'discord', error: `HTTP ${res.status}` };
+    }
+    const data = await res.json() as { name?: string; id?: string; guild_id?: string; channel_id?: string };
+    return {
+      ok: true,
+      platform: 'discord',
+      identity: data.name ?? 'Webhook',
+      details: { id: data.id, guildId: data.guild_id, channelId: data.channel_id },
+    };
+  } catch (error: unknown) {
+    return { ok: false, platform: 'discord', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Probe WhatsApp Cloud API token by checking business profile.
+ */
+export async function probeWhatsApp(accessToken: string, phoneNumberId: string): Promise<ProbeResult> {
+  try {
+    const res = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}`, {
+      headers: { 'authorization': `Bearer ${accessToken}` },
+    });
+    const data = await res.json() as { id?: string; display_phone_number?: string; verified_name?: string; error?: { message?: string } };
+    if (data.id) {
+      return {
+        ok: true,
+        platform: 'whatsapp',
+        identity: data.verified_name ?? data.display_phone_number ?? phoneNumberId,
+        details: { id: data.id, phone: data.display_phone_number },
+      };
+    }
+    return { ok: false, platform: 'whatsapp', error: data.error?.message ?? 'Invalid credentials' };
+  } catch (error: unknown) {
+    return { ok: false, platform: 'whatsapp', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Probe Matrix homeserver by checking the access token.
+ */
+export async function probeMatrix(homeserverUrl: string, accessToken: string): Promise<ProbeResult> {
+  try {
+    const res = await fetch(`${homeserverUrl.replace(/\/$/, '')}/_matrix/client/r0/account/whoami`, {
+      headers: { 'authorization': `Bearer ${accessToken}` },
+    });
+    const data = await res.json() as { user_id?: string; device_id?: string; errcode?: string; error?: string };
+    if (data.user_id) {
+      return {
+        ok: true,
+        platform: 'matrix',
+        identity: data.user_id,
+        details: { userId: data.user_id, deviceId: data.device_id },
+      };
+    }
+    return { ok: false, platform: 'matrix', error: data.error ?? data.errcode ?? 'Invalid token' };
+  } catch (error: unknown) {
+    return { ok: false, platform: 'matrix', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export const normalizeTelegramUpdate = normalizeTelegramWebhook;
+
+export { channels, type ChannelAdapter, type NormalizedChannelMessage, telegramChannel, discordChannel, slackChannel, genericChannel } from './channel-registry.js';
+
+export async function normalizeGatewayRequest(platform: GatewayPlatform, request: Request): Promise<NormalizedInboundMessage | null> {
+  const payload = await request.json();
+  if (platform === 'telegram') {
+    return normalizeTelegramWebhook(payload as TelegramUpdate);
+  }
+  if (platform === 'discord') {
+    return normalizeDiscordWebhook(payload as DiscordInteractionPayload);
+  }
+  if (platform === 'slack') {
+    return normalizeSlackWebhook(payload as SlackEventPayload);
+  }
+  if (platform === 'whatsapp') {
+    return normalizeWhatsAppWebhook(payload as WhatsAppWebhookPayload);
+  }
+  if (platform === 'signal') {
+    return normalizeSignalWebhook(payload as SignalWebhookPayload);
+  }
+  if (platform === 'email') {
+    return normalizeEmailWebhook(payload as EmailWebhookPayload);
+  }
+  if (platform === 'matrix') {
+    return normalizeMatrixWebhook(payload as MatrixWebhookPayload);
+  }
+  if (platform === 'sms') {
+    return normalizeSmsWebhook(payload as SmsWebhookPayload);
+  }
+  return normalizeGenericWebhook(payload as GenericWebhookPayload);
+}

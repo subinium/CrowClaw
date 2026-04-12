@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Cloudflare
+.wrangler/
+.dev.vars
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Runtime
+*.pid
+*.seed
+*.pid.lock
+
+# Plugin state
+.omx/
+
+# Claude Code
+.claude/
+
+# Temp
+tmp/
+.tmp/
+
+# Internal planning docs
+RELEASE_CANDIDATE.md
+RELEASE_CHECKLIST.md
+docs/distillation-plan.md
+docs/finalization-plan.md

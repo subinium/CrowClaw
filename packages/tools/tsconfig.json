@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["@cloudflare/workers-types", "node"]
+  },
+  "references": [
+    {
+      "path": "../core"
+    },
+    {
+      "path": "../storage"
+    },
+    {
+      "path": "../workspace"
+    }
+  ],
+  "include": [
+    "src/**/*.ts"
+  ]
+}
