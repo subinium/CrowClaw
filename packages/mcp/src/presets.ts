@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { McpJsonRpcStdioTransport, type McpStdioServerConfig } from './stdio-transport.js';
 import { McpClient, type McpClientOptions } from './index.js';
 
@@ -156,6 +157,54 @@ export const createMcpFromPreset = <K extends McpPresetName>(
 
 export function listMcpPresetNames(): McpPresetName[] {
   return Object.keys(mcpPresets) as McpPresetName[];
+}
+
+/** Env vars required for each preset to be considered "available". */
+const presetRequiredEnvVars: Partial<Record<McpPresetName, string[]>> = {
+  github: ['GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_TOKEN'],
+  braveSearch: ['BRAVE_API_KEY'],
+  slack: ['SLACK_BOT_TOKEN'],
+  googleMaps: ['GOOGLE_MAPS_API_KEY'],
+};
+
+/** Check if the command/binary for a preset is available */
+export async function verifyPresetAvailability(presetName: string): Promise<{
+  available: boolean;
+  command: string;
+  error?: string;
+}> {
+  if (!(presetName in mcpPresets)) {
+    return { available: false, command: '', error: `Unknown preset: ${presetName}` };
+  }
+
+  const name = presetName as McpPresetName;
+
+  // All current presets use npx — check if npx exists
+  const command = 'npx';
+  const commandExists = await new Promise<boolean>((resolve) => {
+    execFile('which', [command], (error) => {
+      resolve(!error);
+    });
+  });
+
+  if (!commandExists) {
+    return { available: false, command, error: `Command '${command}' not found` };
+  }
+
+  // Check required env vars (any one of the alternatives must be set)
+  const requiredVars = presetRequiredEnvVars[name];
+  if (requiredVars && requiredVars.length > 0) {
+    const anySet = requiredVars.some((v) => Boolean(process.env[v]));
+    if (!anySet) {
+      return {
+        available: false,
+        command,
+        error: `${requiredVars.join(' or ')} not set`,
+      };
+    }
+  }
+
+  return { available: true, command };
 }
 
 export function getMcpPresetDescription(name: McpPresetName): string {

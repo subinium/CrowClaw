@@ -3,7 +3,7 @@ import { McpJsonRpcStdioTransport, type McpStdioServerConfig } from './stdio-tra
 
 export { McpJsonRpcStdioTransport } from './stdio-transport.js';
 export type { McpStdioServerConfig, McpJsonRpcStdioTransportOptions } from './stdio-transport.js';
-export { mcpPresets, createMcpFromPreset, listMcpPresetNames, getMcpPresetDescription } from './presets.js';
+export { mcpPresets, createMcpFromPreset, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from './presets.js';
 export type {
   McpPresetName,
   FilesystemPresetConfig,
@@ -70,6 +70,17 @@ export interface McpCallResult {
   ok: boolean;
   content: unknown;
   isError?: boolean;
+}
+
+export interface McpVerifyResult {
+  ok: boolean;
+  serverName?: string;
+  serverVersion?: string;
+  toolCount?: number;
+  resourceCount?: number;
+  promptCount?: number;
+  error?: string;
+  latencyMs: number;
 }
 
 export interface McpTransport {
@@ -318,6 +329,59 @@ export class McpClient {
       resources,
       prompts
     };
+  }
+
+  /** Test if the MCP server is reachable and functional */
+  async verify(options?: { timeoutMs?: number }): Promise<McpVerifyResult> {
+    const timeoutMs = options?.timeoutMs ?? 5_000;
+    const start = Date.now();
+
+    const timeout = <T>(promise: Promise<T>, label: string): Promise<T> =>
+      Promise.race([
+        promise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+        ),
+      ]);
+
+    try {
+      const tools = await timeout(this.transport.listTools(), 'tools/list');
+      const toolCount = tools.length;
+
+      let resourceCount: number | undefined;
+      if (typeof this.transport.listResources === 'function') {
+        try {
+          const resources = await timeout(this.transport.listResources(), 'resources/list');
+          resourceCount = resources.length;
+        } catch {
+          // resources not supported or failed — non-fatal
+        }
+      }
+
+      let promptCount: number | undefined;
+      if (typeof this.transport.listPrompts === 'function') {
+        try {
+          const prompts = await timeout(this.transport.listPrompts(), 'prompts/list');
+          promptCount = prompts.length;
+        } catch {
+          // prompts not supported or failed — non-fatal
+        }
+      }
+
+      return {
+        ok: true,
+        toolCount,
+        resourceCount,
+        promptCount,
+        latencyMs: Date.now() - start,
+      };
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        latencyMs: Date.now() - start,
+      };
+    }
   }
 }
 

@@ -8,13 +8,13 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-628%20passed-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-1174%20passed-brightgreen.svg" alt="Tests" />
   </p>
 </p>
 
 ---
 
-> **Beta.** Core systems are functional and tested (628 tests), but APIs may change before 1.0. Not recommended for production without review.
+> **Beta.** Core systems are functional and tested (1174 tests), but APIs may change before 1.0. Not recommended for production without review.
 
 CrowClaw started as an effort to bring [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Python) to Cloudflare Workers. Porting it to TypeScript opened up a chance to rethink the architecture — so we [studied dozens of agent frameworks](https://github.com/subinium/awesome-agent-frameworks), distilled the best patterns from each, and built a framework that actually closes the loop: your agent gets better every time it completes a task.
 
