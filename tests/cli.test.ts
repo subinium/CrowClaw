@@ -235,7 +235,9 @@ describe('cli package', () => {
     expect(chat.state.sessionId).toBe(reset.state.sessionId);
 
     const history = await runCliInputLine('/history', chat.state, { runtime });
-    expect(history.output).toContain('user: hello from slash cli');
+    // /history now shows persistent CLI command history, not session chat history
+    expect(history.output).toMatch(/No command history|Last \d+ commands/);
+
 
     const memories = await runCliInputLine('/memories', chat.state, { runtime });
     expect(memories.output).toContain('[');

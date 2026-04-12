@@ -184,3 +184,222 @@ export function containsSecrets(text: string): { detected: boolean; patterns: st
   }
   return { detected: patterns.length > 0, patterns };
 }
+
+// ---------------------------------------------------------------------------
+// Credential Redaction
+// ---------------------------------------------------------------------------
+
+const CREDENTIAL_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+  { name: 'openai_key', pattern: /sk-[a-zA-Z0-9]{20,}/g },
+  { name: 'anthropic_key', pattern: /sk-ant-[a-zA-Z0-9-]{20,}/g },
+  { name: 'github_token_ghp', pattern: /ghp_[a-zA-Z0-9]{36}/g },
+  { name: 'github_token_gho', pattern: /gho_[a-zA-Z0-9]{36}/g },
+  { name: 'github_token_ghs', pattern: /ghs_[a-zA-Z0-9]{36}/g },
+  { name: 'github_pat', pattern: /github_pat_[a-zA-Z0-9_]{20,}/g },
+  { name: 'slack_token', pattern: /xox[bpar]-[a-zA-Z0-9-]+/g },
+  { name: 'aws_key', pattern: /AKIA[A-Z0-9]{16}/g },
+  { name: 'bearer_token', pattern: /Bearer\s+[a-zA-Z0-9._-]{20,}/g },
+  { name: 'generic_credential', pattern: /[a-zA-Z_]{0,30}(?:key|token|secret|password|credential)[a-zA-Z_]{0,30}\s{0,5}[:=]\s{0,5}["'][^"']{8,80}["']/gi },
+  { name: 'private_key_block', pattern: /-----BEGIN[A-Z ]*PRIVATE KEY-----[^-]+-----END[A-Z ]*PRIVATE KEY-----/g },
+];
+
+export function redactCredentials(text: string): string {
+  let result = text;
+  // Apply anthropic_key before openai_key since sk-ant- is a subset of sk-
+  // Sort by specificity: longer/more-specific patterns first
+  const ordered = [
+    CREDENTIAL_PATTERNS.find(p => p.name === 'anthropic_key')!,
+    CREDENTIAL_PATTERNS.find(p => p.name === 'private_key_block')!,
+    ...CREDENTIAL_PATTERNS.filter(p => p.name !== 'anthropic_key' && p.name !== 'private_key_block'),
+  ];
+  for (const { pattern } of ordered) {
+    // Reset lastIndex for global regexes
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, '[REDACTED]');
+  }
+  return result;
+}
+
+export function redactToolOutput(output: string): string {
+  let result = redactCredentials(output);
+  const piiResult = redactPII(result);
+  result = piiResult.text;
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Enhanced Prompt Injection Detection
+// ---------------------------------------------------------------------------
+
+export interface InjectionThreat {
+  type: string;
+  description: string;
+  severity: 'low' | 'medium' | 'high';
+}
+
+export interface EnhancedInjectionScanResult {
+  detected: boolean;
+  threats: InjectionThreat[];
+}
+
+const OVERRIDE_PATTERNS: Array<{ pattern: RegExp; description: string }> = [
+  { pattern: /ignore\s+(all\s+)?previous\s+instructions/i, description: 'Attempts to override previous instructions' },
+  { pattern: /disregard\s+(all\s+)?prior/i, description: 'Attempts to disregard prior context' },
+  { pattern: /system\s*prompt\s*:/i, description: 'Attempts to inject a system prompt' },
+  { pattern: /you\s+are\s+now\s+/i, description: 'Attempts to redefine agent identity' },
+  { pattern: /forget\s+(all\s+)?(your\s+)?instructions/i, description: 'Attempts to clear agent instructions' },
+  { pattern: /pretend\s+you\s+are/i, description: 'Attempts to assume a different persona' },
+  { pattern: /\[SYSTEM\]\s*override/i, description: 'Fake system override marker' },
+  { pattern: /new\s+instructions?\s*:/i, description: 'Attempts to inject new instructions' },
+];
+
+const HIDDEN_HTML_PATTERNS: Array<{ pattern: RegExp; description: string }> = [
+  { pattern: /<!--[\s\S]*?-->/g, description: 'HTML comment with potentially hidden instructions' },
+  { pattern: /<script[\s\S]*?<\/script>/gi, description: 'Script tag with potentially executable content' },
+  { pattern: /<div[^>]*style\s*=\s*["'][^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0|font-size\s*:\s*0)[^"']*["'][^>]*>/gi, description: 'Invisible HTML element with hidden content' },
+  { pattern: /<span[^>]*style\s*=\s*["'][^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0|font-size\s*:\s*0)[^"']*["'][^>]*>/gi, description: 'Invisible span element with hidden content' },
+];
+
+const INVISIBLE_UNICODE_PATTERNS: Array<{ char: string; name: string }> = [
+  { char: '\u200B', name: 'zero-width space' },
+  { char: '\u200D', name: 'zero-width joiner' },
+  { char: '\u202A', name: 'left-to-right embedding' },
+  { char: '\u202B', name: 'right-to-left embedding' },
+  { char: '\u202C', name: 'pop directional formatting' },
+  { char: '\u202D', name: 'left-to-right override' },
+  { char: '\u202E', name: 'right-to-left override' },
+  { char: '\uFEFF', name: 'byte order mark / zero-width no-break space' },
+];
+
+const EXFILTRATION_PATTERNS: Array<{ pattern: RegExp; description: string }> = [
+  { pattern: /send\s+(this\s+|it\s+|the\s+)?(data\s+|info\s+|information\s+|output\s+)?to\s+\S+/i, description: 'Instruction to send data to external target' },
+  { pattern: /forward\s+(this\s+|it\s+|the\s+)?(data\s+|info\s+|output\s+)?to\s+\S+/i, description: 'Instruction to forward data externally' },
+  { pattern: /https?:\/\/[^\s]+/i, description: 'URL embedded in instructions (potential exfiltration endpoint)' },
+];
+
+const ROLE_CONFUSION_PATTERNS: Array<{ pattern: RegExp; description: string }> = [
+  { pattern: /as\s+an?\s+AI/i, description: 'Attempts to reference AI identity for manipulation' },
+  { pattern: /you\s+must\s+/i, description: 'Coercive instruction attempting to override safety' },
+  { pattern: /your\s+new\s+role/i, description: 'Attempts to reassign agent role' },
+  { pattern: /act\s+as\s+if\s+you\s+have\s+no\s+restrictions/i, description: 'Attempts to remove safety restrictions' },
+  { pattern: /bypass\s+(all\s+)?filters/i, description: 'Attempts to bypass safety filters' },
+];
+
+export function scanForEnhancedInjection(text: string): EnhancedInjectionScanResult {
+  const threats: InjectionThreat[] = [];
+
+  // Override attempts (high severity)
+  for (const { pattern, description } of OVERRIDE_PATTERNS) {
+    if (pattern.test(text)) {
+      threats.push({ type: 'override_attempt', description, severity: 'high' });
+    }
+  }
+
+  // Hidden HTML instructions (medium severity)
+  for (const { pattern, description } of HIDDEN_HTML_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) {
+      threats.push({ type: 'hidden_html', description, severity: 'medium' });
+    }
+  }
+
+  // Invisible Unicode characters (medium severity)
+  const foundInvisible: string[] = [];
+  for (const { char, name } of INVISIBLE_UNICODE_PATTERNS) {
+    if (text.includes(char)) {
+      foundInvisible.push(name);
+    }
+  }
+  if (foundInvisible.length > 0) {
+    threats.push({
+      type: 'invisible_unicode',
+      description: `Contains invisible Unicode characters: ${foundInvisible.join(', ')}`,
+      severity: 'medium',
+    });
+  }
+
+  // Data exfiltration patterns (high severity)
+  for (const { pattern, description } of EXFILTRATION_PATTERNS) {
+    if (pattern.test(text)) {
+      threats.push({ type: 'data_exfiltration', description, severity: 'high' });
+    }
+  }
+
+  // Role confusion (low severity)
+  for (const { pattern, description } of ROLE_CONFUSION_PATTERNS) {
+    if (pattern.test(text)) {
+      threats.push({ type: 'role_confusion', description, severity: 'low' });
+    }
+  }
+
+  return {
+    detected: threats.length > 0,
+    threats,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pre-Execution Command Scanner
+// ---------------------------------------------------------------------------
+
+export interface CommandRisk {
+  pattern: string;
+  description: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+}
+
+export interface CommandScanResult {
+  safe: boolean;
+  risks: CommandRisk[];
+}
+
+const COMMAND_RISK_PATTERNS: Array<{ pattern: RegExp; description: string; severity: CommandRisk['severity'] }> = [
+  // Pipe to interpreter (critical)
+  { pattern: /curl\s+[^|]*\|\s*(?:ba)?sh/i, description: 'Piping remote content to shell interpreter', severity: 'critical' },
+  { pattern: /wget\s+[^|]*\|\s*(?:ba)?sh/i, description: 'Piping remote content to shell interpreter', severity: 'critical' },
+  { pattern: /python\s+-c\s+/i, description: 'Inline Python code execution', severity: 'high' },
+
+  // Recursive delete (critical)
+  { pattern: /rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+\//i, description: 'Recursive force delete from root', severity: 'critical' },
+  { pattern: /rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+~/i, description: 'Recursive force delete from home directory', severity: 'critical' },
+  { pattern: /rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+\*/i, description: 'Recursive force delete with wildcard', severity: 'critical' },
+
+  // Privilege escalation (high)
+  { pattern: /\bsudo\b/i, description: 'Privilege escalation via sudo', severity: 'high' },
+  { pattern: /\bsu\s+-/i, description: 'Privilege escalation via su', severity: 'high' },
+  { pattern: /chmod\s+777\b/i, description: 'Setting world-writable permissions', severity: 'high' },
+  { pattern: /chown\b/i, description: 'Changing file ownership', severity: 'medium' },
+
+  // Network exfiltration (critical)
+  { pattern: /curl\s+.*-d\s+@\/etc\//i, description: 'Exfiltrating system files via curl', severity: 'critical' },
+  { pattern: /nc\s+.*-e\b/i, description: 'Reverse shell via netcat', severity: 'critical' },
+
+  // Environment variable theft (high)
+  { pattern: /echo\s+\$[A-Z_]*(?:SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL)/i, description: 'Echoing sensitive environment variables', severity: 'high' },
+  { pattern: /printenv\s*\|.*curl/i, description: 'Exfiltrating environment variables via curl', severity: 'critical' },
+  { pattern: /env\s*\|.*curl/i, description: 'Exfiltrating environment via curl', severity: 'critical' },
+
+  // Git credential exposure (high)
+  { pattern: /git\s+config\s+--global\s+credential/i, description: 'Accessing global git credentials', severity: 'high' },
+
+  // Disk/data destruction (critical)
+  { pattern: /dd\s+if=\/dev\/zero/i, description: 'Writing zeros to disk (data destruction)', severity: 'critical' },
+  { pattern: /\bmkfs\b/i, description: 'Formatting filesystem', severity: 'critical' },
+  { pattern: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/i, description: 'Fork bomb (denial of service)', severity: 'critical' },
+];
+
+export function scanCommand(command: string): CommandScanResult {
+  const risks: CommandRisk[] = [];
+
+  for (const { pattern, description, severity } of COMMAND_RISK_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(command)) {
+      risks.push({ pattern: pattern.source, description, severity });
+    }
+  }
+
+  return {
+    safe: risks.length === 0,
+    risks,
+  };
+}

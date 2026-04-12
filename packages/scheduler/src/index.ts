@@ -1,3 +1,21 @@
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+
+export {
+  type CronExpression,
+  parseCron,
+  cronMatches,
+  nextCronOccurrence,
+  prevCronOccurrence,
+  formatCron,
+  describeCron,
+} from './cron-parser.js';
+
+import {
+  parseCron,
+  nextCronOccurrence,
+} from './cron-parser.js';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -126,6 +144,18 @@ export class InMemorySchedulerStore implements SchedulerStore {
 }
 
 // ---------------------------------------------------------------------------
+// Schedule type detection
+// ---------------------------------------------------------------------------
+
+/** Returns true if the schedule is a cron expression or cron alias */
+export function isCronSchedule(schedule: string): boolean {
+  const trimmed = schedule.trim().toLowerCase();
+  if (trimmed.startsWith('@')) return true;
+  // 5-field cron: contains spaces and is not an interval format
+  return !trimmed.startsWith('every:') && trimmed.includes(' ');
+}
+
+// ---------------------------------------------------------------------------
 // Interval helpers
 // ---------------------------------------------------------------------------
 
@@ -142,6 +172,15 @@ export function computeNextIntervalRun(
   intervalMinutes: number,
 ): string {
   return new Date(now.getTime() + intervalMinutes * 60_000).toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Cron schedule helpers
+// ---------------------------------------------------------------------------
+
+export function computeNextCronRun(schedule: string, after: Date): string {
+  const cron = parseCron(schedule);
+  return nextCronOccurrence(cron, after).toISOString();
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +204,7 @@ export function createEveryNMinutesJob(
 
 export function createScheduledAgentJob(options: {
   id: string;
-  schedule: string; // 'every:5m', 'every:1h', 'every:24h'
+  schedule: string; // 'every:5m', 'every:1h', '0 9 * * *', '@daily'
   task: string;
   skillSlugs?: string[];
   toolsetPreset?: string;
@@ -175,13 +214,17 @@ export function createScheduledAgentJob(options: {
   maxRuns?: number;
   timeoutMs?: number;
 }): CronJobDefinition {
-  const minutes = parseIntervalMinutes(options.schedule);
+  const now = new Date();
+  const nextRunAt = isCronSchedule(options.schedule)
+    ? computeNextCronRun(options.schedule, now)
+    : computeNextIntervalRun(now, parseIntervalMinutes(options.schedule));
+
   return {
     id: options.id,
     schedule: options.schedule,
     task: options.task,
     enabled: true,
-    nextRunAt: computeNextIntervalRun(new Date(), minutes),
+    nextRunAt,
     skillSlugs: options.skillSlugs,
     toolsetPreset: options.toolsetPreset,
     agentPreset: options.agentPreset,
@@ -213,19 +256,22 @@ export async function collectDueJobs(
   return jobs.map((job) => ({ job, due: isJobDue(job, now) }));
 }
 
-export async function markIntervalJobRun(
+export async function markJobRun(
   store: SchedulerStore,
   job: CronJobDefinition,
   now = new Date(),
 ): Promise<CronJobDefinition> {
-  const minutes = parseIntervalMinutes(job.schedule);
-  const next = {
-    ...job,
-    nextRunAt: computeNextIntervalRun(now, minutes),
-  };
+  const nextRunAt = isCronSchedule(job.schedule)
+    ? computeNextCronRun(job.schedule, now)
+    : computeNextIntervalRun(now, parseIntervalMinutes(job.schedule));
+
+  const next = { ...job, nextRunAt };
   await store.saveJob(next);
   return next;
 }
+
+/** @deprecated Use markJobRun instead */
+export const markIntervalJobRun = markJobRun;
 
 // ---------------------------------------------------------------------------
 // Scheduler executor
@@ -264,7 +310,7 @@ export class SchedulerExecutor {
         updated.enabled = false;
       }
 
-      await markIntervalJobRun(this.store, updated, now);
+      await markJobRun(this.store, updated, now);
     }
 
     return results;
@@ -318,5 +364,96 @@ export class SchedulerExecutor {
         executedAt: new Date().toISOString(),
       };
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent file-based scheduler store
+// ---------------------------------------------------------------------------
+
+interface FileStoreData {
+  jobs: CronJobDefinition[];
+  lastSavedAt: string;
+}
+
+export class FileSchedulerStore implements SchedulerStore {
+  private jobs: Map<string, CronJobDefinition> | null = null;
+
+  constructor(private readonly filePath: string) {}
+
+  async listJobs(): Promise<CronJobDefinition[]> {
+    await this.ensureLoaded();
+    return [...this.jobs!.values()];
+  }
+
+  async saveJob(job: CronJobDefinition): Promise<void> {
+    await this.ensureLoaded();
+    this.jobs!.set(job.id, job);
+    await this.persist();
+  }
+
+  async getJob(id: string): Promise<CronJobDefinition | null> {
+    await this.ensureLoaded();
+    return this.jobs!.get(id) ?? null;
+  }
+
+  async deleteJob(id: string): Promise<boolean> {
+    await this.ensureLoaded();
+    const deleted = this.jobs!.delete(id);
+    if (deleted) {
+      await this.persist();
+    }
+    return deleted;
+  }
+
+  async pauseJob(id: string): Promise<CronJobDefinition | null> {
+    await this.ensureLoaded();
+    const job = this.jobs!.get(id);
+    if (!job) return null;
+    const updated = { ...job, enabled: false };
+    this.jobs!.set(id, updated);
+    await this.persist();
+    return updated;
+  }
+
+  async resumeJob(id: string): Promise<CronJobDefinition | null> {
+    await this.ensureLoaded();
+    const job = this.jobs!.get(id);
+    if (!job) return null;
+    const updated = { ...job, enabled: true };
+    this.jobs!.set(id, updated);
+    await this.persist();
+    return updated;
+  }
+
+  // -- Internal helpers --
+
+  private async ensureLoaded(): Promise<void> {
+    if (this.jobs !== null) return;
+    this.jobs = new Map();
+
+    try {
+      const raw = await readFile(this.filePath, 'utf-8');
+      const data: FileStoreData = JSON.parse(raw);
+      for (const job of data.jobs) {
+        this.jobs.set(job.id, job);
+      }
+    } catch (err: unknown) {
+      // File not found is expected on first use
+      if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  private async persist(): Promise<void> {
+    const data: FileStoreData = {
+      jobs: [...this.jobs!.values()],
+      lastSavedAt: new Date().toISOString(),
+    };
+
+    await mkdir(dirname(this.filePath), { recursive: true });
+    await writeFile(this.filePath, JSON.stringify(data, null, 2), 'utf-8');
   }
 }

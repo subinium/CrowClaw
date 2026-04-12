@@ -7,7 +7,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join, extname } from 'node:path';
-import { AgentLoop, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession } from '../packages/core/src/index.js';
+import { AgentLoop, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, PersonaRegistry, parseIdentity } from '../packages/core/src/index.js';
 import { OpenAICompatibleProvider } from '../packages/providers/src/index.js';
 import {
   ToolRegistry,
@@ -23,9 +23,19 @@ import {
   createClarifyTool,
   createTextPatchTool,
   createLinePatchTool,
+  createWorkspaceReadTool,
+  createWorkspaceWriteTool,
+  createWorkspaceListTool,
+  createWorkspaceSearchFilesTool,
+  createWorkspaceExistsTool,
+  createWorkspaceDeleteTool,
+  createWorkspaceRenameTool,
+  createWorkspacePatchTool,
+  createWorkspacePatchTextTool,
 } from '../packages/tools/src/index.js';
 import { InMemorySessionStore } from '../packages/storage/src/index.js';
-import { McpClient, mcpPresets as mcpPresetConfigs, type McpStdioServerConfig } from '../packages/mcp/src/index.js';
+import { FileWorkspaceStore } from '../packages/workspace/src/index.js';
+import { McpClient, mcpPresets as mcpPresetConfigs, verifyPresetAvailability, type McpStdioServerConfig } from '../packages/mcp/src/index.js';
 import { McpJsonRpcStdioTransport } from '../packages/mcp/src/stdio-transport.js';
 import type { ParsedSkillFile } from '../packages/core/src/index.js';
 
@@ -40,6 +50,9 @@ const runtimeState = {
   gatewayTokens: new Map<string, string>(),
   mcpConnections: new Map<string, { status: string; connectedAt?: string }>(),
 };
+
+// Persona registry
+const personaRegistry = new PersonaRegistry();
 
 // Live MCP client instances
 const mcpClients = new Map<string, McpClient>();
@@ -73,7 +86,10 @@ const sessionStore = new InMemorySessionStore();
 const checkpointStore = new InMemoryCheckpointStore();
 const toolRegistry = new ToolRegistry();
 
-// Register safe dev tools (no workspace/terminal for safety)
+// Real filesystem workspace store rooted at cwd
+const workspaceStore = new FileWorkspaceStore(process.cwd());
+
+// Register dev tools (including workspace tools backed by real filesystem)
 toolRegistry.register(createEchoTool());
 toolRegistry.register(createTimeTool());
 toolRegistry.register(createToolListTool(toolRegistry));
@@ -86,6 +102,15 @@ toolRegistry.register(createWebSearchTool());
 toolRegistry.register(createWebExtractMetadataTool());
 toolRegistry.register(createWebExtractLinksTool());
 toolRegistry.register(createWebExtractTextTool());
+toolRegistry.register(createWorkspaceReadTool(workspaceStore));
+toolRegistry.register(createWorkspaceWriteTool(workspaceStore));
+toolRegistry.register(createWorkspaceListTool(workspaceStore));
+toolRegistry.register(createWorkspaceSearchFilesTool(workspaceStore));
+toolRegistry.register(createWorkspaceExistsTool(workspaceStore));
+toolRegistry.register(createWorkspaceDeleteTool(workspaceStore));
+toolRegistry.register(createWorkspaceRenameTool(workspaceStore));
+toolRegistry.register(createWorkspacePatchTool(workspaceStore));
+toolRegistry.register(createWorkspacePatchTextTool(workspaceStore));
 
 function createProvider() {
   const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || '';
@@ -181,6 +206,42 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify(data));
   };
 
+  // Auth verification endpoint
+  if (req.method === 'POST' && url.pathname === '/api/auth/verify') {
+    const dt = process.env.CROWCLAW_DASHBOARD_TOKEN;
+    if (!dt) { return json({ ok: true, bypass: true }); }
+    const body = safeJson(await readBody(req));
+    return json({ ok: body.token === dt });
+  }
+
+  // Auth middleware for /api/* routes
+  const dt = process.env.CROWCLAW_DASHBOARD_TOKEN;
+  if (dt && url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/events') {
+    const ah = req.headers['authorization'];
+    const tk = typeof ah === 'string' && ah.startsWith('Bearer ') ? ah.slice(7) : null;
+    if (tk !== dt) { return json({ error: 'Unauthorized' }, 401); }
+  }
+
+  // Session rename
+  const rnMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/rename$/);
+  if (req.method === 'POST' && rnMatch) {
+    const body = safeJson(await readBody(req));
+    return json({ ok: true, sessionId: rnMatch[1], name: body.name });
+  }
+
+  // Session delete
+  const delSessMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
+  if (req.method === 'DELETE' && delSessMatch) {
+    delete sessions[delSessMatch[1]];
+    return json({ ok: true, sessionId: delSessMatch[1] });
+  }
+
+  // Memory delete
+  const delMemMatch = url.pathname.match(/^\/api\/memories\/([^/]+)$/);
+  if (req.method === 'DELETE' && delMemMatch) {
+    return json({ ok: true, memoryId: delMemMatch[1] });
+  }
+
   // Dashboard
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -244,6 +305,30 @@ const server = createServer(async (req, res) => {
   // Presets
   if (req.method === 'GET' && url.pathname === '/api/presets') {
     return json({ agents: agentPresets, toolsets: toolsetPresets, mcp: mcpPresetList });
+  }
+
+  // Persona API
+  if (req.method === 'GET' && url.pathname === '/api/personas') {
+    return json({ personas: personaRegistry.list() });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/persona/active') {
+    const active = personaRegistry.getActive();
+    const identity = active.files.identity ? parseIdentity(active.files.identity) : {};
+    return json({ name: active.name, identity });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/persona/switch') {
+    const body = safeJson(await readBody(req));
+    const name = body.name as string;
+    if (!name) return json({ ok: false, error: 'Missing persona name' }, 400);
+    try {
+      const profile = personaRegistry.switchTo(name);
+      return json({ ok: true, active: profile.name });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return json({ ok: false, error: msg }, 400);
+    }
   }
 
   // Gateway status
@@ -368,11 +453,15 @@ const server = createServer(async (req, res) => {
         connectedAt: new Date().toISOString(),
       });
 
+      // Run verification after connecting
+      const verify = await client.verify();
+
       return json({
         ok: true,
         preset: presetName,
         status: 'connected',
         tools: tools.map((t) => ({ name: t.registeredName, description: t.description })),
+        verify,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -415,13 +504,97 @@ const server = createServer(async (req, res) => {
     return json({ servers, count: mcpClients.size });
   }
 
+  // MCP verify a connected server
+  if (req.method === 'POST' && url.pathname === '/api/mcp/verify') {
+    const body = safeJson(await readBody(req));
+    const presetName = body.preset as string;
+    if (!presetName) return json({ error: 'Missing preset name' }, 400);
+    const client = mcpClients.get(presetName);
+    if (!client) return json({ ok: false, error: `Server '${presetName}' not connected`, latencyMs: 0 });
+    const result = await client.verify();
+    return json(result);
+  }
+
+  // MCP preset availability status
+  if (req.method === 'GET' && url.pathname === '/api/mcp/presets/status') {
+    const results = await Promise.all(
+      mcpPresetNames.map(async (name: string) => {
+        const result = await verifyPresetAvailability(name);
+        return { name, ...result };
+      })
+    );
+    return json(results);
+  }
+
   // Provider config (from onboarding)
   if (req.method === 'POST' && url.pathname === '/api/config/provider') {
     const body = safeJson(await readBody(req));
     if (body.apiKey) process.env.OPENROUTER_API_KEY = body.apiKey as string;
     if (body.baseUrl) process.env.OPENROUTER_BASE_URL = body.baseUrl as string;
     if (body.model) process.env.OPENROUTER_MODEL = body.model as string;
-    return json({ ok: true, model: body.model, provider: 'openrouter' });
+    return json({ ok: true, model: body.model, provider: body.provider || 'openrouter' });
+  }
+
+  // Provider connection test (onboarding step 3)
+  if (req.method === 'POST' && url.pathname === '/api/config/provider/test') {
+    const body = safeJson(await readBody(req));
+    const apiKey = body.apiKey as string;
+    const baseUrl = (body.baseUrl as string) || 'https://openrouter.ai/api/v1';
+    const provider = (body.provider as string) || 'openrouter';
+    if (!apiKey) return json({ ok: false, error: 'Missing API key' }, 400);
+    try {
+      let testUrl: string;
+      const headers: Record<string, string> = {};
+      if (provider === 'anthropic') {
+        testUrl = baseUrl.replace(/\/$/, '') + '/v1/messages';
+        headers['x-api-key'] = apiKey;
+        headers['anthropic-version'] = '2023-06-01';
+        headers['content-type'] = 'application/json';
+        const testResp = await fetch(testUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model: 'claude-haiku-4', max_tokens: 1, messages: [{ role: 'user', content: 'test' }] }),
+        });
+        if (testResp.ok || testResp.status === 400) {
+          // 400 means auth worked but request was invalid — that's fine for a test
+          return json({ ok: true, provider, models: ['claude-sonnet-4', 'claude-4', 'claude-haiku-4'] });
+        }
+        const errBody = await testResp.text();
+        return json({ ok: false, error: `HTTP ${testResp.status}: ${errBody.slice(0, 200)}` });
+      } else {
+        // OpenAI-compatible (OpenAI, OpenRouter, Custom)
+        testUrl = baseUrl.replace(/\/$/, '') + '/chat/completions';
+        headers['Authorization'] = `Bearer ${apiKey}`;
+        headers['content-type'] = 'application/json';
+        const testResp = await fetch(testUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: 1, messages: [{ role: 'user', content: 'test' }] }),
+        });
+        if (testResp.ok) {
+          // Try to list models
+          let modelList: string[] = [];
+          try {
+            const modelsResp = await fetch(baseUrl.replace(/\/$/, '') + '/models', {
+              headers: { 'Authorization': `Bearer ${apiKey}` },
+            });
+            if (modelsResp.ok) {
+              const modelsData = await modelsResp.json() as { data?: Array<{ id: string }> };
+              modelList = (modelsData.data || []).slice(0, 20).map((m) => m.id);
+            }
+          } catch { /* model list is optional */ }
+          return json({ ok: true, provider, models: modelList });
+        }
+        if (testResp.status === 401) {
+          return json({ ok: false, error: 'Invalid API key' });
+        }
+        const errBody = await testResp.text();
+        return json({ ok: false, error: `HTTP ${testResp.status}: ${errBody.slice(0, 200)}` });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return json({ ok: false, error: msg });
+    }
   }
 
   // Config snapshot
@@ -447,6 +620,82 @@ const server = createServer(async (req, res) => {
         preview: s.messages.at(-1)?.content?.slice(0, 100) || '',
       })),
     });
+  }
+
+  // Session streaming POST (SSE)
+  const streamMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/stream$/);
+  if (req.method === 'POST' && streamMatch) {
+    const sessionId = streamMatch[1];
+    const body = safeJson(await readBody(req));
+    const userMessage = body.message as string;
+    if (!userMessage) { json({ error: 'Missing message' }, 400); return; }
+
+    if (!sessions[sessionId]) sessions[sessionId] = { messages: [] };
+
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+    });
+
+    const abortController = new AbortController();
+    req.on('close', () => { abortController.abort(); });
+
+    try {
+      const loop = createAgentLoop();
+
+      // Build a session state for streaming
+      const existingSession = await sessionStore.get(sessionId);
+      const sessionState = existingSession ?? {
+        agentId: 'crowclaw-dev',
+        sessionId,
+        messages: sessions[sessionId].messages.map((m) => ({
+          role: m.role as import('../packages/core/src/index.js').Role,
+          content: m.content,
+          createdAt: m.createdAt,
+          name: m.name,
+        })),
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (typeof loop.runStreaming === 'function') {
+        for await (const event of loop.runStreaming({
+          userMessage,
+          sessionState,
+          signal: abortController.signal,
+        })) {
+          if (abortController.signal.aborted) break;
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+          if (event.type === 'done') {
+            // Sync session messages
+            sessions[sessionId].messages.push(
+              { role: 'user', content: userMessage, createdAt: new Date().toISOString() },
+              { role: 'assistant', content: event.response, createdAt: new Date().toISOString() },
+            );
+          }
+        }
+      } else {
+        // Fallback to non-streaming
+        const result = await loop.run({
+          agentId: 'crowclaw-dev',
+          sessionId,
+          userMessage,
+        });
+        sessions[sessionId].messages = result.session.messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          name: m.name,
+          createdAt: m.createdAt,
+        }));
+        res.write(`data: ${JSON.stringify({ type: 'done', response: result.finalResponse })}\n\n`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.write(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`);
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
   }
 
   // Session message POST

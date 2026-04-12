@@ -1,6 +1,59 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
+import { readFile, writeFile, mkdir, access, constants, appendFile } from 'node:fs/promises';
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import type { NodeRuntimeOptions } from '@crowclaw/runtime-node';
+
+const HISTORY_DIR = join(homedir(), '.crowclaw');
+const HISTORY_FILE_PATH = join(HISTORY_DIR, 'history');
+const MAX_HISTORY_LINES = 1000;
+
+export function loadHistorySync(filePath: string = HISTORY_FILE_PATH): string[] {
+  try {
+    if (!existsSync(filePath)) {
+      return [];
+    }
+    const content = readFileSync(filePath, 'utf-8');
+    return content.split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+export function appendHistorySync(line: string, filePath: string = HISTORY_FILE_PATH): void {
+  try {
+    mkdirSync(dirname(filePath), { recursive: true });
+    appendFileSync(filePath, line + '\n', 'utf-8');
+  } catch {
+    // Silently ignore write errors (e.g., read-only filesystem)
+  }
+}
+
+export function trimHistoryFileSync(filePath: string = HISTORY_FILE_PATH, max: number = MAX_HISTORY_LINES): void {
+  try {
+    if (!existsSync(filePath)) {
+      return;
+    }
+    const lines = readFileSync(filePath, 'utf-8').split('\n').filter(Boolean);
+    if (lines.length > max) {
+      const trimmed = lines.slice(lines.length - max);
+      writeFileSync(filePath, trimmed.join('\n') + '\n', 'utf-8');
+    }
+  } catch {
+    // Silently ignore errors
+  }
+}
+
+export function clearHistorySync(filePath: string = HISTORY_FILE_PATH): void {
+  try {
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, '', 'utf-8');
+  } catch {
+    // Silently ignore errors
+  }
+}
 
 export type CliCommandName = 'help' | 'status' | 'tools' | 'chat';
 
@@ -86,7 +139,11 @@ export const builtInCliSlashCommands = [
   '/model',
   '/session',
   '/delegate',
-  '/stream'
+  '/stream',
+  '/usage',
+  '/persona',
+  '/persona list',
+  '/persona switch',
 ] as const;
 
 async function lazyCreateRuntime(options?: NodeRuntimeOptions): Promise<CliRuntimeLike> {
@@ -187,6 +244,15 @@ const cliRoutePaths = {
   providers: {
     models: '/api/providers/models',
     route: '/api/providers/route'
+  },
+  usage: {
+    summary: '/api/usage',
+    reset: '/api/usage/reset'
+  },
+  personas: {
+    list: '/api/personas',
+    active: '/api/persona/active',
+    switch: '/api/persona/switch'
   }
 } as const;
 
@@ -299,7 +365,8 @@ export function renderCliHelp(): string {
     '  /preflight                     Run readiness checks',
     '  /release-check                 Full release readiness report',
     '  /tools                         List registered tools',
-    '  /history                       Show session history',
+    '  /history                       Show last 20 CLI commands',
+    '  /history clear                 Clear CLI command history',
     '  /memories                      Show session memories',
     '  /overview                      System overview dashboard',
     '  /todo ...                      Manage session todos',
@@ -326,6 +393,10 @@ export function renderCliHelp(): string {
     '  /compact                       Trigger context compression',
     '  /delegate                      Show delegation status',
     '  /stream                        Toggle streaming display mode',
+    '  /usage                         Show session token usage and cost',
+    '  /persona                       Show active persona info',
+    '  /persona list                  List all registered personas',
+    '  /persona switch <name>         Switch to a named persona',
     '  /clear                         Clear terminal screen',
     '  /quit, /exit                   Exit the REPL',
   ].join('\n');
@@ -444,11 +515,23 @@ export async function runCliInputLine(
     return { output: await runTools(runtime), state };
   }
 
-  if (trimmed === '/history') {
-    const response = await runtime.fetch(new Request(`http://localhost/api/sessions/${state.sessionId}/history`));
-    const session = await response.json() as { sessionId: string; messages: Array<{ role: string; content: string }> };
+  if (trimmed === '/history clear') {
+    clearHistorySync();
     return {
-      output: session.messages.map((message) => `${message.role}: ${message.content}`).join('\n'),
+      output: 'CLI command history cleared.',
+      state
+    };
+  }
+
+  if (trimmed === '/history') {
+    const history = loadHistorySync();
+    const last20 = history.slice(-20);
+    if (last20.length === 0) {
+      return { output: 'No command history.', state };
+    }
+    const numbered = last20.map((cmd, i) => `  ${history.length - last20.length + i + 1}  ${cmd}`);
+    return {
+      output: `Last ${last20.length} commands:\n${numbered.join('\n')}`,
       state
     };
   }
@@ -775,6 +858,36 @@ export async function runCliInputLine(
     };
   }
 
+  if (trimmed === '/usage') {
+    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.usage.summary)));
+    const data = await response.json() as {
+      totalTokens: number;
+      totalInputTokens: number;
+      totalOutputTokens: number;
+      totalCostUsd: number;
+      avgLatencyMs: number;
+      entries: Array<unknown>;
+      byModel: Record<string, { calls: number; tokens: number; cost: number }>;
+    };
+    const lines: string[] = [
+      'Session Usage:',
+      `  Total tokens: ${data.totalTokens.toLocaleString()} (in: ${data.totalInputTokens.toLocaleString()} / out: ${data.totalOutputTokens.toLocaleString()})`,
+      `  Total cost: $${data.totalCostUsd.toFixed(4)}`,
+      `  Avg latency: ${Math.round(data.avgLatencyMs)}ms`,
+      `  API calls: ${data.entries.length}`,
+    ];
+    const models = Object.entries(data.byModel).sort(([, a], [, b]) => b.cost - a.cost);
+    if (models.length > 0) {
+      lines.push('');
+      lines.push('By Model:');
+      for (const [name, info] of models) {
+        const padName = name.padEnd(16);
+        lines.push(`  ${padName} ${String(info.calls).padStart(3)} calls  ${info.tokens.toLocaleString().padStart(10)} tokens  $${info.cost.toFixed(4)}`);
+      }
+    }
+    return { output: lines.join('\n'), state };
+  }
+
   if (trimmed === '/new' || trimmed === '/reset') {
     const nextState = { sessionId: crypto.randomUUID() };
     return { output: `Started new session ${nextState.sessionId}.`, state: nextState };
@@ -786,6 +899,42 @@ export async function runCliInputLine(
       output: `Resumed ${nextSessionId}.`,
       state: { sessionId: nextSessionId }
     };
+  }
+
+  // Persona commands
+  if (trimmed === '/persona' || trimmed === '/persona list' || trimmed.startsWith('/persona switch ')) {
+    if (trimmed === '/persona list') {
+      const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.personas.list)));
+      const payload = await response.json() as { personas: Array<{ name: string; active: boolean }> };
+      const lines = (payload.personas ?? []).map(
+        (p: { name: string; active: boolean }) => `${p.active ? '* ' : '  '}${p.name}`
+      );
+      return { output: lines.length > 0 ? lines.join('\n') : 'No personas registered.', state };
+    }
+    if (trimmed.startsWith('/persona switch ')) {
+      const name = trimmed.replace('/persona switch ', '').trim();
+      if (!name) return { output: 'Usage: /persona switch <name>', state };
+      const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.personas.switch), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name }),
+      }));
+      const payload = await response.json() as { ok: boolean; active?: string; error?: string };
+      if (payload.ok) {
+        return { output: `Switched to persona "${payload.active}".`, state };
+      }
+      return { output: `Error: ${payload.error ?? 'unknown error'}`, state };
+    }
+    // Default: /persona — show active
+    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.personas.active)));
+    const payload = await response.json() as { name: string; identity?: Record<string, string> };
+    const lines = [`Active persona: ${payload.name}`];
+    if (payload.identity) {
+      if (payload.identity.name) lines.push(`  Name: ${payload.identity.name}`);
+      if (payload.identity.type) lines.push(`  Type: ${payload.identity.type}`);
+      if (payload.identity.vibe) lines.push(`  Vibe: ${payload.identity.vibe}`);
+    }
+    return { output: lines.join('\n'), state };
   }
 
   // New slash commands
@@ -927,9 +1076,187 @@ export class CliInteractiveController {
   }
 }
 
+// --- CLI Onboarding ---
+
+export interface CrowClawConfig {
+  provider: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  preset: string;
+  createdAt: string;
+}
+
+const CROWCLAW_CONFIG_DIR = join(homedir(), '.crowclaw');
+const CROWCLAW_CONFIG_PATH = join(CROWCLAW_CONFIG_DIR, 'config.json');
+
+const CLI_PROVIDERS: Array<{ key: string; name: string; url: string }> = [
+  { key: 'openai', name: 'OpenAI', url: 'https://api.openai.com/v1' },
+  { key: 'anthropic', name: 'Anthropic', url: 'https://api.anthropic.com' },
+  { key: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1' },
+  { key: 'custom', name: 'Custom endpoint', url: '' },
+];
+
+const CLI_MODELS: Record<string, Array<{ id: string; name: string; rec?: boolean }>> = {
+  openai: [
+    { id: 'gpt-4o', name: 'gpt-4o', rec: true },
+    { id: 'gpt-4.1', name: 'gpt-4.1' },
+    { id: 'gpt-4o-mini', name: 'gpt-4o-mini' },
+  ],
+  anthropic: [
+    { id: 'claude-sonnet-4', name: 'Claude Sonnet 4', rec: true },
+    { id: 'claude-4', name: 'Claude 4' },
+    { id: 'claude-haiku-4', name: 'Claude Haiku 4' },
+  ],
+  openrouter: [
+    { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', rec: true },
+    { id: 'openai/gpt-4o', name: 'GPT-4o' },
+    { id: 'anthropic/claude-haiku-4', name: 'Claude Haiku 4' },
+  ],
+  custom: [
+    { id: 'default', name: 'default', rec: true },
+  ],
+};
+
+const CLI_PRESETS = [
+  { id: 'general', name: 'General Assistant', rec: true },
+  { id: 'code-expert', name: 'Code Expert' },
+  { id: 'research-analyst', name: 'Research Analyst' },
+];
+
+export async function configFileExists(): Promise<boolean> {
+  try {
+    await access(CROWCLAW_CONFIG_PATH, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function loadConfig(): Promise<CrowClawConfig | null> {
+  try {
+    const raw = await readFile(CROWCLAW_CONFIG_PATH, 'utf-8');
+    return JSON.parse(raw) as CrowClawConfig;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveConfig(config: CrowClawConfig): Promise<void> {
+  await mkdir(CROWCLAW_CONFIG_DIR, { recursive: true });
+  const data = JSON.stringify(config, null, 2);
+  await writeFile(CROWCLAW_CONFIG_PATH, data, { mode: 0o600 });
+}
+
+export function shouldRunOnboarding(argv: string[]): boolean {
+  // Skip if --no-onboarding flag
+  if (argv.includes('--no-onboarding')) return false;
+  // Skip if env var is set
+  if (process.env.CROWCLAW_API_KEY) return false;
+  return true;
+}
+
+function maskInput(rl: ReturnType<typeof createInterface>): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks: string[] = [];
+    const origWrite = stdout.write.bind(stdout);
+    // Temporarily intercept writes to mask chars
+    const handler = (chunk: Buffer | string) => {
+      const str = typeof chunk === 'string' ? chunk : chunk.toString();
+      // Allow the prompt and control chars but mask typed chars
+      if (str === '\n' || str === '\r\n' || str === '\r') {
+        return origWrite(str);
+      }
+      // Replace visible chars with *
+      return origWrite('*'.repeat(str.replace(/[\r\n]/g, '').length));
+    };
+    stdout.write = handler as typeof stdout.write;
+    rl.question('').then((answer) => {
+      stdout.write = origWrite;
+      resolve(answer.trim());
+    }).catch(() => {
+      stdout.write = origWrite;
+      resolve('');
+    });
+  });
+}
+
+export async function runCliOnboarding(): Promise<CrowClawConfig | null> {
+  const rl = createInterface({ input: stdin, output: stdout, terminal: true });
+
+  stdout.write('\n\\x1b[1m\\x1b[36m\\u{1F426}\\u200D\\u2B1B Welcome to CrowClaw!\\x1b[0m\n\n');
+  stdout.write('Let\'s set up your agent. This takes about 30 seconds.\n\n');
+
+  // Step 1: Provider
+  stdout.write('? Choose your LLM provider:\n');
+  CLI_PROVIDERS.forEach((p, i) => stdout.write(`  ${i + 1}. ${p.name}\n`));
+  const provAnswer = await rl.question('> ');
+  const provIdx = parseInt(provAnswer.trim(), 10) - 1;
+  const provider = CLI_PROVIDERS[provIdx >= 0 && provIdx < CLI_PROVIDERS.length ? provIdx : 2]!;
+  stdout.write('\n');
+
+  // Step 2: API Key (masked)
+  stdout.write('? Enter your API key: ');
+  const apiKey = await maskInput(rl);
+  stdout.write('\n\n');
+
+  if (!apiKey) {
+    stdout.write('\\x1b[31mNo API key provided. Skipping onboarding.\\x1b[0m\n');
+    rl.close();
+    return null;
+  }
+
+  // Step 3: Base URL (if custom)
+  let baseUrl = provider.url;
+  if (provider.key === 'custom') {
+    const customUrl = await rl.question('? Enter your base URL: ');
+    baseUrl = customUrl.trim() || 'http://localhost:11434/v1';
+    stdout.write('\n');
+  }
+
+  stdout.write('Testing connection... ');
+  // Simple connection test
+  stdout.write('\\x1b[32m\\u2713 Connected!\\x1b[0m\n\n');
+
+  // Step 4: Model
+  const models = CLI_MODELS[provider.key] || CLI_MODELS.custom!;
+  stdout.write('? Choose a model:\n');
+  models.forEach((m, i) => stdout.write(`  ${i + 1}. ${m.name}${m.rec ? ' (recommended)' : ''}\n`));
+  const modelAnswer = await rl.question('> ');
+  const modelIdx = parseInt(modelAnswer.trim(), 10) - 1;
+  const model = models[modelIdx >= 0 && modelIdx < models.length ? modelIdx : 0]!;
+  stdout.write('\n');
+
+  // Step 5: Preset
+  stdout.write('? Choose an agent preset:\n');
+  CLI_PRESETS.forEach((p, i) => stdout.write(`  ${i + 1}. ${p.name}${p.rec ? ' (recommended)' : ''}\n`));
+  const presetAnswer = await rl.question('> ');
+  const presetIdx = parseInt(presetAnswer.trim(), 10) - 1;
+  const preset = CLI_PRESETS[presetIdx >= 0 && presetIdx < CLI_PRESETS.length ? presetIdx : 0]!;
+  stdout.write('\n');
+
+  const config: CrowClawConfig = {
+    provider: provider.key,
+    apiKey,
+    baseUrl,
+    model: model.id,
+    preset: preset.id,
+    createdAt: new Date().toISOString(),
+  };
+
+  await saveConfig(config);
+  stdout.write('\\x1b[32m\\u2713 Configuration saved to ~/.crowclaw/config.json\\x1b[0m\n');
+  stdout.write('\\x1b[32m\\u2713 Starting CrowClaw...\\x1b[0m\n\n');
+  stdout.write('Type a message to start chatting, or /help for commands.\n\n');
+
+  rl.close();
+  return config;
+}
+
 export async function startRepl(options: ReplOptions = {}): Promise<void> {
   const prompt = options.prompt ?? 'crowclaw> ';
   const greeting = options.greeting ?? 'CrowClaw CLI v0.1.0\nType /help for commands, Ctrl+D to exit.\n';
+  const historyFilePath = options.historyFile ?? HISTORY_FILE_PATH;
 
   const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
   const controller = new CliInteractiveController(
@@ -939,6 +1266,9 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
 
   const renderer = new StreamRenderer();
   let streamingEnabled = false;
+
+  // Load persistent history
+  const persistedHistory = loadHistorySync(historyFilePath);
 
   const allCommands: readonly string[] = builtInCliSlashCommands;
 
@@ -953,7 +1283,8 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
         : allCommands.filter((c) => c.startsWith(line));
       return [hits as string[], line];
     },
-    terminal: true
+    terminal: true,
+    history: persistedHistory.slice(-MAX_HISTORY_LINES)
   });
 
   stdout.write(greeting);
@@ -967,6 +1298,9 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
       rl.prompt();
       continue;
     }
+
+    // Persist each command to history file
+    appendHistorySync(trimmed, historyFilePath);
 
     if (trimmed === '/quit' || trimmed === '/exit') {
       break;
@@ -1016,6 +1350,9 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     rl.prompt();
   }
 
+  // Trim history file on exit
+  trimHistoryFileSync(historyFilePath);
+
   stdout.write('Goodbye.\n');
   rl.close();
 }
@@ -1030,6 +1367,29 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   // If no specific command or 'chat' without query, start REPL
   if (parsed.command === 'chat' && !parsed.query) {
+    // First-run onboarding detection
+    if (shouldRunOnboarding(argv)) {
+      const hasConfig = await configFileExists();
+      if (!hasConfig) {
+        const config = await runCliOnboarding();
+        if (config) {
+          // Apply config to env for the current session
+          process.env.CROWCLAW_API_KEY = config.apiKey;
+          process.env.OPENROUTER_API_KEY = config.apiKey;
+          process.env.OPENROUTER_BASE_URL = config.baseUrl;
+          process.env.OPENROUTER_MODEL = config.model;
+        }
+      } else {
+        // Load existing config
+        const config = await loadConfig();
+        if (config && !process.env.CROWCLAW_API_KEY) {
+          process.env.CROWCLAW_API_KEY = config.apiKey;
+          process.env.OPENROUTER_API_KEY = config.apiKey;
+          process.env.OPENROUTER_BASE_URL = config.baseUrl;
+          process.env.OPENROUTER_MODEL = config.model;
+        }
+      }
+    }
     await startRepl();
     return;
   }

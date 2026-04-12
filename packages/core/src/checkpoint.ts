@@ -92,7 +92,7 @@ export function createCheckpoint(
   loopState?: SessionCheckpoint['loopState'],
 ): SessionCheckpoint {
   return {
-    id: `cp-${session.sessionId}-${iteration}-${Date.now().toString(36)}`,
+    id: `cp-${session.sessionId}-${iteration}-${trigger}-${Date.now().toString(36)}`,
     sessionId: session.sessionId,
     iteration,
     createdAt: new Date().toISOString(),

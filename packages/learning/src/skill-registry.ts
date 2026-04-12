@@ -131,6 +131,20 @@ export class SkillRegistry {
     return this.statusMap.get(slug);
   }
 
+  /** Get all tools required by currently enabled skills (deduplicated) */
+  getRequiredTools(): string[] {
+    const resolved = this.resolve();
+    const toolSet = new Set<string>();
+    for (const skill of resolved) {
+      if (skill.manifest.tools) {
+        for (const tool of skill.manifest.tools) {
+          toolSet.add(tool);
+        }
+      }
+    }
+    return [...toolSet].sort();
+  }
+
   /** Get stats */
   stats(): { builtin: number; learned: number; local: number; disabled: number; total: number } {
     const resolved = this.resolve();
@@ -151,7 +165,7 @@ function draftToSkillFile(draft: StoredSkillDraft, source: SkillSource): ParsedS
       name: draft.slug,
       description: draft.summary,
       triggers: draft.triggerPhrases,
-      tools: [],
+      tools: draft.requiredTools ?? [],
       category: source,
     },
     instructions: draft.steps.join('\n'),

@@ -1,4 +1,4 @@
-import type { ProviderAdapter, ProviderRequest, ProviderResponse, ToolCall, ToolManifest } from '@crowclaw/core';
+import type { ConversationMessage, ProviderAdapter, ProviderRequest, ProviderResponse, ProviderResponseUsage, ToolCall, ToolManifest } from '@crowclaw/core';
 import { parseSlashToolCall } from '@crowclaw/core';
 import type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
 import { collectStream } from '@crowclaw/core/streaming';
@@ -7,6 +7,7 @@ export interface OpenAICompatibleConfig {
   apiKey?: string;
   baseUrl: string;
   model: string;
+  credentialPool?: CredentialPool;
 }
 
 export interface AnthropicConfig {
@@ -14,6 +15,7 @@ export interface AnthropicConfig {
   baseUrl: string;
   model: string;
   promptCaching?: boolean;
+  credentialPool?: CredentialPool;
 }
 
 export interface ModelMetadata {
@@ -56,6 +58,11 @@ interface ChatCompletionsResponse {
       function_call?: OpenAIFunctionCall;
     };
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
 }
 
 interface ChatCompletionsRequestTool {
@@ -94,6 +101,12 @@ interface AnthropicContentBlock {
 
 interface AnthropicMessagesResponse {
   content?: AnthropicContentBlock[];
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
 }
 
 interface AnthropicMessageParam {
@@ -351,6 +364,94 @@ function buildAnthropicMessages(
 }
 
 // ---------------------------------------------------------------------------
+// Token counting helpers
+// ---------------------------------------------------------------------------
+
+function countMessageChars(messages: ConversationMessage[]): number {
+  let chars = 0;
+  for (const msg of messages) {
+    chars += msg.content.length;
+    if (msg.name) chars += msg.name.length;
+    if (msg.metadata) {
+      const meta = msg.metadata;
+      // Count tool call arguments stored in metadata
+      for (const value of Object.values(meta)) {
+        if (typeof value === 'string') {
+          chars += value.length;
+        } else if (typeof value === 'object' && value !== null) {
+          chars += JSON.stringify(value).length;
+        }
+      }
+    }
+  }
+  return chars;
+}
+
+function extractOpenAIUsage(payload: ChatCompletionsResponse): ProviderResponseUsage | undefined {
+  const u = payload.usage;
+  if (!u) return undefined;
+  const inputTokens = u.prompt_tokens ?? 0;
+  const outputTokens = u.completion_tokens ?? 0;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: u.total_tokens ?? (inputTokens + outputTokens),
+  };
+}
+
+function extractAnthropicUsage(payload: AnthropicMessagesResponse): ProviderResponseUsage | undefined {
+  const u = payload.usage;
+  if (!u) return undefined;
+  const inputTokens = u.input_tokens ?? 0;
+  const outputTokens = u.output_tokens ?? 0;
+  const cachedTokens = (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    ...(cachedTokens > 0 ? { cachedTokens } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Rate limit header helpers
+// ---------------------------------------------------------------------------
+
+function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: string): void {
+  // OpenAI: x-ratelimit-remaining / x-ratelimit-reset
+  const remaining = headers.get('x-ratelimit-remaining');
+  if (remaining !== null && parseInt(remaining, 10) === 0) {
+    const resetHeader = headers.get('x-ratelimit-reset');
+    if (resetHeader) {
+      const resetDate = new Date(resetHeader);
+      const durationMs = resetDate.getTime() - Date.now();
+      if (durationMs > 0) {
+        pool.cooldownKey(key, durationMs);
+        return;
+      }
+    }
+    // No valid reset header — use default cooldown
+    pool.cooldownKey(key);
+    return;
+  }
+
+  // Standard: retry-after (seconds or HTTP-date)
+  const retryAfter = headers.get('retry-after');
+  if (retryAfter !== null) {
+    const seconds = parseInt(retryAfter, 10);
+    if (!isNaN(seconds)) {
+      pool.cooldownKey(key, seconds * 1000);
+    } else {
+      const retryDate = new Date(retryAfter);
+      const durationMs = retryDate.getTime() - Date.now();
+      if (durationMs > 0) {
+        pool.cooldownKey(key, durationMs);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
 
@@ -406,8 +507,17 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     return this.config.model;
   }
 
+  /** Estimate token count for messages (~4 chars per token for OpenAI models) */
+  countTokens(messages: ConversationMessage[]): number {
+    const chars = countMessageChars(messages);
+    return Math.ceil(chars / 4);
+  }
+
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
-    if (!this.config.apiKey) {
+    const pool = this.config.credentialPool;
+    const apiKey = pool ? pool.getKey() : this.config.apiKey;
+
+    if (!apiKey) {
       return new EchoProvider().generate(request);
     }
 
@@ -439,7 +549,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.config.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'content-type': 'application/json'
       },
       body: JSON.stringify(body),
@@ -447,29 +557,43 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     });
 
     if (!response.ok) {
+      if (pool) {
+        pool.reportFailure(apiKey, response.status);
+      }
       throw new Error(`Provider request failed: ${response.status} ${response.statusText}`);
+    }
+
+    if (pool) {
+      pool.reportSuccess(apiKey);
+      checkRateLimitHeaders(response.headers, pool, apiKey);
     }
 
     const payload = (await response.json()) as ChatCompletionsResponse;
     const message = payload.choices?.[0]?.message;
     const assistantMessage = normalizeOpenAIMessageContent(message?.content, message?.refusal);
     const parsedToolCalls = parseOpenAIToolCalls(message?.tool_calls, request.availableTools) ?? parseOpenAIFunctionCall(message?.function_call);
+    const usage = extractOpenAIUsage(payload);
 
     if ((!parsedToolCalls || parsedToolCalls.length === 0) && assistantMessage) {
       const slashToolCall = parseSlashToolCall(assistantMessage.trim());
       if (slashToolCall) {
-        return resolveKnownTool(slashToolCall, request.availableTools);
+        const resolved = resolveKnownTool(slashToolCall, request.availableTools);
+        return usage ? { ...resolved, usage } : resolved;
       }
     }
 
     return {
       assistantMessage,
-      toolCalls: parsedToolCalls
+      toolCalls: parsedToolCalls,
+      ...(usage ? { usage } : {}),
     };
   }
 
   async *generateStream(request: ProviderRequest): AsyncGenerator<StreamChunk> {
-    if (!this.config.apiKey) {
+    const pool = this.config.credentialPool;
+    const apiKey = pool ? pool.getKey() : this.config.apiKey;
+
+    if (!apiKey) {
       const echo = new EchoProvider();
       yield* echo.generateStream(request);
       return;
@@ -504,7 +628,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.config.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'content-type': 'application/json'
       },
       body: JSON.stringify(body),
@@ -512,8 +636,16 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     });
 
     if (!response.ok) {
+      if (pool) {
+        pool.reportFailure(apiKey, response.status);
+      }
       yield { type: 'error', error: `Provider request failed: ${response.status} ${response.statusText}` };
       return;
+    }
+
+    if (pool) {
+      pool.reportSuccess(apiKey);
+      checkRateLimitHeaders(response.headers, pool, apiKey);
     }
 
     if (!response.body) {
@@ -610,8 +742,17 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     return this.config.model;
   }
 
+  /** Estimate token count for messages (~3.5 chars per token for Anthropic models) */
+  countTokens(messages: ConversationMessage[]): number {
+    const chars = countMessageChars(messages);
+    return Math.ceil(chars / 3.5);
+  }
+
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
-    if (!this.config.apiKey) {
+    const pool = this.config.credentialPool;
+    const apiKey = pool ? pool.getKey() : this.config.apiKey;
+
+    if (!apiKey) {
       return new EchoProvider().generate(request);
     }
 
@@ -634,7 +775,7 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/messages`, {
       method: 'POST',
       headers: {
-        'x-api-key': this.config.apiKey,
+        'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
         ...(this.config.promptCaching ? { 'anthropic-beta': 'prompt-caching-2024-07-31' } : {})
@@ -644,10 +785,19 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     });
 
     if (!response.ok) {
+      if (pool) {
+        pool.reportFailure(apiKey, response.status);
+      }
       throw new Error(`Anthropic request failed: ${response.status} ${response.statusText}`);
     }
 
+    if (pool) {
+      pool.reportSuccess(apiKey);
+      checkRateLimitHeaders(response.headers, pool, apiKey);
+    }
+
     const payload = (await response.json()) as AnthropicMessagesResponse;
+    const usage = extractAnthropicUsage(payload);
 
     // Extract text content
     const assistantMessage = payload.content
@@ -662,7 +812,8 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     if (toolCalls && toolCalls.length > 0) {
       return {
         assistantMessage,
-        toolCalls
+        toolCalls,
+        ...(usage ? { usage } : {}),
       };
     }
 
@@ -670,17 +821,22 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     if (assistantMessage) {
       const slashToolCall = parseSlashToolCall(assistantMessage.trim());
       if (slashToolCall) {
-        return resolveKnownTool(slashToolCall, request.availableTools);
+        const resolved = resolveKnownTool(slashToolCall, request.availableTools);
+        return usage ? { ...resolved, usage } : resolved;
       }
     }
 
     return {
-      assistantMessage
+      assistantMessage,
+      ...(usage ? { usage } : {}),
     };
   }
 
   async *generateStream(request: ProviderRequest): AsyncGenerator<StreamChunk> {
-    if (!this.config.apiKey) {
+    const pool = this.config.credentialPool;
+    const apiKey = pool ? pool.getKey() : this.config.apiKey;
+
+    if (!apiKey) {
       const echo = new EchoProvider();
       yield* echo.generateStream(request);
       return;
@@ -707,7 +863,7 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        'x-api-key': this.config.apiKey,
+        'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
         ...(this.config.promptCaching ? { 'anthropic-beta': 'prompt-caching-2024-07-31' } : {})
@@ -717,8 +873,16 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     });
 
     if (!response.ok) {
+      if (pool) {
+        pool.reportFailure(apiKey, response.status);
+      }
       yield { type: 'error', error: `Anthropic request failed: ${response.status} ${response.statusText}` };
       return;
+    }
+
+    if (pool) {
+      pool.reportSuccess(apiKey);
+      checkRateLimitHeaders(response.headers, pool, apiKey);
     }
 
     if (!response.body) {
@@ -1441,124 +1605,149 @@ export class SmartModelRouter {
 }
 
 // ---------------------------------------------------------------------------
-// Credential pool
+// Credential pool with failover
 // ---------------------------------------------------------------------------
 
-export type RotationStrategy = 'fill_first' | 'round_robin' | 'random' | 'least_used';
-
-export interface PooledCredential {
-  id: string;
-  apiKey: string;
-  provider: string;
-  requestCount: number;
-  lastUsedAt?: string;
-  lastErrorAt?: string;
-  lastErrorCode?: number;
-  cooldownUntil?: string;
-  leaseHolder?: string;
+export interface CredentialPoolOptions {
+  keys: string[];
+  strategy?: 'round-robin' | 'random'; // default: 'round-robin'
+  cooldownMs?: number; // How long to cool down a key after rate limit (default: 60000)
+  maxFailures?: number; // Max consecutive failures before key is disabled (default: 3)
 }
 
-const COOLDOWN_DURATION_MS = 60 * 60 * 1000; // 1 hour
-const COOLDOWN_ERROR_CODES = new Set([429, 402]);
+interface KeyState {
+  key: string;
+  failures: number;
+  cooldownUntil: Date | null;
+  active: boolean;
+  lastUsed: Date;
+}
+
+function maskKey(key: string): string {
+  if (key.length <= 4) return '****';
+  return `****${key.slice(-4)}`;
+}
 
 export class CredentialPool {
-  private credentials: PooledCredential[];
-  private strategy: RotationStrategy;
+  private readonly keys: KeyState[];
+  private readonly strategy: 'round-robin' | 'random';
+  private readonly cooldownMs: number;
+  private readonly maxFailures: number;
   private roundRobinIndex: number;
 
-  constructor(credentials: PooledCredential[], strategy: RotationStrategy = 'round_robin') {
-    this.credentials = credentials.map((c) => ({ ...c }));
-    this.strategy = strategy;
+  constructor(options: CredentialPoolOptions) {
+    if (options.keys.length === 0) {
+      throw new Error('CredentialPool requires at least one key');
+    }
+    this.keys = options.keys.map((key) => ({
+      key,
+      failures: 0,
+      cooldownUntil: null,
+      active: true,
+      lastUsed: new Date(0),
+    }));
+    this.strategy = options.strategy ?? 'round-robin';
+    this.cooldownMs = options.cooldownMs ?? 60_000;
+    this.maxFailures = options.maxFailures ?? 3;
     this.roundRobinIndex = 0;
   }
 
-  getAvailable(): PooledCredential[] {
-    const now = new Date().toISOString();
-    return this.credentials.filter((c) => {
-      if (c.leaseHolder) return false;
-      if (c.cooldownUntil && c.cooldownUntil > now) return false;
+  /** Get next available key */
+  getKey(): string {
+    const now = new Date();
+    const available = this.keys.filter((k) => {
+      if (!k.active) return false;
+      if (k.cooldownUntil && k.cooldownUntil > now) return false;
       return true;
     });
-  }
 
-  acquire(leaseHolder?: string): PooledCredential | null {
-    const available = this.getAvailable();
-    if (available.length === 0) return null;
+    if (available.length === 0) {
+      const total = this.keys.length;
+      const disabled = this.keys.filter((k) => !k.active).length;
+      const coolingDown = this.keys.filter(
+        (k) => k.active && k.cooldownUntil && k.cooldownUntil > now
+      ).length;
+      throw new Error(
+        `All credential pool keys exhausted (${total} total, ${disabled} disabled, ${coolingDown} cooling down)`
+      );
+    }
 
-    let selected: PooledCredential;
-
-    switch (this.strategy) {
-      case 'fill_first':
-        // Pick the first available credential (stable ordering)
-        selected = available[0];
-        break;
-
-      case 'round_robin': {
-        const idx = this.roundRobinIndex % available.length;
-        selected = available[idx];
-        this.roundRobinIndex = (this.roundRobinIndex + 1) % available.length;
-        break;
+    let selected: KeyState;
+    if (this.strategy === 'random') {
+      selected = available[Math.floor(Math.random() * available.length)]!;
+    } else {
+      // Round-robin: find the next key from the full ordered list that is available
+      let picked: KeyState | null = null;
+      for (let i = 0; i < this.keys.length; i++) {
+        const idx = (this.roundRobinIndex + i) % this.keys.length;
+        const candidate = this.keys[idx]!;
+        if (available.includes(candidate)) {
+          picked = candidate;
+          this.roundRobinIndex = (idx + 1) % this.keys.length;
+          break;
+        }
       }
-
-      case 'random':
-        selected = available[Math.floor(Math.random() * available.length)];
-        break;
-
-      case 'least_used':
-        selected = available.reduce((min, c) =>
-          c.requestCount < min.requestCount ? c : min
-        , available[0]);
-        break;
-
-      default:
-        selected = available[0];
+      selected = picked!;
     }
 
-    // Find the actual credential in the pool and update it
-    const cred = this.credentials.find((c) => c.id === selected.id);
-    if (!cred) return null;
-
-    cred.leaseHolder = leaseHolder;
-    cred.requestCount += 1;
-    cred.lastUsedAt = new Date().toISOString();
-
-    return { ...cred };
+    selected.lastUsed = now;
+    return selected.key;
   }
 
-  release(id: string): void {
-    const cred = this.credentials.find((c) => c.id === id);
-    if (cred) {
-      cred.leaseHolder = undefined;
+  /** Report a key failure (429, 503, auth error) */
+  reportFailure(key: string, statusCode?: number): void {
+    const state = this.keys.find((k) => k.key === key);
+    if (!state) return;
+
+    // Auth errors: immediately disable
+    if (statusCode === 401 || statusCode === 403) {
+      state.active = false;
+      state.failures += 1;
+      return;
+    }
+
+    state.failures += 1;
+
+    // Check if max failures reached
+    if (state.failures >= this.maxFailures) {
+      state.active = false;
+      return;
+    }
+
+    // Rate limit / server errors: set cooldown
+    if (statusCode === 429 || statusCode === 503) {
+      state.cooldownUntil = new Date(Date.now() + this.cooldownMs);
     }
   }
 
-  reportError(id: string, errorCode: number): void {
-    const cred = this.credentials.find((c) => c.id === id);
-    if (!cred) return;
-
-    cred.lastErrorAt = new Date().toISOString();
-    cred.lastErrorCode = errorCode;
-
-    if (COOLDOWN_ERROR_CODES.has(errorCode)) {
-      const cooldownEnd = new Date(Date.now() + COOLDOWN_DURATION_MS);
-      cred.cooldownUntil = cooldownEnd.toISOString();
-    }
-
-    // Release the lease on error
-    cred.leaseHolder = undefined;
+  /** Report successful use of a key */
+  reportSuccess(key: string): void {
+    const state = this.keys.find((k) => k.key === key);
+    if (!state) return;
+    state.failures = 0;
+    state.cooldownUntil = null;
   }
 
-  reportSuccess(id: string): void {
-    const cred = this.credentials.find((c) => c.id === id);
-    if (!cred) return;
+  /** Proactively cool down a key (e.g., when x-ratelimit-remaining is 0) */
+  cooldownKey(key: string, durationMs?: number): void {
+    const state = this.keys.find((k) => k.key === key);
+    if (!state) return;
+    state.cooldownUntil = new Date(Date.now() + (durationMs ?? this.cooldownMs));
+  }
 
-    // Clear error state on success
-    cred.lastErrorAt = undefined;
-    cred.lastErrorCode = undefined;
-    cred.cooldownUntil = undefined;
+  /** Get pool status (for monitoring). Keys are masked for security. */
+  getStatus(): Array<{ key: string; active: boolean; failures: number; cooldownUntil?: string }> {
+    return this.keys.map((k) => ({
+      key: maskKey(k.key),
+      active: k.active,
+      failures: k.failures,
+      ...(k.cooldownUntil ? { cooldownUntil: k.cooldownUntil.toISOString() } : {}),
+    }));
+  }
 
-    // Release the lease
-    cred.leaseHolder = undefined;
+  /** Number of currently active keys (not disabled, ignores cooldown) */
+  activeCount(): number {
+    return this.keys.filter((k) => k.active).length;
   }
 }
 
@@ -1566,7 +1755,7 @@ export class CredentialPool {
 // Exports
 // ---------------------------------------------------------------------------
 
-export { buildOpenAITools, normalizeOpenAIMessageContent, parseOpenAIFunctionCall, parseOpenAIToolCalls };
+export { buildOpenAITools, normalizeOpenAIMessageContent, parseOpenAIFunctionCall, parseOpenAIToolCalls, countMessageChars };
 export { collectStream } from '@crowclaw/core/streaming';
 export type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
 

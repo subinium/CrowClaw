@@ -12,6 +12,16 @@ function uniqueTags(values: string[]): string[] {
   return [...new Set(values.filter(Boolean).map((value) => value.toLowerCase()))];
 }
 
+/** Check whether a record has expired based on its TTL metadata. */
+export function isExpired(record: MemoryRecord): boolean {
+  const ttlMs = record.metadata?.ttlMs;
+  if (typeof ttlMs !== 'number' || ttlMs <= 0) {
+    return false;
+  }
+  const createdMs = new Date(record.createdAt).getTime();
+  return Date.now() > createdMs + ttlMs;
+}
+
 export class MemoryService {
   constructor(private readonly store?: MemoryStore) {}
 
@@ -62,9 +72,22 @@ export class MemoryService {
     return record;
   }
 
-  async remember(sessionId: string, summary: string, tags: string[] = [], metadata?: Record<string, unknown>, scope: MemoryRecord['scope'] = 'session', scopeKey?: string): Promise<MemoryRecord> {
+  async remember(
+    sessionId: string,
+    summary: string,
+    tags: string[] = [],
+    metadata?: Record<string, unknown>,
+    scope: MemoryRecord['scope'] = 'session',
+    scopeKey?: string,
+    ttlMs?: number
+  ): Promise<MemoryRecord> {
     if (!this.store) {
       throw new Error('Memory store not configured.');
+    }
+
+    const recordMetadata: Record<string, unknown> = { ...metadata };
+    if (ttlMs !== undefined && ttlMs > 0) {
+      recordMetadata.ttlMs = ttlMs;
     }
 
     const record: MemoryRecord = {
@@ -75,7 +98,7 @@ export class MemoryService {
       summary,
       tags: uniqueTags(tags),
       createdAt: new Date().toISOString(),
-      metadata
+      metadata: Object.keys(recordMetadata).length > 0 ? recordMetadata : undefined
     };
 
     await this.store.write(record);
@@ -87,7 +110,8 @@ export class MemoryService {
       return [];
     }
 
-    return this.store.search(sessionId, query, limit);
+    const results = await this.store.search(sessionId, query, limit * 2);
+    return results.filter((r) => !isExpired(r)).slice(0, limit);
   }
 
   async recallByScope(scope: MemoryRecord['scope'], query: string, limit = 10, scopeKey?: string): Promise<MemoryRecord[]> {
@@ -95,7 +119,8 @@ export class MemoryService {
       return [];
     }
 
-    return this.store.searchByScope(scope, query, limit, scopeKey);
+    const results = await this.store.searchByScope(scope, query, limit * 2, scopeKey);
+    return results.filter((r) => !isExpired(r)).slice(0, limit);
   }
 
   async list(sessionId: string, limit = 50): Promise<MemoryRecord[]> {
@@ -103,7 +128,8 @@ export class MemoryService {
       return [];
     }
 
-    return (await this.store.list(sessionId)).slice(0, limit);
+    const results = await this.store.list(sessionId);
+    return results.filter((r) => !isExpired(r)).slice(0, limit);
   }
 
   async listByScope(scope: MemoryRecord['scope'], limit = 50, scopeKey?: string): Promise<MemoryRecord[]> {
@@ -111,8 +137,43 @@ export class MemoryService {
       return [];
     }
 
-    return this.store.listByScope(scope, limit, scopeKey);
+    const results = await this.store.listByScope(scope, limit * 2, scopeKey);
+    return results.filter((r) => !isExpired(r)).slice(0, limit);
+  }
+
+  /** Remove all expired memories from the store. Returns the count of cleaned records. */
+  async cleanup(sessionId: string): Promise<number> {
+    if (!this.store) {
+      return 0;
+    }
+
+    const all = await this.store.list(sessionId);
+    const expired = all.filter(isExpired);
+
+    // The MemoryStore interface does not have a delete method,
+    // so we overwrite expired records with a tombstone tag to mark them as cleaned.
+    // Consumers should filter by the __expired__ tag or rely on isExpired().
+    let cleaned = 0;
+    for (const record of expired) {
+      const tombstone: MemoryRecord = {
+        ...record,
+        tags: ['__expired__'],
+        metadata: { ...record.metadata, expired: true, cleanedAt: new Date().toISOString() }
+      };
+      await this.store.write(tombstone);
+      cleaned++;
+    }
+
+    return cleaned;
   }
 }
 
 export { MarkdownMemoryStore, type MarkdownMemoryRecord, type MarkdownMemoryFileSystem } from './markdown-store.js';
+export {
+  EmbeddingMemoryStore,
+  EmbeddingIndex,
+  cosineSimilarity,
+  type EmbeddingProvider,
+  type EmbeddingMemoryStoreOptions
+} from './embedding-store.js';
+export { UserModelService, type UserProfile } from './user-model.js';

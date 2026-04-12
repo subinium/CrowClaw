@@ -40,6 +40,10 @@ export const routePaths = {
     models: '/api/providers/models',
     route: '/api/providers/route'
   },
+  config: {
+    provider: '/api/config/provider',
+    providerTest: '/api/config/provider/test'
+  },
   skills: '/api/skills',
   presets: '/api/presets',
   actions: {
@@ -56,6 +60,20 @@ export const routePaths = {
     status: '/api/system/status',
     preflight: '/api/system/preflight',
     releaseCheck: '/api/system/release-check'
+  },
+  usage: {
+    summary: '/api/usage',
+    reset: '/api/usage/reset'
+  },
+  sessions: {
+    list: '/api/sessions',
+    create: '/api/sessions',
+    stream: '/api/sessions/:id/stream'
+  },
+  personas: {
+    list: '/api/personas',
+    active: '/api/persona/active',
+    switch: '/api/persona/switch'
   }
 } as const;
 

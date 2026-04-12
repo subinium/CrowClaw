@@ -228,15 +228,13 @@ describe('E2E: provider system completeness', () => {
   });
 
   it('manages credential pool with rotation', () => {
-    const pool = new CredentialPool([
-      { id: 'a', apiKey: 'k1', provider: 'openai', requestCount: 0 },
-      { id: 'b', apiKey: 'k2', provider: 'openai', requestCount: 0 }
-    ], 'round_robin');
+    const pool = new CredentialPool({ keys: ['k1', 'k2'], strategy: 'round-robin' });
 
-    expect(pool.acquire()?.id).toBe('a');
-    expect(pool.acquire()?.id).toBe('b');
-    pool.reportError('a', 429);
-    expect(pool.getAvailable().map(c => c.id)).toEqual(['b']);
+    expect(pool.getKey()).toBe('k1');
+    expect(pool.getKey()).toBe('k2');
+    pool.reportFailure('k1', 429);
+    // k1 is on cooldown, only k2 available
+    expect(pool.getKey()).toBe('k2');
   });
 
   it('streams from EchoProvider', async () => {
