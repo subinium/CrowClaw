@@ -69,7 +69,9 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
       sections.push(guidance);
     }
 
-    const toolLines = input.availableTools
+    // Deterministic ordering for prompt caching stability (OpenClaw pattern)
+    const sortedTools = [...input.availableTools].sort((a, b) => a.name.localeCompare(b.name));
+    const toolLines = sortedTools
       .slice(0, 24)
       .map((tool) => `- ${tool.name} (${tool.runtime}, danger:${tool.dangerLevel})`);
     sections.push(['Available tools:', ...toolLines].join('\n'));

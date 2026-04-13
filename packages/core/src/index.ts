@@ -1,6 +1,6 @@
 import { PluginManager } from '@crowclaw/plugins';
 import { buildSystemPrompt } from './prompt-builder.js';
-import { matchSkillManifests, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
+import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
@@ -192,6 +192,8 @@ export interface AgentLoopOptions {
   synthesizeOnExhaustion?: boolean;
   /** Max characters per tool result before truncation. Default: 2000 */
   maxToolResultLength?: number;
+  /** Max approximate tokens for all skills in system prompt. Default: 4000 */
+  skillTokenBudget?: number;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -425,7 +427,11 @@ export class AgentLoop {
     this.protectLastMessages = options.protectLastMessages ?? 12;
     this.plugins = options.plugins;
     this.runtimeName = options.runtimeName ?? 'unknown';
-    this.skills = options.skills ?? [];
+    // OpenClaw pattern: filter skills by activation gates + apply token budget
+    this.skills = filterAndBudgetSkills(options.skills ?? [], {
+      availableToolNames: this.tools.list().map(t => t.name),
+      maxTokenBudget: options.skillTokenBudget ?? 16000,
+    });
     this.agentPreset = options.agentPreset;
     this.personaPrompt = options.personaPrompt;
     this.maxTokens = options.maxTokens;
@@ -1394,7 +1400,7 @@ export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSumma
 export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usage-tracker.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
-export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry } from './skill-manifest.js';
+export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry } from './skill-manifest.js';
 
 export { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames, type AgentPreset } from './agent-presets.js';
 
