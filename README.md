@@ -5,17 +5,17 @@
     <strong>A self-improving TypeScript agent framework that learns from every conversation.</strong>
   </p>
   <p align="center">
-    <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/badge/npm-v0.1.4-cb3837.svg" alt="npm v0.1.3" /></a>
+    <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/npm/v/crowclaw?color=cb3837" alt="npm" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-1599%20passed-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-1619%20passed-brightgreen.svg" alt="Tests" />
   </p>
 </p>
 
 ---
 
-> **Beta.** Core systems are functional and tested (1599 tests), but APIs may change before 1.0. Not recommended for production without review.
+> **Beta.** Core systems are functional and tested (1619 tests), but APIs may change before 1.0. Not recommended for production without review.
 
 CrowClaw started as an effort to bring [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Python) to Cloudflare Workers. Porting it to TypeScript opened up a chance to rethink the architecture — so we [studied dozens of agent frameworks](https://github.com/subinium/awesome-agent-frameworks), distilled the best patterns from each, and built a framework that actually closes the loop: your agent gets better every time it completes a task.
 
@@ -126,9 +126,11 @@ console.log(result.toolResults)
 - **Checkpoint/rollback** — save session state at any point, restore to a checkpoint, replay with different configuration
 - **Scheduled execution** — cron-style jobs that run the agent on a schedule with optional gateway delivery
 - **Presets** — agent identity presets, toolset bundles, MCP server configurations
-- **Security** — SSRF protection on all outbound fetches, prompt injection scanning, PII redaction
+- **Security** — SSRF protection, prompt injection scanning, PII redaction, auth rate limiting, XSS prevention
+- **Structured logging** — JSON logger with request correlation, replacing console.log
+- **SSE event bus** — real-time push for chat, gateway, job, and session events via `/api/events`
 - **CLI** — interactive REPL with tab completion, slash commands, streaming display
-- **Web dashboard** — management UI for tools, skills, gateway, MCP, presets, and settings
+- **Web dashboard** — Lit Web Components UI for tools, skills, gateway, MCP, presets, and settings
 
 ## Architecture
 
@@ -269,6 +271,8 @@ const decision = evaluateAccess(message, policy, isGroup, pendingPairings)
 
 Supported platforms: Telegram . Discord . Slack . WhatsApp . Signal . Email . Matrix . SMS . Generic Webhooks
 
+Outbound messages include per-platform rate limiting and retry with exponential backoff.
+
 ## Security
 
 Every outbound `fetch()` in web tools goes through SSRF validation. Prompt injection detection uses pattern matching (not ML — fast but has limits). PII redaction covers common US patterns.
@@ -297,7 +301,6 @@ redactPII('SSN: 123-45-6789')
 - Advanced prompt injection (adversarial, multi-step, encoded)
 - DNS rebinding attacks
 - Sandbox escape prevention (depends on execution backend)
-- Rate limiting on agent API endpoints
 
 ## Skills & Learning
 
@@ -453,8 +456,8 @@ const results = await executor.tick()
 
 ## Known Limitations
 
-- **In-memory checkpoint and memory stores** -- conversation state and memories are lost on restart (except scheduler jobs, which use `FileSchedulerStore`). Persistent SQLite backend is planned for v0.2.0.
-- **Bag-of-words embeddings** -- `EmbeddingMemoryStore` uses a lightweight hash-based approach, not a real embedding model. Adequate for keyword-heavy recall but misses semantic similarity. Real embedding provider planned for v0.2.0.
+- **In-memory checkpoint and memory stores** -- conversation state and memories are lost on restart (except scheduler jobs, which use `FileSchedulerStore`). Persistent SQLite backend planned for v0.3.0.
+- **Bag-of-words embeddings** -- `EmbeddingMemoryStore` uses a lightweight hash-based approach, not a real embedding model. Adequate for keyword-heavy recall but misses semantic similarity. Real embedding provider planned for v0.3.0.
 - **Cloudflare runtime** is functional but has narrower override support than Node.js -- local SKILL.md loading, persona directories, and some execution overrides are Node-only.
 
 ## Environment Variables
