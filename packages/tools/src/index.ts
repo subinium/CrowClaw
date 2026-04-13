@@ -405,7 +405,20 @@ export function createTerminalExecTool(): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'high'
+      dangerLevel: 'high',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The shell command to execute' },
+          raw: { type: 'string', description: 'Alias for command' },
+          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, modal, daytona)' },
+          container: { type: 'string', description: 'Docker container name (for docker backend)' },
+          image: { type: 'string', description: 'Docker image name (for docker backend)' },
+          target: { type: 'string', description: 'SSH target host (for ssh backend)' },
+          planOnly: { type: 'boolean', description: 'If true, return the resolved command plan without executing' }
+        },
+        required: ['command']
+      }
     },
     async execute(input) {
       const plan = resolveTerminalCommandPlan(input);
@@ -470,7 +483,20 @@ export function createTerminalBackgroundTool(): ToolDefinition {
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'high'
+      dangerLevel: 'high',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The shell command to run in the background' },
+          raw: { type: 'string', description: 'Alias for command' },
+          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, modal, daytona)' },
+          container: { type: 'string', description: 'Docker container name (for docker backend)' },
+          image: { type: 'string', description: 'Docker image name (for docker backend)' },
+          target: { type: 'string', description: 'SSH target host (for ssh backend)' },
+          planOnly: { type: 'boolean', description: 'If true, return the resolved command plan without executing' }
+        },
+        required: ['command']
+      }
     },
     async execute(input) {
       const plan = resolveTerminalCommandPlan(input);
@@ -544,7 +570,8 @@ export function createTerminalBackendsTool(): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       return {
@@ -572,7 +599,8 @@ export function createTerminalBackendStatusTool(): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       const statuses = await probeTerminalBackends();
@@ -601,7 +629,8 @@ export function createTerminalProcessesTool(): ToolDefinition {
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       const processes = [...backgroundProcesses.values()].map((record) => ({
@@ -634,7 +663,14 @@ export function createTerminalKillTool(): ToolDefinition {
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'high'
+      dangerLevel: 'high',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pid: { type: 'number', description: 'Process ID of the background process to kill' }
+        },
+        required: ['pid']
+      }
     },
     async execute(input) {
       const pid = typeof input.pid === 'number' ? input.pid : Number(input.pid);
@@ -1010,7 +1046,15 @@ export function createTextPatchTool(): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'The input text to apply replacements to' },
+          replacements: { type: 'array', items: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] }, description: 'Array of {from, to} replacement pairs' }
+        },
+        required: ['text', 'replacements']
+      }
     },
     async execute(input) {
       const text = typeof input.text === 'string' ? input.text : '';
@@ -1047,7 +1091,15 @@ export function createLinePatchTool(): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'The input text to patch' },
+          patches: { type: 'array', items: { type: 'object', properties: { line: { type: 'number' }, value: { type: 'string' } }, required: ['line', 'value'] }, description: 'Array of {line, value} patches to apply' }
+        },
+        required: ['text', 'patches']
+      }
     },
     async execute(input) {
       const text = typeof input.text === 'string' ? input.text : '';
@@ -1087,7 +1139,8 @@ export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefiniti
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File path to read' } }, required: ['path'] }
     },
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
@@ -1113,7 +1166,8 @@ export function createWorkspaceListTool(workspace: WorkspaceStore): ToolDefiniti
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { prefix: { type: 'string', description: 'Optional path prefix to filter files' } }, required: [] }
     },
     async execute(input) {
       const prefix = typeof input.prefix === 'string' ? input.prefix : '';
@@ -1139,7 +1193,17 @@ export function createWorkspaceSearchFilesTool(workspace: WorkspaceStore): ToolD
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query string' },
+          prefix: { type: 'string', description: 'Optional path prefix to filter files' },
+          limit: { type: 'number', description: 'Max results to return (default: 20)' },
+          mode: { type: 'string', enum: ['substring', 'regex'], description: 'Search mode (default: substring)' }
+        },
+        required: ['query']
+      }
     },
     async execute(input) {
       const query = typeof input.query === 'string' ? input.query : '';
@@ -1224,7 +1288,8 @@ export function createWorkspaceWriteTool(workspace: WorkspaceStore): ToolDefinit
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File path to write' }, content: { type: 'string', description: 'File content to write' } }, required: ['path', 'content'] }
     },
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
@@ -1251,7 +1316,8 @@ export function createWorkspaceExistsTool(workspace: WorkspaceStore): ToolDefini
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File path to check' } }, required: ['path'] }
     },
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
@@ -1277,7 +1343,15 @@ export function createWorkspacePatchTool(workspace: WorkspaceStore): ToolDefinit
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path to patch' },
+          patches: { type: 'array', items: { type: 'object', properties: { line: { type: 'number' }, value: { type: 'string' } }, required: ['line', 'value'] }, description: 'Array of {line, value} patches to apply' }
+        },
+        required: ['path', 'patches']
+      }
     },
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
@@ -1306,7 +1380,15 @@ export function createWorkspacePatchTextTool(workspace: WorkspaceStore): ToolDef
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path to patch' },
+          replacements: { type: 'array', items: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] }, description: 'Array of {from, to} replacement pairs' }
+        },
+        required: ['path', 'replacements']
+      }
     },
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
@@ -1335,7 +1417,8 @@ export function createWorkspaceDeleteTool(workspace: WorkspaceStore): ToolDefini
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File path to delete' } }, required: ['path'] }
     },
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
@@ -1361,7 +1444,8 @@ export function createWorkspaceRenameTool(workspace: WorkspaceStore): ToolDefini
       stateful: true,
       requiresWorkspace: true,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: { type: 'object', properties: { fromPath: { type: 'string', description: 'Current file path' }, toPath: { type: 'string', description: 'New file path' } }, required: ['fromPath', 'toPath'] }
     },
     async execute(input) {
       const fromPath = typeof input.fromPath === 'string' ? input.fromPath : '';
@@ -1388,7 +1472,8 @@ export function createToolListTool(registry: ToolRegistry): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       return {
@@ -1495,7 +1580,16 @@ export function createSendMessageTool(): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          platform: { type: 'string', description: 'Target platform (telegram, slack, discord, webhook)' },
+          channel: { type: 'string', description: 'Channel or chat ID to send to' },
+          text: { type: 'string', description: 'Message text content' }
+        },
+        required: ['platform', 'channel', 'text']
+      }
     },
     async execute(input) {
       const platform = typeof input.platform === 'string' ? input.platform : 'webhook';
@@ -1566,7 +1660,15 @@ export function createSessionSearchTool(search: SessionSearchStore): ToolDefinit
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query string' },
+          limit: { type: 'number', description: 'Max results to return (default: 10)' }
+        },
+        required: ['query']
+      }
     },
     async execute(input, context) {
       const query = typeof input.query === 'string' ? input.query : '';
@@ -1593,7 +1695,16 @@ export function createMemoryRememberTool(memoryStore: MemoryStore): ToolDefiniti
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Summary text to remember' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
+          scope: { type: 'string', enum: ['session', 'user', 'workspace'], description: 'Memory scope (default: session)' }
+        },
+        required: ['summary']
+      }
     },
     async execute(input, context) {
       const scope = normalizeScope(input) ?? 'session';
@@ -1629,7 +1740,16 @@ export function createMemorySearchTool(memoryStore: MemoryStore): ToolDefinition
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query string' },
+          limit: { type: 'number', description: 'Max results to return (default: 10)' },
+          scope: { type: 'string', enum: ['session', 'user', 'workspace'], description: 'Optional scope filter' }
+        },
+        required: ['query']
+      }
     },
     async execute(input, context) {
       const query = typeof input.query === 'string' ? input.query : '';
@@ -1660,7 +1780,15 @@ export function createMemoryListTool(memoryStore: MemoryStore): ToolDefinition {
       stateful: true,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', description: 'Max records to return (default: 50)' },
+          scope: { type: 'string', enum: ['session', 'user', 'workspace'], description: 'Optional scope filter' }
+        },
+        required: []
+      }
     },
     async execute(input, context) {
       const limit = typeof input.limit === 'number' ? input.limit : 50;
@@ -1690,7 +1818,8 @@ export function createMcpListToolsTool(client: McpClient): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: true,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       const tools = await client.listTools();
@@ -1715,7 +1844,8 @@ export function createMcpListResourcesTool(client: McpClient): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: true,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       const resources = await client.listResources();
@@ -1740,7 +1870,8 @@ export function createMcpListPromptsTool(client: McpClient): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: true,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       const prompts = await client.listPrompts();
@@ -1765,7 +1896,8 @@ export function createMcpStatusTool(client: McpClient): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute() {
       const status = client.getStatus();
@@ -1790,7 +1922,8 @@ export function createMcpInspectTool(client: McpClient): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: false,
-      dangerLevel: 'low'
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: { refresh: { type: 'boolean', description: 'If true, refresh cached data before inspecting' } }, required: [] }
     },
     async execute(input) {
       const refresh = Boolean(input.refresh);
@@ -1822,7 +1955,15 @@ export function createMcpCallTool(client: McpClient): ToolDefinition {
       stateful: false,
       requiresWorkspace: false,
       requiresNetwork: true,
-      dangerLevel: 'medium'
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Name of the MCP tool to call' },
+          arguments: { type: 'object', description: 'Arguments to pass to the MCP tool' }
+        },
+        required: ['name']
+      }
     },
     async execute(input) {
       const name = typeof input.name === 'string' ? input.name : '';
