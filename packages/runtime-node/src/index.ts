@@ -80,6 +80,10 @@ import { resolveProviderFromConfig, resolveProvidersFromConfig, createProviderFr
 import { SessionController } from './session-controller.js';
 import { WebSocketManager, handleWebSocketUpgrade } from './websocket.js';
 import { generateConfigSchema, validateConfigUpdate, diffConfigs } from './config-schema.js';
+import { ContextEngine, formatContextForPrompt, type ContextEngineResult } from '@crowclaw/core';
+import { FrozenMemory, InMemoryFrozenStore, FileFrozenStore } from '@crowclaw/memory';
+import { InMemoryMessageStore, type MessageStore as MessageStoreInterface } from '@crowclaw/storage';
+import { resolveApiMode } from '@crowclaw/providers';
 
 const directToolAliases = {
   'browser.wait': 'browser.waitFor',
@@ -787,6 +791,36 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     configStore.setProviderConfig(options.initialProviderConfig ?? null);
   }
 
+  // --- Hermes parity: ContextEngine, FrozenMemory, MessageStore ---
+  const messageStore: MessageStoreInterface = new InMemoryMessageStore();
+
+  const frozenMemoryStore = (() => {
+    try {
+      const os = require('node:os') as { homedir(): string };
+      const path = require('node:path') as { join(...parts: string[]): string };
+      const memDir = path.join(os.homedir(), '.crowclaw', 'memory');
+      return new FileFrozenStore(memDir);
+    } catch {
+      return new InMemoryFrozenStore();
+    }
+  })();
+  const frozenMemory = new FrozenMemory(frozenMemoryStore, 'MEMORY');
+  const frozenUserProfile = new FrozenMemory(frozenMemoryStore, 'USER');
+
+  // Load frozen snapshots at startup (fire-and-forget)
+  void frozenMemory.load().catch(() => {});
+  void frozenUserProfile.load().catch(() => {});
+
+  // Context engine: discover .crowclaw.md, AGENTS.md, CLAUDE.md from working dir
+  let contextEngineResult: ContextEngineResult | null = null;
+  const workingDir = (options as Record<string, unknown>).workingDirectory as string | undefined;
+  if (workingDir) {
+    const engine = new ContextEngine({ workingDirectory: workingDir });
+    void engine.discover().then((result) => {
+      contextEngineResult = result;
+    }).catch(() => {});
+  }
+
   // Security audit log, rate limiters, logger, and session mutex
   const securityAuditLog = new SecurityAuditLog(500);
   const rateLimiter = new RateLimiter();
@@ -1119,13 +1153,43 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Memory recall failed — proceed without memories
     }
 
+    // Hermes: inject frozen memory snapshot
+    if (frozenMemory.size > 0) {
+      memories.push(frozenMemory.formatForPrompt());
+    }
+    if (frozenUserProfile.size > 0) {
+      memories.push(frozenUserProfile.formatForPrompt());
+    }
+
+    // Hermes: inject discovered context files
+    if (contextEngineResult && contextEngineResult.files.length > 0) {
+      memories.push(formatContextForPrompt(contextEngineResult));
+    }
+
     const result = await createConfiguredAgent(overrides).run({
       agentId: options.agentId ?? 'crowclaw',
       ...input,
       memories,
     });
-    // Update user model from conversation (fire-and-forget)
-    void userModelService.updateFromConversation(result.session.messages, input.sessionId).catch(() => {});
+
+    // Record messages to MessageStore (fire-and-forget)
+    const storedMsgs = result.session.messages.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
+      id: crypto.randomUUID(),
+      sessionId: input.sessionId,
+      role: m.role as 'system' | 'user' | 'assistant' | 'tool',
+      content: m.content,
+      name: m.name,
+      createdAt: m.createdAt ?? new Date().toISOString(),
+      metadata: m.metadata,
+    }));
+    void messageStore.appendBatch(storedMsgs).catch(() => {});
+
+    // Save frozen memory updates (extract facts from assistant responses)
+    const lastAssistant = result.session.messages.filter((m: { role: string }) => m.role === 'assistant').at(-1);
+    if (lastAssistant) {
+      void userModelService.updateFromConversation(result.session.messages, input.sessionId).catch(() => {});
+      void frozenMemory.save(input.sessionId).catch(() => {});
+    }
     return result;
   }
 
@@ -4661,6 +4725,51 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           ok: true,
           serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
           trustProxy: !!(options as Record<string, unknown>).trustProxy,
+        });
+      }
+
+      // --- Frozen memory API ---
+      if (request.method === 'GET' && url.pathname === '/api/memory/snapshot') {
+        return Response.json({
+          ok: true,
+          memory: { entries: frozenMemory.getAll(), version: frozenMemory.snapshotVersion, size: frozenMemory.size },
+          user: { entries: frozenUserProfile.getAll(), version: frozenUserProfile.snapshotVersion, size: frozenUserProfile.size },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/memory/snapshot') {
+        const body = (await request.json()) as { namespace: 'memory' | 'user'; action: 'set' | 'remove'; key: string; value?: string; category?: string };
+        const target = body.namespace === 'user' ? frozenUserProfile : frozenMemory;
+        if (body.action === 'set') {
+          target.set(body.key, body.value ?? '', body.category);
+          await target.save();
+        } else if (body.action === 'remove') {
+          target.remove(body.key);
+          await target.save();
+        }
+        return Response.json({ ok: true, size: target.size, version: target.snapshotVersion });
+      }
+
+      // --- Message store API ---
+      if (request.method === 'GET' && url.pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)) {
+        const sid = url.pathname.split('/')[3]!;
+        const msgs = await messageStore.query({ sessionId: sid, limit: 100 });
+        return Response.json({ ok: true, messages: msgs });
+      }
+
+      if (request.method === 'GET' && url.pathname.match(/^\/api\/sessions\/([^/]+)\/stats$/)) {
+        const sid = url.pathname.split('/')[3]!;
+        const stats = await messageStore.stats(sid);
+        return Response.json({ ok: true, ...stats });
+      }
+
+      // --- Context engine status ---
+      if (request.method === 'GET' && url.pathname === '/api/context') {
+        return Response.json({
+          ok: true,
+          files: contextEngineResult?.files.map((f) => ({ path: f.path, filename: f.filename, depth: f.depth, byteSize: f.byteSize, truncated: f.truncated })) ?? [],
+          totalBytes: contextEngineResult?.totalBytes ?? 0,
+          securityWarnings: contextEngineResult?.securityWarnings ?? [],
         });
       }
 
