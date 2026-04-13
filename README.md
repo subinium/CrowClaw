@@ -453,10 +453,10 @@ const results = await executor.tick()
 
 ## Known Limitations
 
-- **No dashboard auth.** The web dashboard has no login. Run behind a reverse proxy or VPN for remote access.
-- **Keyword-based skill matching.** No embedding/semantic search -- works well for explicit triggers, may miss fuzzy matches.
-- **Browser tools are simulated** unless Playwright is installed and configured.
-- **Cloudflare runtime** is functional but has narrower override support than Node.js -- local SKILL.md loading and some execution overrides are Node-only.
+- **In-memory checkpoint and memory stores** -- conversation state and memories are lost on restart (except scheduler jobs, which use `FileSchedulerStore`). Persistent SQLite backend is planned for v0.2.0.
+- **Bag-of-words embeddings** -- `EmbeddingMemoryStore` uses a lightweight hash-based approach, not a real embedding model. Adequate for keyword-heavy recall but misses semantic similarity. Real embedding provider planned for v0.2.0.
+- **Cloudflare runtime** is functional but has narrower override support than Node.js -- local SKILL.md loading, persona directories, and some execution overrides are Node-only.
+- **Single-file dashboard** -- the web dashboard is a single HTML template literal (~2500 lines). Works but limits contributor velocity. Component extraction planned for v0.2.0.
 
 ## Environment Variables
 
@@ -540,9 +540,61 @@ Before opening a PR:
 - Include tests for behavior changes
 - Update docs if the change affects user-facing behavior
 
-## Acknowledgments
+## Design Heritage
 
-CrowClaw's design is informed by studying the open-source agent ecosystem. Notable influences include [OpenClaw](https://docs.openclaw.ai) (SKILL.md format, gateway architecture), [Hermes Agent](https://github.com/NousResearch/hermes-agent) (multi-turn loop patterns), and [NemoClaw](https://github.com/NVIDIA/NemoClaw) (sandbox security model). See [awesome-agent-frameworks](https://github.com/subinium/awesome-agent-frameworks) for the full survey.
+CrowClaw is built on patterns distilled from studying dozens of agent frameworks. See [awesome-agent-frameworks](https://github.com/subinium/awesome-agent-frameworks) for the full survey. Below are the primary influences and what we adopted from each.
+
+### Hermes Agent (Python, NousResearch)
+
+The original foundation. CrowClaw started as a TypeScript port of [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s multi-turn agent loop.
+
+| Inspired by | CrowClaw Implementation |
+|---|---|
+| Multi-turn tool loop with retries and fallbacks | `AgentLoop` in `@crowclaw/core` |
+| Self-improving skill extraction from conversations | `LearningPipeline` with LLM-powered extraction via `SkillExtractionProvider` |
+| Credential pooling with failover rotation | `CredentialPool` in `@crowclaw/providers` -- round-robin, 429 cooldown, rate limit header tracking |
+| Prompt caching (Anthropic cache breakpoints) | `AnthropicProvider` with `cache_control` on system prompt and tool definitions |
+| Real cron expressions for scheduled tasks | `parseCron()` in `@crowclaw/scheduler` -- standard 5-field cron |
+| Batch processing and trajectory export | `runBatch()` + `exportTrajectoryJsonl()` in `@crowclaw/learning` |
+| Extensive built-in tool set | 39+ tools including 5 git tools, vision (real API), TTS, delegation |
+| Token budget and context compression | Token-aware budget with LLM-powered summarization fallback |
+
+### OpenClaw
+
+Dashboard UX, skill format, and persona system were shaped by studying [OpenClaw](https://docs.openclaw.ai)'s operator experience.
+
+| Inspired by | CrowClaw Implementation |
+|---|---|
+| [SKILL.md format](https://docs.openclaw.ai/tools/skills) with YAML frontmatter | `parseSkillFile()` / `renderSkillFile()` in `@crowclaw/core` |
+| Gateway webhook normalization | 9 platform normalizers in `@crowclaw/gateway` |
+| [SoulSpec](https://soulspec.org/) persona files (SOUL.md, IDENTITY.md, USER.md) | `PersonaRegistry` with `scanPersonaDirectories()` in `@crowclaw/core` |
+| Web dashboard with live agent management | 5-tab dashboard (Chat / Agent / Connect / Automate / Settings) with SSE streaming |
+| Cost tracking visualization | `DetailedUsageTracker` with per-session cost, token breakdown in dashboard |
+| Config presets as MCP+Skill+Tool bundles | `ConfigPreset` in `FileConfigStore` -- distinct from agent personas |
+| Provider fallback chain | 5-slot config (primary / fallback / vision / compression / embedding) with UI |
+| Skill rating and refinement | `rateSkill()` with LLM-powered merge of new insights into existing skills |
+
+### NemoClaw and NeMo Agent Toolkit (NVIDIA)
+
+Security sandboxing drew from [NemoClaw](https://github.com/NVIDIA/NemoClaw) (NVIDIA's hardened deployment layer for OpenClaw agents). Observability and memory patterns drew from [NeMo Agent Toolkit](https://github.com/NVIDIA/NeMo-Agent-Toolkit), a separate NVIDIA project.
+
+| Source | Inspired by | CrowClaw Implementation |
+|---|---|---|
+| NemoClaw | Sandboxed execution with declarative security policy | `SecurityPolicy` wired into `AgentLoop` -- credential redaction, injection scanning, command blocking |
+| NeMo Agent Toolkit | Token/cost/latency observability | `DetailedUsageTracker` per provider call with `estimateCostUsd()` |
+| NeMo Agent Toolkit | Pluggable memory backends | `EmbeddingMemoryStore` with cosine similarity recall, TTL, deduplication |
+| NeMo Agent Toolkit | Agent checkpoint and rollback | `createCheckpoint()` / `restoreFromCheckpoint()` with auto-checkpoint on each iteration |
+| NeMo Agent Toolkit | MCP protocol support | `McpClient` with HTTP + stdio transports, 17+ presets, OAuth device code flow |
+| NeMo Agent Toolkit | User modeling from interactions | `UserModelService` tracking expertise areas and preferences |
+
+### Gaps We Identified Across Frameworks
+
+While building CrowClaw we noticed common gaps that no single reference framework fully addressed. Our solutions:
+
+- **Scheduler with built-in delivery** -- cron triggers exist in most frameworks, but few connect job output directly to messaging platforms. `AutonomousScheduler` integrates execution with gateway delivery.
+- **Security audit transparency** -- `SecurityAuditLog` records every redaction, scan, and block decision. The dashboard exposes a security grade (A-F) so operators can see what the security layer is actually doing.
+- **Deny-by-default webhooks** -- all inbound gateway messages require platform-specific signature verification before reaching the agent.
+- **Persistent config store** -- `FileConfigStore` survives restarts without requiring environment variables or re-configuration.
 
 ## License
 
