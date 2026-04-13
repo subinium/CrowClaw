@@ -45,6 +45,12 @@ type TerminalBackendDescriptor = {
   requires?: string[];
 };
 
+type TerminalBackendStatus = TerminalBackendDescriptor & {
+  installed: boolean;
+  command?: string;
+  details: string;
+};
+
 const TERMINAL_BACKENDS: TerminalBackendDescriptor[] = [
   {
     backend: 'local',
@@ -196,6 +202,55 @@ async function runGitCommand(args: string[], cwd?: string): Promise<{ ok: boolea
       });
     });
   });
+}
+
+async function isCommandInstalled(command: string): Promise<boolean> {
+  const cp = await loadChildProcessModule();
+  return await new Promise<boolean>((resolve) => {
+    cp.exec(`command -v ${command}`, (error) => {
+      resolve(!error);
+    });
+  });
+}
+
+async function probeTerminalBackends(): Promise<TerminalBackendStatus[]> {
+  const results: TerminalBackendStatus[] = [];
+  for (const descriptor of TERMINAL_BACKENDS) {
+    if (descriptor.backend === 'local') {
+      results.push({
+        ...descriptor,
+        installed: true,
+        details: 'Local process execution is always available inside the Node runtime.'
+      });
+      continue;
+    }
+    if (descriptor.backend === 'docker') {
+      const installed = await isCommandInstalled('docker');
+      results.push({
+        ...descriptor,
+        installed,
+        command: 'docker',
+        details: installed ? 'docker CLI detected for wrapped container execution.' : 'docker CLI not detected on PATH.'
+      });
+      continue;
+    }
+    if (descriptor.backend === 'ssh') {
+      const installed = await isCommandInstalled('ssh');
+      results.push({
+        ...descriptor,
+        installed,
+        command: 'ssh',
+        details: installed ? 'ssh client detected for remote execution wrapping.' : 'ssh client not detected on PATH.'
+      });
+      continue;
+    }
+    results.push({
+      ...descriptor,
+      installed: false,
+      details: `${descriptor.backend} backend remains a planned descriptor surface.`
+    });
+  }
+  return results;
 }
 
 function normalizeScope(input: Record<string, unknown>): 'session' | 'user' | 'workspace' | undefined {
@@ -501,6 +556,35 @@ export function createTerminalBackendsTool(): ToolDefinition {
           count: TERMINAL_BACKENDS.length,
           available: TERMINAL_BACKENDS.filter((entry) => entry.status === 'available').map((entry) => entry.backend),
           planned: TERMINAL_BACKENDS.filter((entry) => entry.status === 'planned').map((entry) => entry.backend)
+        }
+      };
+    }
+  };
+}
+
+export function createTerminalBackendStatusTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.backendStatus',
+      description: 'Reports backend availability/probe status for local, docker, ssh, and planned backends.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      const statuses = await probeTerminalBackends();
+      return {
+        toolName: 'terminal.backendStatus',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(statuses, null, 2),
+        metadata: {
+          count: statuses.length,
+          installed: statuses.filter((status) => status.installed).map((status) => status.backend),
+          unavailable: statuses.filter((status) => !status.installed).map((status) => status.backend)
         }
       };
     }
@@ -2064,6 +2148,7 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createTerminalExecTool());
   registry.register(createTerminalBackgroundTool());
   registry.register(createTerminalBackendsTool());
+  registry.register(createTerminalBackendStatusTool());
   registry.register(createTerminalProcessesTool());
   registry.register(createTerminalKillTool());
   registry.register(createTodoTool());
@@ -2168,7 +2253,7 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   terminal: {
     name: 'terminal',
     description: 'Shell execution — terminal commands and process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.processes', 'terminal.kill'],
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.processes', 'terminal.kill'],
   },
   workspace: {
     name: 'workspace',
@@ -2193,7 +2278,7 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   devops: {
     name: 'devops',
     description: 'DevOps workflow — terminal, files, web fetch, git, process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch'],
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch'],
   },
   creative: {
     name: 'creative',

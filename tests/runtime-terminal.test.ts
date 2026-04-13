@@ -35,6 +35,12 @@ describe('runtime terminal integration', () => {
     expect(backendsPayload.output).toContain('"docker"');
     expect(backendsPayload.output).toContain('"modal"');
 
+    const backendStatusResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.backendStatus)));
+    const backendStatusPayload = await backendStatusResponse.json() as { ok: boolean; output: string };
+    expect(backendStatusPayload.ok).toBe(true);
+    expect(backendStatusPayload.output).toContain('"installed"');
+    expect(backendStatusPayload.output).toContain('"local"');
+
     const execResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',
       body: JSON.stringify({ command: 'printf "hello-terminal"' })

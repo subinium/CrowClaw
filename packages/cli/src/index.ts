@@ -212,6 +212,7 @@ export const builtInCliSlashCommands = [
   '/vision',
   '/image',
   '/terminal-backends',
+  '/terminal-backend-status',
   '/terminal-exec',
   '/terminal-background',
   '/terminal-processes',
@@ -352,6 +353,7 @@ const cliRoutePaths = {
     exec: '/api/terminal/exec',
     background: '/api/terminal/background',
     backends: '/api/terminal/backends',
+    backendStatus: '/api/terminal/backend-status',
     processes: '/api/terminal/processes',
     kill: '/api/terminal/kill'
   },
@@ -611,6 +613,7 @@ export function renderCliHelp(): string {
     '  /vision ...                    Run vision analysis',
     '  /image ...                     Build image generation payload',
     '  /terminal-backends             List terminal backend descriptors',
+    '  /terminal-backend-status       Probe terminal backend availability',
     '  /terminal-exec ...             Execute a terminal command',
     '  /terminal-background ...       Start a background terminal command',
     '  /terminal-processes            Show tracked background processes',
@@ -1441,6 +1444,11 @@ export async function runCliInputLine(
 
   if (trimmed === '/terminal-backends') {
     const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.backends)));
+    return { output: JSON.stringify(await response.json(), null, 2), state };
+  }
+
+  if (trimmed === '/terminal-backend-status') {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.backendStatus)));
     return { output: JSON.stringify(await response.json(), null, 2), state };
   }
 

@@ -31,7 +31,7 @@ describe('cli package', () => {
   it('suggests slash commands by prefix', () => {
     expect(suggestCliCommands('/mcp-')).toEqual(['/mcp-tools', '/mcp-status', '/mcp-inspect', '/mcp-resources', '/mcp-prompts', '/mcp-server-tools', '/mcp-server-call', '/mcp-auth', '/mcp-add', '/mcp-list', '/mcp-remove']);
     expect(suggestCliCommands('/bridge-')).toEqual(['/bridge-status', '/bridge-spawn', '/bridge-ping', '/bridge-terminate', '/bridge-capabilities', '/bridge-process', '/bridge-transcript']);
-    expect(suggestCliCommands('/terminal-')).toEqual(['/terminal-backends', '/terminal-exec', '/terminal-background', '/terminal-processes', '/terminal-kill']);
+    expect(suggestCliCommands('/terminal-')).toEqual(['/terminal-backends', '/terminal-backend-status', '/terminal-exec', '/terminal-background', '/terminal-processes', '/terminal-kill']);
     expect(suggestCliCommands('/pre')).toEqual(['/preflight']);
     expect(suggestCliCommands('/ver')).toEqual(['/version']);
     expect(suggestCliCommands('/release')).toEqual(['/release-check']);
@@ -352,6 +352,10 @@ describe('cli package', () => {
     const terminalBackends = await runCliInputLine('/terminal-backends', chat.state, { runtime });
     expect(terminalBackends.output).toContain('"docker"');
     expect(terminalBackends.output).toContain('"daytona"');
+
+    const terminalBackendStatus = await runCliInputLine('/terminal-backend-status', chat.state, { runtime });
+    expect(terminalBackendStatus.output).toContain('"installed"');
+    expect(terminalBackendStatus.output).toContain('"local"');
 
     const terminalExecPlan = await runCliInputLine('/terminal-exec --backend docker --container demo --plan printf hello-terminal-cli', chat.state, { runtime });
     expect(terminalExecPlan.output).toContain('docker exec demo');

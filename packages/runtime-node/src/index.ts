@@ -2644,6 +2644,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }));
       }
 
+      if (request.method === 'GET' && url.pathname === routePaths.terminal.backendStatus) {
+        return Response.json(await tools.execute('terminal.backendStatus', {}, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-backend-status',
+        }));
+      }
+
       if (request.method === 'GET' && url.pathname === '/api/terminal/processes') {
         return Response.json(await tools.execute('terminal.processes', {}, {
           agentId: options.agentId ?? 'crowclaw',

@@ -23,6 +23,7 @@ export const routePaths = {
     exec: '/api/terminal/exec',
     background: '/api/terminal/background',
     backends: '/api/terminal/backends',
+    backendStatus: '/api/terminal/backend-status',
     processes: '/api/terminal/processes',
     kill: '/api/terminal/kill'
   },
