@@ -17,11 +17,30 @@ import '../components/toggle-switch.js';
 /*  Type definitions                                                  */
 /* ------------------------------------------------------------------ */
 
-interface ProviderStatus {
+interface ProviderSlot {
   name: string;
+  provider: string;
+  model: string;
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+interface ProviderConfig {
+  primary?: ProviderSlot | null;
+  fallback?: ProviderSlot | null;
+  vision?: ProviderSlot | null;
+  compression?: ProviderSlot | null;
+  embedding?: ProviderSlot | null;
+}
+
+/** Flattened view used in the provider grid UI */
+interface ProviderDisplay {
+  slot: string;
+  name: string;
+  provider: string;
+  model: string;
   baseUrl: string;
-  status: 'live' | 'disc' | 'sim';
-  models?: string[];
+  hasKey: boolean;
 }
 
 interface McpServer {
@@ -30,12 +49,15 @@ interface McpServer {
   args?: string[];
   description?: string;
   env?: Record<string, string>;
-  status: 'live' | 'disc' | 'sim';
+  custom?: boolean;
 }
 
 interface GatewayPlatform {
   name: string;
-  status: 'live' | 'disc' | 'sim';
+  inboundRoute: string;
+  inboundStatus: string;
+  outboundMode: string;
+  outboundRoute?: string;
   enabled: boolean;
 }
 
@@ -46,10 +68,33 @@ interface ToolInfo {
   dangerLevel?: 'safe' | 'moderate' | 'dangerous';
 }
 
+/** Matches GET /api/system/status response shape */
+interface SystemStatusResponse {
+  ok: boolean;
+  deployment: string;
+  version: string;
+  runtime: string;
+  service: string;
+  plugins: string[];
+  counts: {
+    bridgeSessions: number;
+    bridgeProcesses: number;
+    bridgeAliveProcesses: number;
+    browserSessions: number;
+    schedulerJobs: number;
+  };
+  mcp: { degraded?: boolean; servers?: Array<{ name: string }> } | null;
+  gateway: { slackSigningSecretConfigured: boolean };
+  tools: ToolInfo[];
+  model: string;
+  provider: string;
+}
+
+/** Derived status for the overview panel */
 interface SystemStatus {
-  providers: ProviderStatus[];
-  gateway: { status: string; platforms?: number };
-  mcp: { status: string; servers?: number };
+  providers: ProviderDisplay[];
+  gateway: { status: string; platforms: number };
+  mcp: { status: string; servers: number };
   tools: { count: number };
 }
 
@@ -484,7 +529,7 @@ export class ConnectView extends LitElement {
   /* ---- reactive state ---- */
 
   @state() private systemStatus: SystemStatus | null = null;
-  @state() private providers: ProviderStatus[] = [];
+  @state() private providers: ProviderDisplay[] = [];
   @state() private mcpServers: McpServer[] = [];
   @state() private platforms: GatewayPlatform[] = [];
   @state() private tools: ToolInfo[] = [];
@@ -494,7 +539,7 @@ export class ConnectView extends LitElement {
 
   /* Provider config form */
   @state() private configuringProvider: string | null = null;
-  @state() private providerForm = { name: '', baseUrl: '', apiKey: '', model: '' };
+  @state() private providerForm = { slot: '', name: '', provider: '', baseUrl: '', apiKey: '', model: '' };
 
   /* MCP add form */
   @state() private showMcpForm = false;
@@ -523,7 +568,28 @@ export class ConnectView extends LitElement {
 
   private async _fetchStatus() {
     try {
-      this.systemStatus = await api<SystemStatus>('/api/system/status');
+      const raw = await api<SystemStatusResponse>('/api/system/status');
+
+      // Extract tools from the status response (no separate /api/tools endpoint)
+      this.tools = (raw.tools ?? []).map((t) =>
+        typeof t === 'string'
+          ? { name: t as string, description: '', runtime: 'worker' }
+          : t,
+      );
+
+      // Derive the overview panel status from the raw response
+      this.systemStatus = {
+        providers: this.providers, // filled by _fetchProviders
+        gateway: {
+          status: raw.gateway?.slackSigningSecretConfigured ? 'live' : 'disc',
+          platforms: 0, // updated after _fetchPlatforms
+        },
+        mcp: {
+          status: raw.mcp ? (raw.mcp.degraded ? 'degraded' : 'live') : 'disc',
+          servers: raw.mcp?.servers?.length ?? 0,
+        },
+        tools: { count: this.tools.length },
+      };
     } catch {
       this.systemStatus = null;
     }
@@ -531,8 +597,26 @@ export class ConnectView extends LitElement {
 
   private async _fetchProviders() {
     try {
-      const data = await api<{ providers: ProviderStatus[] }>('/api/providers');
-      this.providers = data.providers ?? [];
+      const data = await api<{
+        ok: boolean;
+        config: ProviderConfig | null;
+        slots: ProviderConfig;
+      }>('/api/providers/config');
+
+      const slots = data.slots ?? data.config ?? {};
+      const list: ProviderDisplay[] = [];
+      for (const [slotName, slot] of Object.entries(slots) as [string, ProviderSlot | null | undefined][]) {
+        if (!slot || slot.provider === 'none') continue;
+        list.push({
+          slot: slotName,
+          name: slot.name ?? slotName,
+          provider: slot.provider,
+          model: slot.model,
+          baseUrl: slot.baseUrl ?? '',
+          hasKey: slot.apiKey === '***',
+        });
+      }
+      this.providers = list;
     } catch {
       this.providers = [];
     }
@@ -540,7 +624,7 @@ export class ConnectView extends LitElement {
 
   private async _fetchMcp() {
     try {
-      const data = await api<{ servers: McpServer[] }>('/api/mcp/status');
+      const data = await api<{ servers: McpServer[] }>('/api/mcp/servers');
       this.mcpServers = data.servers ?? [];
     } catch {
       this.mcpServers = [];
@@ -549,35 +633,61 @@ export class ConnectView extends LitElement {
 
   private async _fetchPlatforms() {
     try {
-      const data = await api<{ platforms: GatewayPlatform[] }>('/api/gateway/platforms');
-      this.platforms = data.platforms ?? [];
+      const data = await api<{
+        platforms: Array<{
+          name: string;
+          inboundRoute: string;
+          inboundStatus: string;
+          outboundMode: string;
+          outboundRoute?: string;
+        }>;
+      }>('/api/gateway/status');
+
+      this.platforms = (data.platforms ?? []).map((p) => ({
+        name: p.name,
+        inboundRoute: p.inboundRoute,
+        inboundStatus: p.inboundStatus,
+        outboundMode: p.outboundMode,
+        outboundRoute: p.outboundRoute,
+        enabled: p.outboundMode !== 'not-exposed',
+      }));
+
+      // Update the gateway platform count in systemStatus if already loaded
+      if (this.systemStatus) {
+        this.systemStatus = {
+          ...this.systemStatus,
+          gateway: {
+            ...this.systemStatus.gateway,
+            platforms: this.platforms.length,
+          },
+        };
+      }
     } catch {
       this.platforms = [];
     }
   }
 
+  /** Tools are fetched from /api/system/status, not a separate endpoint */
   private async _fetchTools() {
-    try {
-      const data = await api<{ tools: ToolInfo[] }>('/api/tools');
-      this.tools = data.tools ?? [];
-    } catch {
-      this.tools = [];
-    }
+    // Tools are already loaded by _fetchStatus; this is a no-op.
+    // Kept for structural consistency with _fetchAll.
   }
 
   /* ---- provider config ---- */
 
-  private _openProviderConfig(provider: ProviderStatus) {
-    if (this.configuringProvider === provider.name) {
+  private _openProviderConfig(provider: ProviderDisplay) {
+    if (this.configuringProvider === provider.slot) {
       this.configuringProvider = null;
       return;
     }
-    this.configuringProvider = provider.name;
+    this.configuringProvider = provider.slot;
     this.providerForm = {
+      slot: provider.slot,
       name: provider.name,
+      provider: provider.provider,
       baseUrl: provider.baseUrl,
       apiKey: '',
-      model: '',
+      model: provider.model,
     };
   }
 
@@ -587,20 +697,35 @@ export class ConnectView extends LitElement {
 
   private async _saveProviderConfig() {
     try {
-      const payload: Record<string, unknown> = {
+      // Build a full provider config payload keyed by slot name
+      // POST /api/providers/config expects { primary: {...}, fallback: {...}, ... }
+      const slotData: ProviderSlot = {
         name: this.providerForm.name,
-        baseUrl: this.providerForm.baseUrl,
+        provider: this.providerForm.provider,
+        model: this.providerForm.model,
+        baseUrl: this.providerForm.baseUrl || undefined,
       };
       if (this.providerForm.apiKey) {
-        payload.apiKey = this.providerForm.apiKey;
+        slotData.apiKey = this.providerForm.apiKey;
       }
-      if (this.providerForm.model) {
-        payload.model = this.providerForm.model;
+      const payload: Record<string, ProviderSlot> = {
+        [this.providerForm.slot]: slotData,
+      };
+      // Preserve existing slots by re-fetching current config first
+      try {
+        const current = await api<{ slots: ProviderConfig }>('/api/providers/config');
+        const merged = { ...current.slots, ...payload };
+        await api('/api/providers/config', {
+          method: 'POST',
+          body: JSON.stringify(merged),
+        });
+      } catch {
+        // If we cannot fetch current config, send just the slot
+        await api('/api/providers/config', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
       }
-      await api('/api/providers', {
-        method: 'PUT',
-        body: JSON.stringify(payload),
-      });
       this.configuringProvider = null;
       await this._fetchProviders();
     } catch (error: unknown) {
@@ -699,8 +824,9 @@ export class ConnectView extends LitElement {
       p.name === platform.name ? { ...p, enabled: newEnabled } : p,
     );
     try {
-      await api(`/api/gateway/platforms/${encodeURIComponent(platform.name)}`, {
-        method: 'PATCH',
+      // POST /api/gateway/{platform}/config — sets { enabled, token }
+      await api(`/api/gateway/${encodeURIComponent(platform.name)}/config`, {
+        method: 'POST',
         body: JSON.stringify({ enabled: newEnabled }),
       });
     } catch {
@@ -769,15 +895,16 @@ export class ConnectView extends LitElement {
 
   private _renderStatusOverview() {
     const s = this.systemStatus;
+    const provCount = this.providers.length;
     return html`
       <div class="section-block">
         <div class="section-header">Status Overview</div>
         <div class="status-list">
           <div class="status-row">
-            <span class="dot ${s ? this._statusDotClass(s.providers.length > 0 ? 'live' : 'disc') : 'disc'}"></span>
+            <span class="dot ${provCount > 0 ? 'live' : 'disc'}"></span>
             <span class="label">Providers</span>
-            <span class="detail">${s ? this._providerSummary(s.providers) : '--'}</span>
-            <span class="count">${s?.providers.length ?? 0}</span>
+            <span class="detail">${provCount > 0 ? `${provCount} configured` : 'No active providers'}</span>
+            <span class="count">${provCount}</span>
           </div>
           <div class="status-row">
             <span class="dot ${s?.gateway ? this._statusDotClass(s.gateway.status) : 'disc'}"></span>
@@ -802,14 +929,6 @@ export class ConnectView extends LitElement {
     `;
   }
 
-  private _providerSummary(providers: ProviderStatus[]): string {
-    const liveCount = providers.filter(
-      (p) => p.status === 'live',
-    ).length;
-    if (liveCount === 0) return 'No active providers';
-    return `${liveCount} active`;
-  }
-
   /* ---- Section 2: Providers ---- */
 
   private _renderProviders() {
@@ -832,15 +951,15 @@ export class ConnectView extends LitElement {
     `;
   }
 
-  private _renderProviderCard(provider: ProviderStatus) {
-    const isConfiguring = this.configuringProvider === provider.name;
+  private _renderProviderCard(provider: ProviderDisplay) {
+    const isConfiguring = this.configuringProvider === provider.slot;
     return html`
       <div class="provider-card">
         <div class="provider-hdr">
-          <span class="dot ${this._statusDotClass(provider.status)}"></span>
-          <span class="provider-name">${provider.name}</span>
+          <span class="dot ${provider.hasKey ? 'live' : 'disc'}"></span>
+          <span class="provider-name">${provider.name} (${provider.slot})</span>
         </div>
-        <div class="provider-url">${provider.baseUrl}</div>
+        <div class="provider-url">${provider.baseUrl || provider.provider} / ${provider.model}</div>
         <div class="provider-actions">
           <button
             class="btn ${isConfiguring ? 'btn-p' : ''}"
@@ -849,12 +968,12 @@ export class ConnectView extends LitElement {
             ${isConfiguring ? 'Close' : 'Configure'}
           </button>
         </div>
-        ${isConfiguring ? this._renderProviderForm(provider) : nothing}
+        ${isConfiguring ? this._renderProviderForm() : nothing}
       </div>
     `;
   }
 
-  private _renderProviderForm(provider: ProviderStatus) {
+  private _renderProviderForm() {
     return html`
       <div class="provider-form">
         <div class="form-group">
@@ -866,6 +985,34 @@ export class ConnectView extends LitElement {
               this.providerForm = {
                 ...this.providerForm,
                 name: (e.target as HTMLInputElement).value,
+              };
+            }}
+          />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Provider</label>
+          <input
+            class="form-input"
+            placeholder="openai, anthropic, openrouter, ..."
+            .value=${this.providerForm.provider}
+            @input=${(e: InputEvent) => {
+              this.providerForm = {
+                ...this.providerForm,
+                provider: (e.target as HTMLInputElement).value,
+              };
+            }}
+          />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Model</label>
+          <input
+            class="form-input"
+            placeholder="gpt-4o, claude-sonnet-4-20250514, ..."
+            .value=${this.providerForm.model}
+            @input=${(e: InputEvent) => {
+              this.providerForm = {
+                ...this.providerForm,
+                model: (e.target as HTMLInputElement).value,
               };
             }}
           />
@@ -899,24 +1046,6 @@ export class ConnectView extends LitElement {
             }}
           />
           <div class="form-hint">Leave blank to keep the existing key</div>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Model</label>
-          <select
-            class="form-input"
-            .value=${this.providerForm.model}
-            @change=${(e: Event) => {
-              this.providerForm = {
-                ...this.providerForm,
-                model: (e.target as HTMLSelectElement).value,
-              };
-            }}
-          >
-            <option value="">-- select model --</option>
-            ${(provider.models ?? []).map(
-              (m) => html`<option value=${m}>${m}</option>`,
-            )}
-          </select>
         </div>
         <div class="form-actions">
           <button class="btn" @click=${this._closeProviderConfig}>Cancel</button>
@@ -960,7 +1089,7 @@ export class ConnectView extends LitElement {
   private _renderMcpItem(server: McpServer) {
     return html`
       <div class="mcp-item">
-        <span class="dot ${this._statusDotClass(server.status)}"></span>
+        <span class="dot live"></span>
         <div class="mcp-info">
           <div class="mcp-name">${server.name}</div>
           <div class="mcp-cmd">${server.command}${server.args?.length ? ` ${server.args.join(' ')}` : ''}</div>
@@ -968,12 +1097,16 @@ export class ConnectView extends LitElement {
             ? html`<div class="mcp-desc">${server.description}</div>`
             : nothing}
         </div>
-        <button
-          class="btn btn-danger"
-          @click=${() => this._removeMcpServer(server.name)}
-        >
-          Remove
-        </button>
+        ${server.custom !== false
+          ? html`
+              <button
+                class="btn btn-danger"
+                @click=${() => this._removeMcpServer(server.name)}
+              >
+                Remove
+              </button>
+            `
+          : nothing}
       </div>
     `;
   }
@@ -1101,10 +1234,13 @@ export class ConnectView extends LitElement {
   }
 
   private _renderPlatformCard(platform: GatewayPlatform) {
+    const modeStatus = platform.outboundMode === 'runtime-route' ? 'live'
+      : platform.outboundMode === 'not-exposed' ? 'disc'
+      : 'sim';
     return html`
       <div class="platform-card">
         <div class="platform-info">
-          <span class="dot ${this._statusDotClass(platform.status)}"></span>
+          <span class="dot ${this._statusDotClass(modeStatus)}"></span>
           <span class="platform-name">${platform.name}</span>
         </div>
         <crowclaw-toggle

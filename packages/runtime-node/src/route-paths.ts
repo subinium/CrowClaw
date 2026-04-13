@@ -24,6 +24,7 @@ export const routePaths = {
     background: '/api/terminal/background',
     backends: '/api/terminal/backends',
     backendStatus: '/api/terminal/backend-status',
+    probe: '/api/terminal/probe',
     processes: '/api/terminal/processes',
     kill: '/api/terminal/kill'
   },
@@ -50,7 +51,9 @@ export const routePaths = {
     models: '/api/providers/models',
     route: '/api/providers/route',
     pool: '/api/providers/pool',
-    plan: '/api/providers/plan'
+    plan: '/api/providers/plan',
+    failoverPreview: '/api/providers/failover-preview',
+    failoverSimulate: '/api/providers/failover-simulate'
   },
   config: {
     provider: '/api/config/provider',

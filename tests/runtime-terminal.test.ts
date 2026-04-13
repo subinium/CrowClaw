@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 import { localRoute, routePaths } from '../packages/runtime-node/src/route-paths.js';
 
@@ -40,6 +43,32 @@ describe('runtime terminal integration', () => {
     expect(backendStatusPayload.ok).toBe(true);
     expect(backendStatusPayload.output).toContain('"installed"');
     expect(backendStatusPayload.output).toContain('"local"');
+
+    const probeResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.probe), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ backend: 'local' })
+    }));
+    const probePayload = await probeResponse.json() as { ok: boolean; output: string };
+    expect(probePayload.ok).toBe(true);
+    expect(probePayload.output).toContain('local-ok');
+
+    const tempCwd = await mkdtemp(join(tmpdir(), 'crowclaw-terminal-runtime-'));
+    const cwdResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
+      method: 'POST',
+      body: JSON.stringify({ command: 'pwd', cwd: tempCwd })
+    }));
+    const cwdPayload = await cwdResponse.json() as { ok: boolean; output: string };
+    expect(cwdPayload.ok).toBe(true);
+    expect(cwdPayload.output).toContain(tempCwd);
+
+    const timeoutResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
+      method: 'POST',
+      body: JSON.stringify({ command: 'sleep 1', timeoutMs: 10 })
+    }));
+    const timeoutPayload = await timeoutResponse.json() as { ok: boolean; metadata?: { timeoutMs?: number } };
+    expect(timeoutPayload.ok).toBe(false);
+    expect(timeoutPayload.metadata?.timeoutMs).toBe(10);
 
     const execResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',

@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -223,6 +226,7 @@ describe('tool breadth extensions', () => {
       .register(createTerminalBackgroundTool())
       .register(createTerminalBackendsTool())
       .register(createTerminalBackendStatusTool())
+      .register(createTerminalProbeTool())
       .register(createTerminalProcessesTool())
       .register(createTerminalKillTool());
 
@@ -243,12 +247,34 @@ describe('tool breadth extensions', () => {
     expect(backendStatus.output).toContain('"installed"');
     expect(backendStatus.output).toContain('"local"');
 
+    const localProbe = await registry.execute('terminal.probe', { backend: 'local' }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-probe'
+    });
+    expect(localProbe.ok).toBe(true);
+    expect(localProbe.output).toContain('local-ok');
+
     const execResult = await registry.execute('terminal.exec', { command: 'printf "hello"' }, {
       agentId: 'crowclaw',
       sessionId: 'term-1'
     });
     expect(execResult.ok).toBe(true);
     expect(execResult.output).toContain('hello');
+
+    const tempCwd = await mkdtemp(join(tmpdir(), 'crowclaw-terminal-tool-'));
+    const cwdResult = await registry.execute('terminal.exec', { command: 'pwd', cwd: tempCwd }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-cwd'
+    });
+    expect(cwdResult.ok).toBe(true);
+    expect(cwdResult.output).toContain(tempCwd);
+
+    const timeoutResult = await registry.execute('terminal.exec', { command: 'sleep 1', timeoutMs: 10 }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-timeout'
+    });
+    expect(timeoutResult.ok).toBe(false);
+    expect(String(timeoutResult.metadata?.timeoutMs)).toBe('10');
 
     const dockerPlan = await registry.execute('terminal.exec', { backend: 'docker', container: 'app', command: 'printf "hello"', planOnly: true }, {
       agentId: 'crowclaw',

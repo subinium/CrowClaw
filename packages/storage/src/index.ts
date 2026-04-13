@@ -102,6 +102,35 @@ export class InMemorySessionStore implements SessionStore, SessionSearchStore, S
       .slice(0, limit)
       .map((message) => ({ sessionId, content: message.content }));
   }
+
+  async searchAll(query: string, limit = 10): Promise<Array<{ sessionId: string; matches: Array<{ role: string; content: string; score: number }> }>> {
+    const needle = normalizeNeedle(query);
+    if (!needle) {
+      return [];
+    }
+
+    const terms = needle.split(/\s+/).filter(Boolean);
+    const grouped: Array<{ sessionId: string; matches: Array<{ role: string; content: string; score: number }> }> = [];
+
+    for (const [sessionId, session] of this.store) {
+      const matches: Array<{ role: string; content: string; score: number }> = [];
+      for (const message of session.messages) {
+        const lower = message.content.toLowerCase();
+        const score = terms.reduce((count, term) => count + (lower.includes(term) ? 1 : 0), 0);
+        if (score > 0) {
+          matches.push({ role: message.role, content: message.content, score });
+        }
+      }
+      if (matches.length > 0) {
+        matches.sort((a, b) => b.score - a.score);
+        grouped.push({ sessionId, matches: matches.slice(0, limit) });
+      }
+    }
+
+    // Sort session groups by their best match score descending
+    grouped.sort((a, b) => (b.matches[0]?.score ?? 0) - (a.matches[0]?.score ?? 0));
+    return grouped.slice(0, limit);
+  }
 }
 
 export class InMemoryMemoryStore implements MemoryStore {

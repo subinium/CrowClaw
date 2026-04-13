@@ -213,6 +213,7 @@ export const builtInCliSlashCommands = [
   '/image',
   '/terminal-backends',
   '/terminal-backend-status',
+  '/terminal-probe',
   '/terminal-exec',
   '/terminal-background',
   '/terminal-processes',
@@ -253,6 +254,8 @@ export const builtInCliSlashCommands = [
   '/provider-models',
   '/provider-pool',
   '/provider-plan',
+  '/provider-failover-preview',
+  '/provider-failover-simulate',
   '/provider-route',
   '/new',
   '/reset',
@@ -354,6 +357,7 @@ const cliRoutePaths = {
     background: '/api/terminal/background',
     backends: '/api/terminal/backends',
     backendStatus: '/api/terminal/backend-status',
+    probe: '/api/terminal/probe',
     processes: '/api/terminal/processes',
     kill: '/api/terminal/kill'
   },
@@ -393,7 +397,9 @@ const cliRoutePaths = {
     models: '/api/providers/models',
     route: '/api/providers/route',
     pool: '/api/providers/pool',
-    plan: '/api/providers/plan'
+    plan: '/api/providers/plan',
+    failoverPreview: '/api/providers/failover-preview',
+    failoverSimulate: '/api/providers/failover-simulate'
   },
   usage: {
     summary: '/api/usage',
@@ -614,6 +620,7 @@ export function renderCliHelp(): string {
     '  /image ...                     Build image generation payload',
     '  /terminal-backends             List terminal backend descriptors',
     '  /terminal-backend-status       Probe terminal backend availability',
+    '  /terminal-probe [backend]      Run a benign execution probe for a backend',
     '  /terminal-exec ...             Execute a terminal command',
     '  /terminal-background ...       Start a background terminal command',
     '  /terminal-processes            Show tracked background processes',
@@ -644,6 +651,8 @@ export function renderCliHelp(): string {
     '  /provider-models               List known provider model metadata',
     '  /provider-pool [provider]      Inspect credential pool status',
     '  /provider-plan                 Show effective provider slot/failover plan',
+    '  /provider-failover-preview     Show simulated provider failover order',
+    '  /provider-failover-simulate    Execute a synthetic failover run',
     '  /provider-route ...            Inspect smart provider routing',
     '  /new, /reset                   Start a new session',
     '  /resume <id>                   Resume a session by id',
@@ -1452,6 +1461,16 @@ export async function runCliInputLine(
     return { output: JSON.stringify(await response.json(), null, 2), state };
   }
 
+  if (trimmed === '/terminal-probe' || trimmed.startsWith('/terminal-probe ')) {
+    const backend = trimmed.replace('/terminal-probe', '').trim() || 'local';
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.probe), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ backend })
+    }));
+    return { output: JSON.stringify(await response.json(), null, 2), state };
+  }
+
   if (trimmed === '/terminal-processes') {
     const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.processes)));
     return { output: JSON.stringify(await response.json(), null, 2), state };
@@ -1475,6 +1494,8 @@ export async function runCliInputLine(
     let target: string | undefined;
     let container: string | undefined;
     let image: string | undefined;
+    let cwd: string | undefined;
+    let timeoutMs: number | undefined;
     let planOnly = false;
     const commandParts: string[] = [];
     for (let index = 0; index < tokens.length; index += 1) {
@@ -1499,6 +1520,17 @@ export async function runCliInputLine(
         index += 1;
         continue;
       }
+      if (token === '--cwd') {
+        cwd = tokens[index + 1];
+        index += 1;
+        continue;
+      }
+      if (token === '--timeout') {
+        const parsed = Number(tokens[index + 1]);
+        timeoutMs = Number.isFinite(parsed) ? parsed : undefined;
+        index += 1;
+        continue;
+      }
       if (token === '--plan') {
         planOnly = true;
         continue;
@@ -1513,6 +1545,8 @@ export async function runCliInputLine(
         target,
         container,
         image,
+        cwd,
+        timeoutMs,
         planOnly,
         command: commandParts.join(' ')
       })
@@ -1781,6 +1815,27 @@ export async function runCliInputLine(
 
   if (trimmed === '/provider-plan') {
     const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.plan)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/provider-failover-preview') {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.failoverPreview)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/provider-failover-simulate' || trimmed.startsWith('/provider-failover-simulate ')) {
+    const message = trimmed.replace('/provider-failover-simulate', '').trim() || 'simulate provider fallback';
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.failoverSimulate), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message })
+    }));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state

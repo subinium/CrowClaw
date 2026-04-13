@@ -330,7 +330,7 @@ describe('Dashboard HTML contains CRUD UI elements', () => {
   });
 
   it('contains MCP status API endpoint', () => {
-    expect(DASHBOARD_HTML).toContain('/api/mcp/status');
+    expect(DASHBOARD_HTML).toContain('/api/mcp/servers');
   });
 
   it('contains tools API endpoint', () => {

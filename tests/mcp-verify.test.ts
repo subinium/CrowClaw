@@ -250,7 +250,7 @@ describe('Dashboard HTML contains verification UI elements', () => {
 
   it('contains MCP status API endpoint', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('/api/mcp/status');
+    expect(html).toContain('/api/mcp/servers');
   });
 
   it('contains MCP section text', async () => {

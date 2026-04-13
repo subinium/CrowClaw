@@ -3,34 +3,42 @@ import { customElement, state } from 'lit/decorators.js';
 import { buttonStyles, cardStyles, tagStyles, formStyles, sectionStyles } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
 
+/** Maps to CronJobDefinition from @crowclaw/scheduler */
 interface SchedulerJob {
   id: string;
-  name: string;
   schedule: string;
-  scheduleType: 'interval' | 'cron';
-  status: 'active' | 'paused';
-  lastRun?: string;
-  nextRun?: string;
-  prompt?: string;
+  task: string;
+  enabled: boolean;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  lastRunStatus?: 'success' | 'error' | 'timeout';
+  lastRunError?: string;
+  lastRunResult?: string;
+  runCount?: number;
+  maxRuns?: number;
   model?: string;
-  skills?: string[];
-  deliveryPlatform?: string;
-  deliveryChannel?: string;
+  skillSlugs?: string[];
+  deliverTo?: { platform: string; config: Record<string, string> };
 }
 
+/** Maps to JobRunRecord from @crowclaw/scheduler */
 interface HistoryEntry {
-  id: string;
   jobId: string;
-  jobName: string;
-  startTime: string;
-  duration: number;
-  status: 'success' | 'error';
-  output: string;
+  runId: string;
+  startedAt: string;
+  completedAt: string;
+  ok: boolean;
+  response: string;
+  error?: string;
+  durationMs: number;
+  tokensUsed?: number;
 }
 
+/** Maps to skill object from GET /api/skills */
 interface SkillInfo {
-  name: string;
-  id?: string;
+  slug: string;
+  title: string;
+  triggerPhrases?: string[];
 }
 
 const timeAgo = (d: string) => {
@@ -433,12 +441,14 @@ export class AutomateView extends LitElement {
   ];
 
   @state() private jobs: SchedulerJob[] = [];
-  @state() private history: HistoryEntry[] = [];
   @state() private skills: SkillInfo[] = [];
   @state() private schedulerRunning = false;
   @state() private showForm = false;
   @state() private loading = true;
-  @state() private expandedHistoryIds = new Set<string>();
+  /** Per-job history keyed by job id, fetched on expand */
+  @state() private jobHistory = new Map<string, HistoryEntry[]>();
+  @state() private expandedJobIds = new Set<string>();
+  @state() private loadingHistoryFor = new Set<string>();
 
   // Form state
   @state() private formName = '';
@@ -460,33 +470,53 @@ export class AutomateView extends LitElement {
     this.loading = true;
     await Promise.all([
       this._fetchJobs(),
-      this._fetchHistory(),
+      this._fetchSchedulerStatus(),
       this._fetchSkills(),
     ]);
     this.loading = false;
   }
 
+  /** GET /api/scheduler/jobs returns CronJobDefinition[] (bare array) */
   private async _fetchJobs() {
     try {
-      const data = await api<{ jobs: SchedulerJob[]; running?: boolean }>('/api/scheduler/jobs');
-      this.jobs = data.jobs || [];
-      if (data.running !== undefined) {
-        this.schedulerRunning = data.running;
-      }
+      const data = await api<SchedulerJob[]>('/api/scheduler/jobs');
+      this.jobs = Array.isArray(data) ? data : [];
     } catch {
       this.jobs = [];
     }
   }
 
-  private async _fetchHistory() {
+  /** GET /api/scheduler/status returns { running, interval, lastTick } */
+  private async _fetchSchedulerStatus() {
     try {
-      const data = await api<{ history: HistoryEntry[] }>('/api/scheduler/history');
-      this.history = data.history || [];
+      const data = await api<{ running: boolean }>('/api/scheduler/status');
+      this.schedulerRunning = data.running ?? false;
     } catch {
-      this.history = [];
+      this.schedulerRunning = false;
     }
   }
 
+  /** GET /api/scheduler/jobs/{id}/history returns JobRunRecord[] (bare array) */
+  private async _fetchJobHistory(jobId: string) {
+    if (this.loadingHistoryFor.has(jobId)) return;
+    this.loadingHistoryFor = new Set([...this.loadingHistoryFor, jobId]);
+    try {
+      const data = await api<HistoryEntry[]>(`/api/scheduler/jobs/${encodeURIComponent(jobId)}/history?limit=20`);
+      const next = new Map(this.jobHistory);
+      next.set(jobId, Array.isArray(data) ? data : []);
+      this.jobHistory = next;
+    } catch {
+      const next = new Map(this.jobHistory);
+      next.set(jobId, []);
+      this.jobHistory = next;
+    } finally {
+      const updated = new Set(this.loadingHistoryFor);
+      updated.delete(jobId);
+      this.loadingHistoryFor = updated;
+    }
+  }
+
+  /** GET /api/skills returns { skills: [{ slug, title, ... }] } */
   private async _fetchSkills() {
     try {
       const data = await api<{ skills: SkillInfo[] }>('/api/skills');
@@ -511,8 +541,8 @@ export class AutomateView extends LitElement {
   private async _tickNow() {
     try {
       await api('/api/scheduler/tick', { method: 'POST' });
-      // Refresh history after tick
-      setTimeout(() => this._fetchHistory(), 1000);
+      // Refresh jobs after tick to update lastRunAt / lastRunStatus
+      setTimeout(() => this._fetchJobs(), 1000);
     } catch (error: unknown) {
       if (error instanceof Error) {
         console.error('Failed to tick scheduler:', error.message);
@@ -522,12 +552,12 @@ export class AutomateView extends LitElement {
 
   private async _toggleJob(job: SchedulerJob) {
     try {
-      await api(`/api/scheduler/jobs/${job.id}/toggle`, { method: 'POST' });
-      this.jobs = this.jobs.map((j) =>
-        j.id === job.id
-          ? { ...j, status: j.status === 'active' ? 'paused' as const : 'active' as const }
-          : j,
+      const action = job.enabled ? 'pause' : 'resume';
+      const updated = await api<SchedulerJob>(
+        `/api/scheduler/jobs/${encodeURIComponent(job.id)}/${action}`,
+        { method: 'POST' },
       );
+      this.jobs = this.jobs.map((j) => (j.id === job.id ? updated : j));
     } catch (error: unknown) {
       if (error instanceof Error) {
         console.error('Failed to toggle job:', error.message);
@@ -537,7 +567,7 @@ export class AutomateView extends LitElement {
 
   private async _deleteJob(job: SchedulerJob) {
     try {
-      await api(`/api/scheduler/jobs/${job.id}`, { method: 'DELETE' });
+      await api(`/api/scheduler/jobs/${encodeURIComponent(job.id)}`, { method: 'DELETE' });
       this.jobs = this.jobs.filter((j) => j.id !== job.id);
     } catch (error: unknown) {
       if (error instanceof Error) {
@@ -562,11 +592,11 @@ export class AutomateView extends LitElement {
     this.showForm = false;
   }
 
-  private _toggleFormSkill(skillName: string) {
-    if (this.formSkills.includes(skillName)) {
-      this.formSkills = this.formSkills.filter((s) => s !== skillName);
+  private _toggleFormSkill(slug: string) {
+    if (this.formSkills.includes(slug)) {
+      this.formSkills = this.formSkills.filter((s) => s !== slug);
     } else {
-      this.formSkills = [...this.formSkills, skillName];
+      this.formSkills = [...this.formSkills, slug];
     }
   }
 
@@ -574,16 +604,27 @@ export class AutomateView extends LitElement {
     if (!this.formName.trim() || !this.formPrompt.trim() || !this.formScheduleValue.trim()) return;
     this.formSubmitting = true;
     try {
-      const body = {
-        name: this.formName.trim(),
-        prompt: this.formPrompt.trim(),
-        scheduleType: this.formScheduleType,
-        schedule: this.formScheduleValue.trim(),
+      // Build schedule string: backend supports cron expressions or "every:Nm" interval syntax
+      const scheduleValue = this.formScheduleValue.trim();
+      const schedule = this.formScheduleType === 'interval'
+        ? `every:${scheduleValue}`
+        : scheduleValue;
+
+      const body: Record<string, unknown> = {
+        id: this.formName.trim(),
+        task: this.formPrompt.trim(),
+        schedule,
         model: this.formModel || undefined,
-        skills: this.formSkills.length > 0 ? this.formSkills : undefined,
-        deliveryPlatform: this.formDeliveryPlatform || undefined,
-        deliveryChannel: this.formDeliveryChannel || undefined,
+        skillSlugs: this.formSkills.length > 0 ? this.formSkills : undefined,
       };
+
+      if (this.formDeliveryPlatform) {
+        body.deliverTo = {
+          platform: this.formDeliveryPlatform,
+          config: this.formDeliveryChannel ? { channel: this.formDeliveryChannel } : {},
+        };
+      }
+
       await api('/api/scheduler/jobs', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -599,14 +640,18 @@ export class AutomateView extends LitElement {
     }
   }
 
-  private _toggleHistoryExpand(id: string) {
-    const next = new Set(this.expandedHistoryIds);
-    if (next.has(id)) {
-      next.delete(id);
+  private _toggleJobExpand(jobId: string) {
+    const next = new Set(this.expandedJobIds);
+    if (next.has(jobId)) {
+      next.delete(jobId);
     } else {
-      next.add(id);
+      next.add(jobId);
+      // Fetch history on first expand
+      if (!this.jobHistory.has(jobId)) {
+        void this._fetchJobHistory(jobId);
+      }
     }
-    this.expandedHistoryIds = next;
+    this.expandedJobIds = next;
   }
 
   render() {
@@ -620,7 +665,6 @@ export class AutomateView extends LitElement {
           ? html`<div class="loading">Loading scheduler data...</div>`
           : html`
               ${this._renderSchedulerSection()}
-              ${this._renderHistorySection()}
             `}
       </div>
       ${this.showForm ? this._renderForm() : nothing}
@@ -667,19 +711,27 @@ export class AutomateView extends LitElement {
   }
 
   private _renderJobCard(job: SchedulerJob) {
+    const expanded = this.expandedJobIds.has(job.id);
+    const history = this.jobHistory.get(job.id) ?? [];
+    const loadingHistory = this.loadingHistoryFor.has(job.id);
     return html`
       <div class="job-card">
         <div class="job-card-header">
-          <span class="job-name">${job.name}</span>
-          <span class="tag ${job.status === 'active' ? 'ok' : 'wn'}">
-            ${job.status}
+          <span class="job-name">${job.id}</span>
+          <span class="tag ${job.enabled ? 'ok' : 'wn'}">
+            ${job.enabled ? 'active' : 'paused'}
           </span>
           <div class="job-card-actions">
             <button
               class="icon-btn"
+              @click=${() => this._toggleJobExpand(job.id)}
+              title="History"
+            >&#x1F4CB;</button>
+            <button
+              class="icon-btn"
               @click=${() => this._toggleJob(job)}
-              title="${job.status === 'active' ? 'Pause' : 'Resume'}"
-            >${job.status === 'active' ? '&#x23F8;' : '&#x25B6;'}</button>
+              title="${job.enabled ? 'Pause' : 'Resume'}"
+            >${job.enabled ? '&#x23F8;' : '&#x25B6;'}</button>
             <button
               class="icon-btn danger"
               @click=${() => this._deleteJob(job)}
@@ -690,75 +742,58 @@ export class AutomateView extends LitElement {
         <div class="job-meta">
           <div class="job-meta-row">
             <span class="job-meta-label">Schedule</span>
-            <span class="job-meta-value">
-              <span class="tag">${job.scheduleType}</span>
-              ${job.schedule}
-            </span>
+            <span class="job-meta-value">${job.schedule}</span>
           </div>
           <div class="job-meta-row">
             <span class="job-meta-label">Last Run</span>
-            <span class="job-meta-value">${job.lastRun ? timeAgo(job.lastRun) : '--'}</span>
+            <span class="job-meta-value">${job.lastRunAt ? timeAgo(job.lastRunAt) : '--'}</span>
           </div>
           <div class="job-meta-row">
             <span class="job-meta-label">Next Run</span>
-            <span class="job-meta-value">${job.nextRun ? timeAgo(job.nextRun) : '--'}</span>
+            <span class="job-meta-value">${job.nextRunAt ? timeAgo(job.nextRunAt) : '--'}</span>
           </div>
+          ${job.lastRunStatus ? html`
+            <div class="job-meta-row">
+              <span class="job-meta-label">Status</span>
+              <span class="tag ${job.lastRunStatus === 'success' ? 'ok' : 'er'}">${job.lastRunStatus}</span>
+            </div>
+          ` : nothing}
         </div>
+        ${expanded ? html`
+          <div style="margin-top:var(--sp-3);border-top:1px solid var(--glass-border);padding-top:var(--sp-3)">
+            ${loadingHistory
+              ? html`<div class="loading" style="padding:var(--sp-2)">Loading history...</div>`
+              : history.length === 0
+                ? html`<div style="font-size:var(--text-xs);color:var(--text-muted)">No run history</div>`
+                : html`
+                    <table class="history-table">
+                      <thead>
+                        <tr>
+                          <th>Started</th>
+                          <th>Duration</th>
+                          <th>Status</th>
+                          <th>Output</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${history.map((entry) => html`
+                          <tr class="history-row">
+                            <td>${timeAgo(entry.startedAt)}</td>
+                            <td style="font-family:var(--font-mono);font-size:var(--text-xs)">${formatDuration(entry.durationMs)}</td>
+                            <td>
+                              <span class="tag ${entry.ok ? 'ok' : 'er'}">${entry.ok ? 'success' : 'error'}</span>
+                            </td>
+                            <td>
+                              <div class="output-preview">${(entry.response || entry.error || '--').slice(0, 80)}</div>
+                            </td>
+                          </tr>
+                        `)}
+                      </tbody>
+                    </table>
+                  `}
+          </div>
+        ` : nothing}
       </div>
-    `;
-  }
-
-  private _renderHistorySection() {
-    return html`
-      <div class="section-block">
-        <div class="section-header">Job History</div>
-
-        ${this.history.length === 0
-          ? html`
-              <div class="empty">
-                <div class="empty-title">No History</div>
-                <div class="empty-subtitle">Job execution logs will appear here</div>
-              </div>
-            `
-          : html`
-              <table class="history-table">
-                <thead>
-                  <tr>
-                    <th>Job</th>
-                    <th>Started</th>
-                    <th>Duration</th>
-                    <th>Status</th>
-                    <th>Output</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${this.history.map((entry) => this._renderHistoryRow(entry))}
-                </tbody>
-              </table>
-            `}
-      </div>
-    `;
-  }
-
-  private _renderHistoryRow(entry: HistoryEntry) {
-    const expanded = this.expandedHistoryIds.has(entry.id);
-    return html`
-      <tr class="history-row" @click=${() => this._toggleHistoryExpand(entry.id)}>
-        <td>${entry.jobName}</td>
-        <td>${timeAgo(entry.startTime)}</td>
-        <td style="font-family:var(--font-mono);font-size:var(--text-xs)">${formatDuration(entry.duration)}</td>
-        <td>
-          <span class="tag ${entry.status === 'success' ? 'ok' : 'er'}">${entry.status}</span>
-        </td>
-        <td>
-          <div class="output-preview">${entry.output?.slice(0, 80) || '--'}</div>
-        </td>
-      </tr>
-      <tr>
-        <td colspan="5" style="padding:0;border:none">
-          <div class="output-expanded ${expanded ? 'open' : ''}">${entry.output || 'No output'}</div>
-        </td>
-      </tr>
     `;
   }
 
@@ -856,10 +891,10 @@ export class AutomateView extends LitElement {
                   <label class="checkbox-option">
                     <input
                       type="checkbox"
-                      .checked=${this.formSkills.includes(skill.name)}
-                      @change=${() => this._toggleFormSkill(skill.name)}
+                      .checked=${this.formSkills.includes(skill.slug)}
+                      @change=${() => this._toggleFormSkill(skill.slug)}
                     >
-                    ${skill.name}
+                    ${skill.title || skill.slug}
                   </label>
                 `)}
               </div>

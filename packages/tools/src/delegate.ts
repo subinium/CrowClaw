@@ -10,6 +10,18 @@ import type {
 } from '@crowclaw/core';
 import { AgentLoop } from '@crowclaw/core';
 
+/** Tools denied by default if deniedTools is not explicitly provided. */
+const DEFAULT_DENIED_TOOLS = ['terminal.exec', 'terminal.background'];
+
+export interface DelegationResult {
+  childSessionId: string;
+  toolsUsed: string[];
+  iterationsRun: number;
+  durationMs: number;
+  success: boolean;
+  summary: string;
+}
+
 export interface DelegateToolOptions {
   provider: ProviderAdapter;
   tools: ToolCatalog & ToolExecutor;
@@ -18,6 +30,16 @@ export interface DelegateToolOptions {
   maxConcurrent?: number;
   maxIterations?: number;
   blockedTools?: string[];
+  /** Whitelist: if set, child only gets these tools. */
+  allowedTools?: string[];
+  /** Blacklist: child gets all tools except these. Defaults to ['terminal.exec', 'terminal.background']. */
+  deniedTools?: string[];
+  /** Abort child after this duration (ms). Default: 120_000. */
+  timeoutMs?: number;
+  /** Whether child inherits parent credentials. Default: true. */
+  inheritCredentials?: boolean;
+  /** Callback invoked when a child task completes. */
+  onComplete?: (result: DelegationResult) => void;
 }
 
 export interface DelegateTaskResult {
@@ -25,6 +47,9 @@ export interface DelegateTaskResult {
   response: string;
   toolsUsed: string[];
   success: boolean;
+  childSessionId: string;
+  iterationsRun: number;
+  durationMs: number;
 }
 
 /**
@@ -41,6 +66,11 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
     maxConcurrent = 3,
     maxIterations = 50,
     blockedTools = ['delegate.task', 'clarify.ask', 'send.message'],
+    allowedTools,
+    deniedTools,
+    timeoutMs = 120_000,
+    inheritCredentials = true,
+    onComplete,
   } = options;
 
   return {
@@ -80,6 +110,16 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
       const childMaxIterations =
         typeof input.maxIterations === 'number' ? input.maxIterations : maxIterations;
 
+      // Per-call overrides for toolset isolation
+      const inputAllowedTools = Array.isArray(input.allowedTools)
+        ? input.allowedTools.filter((t): t is string => typeof t === 'string')
+        : undefined;
+      const inputDeniedTools = Array.isArray(input.deniedTools)
+        ? input.deniedTools.filter((t): t is string => typeof t === 'string')
+        : undefined;
+      const inputTimeoutMs =
+        typeof input.timeoutMs === 'number' ? input.timeoutMs : timeoutMs;
+
       if (!task && tasks.length === 0) {
         return {
           toolName: 'delegate.task',
@@ -89,7 +129,17 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
         };
       }
 
-      const filteredTools = new FilteredToolCatalogExecutor(tools, blockedTools);
+      // Resolve toolset: allowedTools (whitelist) takes precedence over deniedTools (blacklist).
+      // deniedTools defaults to DEFAULT_DENIED_TOOLS when neither is explicitly set.
+      const effectiveAllowed = inputAllowedTools ?? allowedTools;
+      const effectiveDenied = inputDeniedTools ?? deniedTools;
+      const filteredTools = buildFilteredTools(
+        tools,
+        blockedTools,
+        effectiveAllowed,
+        effectiveDenied,
+      );
+
       const depth = typeof currentDepth === 'number' ? currentDepth + 1 : 1;
 
       const runChild = async (childTask: string): Promise<DelegateTaskResult> => {
@@ -104,13 +154,34 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
           concurrentToolCalls: true,
         });
 
+        // Set up timeout + cancellation abort controller
+        const childAbortController = new AbortController();
+        const timeoutHandle = setTimeout(() => {
+          childAbortController.abort(new Error(`Delegate task timed out after ${inputTimeoutMs}ms`));
+        }, inputTimeoutMs);
+
+        // Wire parent signal to child abort controller
+        const parentSignal = context.signal;
+        const onParentAbort = (): void => {
+          childAbortController.abort(parentSignal?.reason ?? new Error('Parent cancelled'));
+        };
+        if (parentSignal) {
+          if (parentSignal.aborted) {
+            childAbortController.abort(parentSignal.reason ?? new Error('Parent already aborted'));
+          } else {
+            parentSignal.addEventListener('abort', onParentAbort, { once: true });
+          }
+        }
+
+        const startTime = Date.now();
+
         try {
           const childContext: ToolExecutionContext = {
             agentId: context.agentId,
             sessionId: childSessionId,
             workspaceId: context.workspaceId,
-            env: context.env,
-            signal: context.signal,
+            env: inheritCredentials ? context.env : undefined,
+            signal: childAbortController.signal,
           };
           // Attach depth metadata so recursive delegates are blocked
           (childContext as unknown as Record<string, unknown>).__delegateDepth = depth;
@@ -121,25 +192,61 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
             userMessage: childTask,
             systemPrompt,
             workspaceId: context.workspaceId,
-            signal: context.signal,
+            signal: childAbortController.signal,
           });
 
+          const durationMs = Date.now() - startTime;
           const toolsUsed = result.toolResults.map((r) => r.toolName);
+          const iterationsRun = result.toolResults.length;
+
+          const delegationResult: DelegationResult = {
+            childSessionId,
+            toolsUsed,
+            iterationsRun,
+            durationMs,
+            success: true,
+            summary: result.finalResponse,
+          };
+          onComplete?.(delegationResult);
+
           return {
             task: childTask,
             response: result.finalResponse,
             toolsUsed,
             success: true,
+            childSessionId,
+            iterationsRun,
+            durationMs,
           };
         } catch (error: unknown) {
+          const durationMs = Date.now() - startTime;
           const message =
             error instanceof Error ? error.message : String(error);
+
+          const delegationResult: DelegationResult = {
+            childSessionId,
+            toolsUsed: [],
+            iterationsRun: 0,
+            durationMs,
+            success: false,
+            summary: `Child agent failed: ${message}`,
+          };
+          onComplete?.(delegationResult);
+
           return {
             task: childTask,
             response: `Child agent failed: ${message}`,
             toolsUsed: [],
             success: false,
+            childSessionId,
+            iterationsRun: 0,
+            durationMs,
           };
+        } finally {
+          clearTimeout(timeoutHandle);
+          if (parentSignal && !parentSignal.aborted) {
+            parentSignal.removeEventListener('abort', onParentAbort);
+          }
         }
       };
 
@@ -179,6 +286,30 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
       };
     },
   };
+}
+
+/**
+ * Builds a filtered tool catalog/executor based on allow/deny lists.
+ * Priority: blockedTools are always blocked. If allowedTools is set (whitelist mode),
+ * only those tools pass. Otherwise, deniedTools (or DEFAULT_DENIED_TOOLS) are blocked.
+ */
+function buildFilteredTools(
+  parent: ToolCatalog & ToolExecutor,
+  blockedTools: string[],
+  allowedTools: string[] | undefined,
+  deniedTools: string[] | undefined,
+): FilteredToolCatalogExecutor {
+  if (allowedTools) {
+    // Whitelist mode: only allowed tools pass, minus any blocked tools
+    const allowedSet = new Set(allowedTools);
+    const allNames = parent.list().map((m) => m.name);
+    const denyList = allNames.filter((name) => !allowedSet.has(name));
+    return new FilteredToolCatalogExecutor(parent, [...new Set([...denyList, ...blockedTools])]);
+  }
+
+  // Blacklist mode: blocked + denied + default denied
+  const effectiveDenied = deniedTools ?? DEFAULT_DENIED_TOOLS;
+  return new FilteredToolCatalogExecutor(parent, [...new Set([...blockedTools, ...effectiveDenied])]);
 }
 
 /**

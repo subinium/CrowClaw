@@ -63,4 +63,29 @@ describe('executeWithRetry', () => {
     expect(result.ok).toBe(true);
     expect(result.value).toEqual({ id: 42, name: 'test' });
   });
+
+  it('aborts mid-retry when signal fires during backoff', async () => {
+    const controller = new AbortController();
+    let callCount = 0;
+
+    const resultPromise = executeWithRetry(
+      async () => {
+        callCount++;
+        if (callCount === 1) {
+          // Abort during the backoff sleep after first failure
+          setTimeout(() => controller.abort(), 5);
+          throw new Error('first fail');
+        }
+        return 'should not reach';
+      },
+      { maxAttempts: 5, baseDelayMs: 200 },
+      controller.signal,
+    );
+
+    const result = await resultPromise;
+    expect(result.ok).toBe(false);
+    expect(callCount).toBe(1); // Only ran once before abort cut the retry
+    // After abort during backoff, the next iteration's abort check fires
+    expect(result.lastError).toBe('aborted');
+  });
 });

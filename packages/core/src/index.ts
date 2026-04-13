@@ -10,6 +10,7 @@ import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanC
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
 export type ToolDangerLevel = 'low' | 'medium' | 'high';
+export type ToolSafetyLevel = 'read-only' | 'destructive' | 'idempotent';
 
 export interface ConversationMessage {
   role: Role;
@@ -29,6 +30,7 @@ export interface ToolManifest {
   requiresWorkspace: boolean;
   requiresNetwork: boolean;
   dangerLevel: ToolDangerLevel;
+  safety?: ToolSafetyLevel;
   inputSchema?: Record<string, unknown>;
 }
 
@@ -711,6 +713,36 @@ export class AgentLoop {
     return { ...result, output: redacted, metadata: { ...result.metadata, securityRedacted: true } };
   }
 
+  /**
+   * Partition tool calls by safety level for controlled concurrent execution.
+   * - read-only and idempotent/undefined tools run in parallel first
+   * - destructive tools run sequentially after
+   * Returns null if no tools have safety annotations (caller should use default behavior).
+   */
+  private partitionToolCallsBySafety(toolCalls: ToolCall[]): {
+    parallel: ToolCall[];
+    destructive: ToolCall[];
+  } | null {
+    let hasAnySafety = false;
+    const parallel: ToolCall[] = [];
+    const destructive: ToolCall[] = [];
+
+    for (const tc of toolCalls) {
+      const def = this.tools.get(tc.name);
+      const safety = def?.manifest.safety;
+      if (safety) hasAnySafety = true;
+
+      if (safety === 'destructive') {
+        destructive.push(tc);
+      } else {
+        parallel.push(tc);
+      }
+    }
+
+    if (!hasAnySafety) return null;
+    return { parallel, destructive };
+  }
+
   private async executeToolCall(toolCall: ToolCall, input: AgentRunInput): Promise<ToolExecutionResult> {
     const context: ToolExecutionContext = {
       agentId: input.agentId,
@@ -915,6 +947,7 @@ export class AgentLoop {
     }
 
     let errorReflectionCount = 0;
+    let iterationsCompleted = 0;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
       ensureNotAborted(input.signal);
@@ -955,8 +988,33 @@ export class AgentLoop {
         }
       }
 
-      const iterationResults = this.concurrentToolCalls && currentResponse.toolCalls.length > 1
-        ? await Promise.allSettled(currentResponse.toolCalls.map((toolCall) => this.executeToolCall(toolCall, input)))
+      let iterationResults: ToolExecutionResult[];
+      if (this.concurrentToolCalls && currentResponse.toolCalls.length > 1) {
+        const safetyPartition = this.partitionToolCallsBySafety(currentResponse.toolCalls);
+        if (safetyPartition) {
+          // Safety-aware execution: parallel first, then destructive sequentially
+          const parallelResults = safetyPartition.parallel.length > 0
+            ? await Promise.allSettled(safetyPartition.parallel.map((toolCall) => this.executeToolCall(toolCall, input)))
+                .then((settled) => settled.map((s, i) =>
+                  s.status === 'fulfilled'
+                    ? s.value
+                    : {
+                        toolName: safetyPartition.parallel[i]?.name ?? 'unknown',
+                        runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
+                        ok: false,
+                        output: s.reason instanceof Error ? s.reason.message : String(s.reason),
+                      }
+                ))
+            : [];
+          const destructiveResults: ToolExecutionResult[] = [];
+          for (const toolCall of safetyPartition.destructive) {
+            const result = await this.executeToolCall(toolCall, input);
+            destructiveResults.push(result);
+          }
+          iterationResults = [...parallelResults, ...destructiveResults];
+        } else {
+          // No safety annotations: fall back to all-parallel
+          iterationResults = await Promise.allSettled(currentResponse.toolCalls.map((toolCall) => this.executeToolCall(toolCall, input)))
             .then((settled) => settled.map((s, i) =>
               s.status === 'fulfilled'
                 ? s.value
@@ -966,13 +1024,16 @@ export class AgentLoop {
                     ok: false,
                     output: s.reason instanceof Error ? s.reason.message : String(s.reason),
                   }
-            ))
-        : await currentResponse.toolCalls.reduce<Promise<ToolExecutionResult[]>>(async (accPromise, toolCall) => {
+            ));
+        }
+      } else {
+        iterationResults = await currentResponse.toolCalls.reduce<Promise<ToolExecutionResult[]>>(async (accPromise, toolCall) => {
             const acc = await accPromise;
             const result = await this.executeToolCall(toolCall, input);
             acc.push(result);
             return acc;
           }, Promise.resolve([]));
+      }
 
       const encounteredToolError = iterationResults.some((result) => !result.ok);
       const iterationWarning = budgetStatus(iteration + 1, this.maxToolIterations, this.budgetWarningThreshold, this.budgetCriticalThreshold);
@@ -1081,9 +1142,10 @@ export class AgentLoop {
       // Track 1.2: Record usage from subsequent provider calls
       totalTokensConsumed = this.recordUsage(currentResponse);
       finalResponse = currentResponse.assistantMessage ?? finalResponse;
+      iterationsCompleted = iteration + 1;
     }
 
-    if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && toolResults.length >= this.maxToolIterations) {
+    if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && iterationsCompleted >= this.maxToolIterations) {
       if (this.synthesizeOnExhaustion) {
         // Exhaustion synthesis: one final call with no tools to force a text answer
         nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
@@ -1243,6 +1305,8 @@ export class AgentLoop {
     }
 
     let streamErrorReflectionCount = 0;
+    let streamIterationsCompleted = 0;
+    let lastStreamHadToolCalls = false;
 
     try {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
@@ -1319,9 +1383,12 @@ export class AgentLoop {
 
         // If no tool calls, we're done
         if (streamToolCalls.length === 0) {
+          lastStreamHadToolCalls = false;
           yield { type: 'iteration-end', iteration };
           break;
         }
+
+        lastStreamHadToolCalls = true;
 
         // Push assistant message
         nextMessages.push({
@@ -1334,38 +1401,76 @@ export class AgentLoop {
         let encounteredToolError = false;
         const iterationToolResults: ToolExecutionResult[] = [];
         if (this.concurrentToolCalls && streamToolCalls.length > 1) {
-          // Emit all tool-start events
-          const concurrentStartTime = Date.now();
-          for (const tc of streamToolCalls) {
-            const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
-            (tc as any)._resolvedId = toolCallId;
-            yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
-          }
-          // Execute all in parallel
           const runInput: AgentRunInput = {
             agentId: session.agentId,
             sessionId: session.sessionId,
             userMessage,
             signal,
           };
-          const settled = await Promise.allSettled(
-            streamToolCalls.map((tc) => this.executeToolCall(tc, runInput))
-          );
-          // Emit all tool-end events and collect results
-          for (let i = 0; i < settled.length; i++) {
-            const tc = streamToolCalls[i];
-            const toolCallId = (tc as any)._resolvedId ?? `tc-${tc.name}`;
-            const s = settled[i];
-            const result: ToolExecutionResult = s.status === 'fulfilled'
-              ? s.value
-              : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
-
-            toolResults.push(result);
-            iterationToolResults.push(result);
-            nextMessages.push(toolMessage(result, this.maxToolResultLength));
-            yield { type: 'tool-end' as const, toolName: tc.name, toolCallId, result: result.output, ok: result.ok, durationMs: Date.now() - concurrentStartTime };
-
-            if (!result.ok) encounteredToolError = true;
+          const safetyPartition = this.partitionToolCallsBySafety(streamToolCalls);
+          if (safetyPartition) {
+            // Safety-aware streaming execution
+            const concurrentStartTime = Date.now();
+            // Emit tool-start for parallel tools, execute in parallel
+            for (const tc of safetyPartition.parallel) {
+              const toolCallId = (tc as ToolCall & { id?: string }).id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
+              (tc as any)._resolvedId = toolCallId;
+              yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
+            }
+            if (safetyPartition.parallel.length > 0) {
+              const settled = await Promise.allSettled(
+                safetyPartition.parallel.map((tc) => this.executeToolCall(tc, runInput))
+              );
+              for (let i = 0; i < settled.length; i++) {
+                const tc = safetyPartition.parallel[i];
+                const toolCallId = (tc as any)._resolvedId ?? `tc-${tc.name}`;
+                const s = settled[i];
+                const result: ToolExecutionResult = s.status === 'fulfilled'
+                  ? s.value
+                  : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
+                toolResults.push(result);
+                iterationToolResults.push(result);
+                nextMessages.push(toolMessage(result, this.maxToolResultLength));
+                yield { type: 'tool-end' as const, toolName: tc.name, toolCallId, result: result.output, ok: result.ok, durationMs: Date.now() - concurrentStartTime };
+                if (!result.ok) encounteredToolError = true;
+              }
+            }
+            // Execute destructive tools sequentially
+            for (const tc of safetyPartition.destructive) {
+              const toolCallId = (tc as ToolCall & { id?: string }).id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
+              const toolStartTime = Date.now();
+              yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
+              const result = await this.executeToolCall(tc, runInput);
+              toolResults.push(result);
+              iterationToolResults.push(result);
+              nextMessages.push(toolMessage(result, this.maxToolResultLength));
+              yield { type: 'tool-end' as const, toolName: tc.name, toolCallId, result: result.output, ok: result.ok, durationMs: Date.now() - toolStartTime };
+              if (!result.ok) encounteredToolError = true;
+            }
+          } else {
+            // No safety annotations: fall back to all-parallel
+            const concurrentStartTime = Date.now();
+            for (const tc of streamToolCalls) {
+              const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
+              (tc as any)._resolvedId = toolCallId;
+              yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
+            }
+            const settled = await Promise.allSettled(
+              streamToolCalls.map((tc) => this.executeToolCall(tc, runInput))
+            );
+            for (let i = 0; i < settled.length; i++) {
+              const tc = streamToolCalls[i];
+              const toolCallId = (tc as any)._resolvedId ?? `tc-${tc.name}`;
+              const s = settled[i];
+              const result: ToolExecutionResult = s.status === 'fulfilled'
+                ? s.value
+                : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
+              toolResults.push(result);
+              iterationToolResults.push(result);
+              nextMessages.push(toolMessage(result, this.maxToolResultLength));
+              yield { type: 'tool-end' as const, toolName: tc.name, toolCallId, result: result.output, ok: result.ok, durationMs: Date.now() - concurrentStartTime };
+              if (!result.ok) encounteredToolError = true;
+            }
           }
         } else {
           for (const tc of streamToolCalls) {
@@ -1483,7 +1588,35 @@ export class AgentLoop {
           await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
         }
 
+        streamIterationsCompleted = iteration + 1;
         yield { type: 'iteration-end', iteration };
+      }
+
+      // Synthesize on exhaustion (mirrors run() behavior)
+      if (lastStreamHadToolCalls && streamIterationsCompleted >= this.maxToolIterations && this.synthesizeOnExhaustion) {
+        nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
+        const synthesisRequest: ProviderRequest = {
+          systemPrompt: this.buildSystemPromptForRequest({
+            basePrompt: userMessage,
+            runtimeName: this.runtimeName,
+            sessionId: session.sessionId,
+            availableTools: [],
+            agentPreset: this.agentPreset,
+          }),
+          messages: nextMessages,
+          availableTools: [],
+          signal,
+        };
+        if (streamingProvider) {
+          let synthesisText = '';
+          for await (const chunk of streamingProvider.generateStream(synthesisRequest)) {
+            if (chunk.type === 'text' && chunk.text) {
+              synthesisText += chunk.text;
+              yield { type: 'text-delta', content: chunk.text };
+            }
+          }
+          if (synthesisText) finalResponse = synthesisText;
+        }
       }
 
       // Save completion checkpoint
@@ -1558,3 +1691,5 @@ export {
 } from './persona.js';
 
 export { collectStream, textStream, type StreamChunk, type StreamingProviderAdapter } from './streaming.js';
+
+export { compressWithStructure, mergeStructuredSummaries, formatStructuredSummary, type StructuredSummary, type StructuredCompressionResult, type StructuredCompressionOptions } from './structured-compression.js';

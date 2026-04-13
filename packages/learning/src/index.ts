@@ -498,3 +498,41 @@ export {
   createLlmSkillExtractor,
   type SkillExtractionProvider,
 } from './refinement.js';
+
+export {
+  compressTrajectory,
+  type CompressionStrategy,
+  type CompressedTrajectory,
+} from './trajectory-compressor.js';
+
+export {
+  scoreTrajectory,
+  type TrajectoryScore,
+} from './trajectory-scorer.js';
+
+export {
+  exportDPO,
+  exportSFT,
+  filterByScore,
+  rankByScore,
+} from './rl-export.js';
+
+export {
+  SkillMetricsTracker,
+  type SkillUsageRecord,
+  type SkillMetrics,
+} from './skill-metrics.js';
+
+export {
+  skillSimilarity,
+  findDuplicates,
+  mergeSkills,
+  type DedupResult,
+} from './skill-dedup.js';
+
+export {
+  generateImprovementPlan,
+  detectCompletionEnhanced,
+  type ImprovementAction,
+  type ImprovementPlan,
+} from './auto-improver.js';

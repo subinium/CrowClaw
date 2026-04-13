@@ -47,27 +47,29 @@ interface SecurityEvent {
   detail: string;
 }
 
-interface UsageModel {
-  model: string;
-  tokens: number;
-  cost: number;
-  requests: number;
-}
-
 interface UsageEntry {
   timestamp: string;
   model: string;
-  tokens: number;
-  cost: number;
+  provider: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedTokens: number;
+  costUsd: number;
+  latencyMs: number;
 }
 
 interface UsageData {
-  summary: { totalTokens: number; totalCost: number; totalRequests: number };
-  models: UsageModel[];
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalTokens: number;
+  totalCostUsd: number;
+  avgLatencyMs: number;
   entries: UsageEntry[];
+  byModel: Record<string, { tokens: number; cost: number; calls: number }>;
 }
 
-interface MemoryItem {
+interface MemoryRecord {
   id: string;
   key: string;
   value: string;
@@ -75,13 +77,18 @@ interface MemoryItem {
   timestamp: string;
 }
 
+interface SessionSummary {
+  sessionId: string;
+  title: string;
+  updatedAt: string;
+}
+
 type SettingsTab =
   | 'agent'
   | 'security'
   | 'usage'
   | 'system'
-  | 'memory'
-  | 'logs';
+  | 'memory';
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -93,7 +100,6 @@ const TABS: { key: SettingsTab; label: string }[] = [
   { key: 'usage', label: 'Usage' },
   { key: 'system', label: 'System' },
   { key: 'memory', label: 'Memory' },
-  { key: 'logs', label: 'Logs' },
 ];
 
 const SCOPES = ['All', 'Session', 'User', 'Workspace'] as const;
@@ -570,14 +576,13 @@ export class SettingsView extends LitElement {
   // System
   @state() private systemConfig: Record<string, string> = {};
 
-  // Memory
-  @state() private memories: MemoryItem[] = [];
+  // Memory (session-scoped: backend has /api/sessions/{id}/memories, no global endpoint)
+  @state() private memorySessions: SessionSummary[] = [];
+  @state() private memorySessionId: string | null = null;
+  @state() private memories: MemoryRecord[] = [];
   @state() private memorySearch = '';
   @state() private memoryScope = 'All';
   @state() private selectedMemoryId: string | null = null;
-
-  // Logs
-  @state() private logLines: string[] = [];
 
   /* ---------------------------------------------------------------- */
   /*  Lifecycle                                                       */
@@ -608,17 +613,14 @@ export class SettingsView extends LitElement {
         this._loadSystem();
         break;
       case 'memory':
-        this._loadMemories();
-        break;
-      case 'logs':
-        this._loadLogs();
+        this._loadMemorySessions();
         break;
     }
   }
 
   private async _loadAgentConfig() {
     try {
-      const data = await api<AgentConfig>('/api/agent/config');
+      const data = await api<AgentConfig>('/api/config/agent');
       this.agentConfig = data;
     } catch {
       this.agentConfig = {
@@ -665,35 +667,59 @@ export class SettingsView extends LitElement {
 
   private async _loadSystem() {
     try {
-      const data = await api<Record<string, string>>('/api/system/config');
-      this.systemConfig = data;
+      const data = await api<Record<string, unknown>>('/api/config/snapshot');
+      // Flatten the snapshot into displayable key-value pairs
+      const flat: Record<string, string> = {};
+      for (const [k, v] of Object.entries(data)) {
+        flat[k] = typeof v === 'string' ? v : JSON.stringify(v);
+      }
+      this.systemConfig = flat;
     } catch {
       this.systemConfig = {};
     }
   }
 
-  private async _loadMemories() {
+  private async _loadMemorySessions() {
     try {
-      const params = new URLSearchParams();
-      if (this.memoryScope !== 'All') params.set('scope', this.memoryScope);
-      if (this.memorySearch) params.set('search', this.memorySearch);
-      const q = params.toString();
-      const data = await api<{ memories: MemoryItem[] }>(
-        `/api/memory${q ? `?${q}` : ''}`,
+      const data = await api<{ sessions: SessionSummary[] }>('/api/sessions');
+      this.memorySessions = (data.sessions || []).sort(
+        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
       );
-      this.memories = data.memories || [];
+      // Auto-select first session if none selected
+      if (!this.memorySessionId && this.memorySessions.length > 0) {
+        this.memorySessionId = this.memorySessions[0].sessionId;
+        this._loadMemories();
+      }
     } catch {
-      this.memories = [];
+      this.memorySessions = [];
     }
   }
 
-  private async _loadLogs() {
+  private async _loadMemories() {
+    if (!this.memorySessionId) {
+      this.memories = [];
+      return;
+    }
     try {
-      const data = await api<{ lines: string[] }>('/api/logs');
-      this.logLines = data.lines || [];
-      this._scrollLogsToBottom();
+      const params = new URLSearchParams();
+      if (this.memoryScope !== 'All') params.set('scope', this.memoryScope);
+      const q = params.toString();
+      const data = await api<{ records: MemoryRecord[] }>(
+        `/api/sessions/${this.memorySessionId}/memories${q ? `?${q}` : ''}`,
+      );
+      let records = data.records || [];
+      // Client-side search filter
+      if (this.memorySearch) {
+        const term = this.memorySearch.toLowerCase();
+        records = records.filter(
+          (m) =>
+            m.key.toLowerCase().includes(term) ||
+            m.value.toLowerCase().includes(term),
+        );
+      }
+      this.memories = records;
     } catch {
-      this.logLines = [];
+      this.memories = [];
     }
   }
 
@@ -706,7 +732,7 @@ export class SettingsView extends LitElement {
     this.agentSaving = true;
     this.agentStatus = null;
     try {
-      await api('/api/agent/config', {
+      await api('/api/config/agent', {
         method: 'POST',
         body: JSON.stringify(this.agentConfig),
       });
@@ -764,7 +790,7 @@ export class SettingsView extends LitElement {
 
   private async _deleteMemory(id: string) {
     try {
-      await api(`/api/memory/${id}`, { method: 'DELETE' });
+      await api(`/api/memories/${id}`, { method: 'DELETE' });
       this.memories = this.memories.filter((m) => m.id !== id);
       if (this.selectedMemoryId === id) {
         this.selectedMemoryId = null;
@@ -772,13 +798,6 @@ export class SettingsView extends LitElement {
     } catch {
       /* ignore */
     }
-  }
-
-  private _scrollLogsToBottom() {
-    this.updateComplete.then(() => {
-      const el = this.shadowRoot?.querySelector('.log-output');
-      if (el) el.scrollTop = el.scrollHeight;
-    });
   }
 
   /* ---------------------------------------------------------------- */
@@ -825,8 +844,6 @@ export class SettingsView extends LitElement {
         return this._renderSystem();
       case 'memory':
         return this._renderMemory();
-      case 'logs':
-        return this._renderLogs();
       default:
         return nothing;
     }
@@ -1103,21 +1120,29 @@ export class SettingsView extends LitElement {
               <div class="summary-row">
                 <div class="summary-card">
                   <div class="label">Total Tokens</div>
-                  <div class="value">${formatTokens(usage.summary.totalTokens)}</div>
+                  <div class="value">${formatTokens(usage.totalTokens)}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Input Tokens</div>
+                  <div class="value">${formatTokens(usage.totalInputTokens)}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Output Tokens</div>
+                  <div class="value">${formatTokens(usage.totalOutputTokens)}</div>
                 </div>
                 <div class="summary-card">
                   <div class="label">Total Cost</div>
-                  <div class="value">${formatCost(usage.summary.totalCost)}</div>
+                  <div class="value">${formatCost(usage.totalCostUsd)}</div>
                 </div>
                 <div class="summary-card">
-                  <div class="label">Total Requests</div>
-                  <div class="value">${usage.summary.totalRequests}</div>
+                  <div class="label">Avg Latency</div>
+                  <div class="value">${Math.round(usage.avgLatencyMs)}ms</div>
                 </div>
               </div>
 
               <!-- Per-model breakdown -->
               <div class="sec-h">Per-Model Breakdown</div>
-              ${usage.models.length > 0
+              ${Object.keys(usage.byModel).length > 0
                 ? html`
                     <div class="sub-card" style="overflow-x:auto;margin-bottom:var(--sp-5)">
                       <table class="data-table">
@@ -1126,19 +1151,19 @@ export class SettingsView extends LitElement {
                             <th>Model</th>
                             <th>Tokens</th>
                             <th>Cost</th>
-                            <th>Requests</th>
+                            <th>Calls</th>
                           </tr>
                         </thead>
                         <tbody>
-                          ${usage.models.map(
-                            (m) => html`
+                          ${Object.entries(usage.byModel).map(
+                            ([model, stats]) => html`
                               <tr>
                                 <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
-                                  ${m.model}
+                                  ${model}
                                 </td>
-                                <td>${formatTokens(m.tokens)}</td>
-                                <td>${formatCost(m.cost)}</td>
-                                <td>${m.requests}</td>
+                                <td>${formatTokens(stats.tokens)}</td>
+                                <td>${formatCost(stats.cost)}</td>
+                                <td>${stats.calls}</td>
                               </tr>
                             `,
                           )}
@@ -1160,8 +1185,11 @@ export class SettingsView extends LitElement {
                           <tr>
                             <th>Time</th>
                             <th>Model</th>
-                            <th>Tokens</th>
+                            <th>Input</th>
+                            <th>Output</th>
+                            <th>Total</th>
                             <th>Cost</th>
+                            <th>Latency</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -1174,8 +1202,11 @@ export class SettingsView extends LitElement {
                                 <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
                                   ${e.model}
                                 </td>
-                                <td>${formatTokens(e.tokens)}</td>
-                                <td>${formatCost(e.cost)}</td>
+                                <td>${formatTokens(e.inputTokens)}</td>
+                                <td>${formatTokens(e.outputTokens)}</td>
+                                <td>${formatTokens(e.totalTokens)}</td>
+                                <td>${formatCost(e.costUsd)}</td>
+                                <td>${Math.round(e.latencyMs)}ms</td>
                               </tr>
                             `,
                           )}
@@ -1230,103 +1261,113 @@ export class SettingsView extends LitElement {
       <div class="section-block">
         <div class="section-header">Memory Browser</div>
 
-        <input
-          class="srch"
-          type="text"
-          placeholder="Search memories..."
-          .value=${this.memorySearch}
-          @input=${(e: InputEvent) => {
-            this.memorySearch = (e.target as HTMLInputElement).value;
-            this._loadMemories();
-          }}
-        />
-
-        <div class="scope-row">
-          ${SCOPES.map(
-            (s) => html`
-              <button
-                class="scope-btn ${this.memoryScope === s ? 'active' : ''}"
-                @click=${() => {
-                  this.memoryScope = s;
-                  this._loadMemories();
-                }}
-              >
-                ${s}
-              </button>
-            `,
-          )}
+        <!-- Session selector -->
+        <div class="filter-row" style="margin-bottom:var(--sp-3)">
+          <select
+            @change=${(e: Event) => {
+              this.memorySessionId = (e.target as HTMLSelectElement).value || null;
+              this.selectedMemoryId = null;
+              this._loadMemories();
+            }}
+          >
+            <option value="">Select session...</option>
+            ${this.memorySessions.map(
+              (s) => html`
+                <option
+                  value=${s.sessionId}
+                  ?selected=${this.memorySessionId === s.sessionId}
+                >
+                  ${s.title || s.sessionId}
+                </option>
+              `,
+            )}
+          </select>
         </div>
 
-        ${this.memories.length > 0
+        ${this.memorySessionId
           ? html`
-              <div class="mem-list">
-                ${this.memories.map(
-                  (m) => html`
-                    <div
-                      class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
+              <input
+                class="srch"
+                type="text"
+                placeholder="Search memories..."
+                .value=${this.memorySearch}
+                @input=${(e: InputEvent) => {
+                  this.memorySearch = (e.target as HTMLInputElement).value;
+                  this._loadMemories();
+                }}
+              />
+
+              <div class="scope-row">
+                ${SCOPES.map(
+                  (s) => html`
+                    <button
+                      class="scope-btn ${this.memoryScope === s ? 'active' : ''}"
                       @click=${() => {
-                        this.selectedMemoryId =
-                          this.selectedMemoryId === m.id ? null : m.id;
+                        this.memoryScope = s;
+                        this._loadMemories();
                       }}
                     >
-                      <div class="mem-header">
-                        <span class="mem-key">${m.key}</span>
-                        <div class="mem-meta">
-                          <span class="tag">${m.scope}</span>
-                          <span style="font-size:var(--text-xs);color:var(--text-muted)">
-                            ${formatTime(m.timestamp)}
-                          </span>
-                        </div>
-                      </div>
-                      <div class="mem-preview">
-                        ${m.value.length > 120
-                          ? `${m.value.slice(0, 120)}...`
-                          : m.value}
-                      </div>
-                    </div>
+                      ${s}
+                    </button>
                   `,
                 )}
               </div>
 
-              ${selected
+              ${this.memories.length > 0
                 ? html`
-                    <div class="mem-detail">
-                      <div class="mem-detail-header">
-                        <span class="mem-detail-key">${selected.key}</span>
-                        <button
-                          class="btn btn-danger"
-                          @click=${() => this._deleteMemory(selected.id)}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                      <div class="mem-detail-body">${selected.value}</div>
+                    <div class="mem-list">
+                      ${this.memories.map(
+                        (m) => html`
+                          <div
+                            class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
+                            @click=${() => {
+                              this.selectedMemoryId =
+                                this.selectedMemoryId === m.id ? null : m.id;
+                            }}
+                          >
+                            <div class="mem-header">
+                              <span class="mem-key">${m.key}</span>
+                              <div class="mem-meta">
+                                <span class="tag">${m.scope}</span>
+                                <span style="font-size:var(--text-xs);color:var(--text-muted)">
+                                  ${formatTime(m.timestamp)}
+                                </span>
+                              </div>
+                            </div>
+                            <div class="mem-preview">
+                              ${m.value.length > 120
+                                ? `${m.value.slice(0, 120)}...`
+                                : m.value}
+                            </div>
+                          </div>
+                        `,
+                      )}
                     </div>
+
+                    ${selected
+                      ? html`
+                          <div class="mem-detail">
+                            <div class="mem-detail-header">
+                              <span class="mem-detail-key">${selected.key}</span>
+                              <button
+                                class="btn btn-danger"
+                                @click=${() => this._deleteMemory(selected.id)}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                            <div class="mem-detail-body">${selected.value}</div>
+                          </div>
+                        `
+                      : nothing}
                   `
-                : nothing}
+                : html`<div class="status-msg" style="color:var(--text-muted)">
+                    No memories found for this session.
+                  </div>`}
             `
           : html`<div class="status-msg" style="color:var(--text-muted)">
-              No memories found.
+              Select a session to browse its memories.
             </div>`}
-      </div>
-    `;
-  }
-
-  /* ---- Logs ---- */
-
-  private _renderLogs() {
-    return html`
-      <div class="section-block">
-        <div class="actions-row">
-          <div class="section-header" style="border:none;padding:0;margin:0">Logs</div>
-          <button class="btn" @click=${this._loadLogs}>Refresh</button>
-        </div>
-
-        <div class="log-output">
-          ${this.logLines.length > 0
-            ? this.logLines.join('\n')
-            : 'No log output available.'}
-        </div>
       </div>
     `;
   }

@@ -423,10 +423,19 @@ describe('MEDIUM: Cookie-based authentication', () => {
     setEnvToken('my-secret-token');
     const runtime = createNodeRuntime({ hostname: '127.0.0.1' });
 
-    // Use cookie header instead of Authorization bearer
+    // Login to get the derived cookie token
+    const loginRes = await runtime.fetch(
+      makeRequest('/api/auth/verify', { method: 'POST', body: { token: 'my-secret-token' } })
+    );
+    const setCookie = loginRes.headers.get('set-cookie') ?? '';
+    const cookieMatch = setCookie.match(/crowclaw_auth=([^;]+)/);
+    expect(cookieMatch).not.toBeNull();
+    const cookieValue = cookieMatch![1];
+
+    // Use derived cookie for subsequent requests
     const response = await runtime.fetch(
       makeRequest('/api/system/status', {
-        headers: { cookie: 'crowclaw_auth=my-secret-token' },
+        headers: { cookie: `crowclaw_auth=${cookieValue}` },
       })
     );
 
@@ -437,10 +446,18 @@ describe('MEDIUM: Cookie-based authentication', () => {
     setEnvToken('my-secret-token');
     const runtime = createNodeRuntime({ hostname: '127.0.0.1' });
 
-    // With valid cookie
+    // Login to get the derived cookie token
+    const loginRes = await runtime.fetch(
+      makeRequest('/api/auth/verify', { method: 'POST', body: { token: 'my-secret-token' } })
+    );
+    const setCookie = loginRes.headers.get('set-cookie') ?? '';
+    const cookieMatch = setCookie.match(/crowclaw_auth=([^;]+)/);
+    const cookieValue = cookieMatch![1];
+
+    // With valid derived cookie
     const authed = await runtime.fetch(
       makeRequest('/api/auth/check', {
-        headers: { cookie: 'crowclaw_auth=my-secret-token' },
+        headers: { cookie: `crowclaw_auth=${cookieValue}` },
       })
     );
     expect(authed.status).toBe(200);

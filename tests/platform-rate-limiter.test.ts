@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PlatformRateLimiter } from '@crowclaw/gateway/platform-rate-limiter';
 
 describe('PlatformRateLimiter', () => {
@@ -51,5 +51,28 @@ describe('PlatformRateLimiter', () => {
     expect(limiter.check('sms')).toBe(false);
     // Telegram should still be available
     expect(limiter.check('telegram')).toBe(true);
+  });
+
+  it('resets after the 60-second window expires', () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new PlatformRateLimiter();
+
+      // Exhaust SMS limit (10/min)
+      for (let i = 0; i < 10; i++) {
+        limiter.check('sms');
+      }
+      expect(limiter.check('sms')).toBe(false);
+      expect(limiter.remaining('sms')).toBe(0);
+
+      // Advance past the 60s window
+      vi.advanceTimersByTime(61_000);
+
+      // Should be allowed again
+      expect(limiter.check('sms')).toBe(true);
+      expect(limiter.remaining('sms')).toBe(9);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

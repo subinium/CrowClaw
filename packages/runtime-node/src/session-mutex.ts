@@ -15,8 +15,19 @@
  */
 export class SessionMutex {
   private chains = new Map<string, Promise<void>>();
+  private readonly maxSessions: number;
+
+  constructor(options?: { maxSessions?: number }) {
+    this.maxSessions = options?.maxSessions ?? 10_000;
+  }
 
   async acquire(sessionId: string): Promise<() => void> {
+    // Evict oldest entries if at capacity (prevents unbounded memory growth)
+    if (this.chains.size >= this.maxSessions && !this.chains.has(sessionId)) {
+      const oldest = this.chains.keys().next().value;
+      if (oldest !== undefined) this.chains.delete(oldest);
+    }
+
     const existing = this.chains.get(sessionId) ?? Promise.resolve();
 
     let release!: () => void;
