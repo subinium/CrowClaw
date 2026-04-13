@@ -19,7 +19,7 @@ export interface SkillMetrics {
   /** Fraction of uses with high or medium completion confidence. */
   successRate: number;
   averageDurationMs: number;
-  /** Fraction of rated uses marked helpful. NaN if no ratings. */
+  /** Fraction of rated uses marked helpful. 0 if no ratings. */
   helpfulRate: number;
   lastUsedAt: string | null;
   trend: 'improving' | 'stable' | 'declining' | 'insufficient-data';

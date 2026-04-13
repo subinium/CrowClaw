@@ -73,7 +73,8 @@ export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {
       reconnectDelay = INITIAL_RECONNECT_DELAY;
       callbacks.onOpen?.();
 
-      send({ type: 'subscribe', channels: [] });
+      // Empty channels array = subscribe to all events (server treats non-array as "all")
+      send({ type: 'subscribe' });
     };
 
     ws.onmessage = (event: MessageEvent) => {

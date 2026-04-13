@@ -278,15 +278,26 @@ describe('WebSocketManager', () => {
       expect(messages.some((m: { type: string }) => m.type === 'chat:error')).toBe(false);
     });
 
-    it('calls abort handler on session:abort', () => {
+    it('calls abort handler on session:abort when authenticated', () => {
       const abortFn = vi.fn();
       manager.onAbort(abortFn);
 
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage(JSON.stringify({ type: 'session:abort', sessionId: 'sess-123' }));
       expect(abortFn).toHaveBeenCalledWith('sess-123');
+    });
+
+    it('ignores session:abort when not authenticated', () => {
+      const abortFn = vi.fn();
+      manager.onAbort(abortFn);
+
+      const ws = new MockWebSocket();
+      manager.addConnection(ws as unknown as WebSocket); // not authenticated
+
+      ws.simulateMessage(JSON.stringify({ type: 'session:abort', sessionId: 'sess-123' }));
+      expect(abortFn).not.toHaveBeenCalled();
     });
 
     it('ignores session:abort with no handler', () => {

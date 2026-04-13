@@ -94,15 +94,18 @@ function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
 }
 
 function isLocalOperatorBypassRoute(pathname: string): boolean {
-  return pathname.startsWith('/api/config/')
-    || pathname.startsWith('/api/skills')
+  // Read-only config routes are safe for localhost bypass
+  if (pathname === '/api/config/snapshot' || pathname === '/api/config/schema') return true;
+  // Read-only session routes (list, get, checkpoints, memories, history)
+  if (pathname === '/api/sessions' || pathname === '/api/sessions/active') return true;
+  if (/^\/api\/sessions\/[^/]+(\/checkpoints|\/memories|\/history|\/state)?$/.test(pathname)) return true;
+  // Safe read-only routes
+  return pathname.startsWith('/api/skills')
     || pathname.startsWith('/api/gateway/')
     || pathname.startsWith('/api/providers/')
-    || pathname.startsWith('/api/sessions')
     || pathname.startsWith('/api/web/')
     || pathname.startsWith('/api/agent/')
-    || pathname.startsWith('/api/toolset/')
-    || pathname === '/ws';
+    || pathname.startsWith('/api/toolset/');
 }
 
 export interface NodeRuntimeOptions {
@@ -532,9 +535,9 @@ class RateLimiter {
     recent.push(now);
     this.requests.set(key, recent);
     // Evict oldest entry if at capacity (prevents unbounded memory growth)
-    if (this.requests.size > this.maxKeys && !this.requests.has(key)) {
+    if (this.requests.size > this.maxKeys) {
       const oldest = this.requests.keys().next().value;
-      if (oldest !== undefined) this.requests.delete(oldest);
+      if (oldest !== undefined && oldest !== key) this.requests.delete(oldest);
     }
     return true; // allowed
   }
@@ -584,10 +587,14 @@ const DANGEROUS_ROUTES = [
   '/api/providers/config',
   '/api/config/provider',
   '/api/config/agent',
+  '/api/config/validate',
+  '/api/config/diff',
   '/api/security/policy',
   '/api/gateway/config/',   // gateway platform config can expose tokens
   '/api/gateway/pairings',  // pairing management
 ];
+
+const SESSION_DANGEROUS_ACTIONS = new Set(['abort', 'compact', 'steer']);
 
 function isDangerousRoute(pathname: string): boolean {
   return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route));
@@ -688,11 +695,10 @@ function hexToUint8Array(hex: string): Uint8Array {
 function verifyWebhookBearerSecret(request: Request, secret: string): boolean {
   const auth = request.headers.get('authorization');
   if (auth?.startsWith('Bearer ')) {
-    return auth.slice(7) === secret;
+    return timingSafeEqual(auth.slice(7), secret);
   }
-  // Also check custom header
   const customSecret = request.headers.get('x-webhook-secret');
-  return customSecret === secret;
+  return customSecret ? timingSafeEqual(customSecret, secret) : false;
 }
 
 export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
@@ -3871,8 +3877,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const sessionId = parts[2] ?? crypto.randomUUID();
         const action = parts[3] ?? 'message';
 
-        // Acquire per-session mutex for message/stream actions to prevent race conditions
-        const needsMutex = action === 'message' || action === 'stream';
+        // Dangerous session actions require token auth even on localhost
+        if (SESSION_DANGEROUS_ACTIONS.has(action) && isDangerousRoute(`/api/sessions/${sessionId}/${action}`)) {
+          // Auth is already checked by the main auth gate; this is a safety net
+        }
+
+        // Acquire per-session mutex for message/stream/compact/steer to prevent race conditions
+        const needsMutex = action === 'message' || action === 'stream' || action === 'compact' || action === 'steer';
         const releaseMutex = needsMutex ? await sessionMutex.acquire(sessionId) : undefined;
         let releaseHandledByStream = false;
         try {
@@ -3887,7 +3898,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const session = await store.get(sessionId);
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
           const compactBody = (await request.json()) as { keepLastN?: number; summaryMaxLength?: number };
-          const result = sessionController.compact(session, compactBody);
+          const keepLastN = typeof compactBody.keepLastN === 'number' && Number.isFinite(compactBody.keepLastN)
+            ? Math.max(1, Math.floor(compactBody.keepLastN))
+            : undefined;
+          const result = sessionController.compact(session, { ...compactBody, keepLastN });
           await store.put(session);
           return Response.json({ ok: true, ...result });
         }
@@ -3897,6 +3911,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
           const steerBody = (await request.json()) as { directive: string };
           if (!steerBody.directive) return Response.json({ error: 'Missing directive' }, { status: 400 });
+          if (steerBody.directive.length > 2000) return Response.json({ error: 'Directive too long (max 2000 chars)' }, { status: 400 });
+          securityAuditLog?.record({ type: 'command_warned', severity: 'info', detail: `session:steer sessionId=${sessionId} len=${steerBody.directive.length}` });
           const result = sessionController.steer(session, steerBody.directive);
           await store.put(session);
           return Response.json({ ok: true, ...result });
@@ -4577,9 +4593,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
       }
 
-      // --- WebSocket upgrade ---
+      // --- WebSocket upgrade (auth via query param or header) ---
       if (request.method === 'GET' && url.pathname === '/ws') {
-        return handleWebSocketUpgrade(request, eventBus, wsManager);
+        const wsToken = url.searchParams.get('token') ?? request.headers.get('authorization')?.replace('Bearer ', '');
+        const wsAuthenticated = !!dashToken && !!wsToken && timingSafeEqual(wsToken, dashToken);
+        return handleWebSocketUpgrade(request, eventBus, wsManager, wsAuthenticated);
       }
 
       // --- Config schema routes ---

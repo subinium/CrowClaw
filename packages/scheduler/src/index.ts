@@ -609,6 +609,8 @@ export class AutonomousScheduler {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private readonly intervalMs: number;
   private _lastTick: string | null = null;
+  private _lastError: string | null = null;
+  private _consecutiveErrors = 0;
 
   constructor(
     private readonly executor: SchedulerExecutor,
@@ -624,8 +626,11 @@ export class AutonomousScheduler {
       try {
         await this.executor.tick();
         this._lastTick = new Date().toISOString();
-      } catch {
-        // Swallow tick errors to keep the interval alive
+        this._consecutiveErrors = 0;
+        this._lastError = null;
+      } catch (err: unknown) {
+        this._consecutiveErrors += 1;
+        this._lastError = err instanceof Error ? err.message : String(err);
       }
     }, this.intervalMs);
   }
@@ -650,6 +655,16 @@ export class AutonomousScheduler {
   /** ISO timestamp of the last successful tick, or null if none. */
   get lastTick(): string | null {
     return this._lastTick;
+  }
+
+  /** Last tick error message, or null if the last tick succeeded. */
+  get lastError(): string | null {
+    return this._lastError;
+  }
+
+  /** Number of consecutive tick errors. Resets to 0 on success. */
+  get consecutiveErrors(): number {
+    return this._consecutiveErrors;
   }
 }
 

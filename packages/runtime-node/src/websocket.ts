@@ -29,9 +29,13 @@ interface TrackedConnection {
   ws: WebSocket;
   channels: Set<string> | null; // null = subscribed to all
   alive: boolean;
+  authenticated: boolean;
 }
 
 export type AbortHandler = (sessionId: string) => void;
+
+const MAX_CONNECTIONS = 100;
+const MAX_CHANNELS = 50;
 
 export class WebSocketManager {
   private connections = new Map<WebSocket, TrackedConnection>();
@@ -54,13 +58,17 @@ export class WebSocketManager {
 
     this.heartbeatInterval = setInterval(() => {
       const now = new Date().toISOString();
+      const toRemove: WebSocket[] = [];
       for (const [ws, conn] of this.connections) {
         if (!conn.alive) {
-          this.removeConnection(ws);
+          toRemove.push(ws);
           continue;
         }
         conn.alive = false;
         this.sendTo(ws, { type: 'ping', timestamp: now });
+      }
+      for (const ws of toRemove) {
+        this.removeConnection(ws);
       }
     }, 15_000);
   }
@@ -80,8 +88,13 @@ export class WebSocketManager {
     this.connections.clear();
   }
 
-  addConnection(ws: WebSocket): void {
-    const conn: TrackedConnection = { ws, channels: null, alive: true };
+  addConnection(ws: WebSocket, authenticated = false): boolean {
+    if (this.connections.size >= MAX_CONNECTIONS) {
+      try { ws.close(1013, 'max connections reached'); } catch { /* ignore */ }
+      return false;
+    }
+
+    const conn: TrackedConnection = { ws, channels: null, alive: true, authenticated };
     this.connections.set(ws, conn);
 
     ws.addEventListener('message', (event: MessageEvent) => {
@@ -100,15 +113,19 @@ export class WebSocketManager {
       type: 'connected',
       timestamp: new Date().toISOString(),
     });
+
+    return true;
   }
 
   removeConnection(ws: WebSocket): void {
+    if (!this.connections.has(ws)) return;
     this.connections.delete(ws);
     try { ws.close(); } catch { /* already closed */ }
   }
 
   broadcast(type: RuntimeEventType | string, data: Record<string, unknown>): void {
     const message = JSON.stringify({ type, data });
+    const toRemove: WebSocket[] = [];
     for (const [ws, conn] of this.connections) {
       if (conn.channels !== null && !conn.channels.has(type)) {
         continue;
@@ -116,8 +133,11 @@ export class WebSocketManager {
       try {
         ws.send(message);
       } catch {
-        this.removeConnection(ws);
+        toRemove.push(ws);
       }
+    }
+    for (const ws of toRemove) {
+      this.removeConnection(ws);
     }
   }
 
@@ -147,8 +167,10 @@ export class WebSocketManager {
     switch (msg.type) {
       case 'subscribe': {
         const channels = (msg as WsSubscribeMessage).channels;
-        if (Array.isArray(channels)) {
-          conn.channels = new Set(channels);
+        if (Array.isArray(channels) && channels.length > 0) {
+          conn.channels = new Set(channels.slice(0, MAX_CHANNELS));
+        } else {
+          conn.channels = null; // subscribe to all
         }
         break;
       }
@@ -157,6 +179,7 @@ export class WebSocketManager {
         break;
       }
       case 'session:abort': {
+        if (!conn.authenticated) break; // abort requires auth
         const sessionId = (msg as WsSessionAbortMessage).sessionId;
         if (typeof sessionId === 'string' && sessionId.length > 0 && this.abortHandler) {
           this.abortHandler(sessionId);
@@ -167,20 +190,34 @@ export class WebSocketManager {
   }
 }
 
+/**
+ * Handle WebSocket upgrade using the WebSocketPair API (Cloudflare Workers / WinterCG).
+ * For Node.js HTTP servers, the upgrade must be handled at the HTTP server level
+ * using the `ws` library. This function works with Bun.serve() and Cloudflare Workers.
+ */
 export const createWebSocketResponse = (
   request: Request,
   manager: WebSocketManager,
+  authenticated = false,
 ): Response => {
   const upgradeHeader = request.headers.get('Upgrade');
   if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
     return new Response('Expected WebSocket upgrade', { status: 426 });
   }
 
+  // WebSocketPair is available in Cloudflare Workers and Bun
+  if (typeof (globalThis as Record<string, unknown>).WebSocketPair === 'undefined') {
+    return new Response('WebSocket upgrade not supported in this runtime', { status: 501 });
+  }
+
   const pair = new WebSocketPair();
   const [client, server] = [pair[0], pair[1]];
 
   server.accept();
-  manager.addConnection(server);
+  const added = manager.addConnection(server, authenticated);
+  if (!added) {
+    return new Response('Too many connections', { status: 503 });
+  }
 
   return new Response(null, {
     status: 101,
@@ -190,8 +227,9 @@ export const createWebSocketResponse = (
 
 export const handleWebSocketUpgrade = (
   request: Request,
-  eventBus: EventBus,
+  _eventBus: EventBus,
   manager: WebSocketManager,
+  authenticated = false,
 ): Response => {
-  return createWebSocketResponse(request, manager);
+  return createWebSocketResponse(request, manager, authenticated);
 };
