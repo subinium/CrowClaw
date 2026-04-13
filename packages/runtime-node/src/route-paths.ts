@@ -54,7 +54,8 @@ export const routePaths = {
   },
   config: {
     provider: '/api/config/provider',
-    providerTest: '/api/config/provider/test'
+    providerTest: '/api/config/provider/test',
+    agent: '/api/config/agent',
   },
   providerConfig: {
     get: '/api/providers/config',

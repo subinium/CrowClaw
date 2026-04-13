@@ -536,6 +536,7 @@ const DANGEROUS_ROUTES = [
   '/api/mcp/servers',  // CRUD for custom MCP servers — can define commands to spawn
   '/api/providers/config',
   '/api/config/provider',
+  '/api/config/agent',
   '/api/security/policy',
   '/api/gateway/config/',   // gateway platform config can expose tokens
   '/api/gateway/pairings',  // pairing management
@@ -706,7 +707,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     sessionSearchStore: store,
     memoryStore,
     workspaceStore,
-    mcpClient
+    mcpClient,
+    recallFn: (sessionId: string, query: string, limit: number) => memoryService.recall(sessionId, query, limit)
   });
 
   // Provider: resolve from env/config if not explicitly provided
@@ -3863,6 +3865,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             Object.keys(snapshot.gatewayConfigs as Record<string, unknown>).map((k) => [k, { configured: true }])
           ),
         });
+      }
+
+      // Agent config (loop settings)
+      if (request.method === 'GET' && url.pathname === routePaths.config.agent) {
+        return Response.json({ config: configStore.getAgentConfig() });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.config.agent) {
+        const body = await request.json() as Partial<Record<string, unknown>>;
+        configStore.setAgentConfig(body as Partial<import('./config-store.js').AgentConfig>);
+        return Response.json({ ok: true, config: configStore.getAgentConfig() });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/usage') {

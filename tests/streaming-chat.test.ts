@@ -164,7 +164,7 @@ describe('SSE streaming chat', () => {
     });
 
     it('contains streaming JS functions', () => {
-      expect(DASHBOARD_HTML).toContain('function sndStream()');
+      expect(DASHBOARD_HTML).toContain('function sndStream(');
       expect(DASHBOARD_HTML).toContain('function handleStreamEvent(');
       expect(DASHBOARD_HTML).toContain('function sndFallback(');
       expect(DASHBOARD_HTML).toContain('function toggleTrace()');
@@ -212,11 +212,12 @@ describe('SSE streaming chat', () => {
     });
 
     it('streaming uses /stream endpoint', () => {
-      expect(DASHBOARD_HTML).toContain("/api/sessions/'+sid+'/stream");
+      expect(DASHBOARD_HTML).toContain("/api/sessions/' + sid + '/stream");
     });
 
     it('fallback uses original POST endpoint', () => {
-      expect(DASHBOARD_HTML).toContain("/api/sessions/'+sid,{method:'POST'");
+      expect(DASHBOARD_HTML).toContain("/api/sessions/' + sid, {");
+      expect(DASHBOARD_HTML).toContain("method: 'POST'");
     });
   });
 

@@ -353,11 +353,11 @@ describe('Dashboard provider UI', () => {
   });
 
   it('contains all slot labels', () => {
-    expect(DASHBOARD_HTML).toContain("primary:'Primary'");
-    expect(DASHBOARD_HTML).toContain("fallback:'Fallback'");
-    expect(DASHBOARD_HTML).toContain("vision:'Vision'");
-    expect(DASHBOARD_HTML).toContain("compression:'Compression'");
-    expect(DASHBOARD_HTML).toContain("embedding:'Embedding'");
+    expect(DASHBOARD_HTML).toContain("primary: 'Primary'");
+    expect(DASHBOARD_HTML).toContain("fallback: 'Fallback'");
+    expect(DASHBOARD_HTML).toContain("vision: 'Vision'");
+    expect(DASHBOARD_HTML).toContain("compression: 'Compression'");
+    expect(DASHBOARD_HTML).toContain("embedding: 'Embedding'");
   });
 
   it('contains provider test function', () => {
@@ -379,7 +379,7 @@ describe('Dashboard provider UI', () => {
   });
 
   it('providers appears in command palette', () => {
-    expect(DASHBOARD_HTML).toContain("label:'Providers'");
+    expect(DASHBOARD_HTML).toContain("label: 'Providers'");
   });
 });
 

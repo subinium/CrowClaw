@@ -112,6 +112,22 @@ export interface SecurityPolicyConfig {
   piiRedaction: boolean;
 }
 
+export interface AgentConfig {
+  maxToolIterations: number;
+  concurrentToolCalls: boolean;
+  synthesizeOnExhaustion: boolean;
+  maxToolResultLength: number;
+  requireApprovalForDangerousTools: boolean;
+}
+
+export const DEFAULT_AGENT_CONFIG: AgentConfig = {
+  maxToolIterations: 5,
+  concurrentToolCalls: false,
+  synthesizeOnExhaustion: true,
+  maxToolResultLength: 2000,
+  requireApprovalForDangerousTools: true,
+};
+
 export const DEFAULT_SECURITY_POLICY: SecurityPolicyConfig = {
   redactToolOutput: true,
   scanUserInput: false,
@@ -157,6 +173,9 @@ export interface RuntimeConfig {
 
   // Security policy
   securityPolicy: SecurityPolicyConfig;
+
+  // Agent loop configuration
+  agentConfig: AgentConfig;
 }
 
 type ConfigChangeListener = (key: string, value: unknown) => void;
@@ -186,6 +205,7 @@ export class RuntimeConfigStore {
       configPresets: defaultPresets,
       activeConfigPreset: null,
       securityPolicy: { ...DEFAULT_SECURITY_POLICY },
+      agentConfig: { ...DEFAULT_AGENT_CONFIG },
     };
   }
 
@@ -203,6 +223,7 @@ export class RuntimeConfigStore {
     return { type: this.config.providerType, model: this.config.model, configured: !!this.config.apiKey };
   }
   getSecurityPolicy(): SecurityPolicyConfig { return { ...this.config.securityPolicy }; }
+  getAgentConfig(): AgentConfig { return { ...this.config.agentConfig }; }
   // --- Provider Config ---
   getProviderConfig(): ProviderConfig | null { return this.config.providerConfig; }
 
@@ -361,6 +382,11 @@ export class RuntimeConfigStore {
     this.emit('securityPolicy', this.config.securityPolicy);
   }
 
+  setAgentConfig(config: Partial<AgentConfig>): void {
+    this.config.agentConfig = { ...this.config.agentConfig, ...config };
+    this.emit('agentConfig', this.config.agentConfig);
+  }
+
   // --- Snapshot (for API responses) ---
   snapshot(): Record<string, unknown> {
     return {
@@ -390,6 +416,7 @@ export class RuntimeConfigStore {
       configPresets: [...this.config.configPresets.values()],
       activeConfigPreset: this.config.activeConfigPreset,
       securityPolicy: this.config.securityPolicy,
+      agentConfig: this.config.agentConfig,
     };
   }
 
@@ -427,6 +454,7 @@ interface SerializedConfig {
   configPresets?: ConfigPreset[];
   activeConfigPreset?: string | null;
   securityPolicy?: SecurityPolicyConfig;
+  agentConfig?: AgentConfig;
 }
 
 /**
@@ -516,6 +544,9 @@ export class FileConfigStore extends RuntimeConfigStore {
     if (data.securityPolicy) {
       super.setSecurityPolicy(data.securityPolicy);
     }
+    if (data.agentConfig) {
+      super.setAgentConfig(data.agentConfig);
+    }
   }
 
   /** Persist current state to disk. Silently falls back to in-memory on failure. */
@@ -550,6 +581,7 @@ export class FileConfigStore extends RuntimeConfigStore {
         configPresets: [...cfg.configPresets.values()],
         activeConfigPreset: cfg.activeConfigPreset,
         securityPolicy: cfg.securityPolicy,
+        agentConfig: cfg.agentConfig,
       };
       await mkdir(dirname(this.filePath), { recursive: true });
       await writeFile(this.filePath, JSON.stringify(serialized, null, 2), { mode: 0o600 });
@@ -660,6 +692,11 @@ export class FileConfigStore extends RuntimeConfigStore {
 
   override setSecurityPolicy(policy: Partial<SecurityPolicyConfig>): void {
     super.setSecurityPolicy(policy);
+    void this.persistToDisk();
+  }
+
+  override setAgentConfig(config: Partial<AgentConfig>): void {
+    super.setAgentConfig(config);
     void this.persistToDisk();
   }
 

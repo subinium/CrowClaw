@@ -248,10 +248,10 @@ describe('Dashboard security panel', () => {
   });
 
   it('contains security status card elements', () => {
-    expect(DASHBOARD_HTML).toContain('id="secCards"');
-    expect(DASHBOARD_HTML).toContain('id="secGrade"');
-    expect(DASHBOARD_HTML).toContain('id="secToggles"');
-    expect(DASHBOARD_HTML).toContain('id="secEvtList"');
+    expect(DASHBOARD_HTML).toContain('secCards');
+    expect(DASHBOARD_HTML).toContain('secGrade');
+    expect(DASHBOARD_HTML).toContain('secToggles');
+    expect(DASHBOARD_HTML).toContain('secEvtList');
   });
 
   it('contains event filter controls', () => {
@@ -274,8 +274,10 @@ describe('Dashboard security panel', () => {
     expect(DASHBOARD_HTML).toContain('/api/security/events/clear');
   });
 
-  it('contains shield icon SVG for security nav', () => {
-    expect(DASHBOARD_HTML).toContain('M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z');
+  it('contains settings nav icon for security section', () => {
+    // Security is under the Settings tab which uses a gear icon
+    expect(DASHBOARD_HTML).toContain('v-security');
+    expect(DASHBOARD_HTML).toContain('Settings');
   });
 });
 

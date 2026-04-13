@@ -108,7 +108,7 @@ describe('Web onboarding wizard', () => {
     // The JS should POST to /api/config/provider, not store key in localStorage
     expect(html).toContain('/api/config/provider');
     // Only cc_onboarded flag in localStorage
-    expect(html).toContain("localStorage.setItem('cc_onboarded','1')");
+    expect(html).toContain("localStorage.setItem('cc_onboarded', '1')");
     // Should NOT store the key in localStorage
     expect(html).not.toContain("localStorage.setItem('cc_api_key'");
   });
@@ -128,14 +128,14 @@ describe('Web onboarding wizard', () => {
   });
 
   it('has smooth step transitions via CSS', () => {
-    expect(html).toContain('transition:opacity .25s ease,transform .25s ease');
+    expect(html).toContain('transition: opacity .25s ease, transform .25s ease');
   });
 
   it('model definitions include provider-specific models', () => {
-    expect(html).toContain("openai:[");
-    expect(html).toContain("anthropic:[");
-    expect(html).toContain("openrouter:[");
-    expect(html).toContain("custom:[");
+    expect(html).toContain("openai: [");
+    expect(html).toContain("anthropic: [");
+    expect(html).toContain("openrouter: [");
+    expect(html).toContain("custom: [");
   });
 });
 

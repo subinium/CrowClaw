@@ -152,7 +152,7 @@ describe('capability badges', () => {
       expect(DASHBOARD_HTML).toContain('lCap()');
       // Verify lCap is called inside initApp
       const initAppMatch = DASHBOARD_HTML.match(
-        /function initApp\(\)\{[^}]+\}/
+        /function initApp\(\)\s*\{[^}]+\}/
       );
       expect(initAppMatch).not.toBeNull();
       expect(initAppMatch![0]).toContain('lCap()');

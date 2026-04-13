@@ -16,7 +16,7 @@ import {
   buildTelegramSendUrl
 } from '@crowclaw/gateway';
 import type { McpClient } from '@crowclaw/mcp';
-import type { MemoryStore, SessionSearchStore } from '@crowclaw/storage';
+import type { MemoryRecord, MemoryStore, SessionSearchStore } from '@crowclaw/storage';
 import type { WorkspaceStore } from '@crowclaw/workspace';
 
 type BackgroundProcessRecord = {
@@ -1747,7 +1747,10 @@ export function createMemoryRememberTool(memoryStore: MemoryStore): ToolDefiniti
   };
 }
 
-export function createMemorySearchTool(memoryStore: MemoryStore): ToolDefinition {
+export function createMemorySearchTool(
+  memoryStore: MemoryStore,
+  options?: { recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]> }
+): ToolDefinition {
   return {
     manifest: {
       name: 'memory.search',
@@ -1772,6 +1775,20 @@ export function createMemorySearchTool(memoryStore: MemoryStore): ToolDefinition
       const query = typeof input.query === 'string' ? input.query : '';
       const limit = typeof input.limit === 'number' ? input.limit : 10;
       const scope = normalizeScope(input);
+
+      // Route through MemoryService if available (for TTL filtering)
+      if (options?.recallFn && !scope) {
+        const results = await options.recallFn(context.sessionId, query, limit);
+        return {
+          toolName: 'memory.search',
+          runtime: 'worker' as const,
+          ok: true,
+          output: JSON.stringify(results, null, 2),
+          metadata: { count: results.length }
+        };
+      }
+
+      // Existing direct store access (fallback or scoped queries)
       const scopeKey = typeof input.scopeKey === 'string' ? input.scopeKey : defaultScopeKey(scope, context);
       const results = scope
         ? await memoryStore.searchByScope(scope, query, limit, scopeKey)
@@ -2341,11 +2358,12 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
 export function registerSearchAndMemoryTools(
   registry: ToolRegistry,
   sessionSearchStore: SessionSearchStore,
-  memoryStore: MemoryStore
+  memoryStore: MemoryStore,
+  options?: { recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]> }
 ): ToolRegistry {
   registry.register(createSessionSearchTool(sessionSearchStore));
   registry.register(createMemoryRememberTool(memoryStore));
-  registry.register(createMemorySearchTool(memoryStore));
+  registry.register(createMemorySearchTool(memoryStore, options));
   registry.register(createMemoryListTool(memoryStore));
   return registry;
 }
@@ -2378,10 +2396,13 @@ export function createDefaultWorkerRegistry(options?: {
   memoryStore?: MemoryStore;
   workspaceStore?: WorkspaceStore;
   mcpClient?: McpClient;
+  recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]>;
 }): ToolRegistry {
   const registry = registerCoreTools(new ToolRegistry());
   if (options?.sessionSearchStore && options.memoryStore) {
-    registerSearchAndMemoryTools(registry, options.sessionSearchStore, options.memoryStore);
+    registerSearchAndMemoryTools(registry, options.sessionSearchStore, options.memoryStore, {
+      recallFn: options.recallFn
+    });
   }
   if (options?.workspaceStore) {
     registerWorkspaceTools(registry, options.workspaceStore);

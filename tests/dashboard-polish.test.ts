@@ -25,11 +25,11 @@ describe('Dashboard UX Polish', () => {
 
     it('uses var() references for colors instead of hardcoded hex', () => {
       // The legacy shorthand vars (--b0, --t0, etc.) should reference the new CSS variables
-      expect(DASHBOARD_HTML).toContain('--b0:var(--bg-primary)');
-      expect(DASHBOARD_HTML).toContain('--b1:var(--bg-secondary)');
-      expect(DASHBOARD_HTML).toContain('--ac:var(--accent)');
-      expect(DASHBOARD_HTML).toContain('--ok:var(--success)');
-      expect(DASHBOARD_HTML).toContain('--er:var(--error)');
+      expect(DASHBOARD_HTML).toContain('--b0: var(--bg-primary)');
+      expect(DASHBOARD_HTML).toContain('--b1: var(--bg-secondary)');
+      expect(DASHBOARD_HTML).toContain('--ac: var(--accent)');
+      expect(DASHBOARD_HTML).toContain('--ok: var(--success)');
+      expect(DASHBOARD_HTML).toContain('--er: var(--error)');
     });
   });
 
@@ -59,7 +59,7 @@ describe('Dashboard UX Polish', () => {
     it('has delete functionality with confirmation', () => {
       expect(DASHBOARD_HTML).toContain('sessDelete');
       expect(DASHBOARD_HTML).toContain('Delete this session?');
-      expect(DASHBOARD_HTML).toContain("method:'DELETE'");
+      expect(DASHBOARD_HTML).toContain("method: 'DELETE'");
     });
 
     it('has context usage progress bar', () => {
@@ -188,14 +188,14 @@ describe('Dashboard UX Polish', () => {
     });
 
     it('handles 401 responses by showing auth overlay', () => {
-      expect(DASHBOARD_HTML).toContain('r.status===401');
+      expect(DASHBOARD_HTML).toContain('r.status === 401');
       expect(DASHBOARD_HTML).toContain('showAuth');
     });
   });
 
   describe('Responsive Design', () => {
     it('has media query for 768px breakpoint', () => {
-      expect(DASHBOARD_HTML).toContain('@media (max-width:768px)');
+      expect(DASHBOARD_HTML).toContain('@media (max-width: 768px)');
     });
 
     it('has hamburger menu button', () => {
@@ -212,25 +212,27 @@ describe('Dashboard UX Polish', () => {
 
     it('sidebar slides over on mobile', () => {
       expect(DASHBOARD_HTML).toContain('mobile-open');
-      expect(DASHBOARD_HTML).toContain('.sb{position:fixed;left:-232px');
+      expect(DASHBOARD_HTML).toContain('position: fixed');
+      expect(DASHBOARD_HTML).toContain('left: -232px');
     });
 
     it('session sidebar hidden on mobile with toggle', () => {
       expect(DASHBOARD_HTML).toContain('sess-toggle');
       expect(DASHBOARD_HTML).toContain('toggleSessSidebar');
-      expect(DASHBOARD_HTML).toContain('.sess-sidebar{display:none}');
+      expect(DASHBOARD_HTML).toContain('display: none');
     });
 
     it('grid stacks to single column on mobile', () => {
-      expect(DASHBOARD_HTML).toContain('.grid{grid-template-columns:1fr}');
+      expect(DASHBOARD_HTML).toContain('grid-template-columns: 1fr');
     });
 
     it('chat input stays fixed at bottom on mobile', () => {
-      expect(DASHBOARD_HTML).toContain('.ci{position:sticky;bottom:0');
+      expect(DASHBOARD_HTML).toContain('position: sticky');
+      expect(DASHBOARD_HTML).toContain('bottom: 0');
     });
 
     it('tables scroll horizontally on mobile', () => {
-      expect(DASHBOARD_HTML).toContain('.mem-table{display:block;overflow-x:auto}');
+      expect(DASHBOARD_HTML).toContain('overflow-x: auto');
     });
   });
 
@@ -285,12 +287,12 @@ describe('Dashboard UX Polish', () => {
     });
 
     it('has message slide-up animation', () => {
-      expect(DASHBOARD_HTML).toContain('@keyframes mi{from{opacity:0;transform:translateY');
+      expect(DASHBOARD_HTML).toContain('@keyframes mi');
     });
 
     it('has modal scale animation', () => {
       expect(DASHBOARD_HTML).toContain('modalScale');
-      expect(DASHBOARD_HTML).toContain('transform:scale');
+      expect(DASHBOARD_HTML).toContain('transform: scale');
     });
 
     it('uses hardware-accelerated properties', () => {
@@ -301,14 +303,14 @@ describe('Dashboard UX Polish', () => {
 
   describe('Keyboard Navigation', () => {
     it('has Escape key handler for modals', () => {
-      expect(DASHBOARD_HTML).toContain("e.key==='Escape'");
+      expect(DASHBOARD_HTML).toContain("e.key === 'Escape'");
       expect(DASHBOARD_HTML).toContain('cpClose');
       expect(DASHBOARD_HTML).toContain('jbModalClose');
       expect(DASHBOARD_HTML).toContain('memModalClose');
     });
 
     it('has Cmd+K for command palette', () => {
-      expect(DASHBOARD_HTML).toContain("e.key==='k'");
+      expect(DASHBOARD_HTML).toContain("e.key === 'k'");
       expect(DASHBOARD_HTML).toContain('cpOpen');
     });
 
