@@ -891,7 +891,14 @@ export function createWebSearchTool(): ToolDefinition {
         return { toolName: 'web.search', runtime: 'worker', ok: false, output: `URL blocked: ${searchUrlCheck.reason}` };
       }
 
-      const response = await fetch(searchUrl, { signal: context.signal });
+      const response = await fetch(searchUrl, {
+        signal: context.signal,
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CrowClaw/0.1; +https://github.com/subinium/CrowClaw)' },
+      });
+      if (!response.ok) {
+        return { toolName: 'web.search', runtime: 'worker', ok: false, output: `Search request failed: HTTP ${response.status}` };
+      }
       const html = await response.text();
       const results = [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
         .map((match) => {
