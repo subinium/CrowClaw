@@ -205,6 +205,18 @@ describe('cli package', () => {
     if (prevOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY;
     else process.env.OPENROUTER_API_KEY = prevOpenRouter;
 
+    await runtime.fetch(new Request('http://localhost/api/providers/config', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        primary: { name: 'Primary', provider: 'openai', model: 'gpt-4o' },
+        fallback: { name: 'Fallback', provider: 'anthropic', model: 'claude-haiku-4' }
+      })
+    }));
+    const providerPlan = await runCliInputLine('/provider-plan', initial, { runtime });
+    expect(providerPlan.output).toContain('"executionPlan"');
+    expect(providerPlan.output).toContain('"fallbackChain"');
+
     const providerRoute = await runCliInputLine('/provider-route debug this tool', initial, { runtime });
     expect(providerRoute.output).toContain('"selectedTier"');
     expect(providerRoute.output).toContain('"fallbackTier"');

@@ -162,7 +162,7 @@ export interface RuntimeConfig {
 type ConfigChangeListener = (key: string, value: unknown) => void;
 
 export class RuntimeConfigStore {
-  private config: RuntimeConfig;
+  protected config: RuntimeConfig;
   private listeners: ConfigChangeListener[] = [];
 
   constructor() {
@@ -369,7 +369,12 @@ export class RuntimeConfigStore {
       activeToolset: this.config.activeToolset,
       disabledSkills: [...this.config.disabledSkills],
       mcpConnections: Object.fromEntries(this.config.mcpConnections),
-      customMcpServers: [...this.config.customMcpServers.values()],
+      customMcpServers: [...this.config.customMcpServers.values()].map((s) => ({
+        ...s,
+        env: s.env ? Object.fromEntries(
+          Object.entries(s.env).map(([k, v]) => [k, v ? '***' : undefined])
+        ) : undefined,
+      })),
       gatewayConfigs: Object.fromEntries(
         [...this.config.gatewayConfigs].map(([k, v]) => [k, { ...v, token: v.token ? '***' : undefined }])
       ),
@@ -518,26 +523,33 @@ export class FileConfigStore extends RuntimeConfigStore {
     try {
       const { writeFile, mkdir } = await import('node:fs/promises');
       const { dirname } = await import('node:path');
-      const snapshot = this.snapshot();
+      // Persist raw config directly — NOT the redacted snapshot().
+      // snapshot() redacts API keys and MCP env values for API responses,
+      // but we need the real values on disk for restart recovery.
+      const cfg = this.config;
       const serialized: SerializedConfig = {
-        activePreset: snapshot.activePreset as string | null,
-        agentPreset: snapshot.agentPreset as SerializedConfig['agentPreset'],
-        activeToolset: snapshot.activeToolset as string | null,
-        disabledSkills: snapshot.disabledSkills as string[],
-        mcpConnections: snapshot.mcpConnections as Record<string, McpConnectionState>,
-        customMcpServers: snapshot.customMcpServers as McpServerConfig[],
-        gatewayConfigs: snapshot.gatewayConfigs as Record<string, GatewayPlatformConfig>,
-        providerType: (snapshot.provider as { type: string }).type,
-        model: (snapshot.provider as { model: string }).model,
-        apiKey: '', // Never persist API keys to the runtime config snapshot
-        providerConfig: snapshot.providerConfig as ProviderConfig | null,
-        pendingPairings: Object.fromEntries(
-          (snapshot.pendingPairings as Array<{ code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }>)
-            .map((p) => [`${p.platform}:${p.senderId}`, p])
+        activePreset: cfg.activePreset,
+        agentPreset: cfg.agentPreset,
+        activeToolset: cfg.activeToolset,
+        disabledSkills: [...cfg.disabledSkills],
+        mcpConnections: Object.fromEntries(cfg.mcpConnections),
+        customMcpServers: [...cfg.customMcpServers.values()],
+        gatewayConfigs: Object.fromEntries(
+          [...cfg.gatewayConfigs].map(([platform, gatewayConfig]) => [
+            platform,
+            { ...gatewayConfig, token: gatewayConfig.token ? '***' : undefined }
+          ])
         ),
-        configPresets: snapshot.configPresets as ConfigPreset[],
-        activeConfigPreset: snapshot.activeConfigPreset as string | null,
-        securityPolicy: snapshot.securityPolicy as SecurityPolicyConfig,
+        providerType: cfg.providerType,
+        model: cfg.model,
+        apiKey: '', // Never persist LLM API keys to disk — require env var or re-entry
+        providerConfig: cfg.providerConfig ? JSON.parse(JSON.stringify(cfg.providerConfig)) : null,
+        pendingPairings: Object.fromEntries(
+          [...cfg.pendingPairings].map(([k, v]) => [k, v])
+        ),
+        configPresets: [...cfg.configPresets.values()],
+        activeConfigPreset: cfg.activeConfigPreset,
+        securityPolicy: cfg.securityPolicy,
       };
       await mkdir(dirname(this.filePath), { recursive: true });
       await writeFile(this.filePath, JSON.stringify(serialized, null, 2), { mode: 0o600 });

@@ -1,6 +1,11 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 import { DASHBOARD_HTML } from '../packages/web/src/index.js';
+
+// MCP server CRUD routes are dangerous — require auth token
+const TEST_TOKEN = 'test-mcp-crud-token';
+beforeAll(() => { process.env.CROWCLAW_DASHBOARD_TOKEN = TEST_TOKEN; });
+afterAll(() => { delete process.env.CROWCLAW_DASHBOARD_TOKEN; });
 
 vi.mock('@cloudflare/sandbox', () => ({
   Sandbox: class Sandbox {},
@@ -43,13 +48,15 @@ function createTestRuntime() {
 
 // --- MCP CRUD tests ---
 
+const authHeaders = { authorization: `Bearer ${TEST_TOKEN}` };
+
 describe('MCP Server CRUD', () => {
   it('adds a custom server via POST /api/mcp/servers', async () => {
     const runtime = createTestRuntime();
     const res = await runtime.fetch(
       new Request('http://localhost/api/mcp/servers', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ name: 'test-server', command: 'npx', args: '-y, @test/server', description: 'Test server' }),
       }),
     );
@@ -60,8 +67,8 @@ describe('MCP Server CRUD', () => {
     expect(data.server.args).toEqual(['-y', '@test/server']);
     expect(data.server.custom).toBe(true);
 
-    // Verify it appears in the list
-    const listRes = await runtime.fetch(new Request('http://localhost/api/mcp/servers'));
+    // Verify it appears in the list (env values should be redacted)
+    const listRes = await runtime.fetch(new Request('http://localhost/api/mcp/servers', { headers: authHeaders }));
     const listData = await listRes.json();
     expect(listData.servers.length).toBe(1);
     expect(listData.servers[0].name).toBe('test-server');
@@ -74,27 +81,27 @@ describe('MCP Server CRUD', () => {
     await runtime.fetch(
       new Request('http://localhost/api/mcp/servers', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ name: 'to-delete', command: 'npx', args: [] }),
       }),
     );
 
     // Delete
     const res = await runtime.fetch(
-      new Request('http://localhost/api/mcp/servers/to-delete', { method: 'DELETE' }),
+      new Request('http://localhost/api/mcp/servers/to-delete', { method: 'DELETE', headers: authHeaders }),
     );
     const data = await res.json();
     expect(data.ok).toBe(true);
 
     // Verify gone
-    const listRes = await runtime.fetch(new Request('http://localhost/api/mcp/servers'));
+    const listRes = await runtime.fetch(new Request('http://localhost/api/mcp/servers', { headers: authHeaders }));
     const listData = await listRes.json();
     expect(listData.servers.length).toBe(0);
   });
 
   it('lists tools from a server via GET /api/mcp/servers/:name/tools', async () => {
     const runtime = createTestRuntime();
-    const res = await runtime.fetch(new Request('http://localhost/api/mcp/servers/test-server/tools'));
+    const res = await runtime.fetch(new Request('http://localhost/api/mcp/servers/test-server/tools', { headers: authHeaders }));
     const data = await res.json();
     expect(data.server).toBe('test-server');
     expect(Array.isArray(data.tools)).toBe(true);
@@ -104,7 +111,7 @@ describe('MCP Server CRUD', () => {
   it('reconnects a server via POST /api/mcp/servers/:name/reconnect', async () => {
     const runtime = createTestRuntime();
     const res = await runtime.fetch(
-      new Request('http://localhost/api/mcp/servers/test-server/reconnect', { method: 'POST' }),
+      new Request('http://localhost/api/mcp/servers/test-server/reconnect', { method: 'POST', headers: authHeaders }),
     );
     const data = await res.json();
     expect(data.ok).toBe(true);
@@ -118,13 +125,13 @@ describe('MCP Server CRUD', () => {
     await runtime.fetch(
       new Request('http://localhost/api/mcp/servers', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ name: 'persist-test', command: 'node', args: ['server.js'], env: { API_KEY: 'test' } }),
       }),
     );
 
     // Check it's in the config snapshot
-    const snapRes = await runtime.fetch(new Request('http://localhost/api/config/snapshot'));
+    const snapRes = await runtime.fetch(new Request('http://localhost/api/config/snapshot', { headers: authHeaders }));
     const snapData = await snapRes.json();
     // The snapshot should be returned (it contains customMcpServers at the store level)
     expect(snapData.ok).toBe(true);
@@ -133,7 +140,7 @@ describe('MCP Server CRUD', () => {
   it('returns 404 when deleting non-existent server', async () => {
     const runtime = createTestRuntime();
     const res = await runtime.fetch(
-      new Request('http://localhost/api/mcp/servers/nonexistent', { method: 'DELETE' }),
+      new Request('http://localhost/api/mcp/servers/nonexistent', { method: 'DELETE', headers: authHeaders }),
     );
     expect(res.status).toBe(404);
   });
@@ -147,7 +154,7 @@ describe('Skill CRUD', () => {
     const res = await runtime.fetch(
       new Request('http://localhost/api/skills', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({
           title: 'Test Skill',
           summary: 'A test skill',
@@ -164,7 +171,7 @@ describe('Skill CRUD', () => {
     expect(data.skill.status).toBe('published');
 
     // Verify in list
-    const listRes = await runtime.fetch(new Request('http://localhost/api/skills'));
+    const listRes = await runtime.fetch(new Request('http://localhost/api/skills', { headers: authHeaders }));
     const listData = await listRes.json();
     const found = listData.skills.find((s: { slug: string }) => s.slug === 'test-skill');
     expect(found).toBeDefined();
@@ -178,7 +185,7 @@ describe('Skill CRUD', () => {
     await runtime.fetch(
       new Request('http://localhost/api/skills', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ title: 'Update Me', summary: 'Original' }),
       }),
     );
@@ -187,7 +194,7 @@ describe('Skill CRUD', () => {
     const res = await runtime.fetch(
       new Request('http://localhost/api/skills/update-me', {
         method: 'PUT',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ summary: 'Updated summary', steps: ['New step'] }),
       }),
     );
@@ -204,14 +211,14 @@ describe('Skill CRUD', () => {
     await runtime.fetch(
       new Request('http://localhost/api/skills', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ title: 'Delete Me', summary: 'Temporary' }),
       }),
     );
 
     // Delete
     const res = await runtime.fetch(
-      new Request('http://localhost/api/skills/delete-me', { method: 'DELETE' }),
+      new Request('http://localhost/api/skills/delete-me', { method: 'DELETE', headers: authHeaders }),
     );
     const data = await res.json();
     expect(data.ok).toBe(true);
@@ -222,7 +229,7 @@ describe('Skill CRUD', () => {
 
     // Try to delete a built-in skill
     const res = await runtime.fetch(
-      new Request('http://localhost/api/skills/git-commit-workflow', { method: 'DELETE' }),
+      new Request('http://localhost/api/skills/git-commit-workflow', { method: 'DELETE', headers: authHeaders }),
     );
     const data = await res.json();
     expect(data.ok).toBe(false);
@@ -248,7 +255,7 @@ This skill does something useful.
     const res = await runtime.fetch(
       new Request('http://localhost/api/skills/import', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ markdown }),
       }),
     );
@@ -266,7 +273,7 @@ This skill does something useful.
     await runtime.fetch(
       new Request('http://localhost/api/skills', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ title: 'Rate Me', summary: 'Ratable skill' }),
       }),
     );
@@ -275,7 +282,7 @@ This skill does something useful.
     const res = await runtime.fetch(
       new Request('http://localhost/api/skills/rate-me/rate', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ rating: 'helpful' }),
       }),
     );
@@ -291,12 +298,12 @@ This skill does something useful.
     await runtime.fetch(
       new Request('http://localhost/api/skills', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders },
         body: JSON.stringify({ title: 'Versioned Skill', summary: 'v1' }),
       }),
     );
 
-    const res = await runtime.fetch(new Request('http://localhost/api/skills/versioned-skill/versions'));
+    const res = await runtime.fetch(new Request('http://localhost/api/skills/versioned-skill/versions', { headers: authHeaders }));
     const data = await res.json();
     expect(data.versions.length).toBe(1);
     expect(data.versions[0].version).toBe(1);

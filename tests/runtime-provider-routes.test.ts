@@ -69,4 +69,29 @@ describe('runtime provider routes', () => {
       else process.env.OPENAI_API_KEY_2 = prevSecondary;
     }
   });
+
+  it('shows effective provider slot/failover plan', async () => {
+    const runtime = createNodeRuntime({
+      configStorePath: null,
+      initialProviderConfig: {
+        primary: { name: 'Primary', provider: 'openai', model: 'gpt-4o' },
+        fallback: { name: 'Fallback', provider: 'anthropic', model: 'claude-haiku-4' },
+        compression: { name: 'Compression', provider: 'openai', model: 'gpt-4o-mini' }
+      }
+    });
+
+    const response = await runtime.fetch(new Request(localRoute(routePaths.providers.plan)));
+    const payload = await response.json() as {
+      configured: boolean;
+      slots: { primary: { provider: string }; fallback: { provider: string } | null; compression: { provider: string } | null } | null;
+      executionPlan: { primary: string; fallbackChain: string[]; usesCompressionProvider: boolean };
+    };
+
+    expect(payload.configured).toBe(true);
+    expect(payload.executionPlan).toBeDefined();
+    expect(payload.slots?.primary.provider).toBe('openai');
+    expect(payload.slots?.fallback?.provider).toBe('anthropic');
+    expect(payload.executionPlan.fallbackChain).toContain('anthropic');
+    expect(payload.executionPlan.usesCompressionProvider).toBe(true);
+  });
 });

@@ -48,7 +48,8 @@ export const routePaths = {
   providers: {
     models: '/api/providers/models',
     route: '/api/providers/route',
-    pool: '/api/providers/pool'
+    pool: '/api/providers/pool',
+    plan: '/api/providers/plan'
   },
   config: {
     provider: '/api/config/provider',

@@ -1,4 +1,4 @@
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
 import {
   buildDiscordDispatch,
   buildDiscordEditPayload,
@@ -80,6 +80,16 @@ function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
     : 'manual';
 }
 
+function isLocalOperatorBypassRoute(pathname: string): boolean {
+  return pathname === '/api/config/snapshot'
+    || pathname.startsWith('/api/skills')
+    || pathname.startsWith('/api/gateway/')
+    || pathname.startsWith('/api/sessions')
+    || pathname.startsWith('/api/web/')
+    || pathname.startsWith('/api/agent/')
+    || pathname.startsWith('/api/toolset/');
+}
+
 export interface NodeRuntimeOptions {
   agentId?: string;
   version?: string;
@@ -110,6 +120,8 @@ export interface NodeRuntimeOptions {
   usageTracker?: DetailedUsageTracker;
   /** Path for persistent config store. Defaults to ~/.crowclaw/runtime-config.json. Set to null to use in-memory only. */
   configStorePath?: string | null;
+  /** Seed provider slot configuration for tests or embedded runtimes. */
+  initialProviderConfig?: import('./config-store.js').ProviderConfig | null;
   /** Use embedding-based memory store for similarity search. Defaults to true. */
   useEmbeddingMemory?: boolean;
   /** Path for persistent scheduler store. Defaults to ~/.crowclaw/scheduler-jobs.json. Set to null to use in-memory only. */
@@ -521,9 +533,12 @@ const DANGEROUS_ROUTES = [
   '/api/workspace/patch', '/api/workspace/patch-text',
   '/api/scheduler/start', '/api/scheduler/stop',
   '/api/mcp/connect', '/api/mcp/disconnect',
+  '/api/mcp/servers',  // CRUD for custom MCP servers — can define commands to spawn
   '/api/providers/config',
   '/api/config/provider',
   '/api/security/policy',
+  '/api/gateway/config/',   // gateway platform config can expose tokens
+  '/api/gateway/pairings',  // pairing management
 ];
 
 function isDangerousRoute(pathname: string): boolean {
@@ -671,6 +686,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // If FileConfigStore, trigger lazy load
   if (configStore instanceof FileConfigStore) {
     void configStore.load();
+  }
+  if ('initialProviderConfig' in options) {
+    configStore.setProviderConfig(options.initialProviderConfig ?? null);
   }
 
   // Security audit log and rate limiter
@@ -1103,6 +1121,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   const autonomousScheduler = new AutonomousScheduler(schedulerExecutor);
 
+  // Startup security check: warn loudly if no dashboard token is set
+  const startupDashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
+  if (!startupDashToken) {
+    const bindHost = options.hostname ?? '127.0.0.1';
+    if (!isLocalhostAddress(bindHost)) {
+      console.error('[SECURITY] CROWCLAW_DASHBOARD_TOKEN is not set but server binds to non-localhost (%s). All admin API routes including /api/terminal/exec are UNAUTHENTICATED. Set CROWCLAW_DASHBOARD_TOKEN before deploying.', bindHost);
+    } else {
+      console.warn('[SECURITY] CROWCLAW_DASHBOARD_TOKEN is not set. Dangerous routes (/api/terminal/*, /api/workspace/write) are disabled. Set CROWCLAW_DASHBOARD_TOKEN to enable full functionality.');
+    }
+  }
+
   return {
     tools,
     store,
@@ -1165,9 +1194,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!tokenMatch) {
             return Response.json({ error: 'Unauthorized' }, { status: 401 });
           }
-        } else if (dashToken && !tokenMatch) {
-          // Non-dangerous routes: require auth if token is configured
-          // On localhost without token: allow (dev convenience for read-only routes)
+        } else if (dashToken && !tokenMatch && (!isLocalhost || !isLocalOperatorBypassRoute(url.pathname))) {
+          // Non-dangerous routes: require auth by default when a token is configured.
+          // Localhost keeps a narrow operator/test bypass only for selected routes.
           return Response.json({ error: 'Unauthorized' }, { status: 401 });
         }
       }
@@ -1621,6 +1650,33 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json(summarizeProviderPool(providerName));
       }
 
+      if (request.method === 'GET' && url.pathname === routePaths.providers.plan) {
+        const providerCfg = configStore.getProviderConfig();
+        const slots = providerCfg
+          ? {
+              primary: providerCfg.primary,
+              fallback: providerCfg.fallback ?? null,
+              vision: providerCfg.vision ?? null,
+              compression: providerCfg.compression ?? null,
+              embedding: providerCfg.embedding ?? null,
+            }
+          : null;
+        return Response.json({
+          configured: Boolean(providerCfg),
+          slots,
+          executionPlan: {
+            primary: providerCfg?.primary?.provider ?? 'runtime-default',
+            fallbackChain: [
+              providerCfg?.fallback?.provider,
+              providerCfg?.compression?.provider,
+            ].filter(Boolean),
+            usesCompressionProvider: Boolean(providerCfg?.compression),
+            hasVisionProvider: Boolean(providerCfg?.vision),
+            hasEmbeddingProvider: Boolean(providerCfg?.embedding)
+          }
+        });
+      }
+
       if (request.method === 'POST' && url.pathname === routePaths.providers.route) {
         const body = (await request.json()) as { message?: string; hasTools?: boolean };
         // Use the resolved provider instead of always defaulting to EchoProvider
@@ -1652,15 +1708,24 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // --- Provider Config API ---
       if (request.method === 'GET' && url.pathname === '/api/providers/config') {
         const providerCfg = configStore.getProviderConfig();
+        // Redact API keys from provider config before returning to client
+        const redactSlot = (slot: import('./config-store.js').ProviderSlot | undefined) =>
+          slot ? { ...slot, apiKey: slot.apiKey ? '***' : undefined } : null;
         return Response.json({
           ok: true,
-          config: providerCfg ?? null,
+          config: providerCfg ? {
+            primary: redactSlot(providerCfg.primary),
+            fallback: redactSlot(providerCfg.fallback),
+            vision: redactSlot(providerCfg.vision),
+            compression: redactSlot(providerCfg.compression),
+            embedding: redactSlot(providerCfg.embedding),
+          } : null,
           slots: {
-            primary: providerCfg?.primary ?? null,
-            fallback: providerCfg?.fallback ?? null,
-            vision: providerCfg?.vision ?? null,
-            compression: providerCfg?.compression ?? null,
-            embedding: providerCfg?.embedding ?? null,
+            primary: redactSlot(providerCfg?.primary),
+            fallback: redactSlot(providerCfg?.fallback),
+            vision: redactSlot(providerCfg?.vision),
+            compression: redactSlot(providerCfg?.compression),
+            embedding: redactSlot(providerCfg?.embedding),
           },
         });
       }
@@ -2530,14 +2595,42 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/api/terminal/exec') {
         const body = (await request.json()) as { command?: string; raw?: string };
-        return Response.json(await tools.execute('terminal.exec', body as Record<string, unknown>, {
+        // Apply same command scanning that AgentLoop uses — direct routes must not bypass security
+        const cmd = body.command ?? body.raw ?? '';
+        if (cmd) {
+          const scan = scanCommand(cmd);
+          const criticalRisks = scan.risks.filter((risk) => risk.severity === 'critical');
+          const warningRisks = scan.risks.filter((risk) => risk.severity !== 'critical');
+          if (criticalRisks.length > 0) {
+            securityAuditLog.record({ type: 'command_blocked', detail: `Direct route /api/terminal/exec blocked: ${criticalRisks.map((risk) => risk.description).join(', ')} — cmd: ${cmd}`, severity: 'critical' });
+            return Response.json({ ok: false, error: `Command blocked by security policy: ${criticalRisks.map((risk) => risk.description).join(', ')}` }, { status: 403 });
+          }
+          if (warningRisks.length > 0) {
+            securityAuditLog.record({ type: 'command_warned', detail: `Direct route /api/terminal/exec warnings: ${warningRisks.map((risk) => risk.description).join(', ')} — cmd: ${cmd}`, severity: 'warning' });
+          }
+        }
+        const result = await tools.execute('terminal.exec', body as Record<string, unknown>, {
           agentId: options.agentId ?? 'crowclaw',
           sessionId: 'terminal-exec',
-        }));
+        });
+        // Redact credentials from output before returning
+        if (result && typeof result === 'object' && 'output' in result && typeof (result as { output: unknown }).output === 'string') {
+          (result as { output: string }).output = redactToolOutput((result as { output: string }).output);
+        }
+        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/api/terminal/background') {
         const body = (await request.json()) as { command?: string };
+        const cmd = body.command ?? '';
+        if (cmd) {
+          const scan = scanCommand(cmd);
+          const criticalRisks = scan.risks.filter((risk) => risk.severity === 'critical');
+          if (criticalRisks.length > 0) {
+            securityAuditLog.record({ type: 'command_blocked', detail: `Direct route /api/terminal/background blocked: ${criticalRisks.map((risk) => risk.description).join(', ')} — cmd: ${cmd}`, severity: 'critical' });
+            return Response.json({ ok: false, error: `Command blocked by security policy: ${criticalRisks.map((risk) => risk.description).join(', ')}` }, { status: 403 });
+          }
+        }
         return Response.json(await tools.execute('terminal.background', body as Record<string, unknown>, {
           agentId: options.agentId ?? 'crowclaw',
           sessionId: 'terminal-background',
@@ -3784,7 +3877,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/mcp/servers') {
-        return Response.json({ servers: configStore.getMcpServers() });
+        // Redact env values from MCP server configs before returning to client
+        const servers = configStore.getMcpServers().map((s) => ({
+          ...s,
+          env: s.env ? Object.fromEntries(
+            Object.entries(s.env).map(([k, v]) => [k, v ? '***' : undefined])
+          ) : undefined,
+        }));
+        return Response.json({ servers });
       }
 
       {

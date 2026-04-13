@@ -1,8 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AgentLoop, type ParsedSkillFile, type ProviderRequest, type ProviderResponse } from '@crowclaw/core';
 import { InMemorySessionStore } from '@crowclaw/storage';
 import { ToolRegistry, createEchoTool } from '@crowclaw/tools';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
+
+// Gateway config/pairings routes require auth
+const TEST_TOKEN = 'test-wiring-token';
+beforeAll(() => { process.env.CROWCLAW_DASHBOARD_TOKEN = TEST_TOKEN; });
+afterAll(() => { delete process.env.CROWCLAW_DASHBOARD_TOKEN; });
+const authHeaders = { authorization: `Bearer ${TEST_TOKEN}` };
 
 class InspectingProvider {
   readonly requests: ProviderRequest[] = [];
@@ -70,7 +76,7 @@ describe('runtime wiring e2e', () => {
 
     const firstPolicyResponse = await runtime.fetch(new Request('http://localhost/api/gateway/telegram/policy', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ dmPolicy: 'pairing', allowlist: [] })
     }));
     expect(firstPolicyResponse.ok).toBe(true);
@@ -88,7 +94,7 @@ describe('runtime wiring e2e', () => {
     expect(firstPayload.pairingCode).toHaveLength(8);
     expect(provider.requests).toHaveLength(0);
 
-    const pairingsResponse = await runtime.fetch(new Request('http://localhost/api/gateway/pairings'));
+    const pairingsResponse = await runtime.fetch(new Request('http://localhost/api/gateway/pairings', { headers: authHeaders }));
     const pairingsPayload = await pairingsResponse.json() as { pairings: Array<{ code: string; senderId: string; platform: string }> };
     expect(pairingsPayload.pairings).toContainEqual(expect.objectContaining({
       code: firstPayload.pairingCode,
@@ -98,7 +104,7 @@ describe('runtime wiring e2e', () => {
 
     const approveResponse = await runtime.fetch(new Request('http://localhost/api/gateway/pairing/approve', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ code: firstPayload.pairingCode })
     }));
     const approvePayload = await approveResponse.json() as { ok: boolean; approved: boolean; senderId: string; platform: string };
@@ -128,7 +134,7 @@ describe('runtime wiring e2e', () => {
 
     await runtime.fetch(new Request('http://localhost/api/agent/preset', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({
         name: 'custom-reviewer',
         role: 'Senior reviewer',
@@ -138,13 +144,13 @@ describe('runtime wiring e2e', () => {
 
     await runtime.fetch(new Request('http://localhost/api/toolset/select', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ name: 'minimal' })
     }));
 
     const firstRun = await runtime.fetch(new Request('http://localhost/api/sessions/configured-1', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ userMessage: 'write tests for auth edge cases' })
     }));
     expect(firstRun.ok).toBe(true);
@@ -156,13 +162,13 @@ describe('runtime wiring e2e', () => {
 
     await runtime.fetch(new Request('http://localhost/api/skills/write-tests/toggle', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ enabled: false })
     }));
 
     const secondRun = await runtime.fetch(new Request('http://localhost/api/sessions/configured-2', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ userMessage: 'write tests for auth edge cases' })
     }));
     expect(secondRun.ok).toBe(true);
@@ -180,7 +186,7 @@ describe('runtime wiring e2e', () => {
     const runtime = createNodeRuntime();
     const response = await runtime.fetch(new Request('http://localhost/api/web/fetch', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders },
       body: JSON.stringify({ url: 'http://localhost/internal' })
     }));
 

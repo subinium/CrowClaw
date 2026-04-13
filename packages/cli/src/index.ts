@@ -251,6 +251,7 @@ export const builtInCliSlashCommands = [
   '/skill-toggle',
   '/provider-models',
   '/provider-pool',
+  '/provider-plan',
   '/provider-route',
   '/new',
   '/reset',
@@ -389,7 +390,8 @@ const cliRoutePaths = {
   providers: {
     models: '/api/providers/models',
     route: '/api/providers/route',
-    pool: '/api/providers/pool'
+    pool: '/api/providers/pool',
+    plan: '/api/providers/plan'
   },
   usage: {
     summary: '/api/usage',
@@ -638,6 +640,7 @@ export function renderCliHelp(): string {
     '  /skill-toggle <slug> <on|off>  Enable or disable a skill',
     '  /provider-models               List known provider model metadata',
     '  /provider-pool [provider]      Inspect credential pool status',
+    '  /provider-plan                 Show effective provider slot/failover plan',
     '  /provider-route ...            Inspect smart provider routing',
     '  /new, /reset                   Start a new session',
     '  /resume <id>                   Resume a session by id',
@@ -1762,6 +1765,14 @@ export async function runCliInputLine(
   if (trimmed === '/provider-pool' || trimmed.startsWith('/provider-pool ')) {
     const providerName = trimmed.replace('/provider-pool', '').trim() || 'openrouter';
     const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.providers.pool)}?provider=${encodeURIComponent(providerName)}`));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/provider-plan') {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.plan)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
