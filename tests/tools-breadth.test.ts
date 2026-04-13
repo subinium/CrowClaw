@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
+import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -221,8 +221,18 @@ describe('tool breadth extensions', () => {
     const registry = new ToolRegistry()
       .register(createTerminalExecTool())
       .register(createTerminalBackgroundTool())
+      .register(createTerminalBackendsTool())
       .register(createTerminalProcessesTool())
       .register(createTerminalKillTool());
+
+    const backends = await registry.execute('terminal.backends', {}, {
+      agentId: 'crowclaw',
+      sessionId: 'term-0'
+    });
+    expect(backends.ok).toBe(true);
+    expect(backends.output).toContain('"docker"');
+    expect(backends.output).toContain('"ssh"');
+    expect(backends.output).toContain('"daytona"');
 
     const execResult = await registry.execute('terminal.exec', { command: 'printf "hello"' }, {
       agentId: 'crowclaw',
@@ -230,6 +240,20 @@ describe('tool breadth extensions', () => {
     });
     expect(execResult.ok).toBe(true);
     expect(execResult.output).toContain('hello');
+
+    const dockerPlan = await registry.execute('terminal.exec', { backend: 'docker', container: 'app', command: 'printf "hello"', planOnly: true }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-1'
+    });
+    expect(dockerPlan.ok).toBe(true);
+    expect(dockerPlan.output).toContain('docker exec app');
+
+    const sshPlan = await registry.execute('terminal.exec', { backend: 'ssh', target: 'demo@example.com', command: 'uname -a', planOnly: true }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-1'
+    });
+    expect(sshPlan.ok).toBe(true);
+    expect(sshPlan.output).toContain('ssh demo@example.com');
 
     const background = await registry.execute('terminal.background', { command: 'sleep 5' }, {
       agentId: 'crowclaw',
@@ -243,6 +267,7 @@ describe('tool breadth extensions', () => {
       sessionId: 'term-2'
     });
     expect(processes.output).toContain('"pid"');
+    expect(processes.output).toContain('"backend"');
 
     const kill = await registry.execute('terminal.kill', { pid: bgPayload.pid }, {
       agentId: 'crowclaw',

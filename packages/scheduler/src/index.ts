@@ -53,6 +53,18 @@ export interface DueJob {
   due: boolean;
 }
 
+export interface JobRunRecord {
+  jobId: string;
+  runId: string;
+  startedAt: string;
+  completedAt: string;
+  ok: boolean;
+  response: string;
+  error?: string;
+  durationMs: number;
+  tokensUsed?: number;
+}
+
 export interface SchedulerStore {
   listJobs(): Promise<CronJobDefinition[]>;
   saveJob(job: CronJobDefinition): Promise<void>;
@@ -60,6 +72,8 @@ export interface SchedulerStore {
   deleteJob(id: string): Promise<boolean>;
   pauseJob(id: string): Promise<CronJobDefinition | null>;
   resumeJob(id: string): Promise<CronJobDefinition | null>;
+  getRunHistory(jobId: string, limit?: number): Promise<JobRunRecord[]>;
+  recordRun(record: JobRunRecord): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +123,7 @@ export interface SchedulerTickResult {
 
 export class InMemorySchedulerStore implements SchedulerStore {
   private readonly jobs = new Map<string, CronJobDefinition>();
+  private readonly runHistory = new Map<string, JobRunRecord[]>();
 
   async listJobs(): Promise<CronJobDefinition[]> {
     return [...this.jobs.values()];
@@ -140,6 +155,19 @@ export class InMemorySchedulerStore implements SchedulerStore {
     const updated = { ...job, enabled: true };
     this.jobs.set(id, updated);
     return updated;
+  }
+
+  async getRunHistory(jobId: string, limit?: number): Promise<JobRunRecord[]> {
+    const records = this.runHistory.get(jobId) ?? [];
+    // Return most recent first
+    const sorted = [...records].reverse();
+    return limit !== undefined ? sorted.slice(0, limit) : sorted;
+  }
+
+  async recordRun(record: JobRunRecord): Promise<void> {
+    const records = this.runHistory.get(record.jobId) ?? [];
+    records.push(record);
+    this.runHistory.set(record.jobId, records);
   }
 }
 
@@ -292,8 +320,24 @@ export class SchedulerExecutor {
     for (const { job, due } of dueJobs) {
       if (!due) continue;
 
+      const startedAt = new Date().toISOString();
+      const startMs = Date.now();
       const result = await this.executeJob(job);
+      const durationMs = Date.now() - startMs;
       results.push(result);
+
+      // Record run history
+      const runRecord: JobRunRecord = {
+        jobId: job.id,
+        runId: result.sessionId,
+        startedAt,
+        completedAt: result.executedAt,
+        ok: result.ok,
+        response: result.response ?? '',
+        error: result.error,
+        durationMs,
+      };
+      await this.store.recordRun(runRecord);
 
       // Update job state
       const updated: CronJobDefinition = {
@@ -314,6 +358,45 @@ export class SchedulerExecutor {
     }
 
     return results;
+  }
+
+  /** Pause a job by id. Returns the updated job or null if not found. */
+  async pauseJob(id: string): Promise<CronJobDefinition | null> {
+    return this.store.pauseJob(id);
+  }
+
+  /** Resume a paused job by id. Returns the updated job or null if not found. */
+  async resumeJob(id: string): Promise<CronJobDefinition | null> {
+    return this.store.resumeJob(id);
+  }
+
+  /** Delete a job permanently. Returns true if found and deleted. */
+  async deleteJob(id: string): Promise<boolean> {
+    return this.store.deleteJob(id);
+  }
+
+  /** Execute a job once without updating lastRunAt or runCount. */
+  async dryRun(jobId: string): Promise<JobRunRecord> {
+    const job = await this.store.getJob(jobId);
+    if (!job) {
+      throw new Error(`Job not found: ${jobId}`);
+    }
+
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const result = await this.executeJob(job);
+    const durationMs = Date.now() - startMs;
+
+    return {
+      jobId: job.id,
+      runId: result.sessionId,
+      startedAt,
+      completedAt: result.executedAt,
+      ok: result.ok,
+      response: result.response ?? '',
+      error: result.error,
+      durationMs,
+    };
   }
 
   private async executeJob(job: CronJobDefinition): Promise<SchedulerTickResult> {
@@ -368,16 +451,70 @@ export class SchedulerExecutor {
 }
 
 // ---------------------------------------------------------------------------
+// Autonomous scheduler — interval-based ticking
+// ---------------------------------------------------------------------------
+
+export class AutonomousScheduler {
+  private intervalId: ReturnType<typeof setInterval> | null = null;
+  private readonly intervalMs: number;
+  private _lastTick: string | null = null;
+
+  constructor(
+    private readonly executor: SchedulerExecutor,
+    intervalMs?: number,
+  ) {
+    this.intervalMs = intervalMs ?? 60_000;
+  }
+
+  /** Start interval-based ticking. No-op if already running. */
+  start(): void {
+    if (this.intervalId !== null) return;
+    this.intervalId = setInterval(async () => {
+      try {
+        await this.executor.tick();
+        this._lastTick = new Date().toISOString();
+      } catch {
+        // Swallow tick errors to keep the interval alive
+      }
+    }, this.intervalMs);
+  }
+
+  /** Stop the interval. No-op if not running. */
+  stop(): void {
+    if (this.intervalId === null) return;
+    clearInterval(this.intervalId);
+    this.intervalId = null;
+  }
+
+  /** Whether the autonomous scheduler is actively ticking. */
+  isRunning(): boolean {
+    return this.intervalId !== null;
+  }
+
+  /** Current interval in milliseconds. */
+  get interval(): number {
+    return this.intervalMs;
+  }
+
+  /** ISO timestamp of the last successful tick, or null if none. */
+  get lastTick(): string | null {
+    return this._lastTick;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Persistent file-based scheduler store
 // ---------------------------------------------------------------------------
 
 interface FileStoreData {
   jobs: CronJobDefinition[];
+  runHistory: Record<string, JobRunRecord[]>;
   lastSavedAt: string;
 }
 
 export class FileSchedulerStore implements SchedulerStore {
   private jobs: Map<string, CronJobDefinition> | null = null;
+  private runHistoryMap: Map<string, JobRunRecord[]> | null = null;
 
   constructor(private readonly filePath: string) {}
 
@@ -426,17 +563,38 @@ export class FileSchedulerStore implements SchedulerStore {
     return updated;
   }
 
+  async getRunHistory(jobId: string, limit?: number): Promise<JobRunRecord[]> {
+    await this.ensureLoaded();
+    const records = this.runHistoryMap!.get(jobId) ?? [];
+    const sorted = [...records].reverse();
+    return limit !== undefined ? sorted.slice(0, limit) : sorted;
+  }
+
+  async recordRun(record: JobRunRecord): Promise<void> {
+    await this.ensureLoaded();
+    const records = this.runHistoryMap!.get(record.jobId) ?? [];
+    records.push(record);
+    this.runHistoryMap!.set(record.jobId, records);
+    await this.persist();
+  }
+
   // -- Internal helpers --
 
   private async ensureLoaded(): Promise<void> {
     if (this.jobs !== null) return;
     this.jobs = new Map();
+    this.runHistoryMap = new Map();
 
     try {
       const raw = await readFile(this.filePath, 'utf-8');
       const data: FileStoreData = JSON.parse(raw);
       for (const job of data.jobs) {
         this.jobs.set(job.id, job);
+      }
+      if (data.runHistory) {
+        for (const [jobId, records] of Object.entries(data.runHistory)) {
+          this.runHistoryMap.set(jobId, records);
+        }
       }
     } catch (err: unknown) {
       // File not found is expected on first use
@@ -448,8 +606,14 @@ export class FileSchedulerStore implements SchedulerStore {
   }
 
   private async persist(): Promise<void> {
+    const history: Record<string, JobRunRecord[]> = {};
+    for (const [jobId, records] of this.runHistoryMap!) {
+      history[jobId] = records;
+    }
+
     const data: FileStoreData = {
       jobs: [...this.jobs!.values()],
+      runHistory: history,
       lastSavedAt: new Date().toISOString(),
     };
 

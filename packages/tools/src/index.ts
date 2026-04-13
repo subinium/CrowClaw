@@ -22,6 +22,8 @@ import type { WorkspaceStore } from '@crowclaw/workspace';
 type BackgroundProcessRecord = {
   pid: number;
   command: string;
+  backend: 'local' | 'docker' | 'ssh';
+  resolvedCommand: string;
   startedAt: string;
   status: 'running' | 'exited' | 'killed';
   exitCode?: number | null;
@@ -32,6 +34,134 @@ type BackgroundProcessRecord = {
 };
 
 const backgroundProcesses = new Map<number, BackgroundProcessRecord>();
+
+type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'modal' | 'daytona';
+
+type TerminalBackendDescriptor = {
+  backend: TerminalBackendKind;
+  status: 'available' | 'planned';
+  execution: 'native' | 'wrapped' | 'descriptor';
+  description: string;
+  requires?: string[];
+};
+
+const TERMINAL_BACKENDS: TerminalBackendDescriptor[] = [
+  {
+    backend: 'local',
+    status: 'available',
+    execution: 'native',
+    description: 'Executes commands directly on the local host process.'
+  },
+  {
+    backend: 'docker',
+    status: 'available',
+    execution: 'wrapped',
+    description: 'Wraps commands through docker exec/run for container-oriented execution.',
+    requires: ['container or image']
+  },
+  {
+    backend: 'ssh',
+    status: 'available',
+    execution: 'wrapped',
+    description: 'Wraps commands through ssh for remote shell execution.',
+    requires: ['target']
+  },
+  {
+    backend: 'modal',
+    status: 'planned',
+    execution: 'descriptor',
+    description: 'Reserved execution descriptor for future Modal backend integration.',
+    requires: ['app or function reference']
+  },
+  {
+    backend: 'daytona',
+    status: 'planned',
+    execution: 'descriptor',
+    description: 'Reserved execution descriptor for future Daytona workspace execution.',
+    requires: ['workspace or project reference']
+  }
+];
+
+function normalizeTerminalBackend(input: unknown): TerminalBackendKind {
+  return input === 'docker' || input === 'ssh' || input === 'modal' || input === 'daytona'
+    ? input
+    : 'local';
+}
+
+function quoteShell(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function resolveTerminalCommandPlan(input: Record<string, unknown>): {
+  ok: boolean;
+  backend: TerminalBackendKind;
+  command: string;
+  resolvedCommand?: string;
+  output?: string;
+  metadata?: Record<string, unknown>;
+} {
+  const backend = normalizeTerminalBackend(input.backend);
+  const command = typeof input.command === 'string' ? input.command : typeof input.raw === 'string' ? input.raw : '';
+  if (!command) {
+    return { ok: false, backend, command, output: 'Missing command.' };
+  }
+
+  if (backend === 'local') {
+    return {
+      ok: true,
+      backend,
+      command,
+      resolvedCommand: command,
+      metadata: { backend, mode: 'native' }
+    };
+  }
+
+  if (backend === 'docker') {
+    const container = typeof input.container === 'string' ? input.container.trim() : '';
+    const image = typeof input.image === 'string' ? input.image.trim() : '';
+    if (!container && !image) {
+      return { ok: false, backend, command, output: 'Docker backend requires container or image.' };
+    }
+    const resolvedCommand = container
+      ? `docker exec ${container} /bin/sh -lc ${quoteShell(command)}`
+      : `docker run --rm ${image} /bin/sh -lc ${quoteShell(command)}`;
+    return {
+      ok: true,
+      backend,
+      command,
+      resolvedCommand,
+      metadata: { backend, container: container || undefined, image: image || undefined, mode: 'wrapped' }
+    };
+  }
+
+  if (backend === 'ssh') {
+    const target = typeof input.target === 'string' ? input.target.trim() : '';
+    if (!target) {
+      return { ok: false, backend, command, output: 'SSH backend requires target.' };
+    }
+    const resolvedCommand = `ssh ${target} /bin/sh -lc ${quoteShell(command)}`;
+    return {
+      ok: true,
+      backend,
+      command,
+      resolvedCommand,
+      metadata: { backend, target, mode: 'wrapped' }
+    };
+  }
+
+  const descriptor = TERMINAL_BACKENDS.find((entry) => entry.backend === backend);
+  return {
+    ok: false,
+    backend,
+    command,
+    output: `${backend} backend is planned but not yet executable.`,
+    metadata: {
+      backend,
+      mode: 'descriptor',
+      requires: descriptor?.requires ?? []
+    }
+  };
+}
 
 async function loadChildProcessModule(): Promise<{
   exec(command: string, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
@@ -214,7 +344,7 @@ export function createTerminalExecTool(): ToolDefinition {
   return {
     manifest: {
       name: 'terminal.exec',
-      description: 'Executes a shell command locally and returns stdout/stderr.',
+      description: 'Executes a shell command through the selected terminal backend and returns stdout/stderr.',
       runtime: 'worker',
       streaming: false,
       stateful: false,
@@ -223,20 +353,47 @@ export function createTerminalExecTool(): ToolDefinition {
       dangerLevel: 'high'
     },
     async execute(input) {
-      const command = typeof input.command === 'string' ? input.command : typeof input.raw === 'string' ? input.raw : '';
-      if (!command) {
-        return { toolName: 'terminal.exec', runtime: 'worker', ok: false, output: 'Missing command.' };
+      const plan = resolveTerminalCommandPlan(input);
+      if (!plan.ok || !plan.resolvedCommand) {
+        return {
+          toolName: 'terminal.exec',
+          runtime: 'worker',
+          ok: false,
+          output: plan.output ?? 'Unable to resolve terminal command.',
+          metadata: plan.metadata
+        };
       }
+      if (input.planOnly === true) {
+        return {
+          toolName: 'terminal.exec',
+          runtime: 'worker',
+          ok: true,
+          output: JSON.stringify({
+            backend: plan.backend,
+            command: plan.command,
+            resolvedCommand: plan.resolvedCommand,
+            mode: 'plan'
+          }, null, 2),
+          metadata: {
+            ...plan.metadata,
+            resolvedCommand: plan.resolvedCommand,
+            planOnly: true
+          }
+        };
+      }
+      const resolvedCommand = plan.resolvedCommand;
       const childProcess = await loadChildProcessModule();
       return await new Promise<ToolExecutionResult>((resolve) => {
-        childProcess.exec(command, (error, stdout, stderr) => {
+        childProcess.exec(resolvedCommand, (error, stdout, stderr) => {
           resolve({
             toolName: 'terminal.exec',
             runtime: 'worker',
             ok: !error,
             output: [stdout, stderr].filter(Boolean).join('').trim() || (error ? String(error.message) : ''),
             metadata: {
-              command,
+              backend: plan.backend,
+              command: plan.command,
+              resolvedCommand,
               exitCode: error ? 1 : 0,
               stdout,
               stderr
@@ -261,12 +418,37 @@ export function createTerminalBackgroundTool(): ToolDefinition {
       dangerLevel: 'high'
     },
     async execute(input) {
-      const command = typeof input.command === 'string' ? input.command : '';
-      if (!command) {
-        return { toolName: 'terminal.background', runtime: 'worker', ok: false, output: 'Missing command.' };
+      const plan = resolveTerminalCommandPlan(input);
+      if (!plan.ok || !plan.resolvedCommand) {
+        return {
+          toolName: 'terminal.background',
+          runtime: 'worker',
+          ok: false,
+          output: plan.output ?? 'Unable to resolve terminal command.',
+          metadata: plan.metadata
+        };
       }
+      if (input.planOnly === true) {
+        return {
+          toolName: 'terminal.background',
+          runtime: 'worker',
+          ok: true,
+          output: JSON.stringify({
+            backend: plan.backend,
+            command: plan.command,
+            resolvedCommand: plan.resolvedCommand,
+            mode: 'plan'
+          }, null, 2),
+          metadata: {
+            ...plan.metadata,
+            resolvedCommand: plan.resolvedCommand,
+            planOnly: true
+          }
+        };
+      }
+      const resolvedCommand = plan.resolvedCommand;
       const childProcess = await loadChildProcessModule();
-      const child = childProcess.spawn('/bin/sh', ['-lc', command], {
+      const child = childProcess.spawn('/bin/sh', ['-lc', resolvedCommand], {
         stdio: 'ignore',
         detached: true
       });
@@ -274,7 +456,9 @@ export function createTerminalBackgroundTool(): ToolDefinition {
       const pid = child.pid ?? Math.floor(Math.random() * 100000);
       const record: BackgroundProcessRecord = {
         pid,
-        command,
+        command: plan.command,
+        backend: plan.backend === 'local' || plan.backend === 'docker' || plan.backend === 'ssh' ? plan.backend : 'local',
+        resolvedCommand,
         startedAt: new Date().toISOString(),
         status: 'running',
         handle: child
@@ -288,8 +472,36 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         toolName: 'terminal.background',
         runtime: 'worker',
         ok: true,
-        output: JSON.stringify({ pid, command }, null, 2),
-        metadata: { pid, command }
+        output: JSON.stringify({ pid, command: plan.command, backend: plan.backend }, null, 2),
+        metadata: { pid, command: plan.command, backend: plan.backend, resolvedCommand }
+      };
+    }
+  };
+}
+
+export function createTerminalBackendsTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.backends',
+      description: 'Lists available terminal backend descriptors and execution expectations.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low'
+    },
+    async execute() {
+      return {
+        toolName: 'terminal.backends',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify(TERMINAL_BACKENDS, null, 2),
+        metadata: {
+          count: TERMINAL_BACKENDS.length,
+          available: TERMINAL_BACKENDS.filter((entry) => entry.status === 'available').map((entry) => entry.backend),
+          planned: TERMINAL_BACKENDS.filter((entry) => entry.status === 'planned').map((entry) => entry.backend)
+        }
       };
     }
   };
@@ -311,6 +523,8 @@ export function createTerminalProcessesTool(): ToolDefinition {
       const processes = [...backgroundProcesses.values()].map((record) => ({
         pid: record.pid,
         command: record.command,
+        backend: record.backend,
+        resolvedCommand: record.resolvedCommand,
         status: record.status,
         startedAt: record.startedAt,
         exitCode: record.exitCode
@@ -1849,6 +2063,7 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createTimeTool());
   registry.register(createTerminalExecTool());
   registry.register(createTerminalBackgroundTool());
+  registry.register(createTerminalBackendsTool());
   registry.register(createTerminalProcessesTool());
   registry.register(createTerminalKillTool());
   registry.register(createTodoTool());
@@ -1953,7 +2168,7 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   terminal: {
     name: 'terminal',
     description: 'Shell execution — terminal commands and process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.processes', 'terminal.kill'],
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.processes', 'terminal.kill'],
   },
   workspace: {
     name: 'workspace',
@@ -1978,7 +2193,7 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   devops: {
     name: 'devops',
     description: 'DevOps workflow — terminal, files, web fetch, git, process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch'],
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch'],
   },
   creative: {
     name: 'creative',

@@ -55,13 +55,26 @@ export function clearHistorySync(filePath: string = HISTORY_FILE_PATH): void {
   }
 }
 
-export type CliCommandName = 'help' | 'status' | 'tools' | 'chat';
+export type CliCommandName =
+  | 'help'
+  | 'status'
+  | 'tools'
+  | 'chat'
+  | 'init'
+  | 'doctor'
+  | 'sessions'
+  | 'skills'
+  | 'jobs'
+  | 'serve'
+  | 'repl';
 
 export interface ParsedCliCommand {
   command: CliCommandName;
   query?: string;
   sessionId?: string;
   continueSession?: boolean;
+  port?: number;
+  noOnboarding?: boolean;
 }
 
 export interface CliRuntimeLike {
@@ -107,6 +120,11 @@ export const builtInCliSlashCommands = [
   '/send',
   '/vision',
   '/image',
+  '/terminal-backends',
+  '/terminal-exec',
+  '/terminal-background',
+  '/terminal-processes',
+  '/terminal-kill',
   '/bridge-status',
   '/bridge-spawn',
   '/bridge-ping',
@@ -217,6 +235,13 @@ const cliRoutePaths = {
   browser: {
     session: '/api/browser/session'
   },
+  terminal: {
+    exec: '/api/terminal/exec',
+    background: '/api/terminal/background',
+    backends: '/api/terminal/backends',
+    processes: '/api/terminal/processes',
+    kill: '/api/terminal/kill'
+  },
   actions: {
     todo: '/api/todo',
     clarify: '/api/clarify',
@@ -289,33 +314,65 @@ function formatOutput(output: string): string {
 }
 
 export function parseCliArgs(argv: string[]): ParsedCliCommand {
-  if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
+  const noOnboarding = argv.includes('--no-onboarding');
+  const filtered = argv.filter((a) => a !== '--no-onboarding');
+
+  if (filtered.length === 0) {
+    return { command: 'repl', noOnboarding };
+  }
+
+  if (filtered.includes('--help') || filtered.includes('-h')) {
     return { command: 'help' };
   }
 
-  const [first, ...rest] = argv;
-  if (first === 'status') {
-    return { command: 'status' };
+  const [first, ...rest] = filtered;
+
+  // Simple noun subcommands (no extra args)
+  const simpleCommands: Record<string, CliCommandName> = {
+    help: 'help',
+    init: 'init',
+    doctor: 'doctor',
+    status: 'status',
+    sessions: 'sessions',
+    skills: 'skills',
+    tools: 'tools',
+    jobs: 'jobs',
+  };
+
+  if (first !== undefined && first in simpleCommands) {
+    return { command: simpleCommands[first]!, noOnboarding };
   }
 
-  if (first === 'tools') {
-    return { command: 'tools' };
+  // serve — supports --port
+  if (first === 'serve') {
+    let port: number | undefined;
+    for (let i = 0; i < rest.length; i += 1) {
+      if (rest[i] === '--port' && rest[i + 1] !== undefined) {
+        port = parseInt(rest[i + 1]!, 10);
+        i += 1;
+      }
+    }
+    return { command: 'serve', port, noOnboarding };
   }
 
-  const command: CliCommandName = first === 'chat' ? 'chat' : 'chat';
+  // chat subcommand or -q flag at top level
   let query: string | undefined;
   let sessionId: string | undefined;
   let continueSession = false;
+  let port: number | undefined;
 
-  for (let index = first === 'chat' ? 0 : -1; index < rest.length; index += 1) {
-    const value = rest[index]!;
+  const isChat = first === 'chat';
+  const argsToScan = isChat ? rest : filtered;
+
+  for (let index = 0; index < argsToScan.length; index += 1) {
+    const value = argsToScan[index]!;
     if (value === '-q' || value === '--query') {
-      query = rest[index + 1];
+      query = argsToScan[index + 1];
       index += 1;
       continue;
     }
     if (value === '--session') {
-      sessionId = rest[index + 1];
+      sessionId = argsToScan[index + 1];
       index += 1;
       continue;
     }
@@ -323,16 +380,33 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
       continueSession = true;
       continue;
     }
+    if (value === '--port') {
+      port = parseInt(argsToScan[index + 1] ?? '3117', 10);
+      index += 1;
+      continue;
+    }
     if (!value.startsWith('-') && !query) {
       query = value;
     }
   }
 
+  // If -q was used at the top level (no 'chat' subcommand), treat as chat
+  if (!isChat && query) {
+    return { command: 'chat', query, sessionId, continueSession, port, noOnboarding };
+  }
+
+  // 'chat' subcommand with no query → start REPL
+  if (isChat && !query && !continueSession) {
+    return { command: 'repl', noOnboarding };
+  }
+
   return {
-    command,
+    command: 'chat',
     query,
     sessionId,
-    continueSession
+    continueSession,
+    port,
+    noOnboarding,
   };
 }
 
@@ -340,22 +414,25 @@ export function renderCliHelp(): string {
   return [
     'CrowClaw CLI v0.1.0',
     '',
-    'Usage:',
-    '  crowclaw                        Start interactive REPL',
-    '  crowclaw chat -q "message"      Send one chat message',
-    '  crowclaw chat --session demo --continue  Resume a session',
-    '  crowclaw status                 Check runtime health',
-    '  crowclaw tools                  List registered tools',
+    'Usage: crowclaw [command] [options]',
     '',
     'Commands:',
-    '  version                        Show CrowClaw runtime version metadata',
-    '  status                         Check runtime health',
-    '  doctor                         Inspect runtime/deployment status',
-    '  preflight                      Run deployment/readiness checks',
-    '  release-check                  Summarize release-candidate readiness',
-    '  tools                          List registered tools',
-    '  chat -q "message"              Send one chat message',
-    '  chat --session demo --continue Resume a session by id',
+    '  (none)              Start interactive REPL',
+    '  init                Set up CrowClaw (provider, model, preset)',
+    '  doctor              Run system health checks',
+    '  chat "msg"          One-shot chat message',
+    '  serve               Start HTTP server + dashboard',
+    '  status              Show system status',
+    '  sessions            List sessions',
+    '  skills              List skills with status',
+    '  tools               List registered tools',
+    '  jobs                List scheduled jobs',
+    '  help                Show this help',
+    '',
+    'Options:',
+    '  -q "msg"            One-shot chat (alias for chat)',
+    '  --no-onboarding     Skip first-run wizard',
+    '  --port N            Server port (default: 3117)',
     '',
     'REPL Slash Commands:',
     '  /help                          Show this help text',
@@ -374,6 +451,11 @@ export function renderCliHelp(): string {
     '  /send ...                      Build an outbound message payload',
     '  /vision ...                    Run vision analysis',
     '  /image ...                     Build image generation payload',
+    '  /terminal-backends             List terminal backend descriptors',
+    '  /terminal-exec ...             Execute a terminal command',
+    '  /terminal-background ...       Start a background terminal command',
+    '  /terminal-processes            Show tracked background processes',
+    '  /terminal-kill <pid>           Stop a tracked background process',
     '  /bridge-*                      Bridge management commands',
     '  /browser-session               Browser session info',
     '  /mcp-*                         MCP management commands',
@@ -441,6 +523,289 @@ async function runChat(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promi
   }));
   const payload = await response.json() as { finalResponse: string; session: { sessionId: string } };
   return `[${payload.session.sessionId}] ${payload.finalResponse}`;
+}
+
+// --- Health check types ---
+
+export interface DoctorCheckResult {
+  name: string;
+  status: 'ok' | 'warn' | 'error';
+  detail: string;
+}
+
+export interface DoctorReport {
+  checks: DoctorCheckResult[];
+  issues: string[];
+}
+
+function checkIcon(status: 'ok' | 'warn' | 'error'): string {
+  if (status === 'ok') return '\x1b[32m\u2713\x1b[0m';
+  if (status === 'warn') return '\x1b[33m\u26A0\x1b[0m';
+  return '\x1b[31m\u2717\x1b[0m';
+}
+
+function padLabel(label: string, width = 16): string {
+  const dots = '.'.repeat(Math.max(1, width - label.length));
+  return `${label} ${dots}`;
+}
+
+export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> {
+  const checks: DoctorCheckResult[] = [];
+  const issues: string[] = [];
+
+  // 1. Provider / Health
+  try {
+    const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.health)));
+    const data = await res.json() as { ok: boolean; runtime?: string; service?: string };
+    if (data.ok) {
+      checks.push({ name: 'Provider', status: 'ok', detail: `${data.service ?? 'CrowClaw'} (${data.runtime ?? 'node'})` });
+    } else {
+      checks.push({ name: 'Provider', status: 'error', detail: 'Health check returned not-ok' });
+      issues.push('Provider: Health check failed — verify provider configuration');
+    }
+  } catch {
+    checks.push({ name: 'Provider', status: 'error', detail: 'Unreachable' });
+    issues.push('Provider: Cannot reach runtime — is the server running?');
+  }
+
+  // 2. Config file
+  try {
+    const configPath = join(homedir(), '.crowclaw', 'config.json');
+    if (existsSync(configPath)) {
+      checks.push({ name: 'Config', status: 'ok', detail: `~/.crowclaw/config.json` });
+    } else {
+      checks.push({ name: 'Config', status: 'warn', detail: 'No config file found' });
+      issues.push('Config: No config file — run `crowclaw init`');
+    }
+  } catch {
+    checks.push({ name: 'Config', status: 'warn', detail: 'Could not check config' });
+  }
+
+  // 3. System status (workspace, tools, skills, memory, security)
+  try {
+    const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.status)));
+    const data = await res.json() as Record<string, unknown>;
+
+    // Tools
+    const toolCount = typeof data.toolCount === 'number' ? data.toolCount : (runtime.tools?.list?.()?.length ?? 0);
+    const dangerousCount = typeof data.dangerousToolCount === 'number' ? data.dangerousToolCount : 0;
+    checks.push({
+      name: 'Tools',
+      status: 'ok',
+      detail: `${toolCount} registered${dangerousCount > 0 ? ` (${dangerousCount} dangerous)` : ''}`
+    });
+
+    // Skills
+    const skillCount = typeof data.skillCount === 'number' ? data.skillCount : 0;
+    const learnedCount = typeof data.learnedSkillCount === 'number' ? data.learnedSkillCount : 0;
+    checks.push({
+      name: 'Skills',
+      status: 'ok',
+      detail: `${skillCount} built-in, ${learnedCount} learned`
+    });
+
+    // Memory
+    const memoryType = typeof data.memoryType === 'string' ? data.memoryType : 'in-memory';
+    checks.push({ name: 'Memory', status: 'ok', detail: memoryType });
+
+    // Workspace
+    const workspaceType = typeof data.workspaceType === 'string' ? data.workspaceType : 'unknown';
+    checks.push({ name: 'Workspace', status: 'ok', detail: workspaceType });
+
+    // Security
+    const securityActive = typeof data.securityActive === 'boolean' ? data.securityActive : true;
+    checks.push({
+      name: 'Security',
+      status: securityActive ? 'ok' : 'warn',
+      detail: securityActive ? 'Active' : 'Not configured'
+    });
+  } catch {
+    // If system status fails, still add basic tool check from runtime
+    const toolCount = runtime.tools?.list?.()?.length ?? 0;
+    checks.push({ name: 'Tools', status: toolCount > 0 ? 'ok' : 'warn', detail: `${toolCount} registered` });
+    checks.push({ name: 'Skills', status: 'warn', detail: 'Could not retrieve' });
+    checks.push({ name: 'Memory', status: 'warn', detail: 'Could not retrieve' });
+    checks.push({ name: 'Workspace', status: 'warn', detail: 'Could not retrieve' });
+    checks.push({ name: 'Security', status: 'warn', detail: 'Could not retrieve' });
+  }
+
+  // 4. Scheduler
+  try {
+    const res = await runtime.fetch(new Request(localRoute('/api/scheduler/jobs')));
+    const jobs = await res.json() as Array<unknown>;
+    const jobCount = Array.isArray(jobs) ? jobs.length : 0;
+    if (jobCount > 0) {
+      checks.push({ name: 'Scheduler', status: 'ok', detail: `${jobCount} job(s) defined` });
+    } else {
+      checks.push({ name: 'Scheduler', status: 'warn', detail: 'No jobs defined' });
+    }
+  } catch {
+    checks.push({ name: 'Scheduler', status: 'warn', detail: 'Not available' });
+  }
+
+  // 5. Gateway
+  try {
+    const res = await runtime.fetch(new Request(localRoute('/api/gateway/status')));
+    const data = await res.json() as { platforms?: Array<unknown> };
+    const platformCount = Array.isArray(data.platforms) ? data.platforms.length : 0;
+    if (platformCount > 0) {
+      checks.push({ name: 'Gateway', status: 'ok', detail: `${platformCount} platform(s) configured` });
+    } else {
+      checks.push({ name: 'Gateway', status: 'error', detail: 'No platforms configured' });
+      issues.push('Gateway: No platforms configured — run `crowclaw gateway connect <platform>`');
+    }
+  } catch {
+    checks.push({ name: 'Gateway', status: 'error', detail: 'Not available' });
+    issues.push('Gateway: Gateway service not available');
+  }
+
+  // 6. MCP
+  try {
+    const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.status)));
+    const data = await res.json() as Record<string, unknown> | null;
+    if (data && typeof data === 'object' && Object.keys(data).length > 0) {
+      checks.push({ name: 'MCP', status: 'ok', detail: 'Connected' });
+    } else {
+      checks.push({ name: 'MCP', status: 'error', detail: 'No servers connected' });
+      issues.push('MCP: No servers connected — run `crowclaw mcp add <server>`');
+    }
+  } catch {
+    checks.push({ name: 'MCP', status: 'error', detail: 'Not available' });
+    issues.push('MCP: MCP service not available');
+  }
+
+  // 7. Dashboard
+  try {
+    const res = await runtime.fetch(new Request(localRoute('/dashboard')));
+    if (res.ok || res.status === 200) {
+      checks.push({ name: 'Dashboard', status: 'ok', detail: 'Available at http://localhost:3117' });
+    } else {
+      checks.push({ name: 'Dashboard', status: 'warn', detail: 'Not serving' });
+    }
+  } catch {
+    checks.push({ name: 'Dashboard', status: 'warn', detail: 'Not available' });
+  }
+
+  return { checks, issues };
+}
+
+export function formatDoctorReport(report: DoctorReport): string {
+  const lines: string[] = [
+    '\x1b[1mCrowClaw Doctor\x1b[0m',
+    '',
+  ];
+
+  for (const check of report.checks) {
+    lines.push(`${padLabel(check.name)} ${checkIcon(check.status)} ${check.detail}`);
+  }
+
+  if (report.issues.length > 0) {
+    lines.push('');
+    lines.push(`Issues found: ${report.issues.length}`);
+    report.issues.forEach((issue, i) => {
+      lines.push(`  ${i + 1}. ${issue}`);
+    });
+  } else {
+    lines.push('');
+    lines.push('\x1b[32mAll checks passed.\x1b[0m');
+  }
+
+  return lines.join('\n');
+}
+
+// --- List command formatters ---
+
+export interface FormattedTool {
+  name: string;
+  description: string;
+  dangerous: boolean;
+}
+
+export function formatToolsTable(tools: Array<{ name: string; description?: string; dangerous?: boolean }>): string {
+  if (tools.length === 0) return 'No tools registered.';
+
+  const nameWidth = Math.max(4, ...tools.map((t) => t.name.length));
+  const header = `${'Name'.padEnd(nameWidth)}  ${'Danger'.padEnd(8)}  Description`;
+  const separator = '-'.repeat(header.length);
+  const rows = tools.map((t) => {
+    const danger = t.dangerous ? '\x1b[31myes\x1b[0m   ' : 'no      ';
+    return `${t.name.padEnd(nameWidth)}  ${danger}  ${t.description ?? ''}`;
+  });
+  return [header, separator, ...rows].join('\n');
+}
+
+export function formatSkillsTable(skills: Array<{ name?: string; slug?: string; enabled?: boolean; triggerCount?: number; status?: string }>): string {
+  if (skills.length === 0) return 'No skills found.';
+
+  const nameWidth = Math.max(4, ...skills.map((s) => (s.name ?? s.slug ?? '').length));
+  const header = `${'Name'.padEnd(nameWidth)}  ${'Status'.padEnd(10)}  Triggers`;
+  const separator = '-'.repeat(header.length);
+  const rows = skills.map((s) => {
+    const name = s.name ?? s.slug ?? 'unknown';
+    const status = s.enabled === false ? '\x1b[31mdisabled\x1b[0m  ' : (s.status ?? '\x1b[32menabled\x1b[0m   ');
+    const triggers = String(s.triggerCount ?? 0);
+    return `${name.padEnd(nameWidth)}  ${status}  ${triggers}`;
+  });
+  return [header, separator, ...rows].join('\n');
+}
+
+export function formatSessionsTable(sessions: Array<{ id?: string; sessionId?: string; lastMessage?: string; createdAt?: string; updatedAt?: string; messageCount?: number }>): string {
+  if (sessions.length === 0) return 'No sessions found.';
+
+  const idWidth = Math.max(2, ...sessions.map((s) => (s.id ?? s.sessionId ?? '').length));
+  const clampedIdWidth = Math.min(idWidth, 36);
+  const header = `${'ID'.padEnd(clampedIdWidth)}  ${'Messages'.padEnd(8)}  ${'Date'.padEnd(20)}  Last Message`;
+  const separator = '-'.repeat(Math.min(header.length, 120));
+  const rows = sessions.map((s) => {
+    const id = (s.id ?? s.sessionId ?? '').slice(0, clampedIdWidth).padEnd(clampedIdWidth);
+    const msgCount = String(s.messageCount ?? 0).padEnd(8);
+    const date = (s.updatedAt ?? s.createdAt ?? '').slice(0, 20).padEnd(20);
+    const lastMsg = (s.lastMessage ?? '').slice(0, 50);
+    return `${id}  ${msgCount}  ${date}  ${lastMsg}`;
+  });
+  return [header, separator, ...rows].join('\n');
+}
+
+export function formatJobsTable(jobs: Array<{ id?: string; name?: string; schedule?: string; nextRun?: string; enabled?: boolean; lastRun?: string }>): string {
+  if (jobs.length === 0) return 'No scheduled jobs.';
+
+  const idWidth = Math.max(2, ...jobs.map((j) => (j.id ?? j.name ?? '').length));
+  const header = `${'ID'.padEnd(idWidth)}  ${'Schedule'.padEnd(16)}  ${'Enabled'.padEnd(8)}  Next Run`;
+  const separator = '-'.repeat(header.length);
+  const rows = jobs.map((j) => {
+    const id = (j.id ?? j.name ?? '').padEnd(idWidth);
+    const schedule = (j.schedule ?? '').padEnd(16);
+    const enabled = j.enabled === false ? 'no      ' : 'yes     ';
+    const nextRun = j.nextRun ?? j.lastRun ?? '';
+    return `${id}  ${schedule}  ${enabled}  ${nextRun}`;
+  });
+  return [header, separator, ...rows].join('\n');
+}
+
+async function runSessions(runtime: CliRuntimeLike): Promise<string> {
+  const res = await runtime.fetch(new Request(localRoute('/api/sessions?limit=50')));
+  const data = await res.json() as Array<{ id?: string; sessionId?: string; lastMessage?: string; createdAt?: string; updatedAt?: string; messageCount?: number }>;
+  const sessions = Array.isArray(data) ? data : [];
+  return formatSessionsTable(sessions);
+}
+
+async function runSkillsList(runtime: CliRuntimeLike): Promise<string> {
+  const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.skills.list)));
+  const data = await res.json() as { skills?: Array<{ name?: string; slug?: string; enabled?: boolean; triggerCount?: number; status?: string }> } | Array<{ name?: string; slug?: string; enabled?: boolean; triggerCount?: number; status?: string }>;
+  const skills = Array.isArray(data) ? data : (data.skills ?? []);
+  return formatSkillsTable(skills);
+}
+
+async function runJobsList(runtime: CliRuntimeLike): Promise<string> {
+  const res = await runtime.fetch(new Request(localRoute('/api/scheduler/jobs')));
+  const data = await res.json() as Array<{ id?: string; name?: string; schedule?: string; nextRun?: string; enabled?: boolean; lastRun?: string }>;
+  const jobs = Array.isArray(data) ? data : [];
+  return formatJobsTable(jobs);
+}
+
+async function runFormattedTools(runtime: CliRuntimeLike): Promise<string> {
+  const tools = runtime.tools?.list?.() ?? [];
+  return formatToolsTable(tools.map((t) => ({ name: t.name, description: t.description, dangerous: false })));
 }
 
 export async function runCliInputLine(
@@ -621,6 +986,79 @@ export async function runCliInputLine(
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: prompt || 'generate an image' })
+    }));
+    return { output: JSON.stringify(await response.json(), null, 2), state };
+  }
+
+  if (trimmed === '/terminal-backends') {
+    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.terminal.backends)));
+    return { output: JSON.stringify(await response.json(), null, 2), state };
+  }
+
+  if (trimmed === '/terminal-processes') {
+    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.terminal.processes)));
+    return { output: JSON.stringify(await response.json(), null, 2), state };
+  }
+
+  if (trimmed.startsWith('/terminal-kill ')) {
+    const pid = trimmed.replace('/terminal-kill ', '').trim();
+    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.terminal.kill), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pid })
+    }));
+    return { output: JSON.stringify(await response.json(), null, 2), state };
+  }
+
+  if (trimmed === '/terminal-exec' || trimmed.startsWith('/terminal-exec ') || trimmed === '/terminal-background' || trimmed.startsWith('/terminal-background ')) {
+    const background = trimmed.startsWith('/terminal-background');
+    const raw = trimmed.replace(background ? '/terminal-background' : '/terminal-exec', '').trim();
+    const tokens = raw.length > 0 ? raw.split(/\s+/) : [];
+    let backend = 'local';
+    let target: string | undefined;
+    let container: string | undefined;
+    let image: string | undefined;
+    let planOnly = false;
+    const commandParts: string[] = [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index]!;
+      if (token === '--backend') {
+        backend = tokens[index + 1] ?? backend;
+        index += 1;
+        continue;
+      }
+      if (token === '--target') {
+        target = tokens[index + 1];
+        index += 1;
+        continue;
+      }
+      if (token === '--container') {
+        container = tokens[index + 1];
+        index += 1;
+        continue;
+      }
+      if (token === '--image') {
+        image = tokens[index + 1];
+        index += 1;
+        continue;
+      }
+      if (token === '--plan') {
+        planOnly = true;
+        continue;
+      }
+      commandParts.push(token);
+    }
+    const response = await runtime.fetch(new Request(localRoute(background ? cliRoutePaths.terminal.background : cliRoutePaths.terminal.exec), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        backend,
+        target,
+        container,
+        image,
+        planOnly,
+        command: commandParts.join(' ')
+      })
     }));
     return { output: JSON.stringify(await response.json(), null, 2), state };
   }
@@ -1006,9 +1444,27 @@ export async function runCli(argv: string[], options: CliRunOptions = {}): Promi
     case 'status':
       return runStatus(runtime);
     case 'tools':
-      return runTools(runtime);
+      return runFormattedTools(runtime);
     case 'chat':
       return runChat(runtime, parsed);
+    case 'doctor': {
+      const report = await runDoctor(runtime);
+      return formatDoctorReport(report);
+    }
+    case 'sessions':
+      return runSessions(runtime);
+    case 'skills':
+      return runSkillsList(runtime);
+    case 'jobs':
+      return runJobsList(runtime);
+    case 'init':
+      // init is handled in main() because it needs interactive I/O
+      return 'Run `crowclaw init` directly (not via runCli).';
+    case 'serve':
+      // serve is handled in main() because it needs to stay alive
+      return 'Run `crowclaw serve` directly (not via runCli).';
+    case 'repl':
+      return 'Run `crowclaw` directly to start the REPL.';
   }
 }
 
@@ -1357,46 +1813,115 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
   rl.close();
 }
 
+export async function runServe(options: CliRunOptions & { port?: number } = {}): Promise<void> {
+  const port = options.port ?? 3117;
+  const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
+
+  // Start an HTTP server that delegates to the runtime fetch handler
+  const { createServer } = await import('node:http');
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (typeof value === 'string') headers.set(key, value);
+        else if (Array.isArray(value)) headers.set(key, value.join(', '));
+      }
+
+      const bodyChunks: Buffer[] = [];
+      for await (const chunk of req) {
+        bodyChunks.push(chunk as Buffer);
+      }
+      const body = bodyChunks.length > 0 ? Buffer.concat(bodyChunks) : undefined;
+
+      const request = new Request(url.toString(), {
+        method: req.method ?? 'GET',
+        headers,
+        body: body && req.method !== 'GET' && req.method !== 'HEAD' ? body : undefined,
+      });
+
+      const response = await runtime.fetch(request);
+      res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+      const responseBody = await response.arrayBuffer();
+      res.end(Buffer.from(responseBody));
+    } catch (error: unknown) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  });
+
+  server.listen(port, () => {
+    stdout.write(`CrowClaw server running at http://localhost:${port}\n`);
+    stdout.write(`Dashboard at http://localhost:${port}/dashboard\n`);
+    stdout.write('Press Ctrl+C to stop.\n');
+  });
+
+  // Keep process alive
+  await new Promise<void>((resolve) => {
+    process.on('SIGINT', () => {
+      stdout.write('\nShutting down...\n');
+      server.close(() => resolve());
+    });
+    process.on('SIGTERM', () => {
+      server.close(() => resolve());
+    });
+  });
+}
+
+async function applyConfigToEnv(argv: string[]): Promise<void> {
+  if (!shouldRunOnboarding(argv)) return;
+  const hasConfig = await configFileExists();
+  if (!hasConfig) {
+    const config = await runCliOnboarding();
+    if (config) {
+      process.env.CROWCLAW_API_KEY = config.apiKey;
+      process.env.OPENROUTER_API_KEY = config.apiKey;
+      process.env.OPENROUTER_BASE_URL = config.baseUrl;
+      process.env.OPENROUTER_MODEL = config.model;
+    }
+  } else {
+    const config = await loadConfig();
+    if (config && !process.env.CROWCLAW_API_KEY) {
+      process.env.CROWCLAW_API_KEY = config.apiKey;
+      process.env.OPENROUTER_API_KEY = config.apiKey;
+      process.env.OPENROUTER_BASE_URL = config.baseUrl;
+      process.env.OPENROUTER_MODEL = config.model;
+    }
+  }
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
   const parsed = parseCliArgs(argv);
 
-  if (parsed.command === 'help') {
-    stdout.write(renderCliHelp() + '\n');
-    return;
-  }
+  switch (parsed.command) {
+    case 'help':
+      stdout.write(renderCliHelp() + '\n');
+      return;
 
-  // If no specific command or 'chat' without query, start REPL
-  if (parsed.command === 'chat' && !parsed.query) {
-    // First-run onboarding detection
-    if (shouldRunOnboarding(argv)) {
-      const hasConfig = await configFileExists();
-      if (!hasConfig) {
-        const config = await runCliOnboarding();
-        if (config) {
-          // Apply config to env for the current session
-          process.env.CROWCLAW_API_KEY = config.apiKey;
-          process.env.OPENROUTER_API_KEY = config.apiKey;
-          process.env.OPENROUTER_BASE_URL = config.baseUrl;
-          process.env.OPENROUTER_MODEL = config.model;
-        }
-      } else {
-        // Load existing config
-        const config = await loadConfig();
-        if (config && !process.env.CROWCLAW_API_KEY) {
-          process.env.CROWCLAW_API_KEY = config.apiKey;
-          process.env.OPENROUTER_API_KEY = config.apiKey;
-          process.env.OPENROUTER_BASE_URL = config.baseUrl;
-          process.env.OPENROUTER_MODEL = config.model;
-        }
+    case 'repl':
+      await applyConfigToEnv(argv);
+      await startRepl();
+      return;
+
+    case 'init': {
+      const config = await runCliOnboarding();
+      if (config) {
+        stdout.write('Setup complete. Run `crowclaw` to start.\n');
       }
+      return;
     }
-    await startRepl();
-    return;
-  }
 
-  // Otherwise run one-shot
-  const output = await runCli(argv);
-  stdout.write(output + '\n');
+    case 'serve':
+      await applyConfigToEnv(argv);
+      await runServe({ port: parsed.port });
+      return;
+
+    default: {
+      // One-shot commands: doctor, status, tools, chat, sessions, skills, jobs
+      const output = await runCli(argv);
+      stdout.write(output + '\n');
+    }
+  }
 }
 
 // Auto-invoke when run directly

@@ -35,6 +35,7 @@ import {
 } from '../packages/tools/src/index.js';
 import { InMemorySessionStore } from '../packages/storage/src/index.js';
 import { FileWorkspaceStore } from '../packages/workspace/src/index.js';
+import { InMemorySchedulerStore, SchedulerExecutor, AutonomousScheduler, createScheduledAgentJob } from '../packages/scheduler/src/index.js';
 import { McpClient, mcpPresets as mcpPresetConfigs, verifyPresetAvailability, type McpStdioServerConfig } from '../packages/mcp/src/index.js';
 import { McpJsonRpcStdioTransport } from '../packages/mcp/src/stdio-transport.js';
 import type { ParsedSkillFile } from '../packages/core/src/index.js';
@@ -88,6 +89,20 @@ const toolRegistry = new ToolRegistry();
 
 // Real filesystem workspace store rooted at cwd
 const workspaceStore = new FileWorkspaceStore(process.cwd());
+
+// Scheduler infrastructure for dev mode
+const schedulerStore = new InMemorySchedulerStore();
+const schedulerExecutor = new SchedulerExecutor(
+  schedulerStore,
+  async (input) => {
+    // In dev mode, use a simple echo response for scheduled jobs
+    return {
+      finalResponse: `[dev-mode] Executed scheduled task: ${input.userMessage}`,
+      toolResults: [],
+    };
+  },
+);
+const autonomousScheduler = new AutonomousScheduler(schedulerExecutor);
 
 // Register dev tools (including workspace tools backed by real filesystem)
 toolRegistry.register(createEchoTool());
@@ -160,7 +175,7 @@ function safeJson(raw: string): Record<string, unknown> {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
   res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
+  res.setHeader('access-control-allow-methods', 'GET,POST,DELETE,OPTIONS');
   res.setHeader('access-control-allow-headers', 'content-type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
@@ -288,6 +303,44 @@ const server = createServer(async (req, res) => {
       disabledSkillCount: runtimeState.disabledSkills.size,
       configuredGateways: [...runtimeState.gatewayTokens.keys()],
       mcpConnections: Object.fromEntries(runtimeState.mcpConnections),
+    });
+  }
+
+  // Capabilities — runtime status of each subsystem
+  if (req.method === 'GET' && url.pathname === '/api/capabilities') {
+    const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || '';
+    const model = process.env.OPENROUTER_MODEL || process.env.OPENAI_MODEL || '';
+    const hasRealProvider = Boolean(apiKey);
+    const hasGatewayTokens = runtimeState.gatewayTokens.size > 0;
+    const hasMcpConnections = mcpClients.size > 0;
+    const toolCount = toolRegistry.list().length;
+    const skillCount = builtInSkills.length;
+
+    return json({
+      provider: {
+        status: hasRealProvider ? 'live' : 'simulated',
+        detail: hasRealProvider ? model || 'configured' : 'EchoProvider (no API key)',
+      },
+      chat: { status: hasRealProvider ? 'live' : 'simulated' },
+      streaming: { status: 'live' },
+      tools: { status: 'live', detail: `${toolCount} registered` },
+      memory: { status: 'simulated', detail: 'In-memory only' },
+      skills: { status: 'live', detail: `${skillCount} built-in` },
+      scheduler: { status: 'live' },
+      gateway: {
+        status: hasGatewayTokens ? 'live' : 'disconnected',
+        detail: hasGatewayTokens
+          ? `${runtimeState.gatewayTokens.size} platform(s) configured`
+          : 'No platforms configured',
+      },
+      mcp: {
+        status: hasMcpConnections ? 'live' : 'disconnected',
+        detail: hasMcpConnections
+          ? `${mcpClients.size} server(s) connected`
+          : 'No servers connected',
+      },
+      browser: { status: 'simulated' },
+      workspace: { status: 'live', detail: 'File-backed' },
     });
   }
 
@@ -833,6 +886,104 @@ const server = createServer(async (req, res) => {
     const replaySession = createReplaySession(checkpoint, body.newSessionId as string);
     await sessionStore.put(replaySession);
     return json({ ok: true, sessionId: replaySession.sessionId, messageCount: replaySession.messages.length });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Scheduler routes
+  // ---------------------------------------------------------------------------
+
+  if (req.method === 'GET' && url.pathname === '/api/scheduler/jobs') {
+    return json(await schedulerStore.listJobs());
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/scheduler/jobs') {
+    const body = safeJson(await readBody(req));
+    const schedule = (body.schedule as string) ?? `every:${body.everyMinutes ?? 5}m`;
+    const job = createScheduledAgentJob({
+      id: body.id as string,
+      schedule,
+      task: body.task as string,
+      skillSlugs: body.skillSlugs as string[] | undefined,
+      model: body.model as string | undefined,
+      maxRuns: body.maxRuns as number | undefined,
+      timeoutMs: body.timeoutMs as number | undefined,
+    });
+    await schedulerStore.saveJob(job);
+    return json(job);
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/scheduler/tick') {
+    const results = await schedulerExecutor.tick();
+    return json({ ok: true, results });
+  }
+
+  {
+    const jobActionMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)\/(pause|resume|history|dry-run)$/);
+    const jobDeleteMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)$/);
+
+    if (req.method === 'POST' && jobActionMatch) {
+      const jobId = decodeURIComponent(jobActionMatch[1]);
+      const action = jobActionMatch[2];
+
+      if (action === 'pause') {
+        const result = await schedulerExecutor.pauseJob(jobId);
+        if (!result) return json({ error: 'Job not found' }, 404);
+        return json(result);
+      }
+
+      if (action === 'resume') {
+        const result = await schedulerExecutor.resumeJob(jobId);
+        if (!result) return json({ error: 'Job not found' }, 404);
+        return json(result);
+      }
+
+      if (action === 'dry-run') {
+        try {
+          const record = await schedulerExecutor.dryRun(jobId);
+          return json(record);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return json({ error: msg }, 404);
+        }
+      }
+    }
+
+    if (req.method === 'GET' && jobActionMatch) {
+      const jobId = decodeURIComponent(jobActionMatch[1]);
+      const action = jobActionMatch[2];
+
+      if (action === 'history') {
+        const limitParam = url.searchParams.get('limit');
+        const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+        const history = await schedulerStore.getRunHistory(jobId, limit);
+        return json(history);
+      }
+    }
+
+    if (req.method === 'DELETE' && jobDeleteMatch) {
+      const jobId = decodeURIComponent(jobDeleteMatch[1]);
+      const deleted = await schedulerExecutor.deleteJob(jobId);
+      if (!deleted) return json({ error: 'Job not found' }, 404);
+      return json({ ok: true });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/scheduler/start') {
+    autonomousScheduler.start();
+    return json({ ok: true, running: true });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/scheduler/stop') {
+    autonomousScheduler.stop();
+    return json({ ok: true, running: false });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/scheduler/status') {
+    return json({
+      running: autonomousScheduler.isRunning(),
+      interval: autonomousScheduler.interval,
+      lastTick: autonomousScheduler.lastTick,
+    });
   }
 
   json({ error: 'Not found' }, 404);

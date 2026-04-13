@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "mercury",
+  "name": "crowclaw",
   "main": "packages/runtime-cloudflare/src/index.ts",
   "compatibility_date": "2026-04-11",
   "compatibility_flags": ["nodejs_compat"],
@@ -25,14 +25,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "mercury",
+      "database_name": "crowclaw",
       "database_id": "local-dev"
     }
   ],
   "r2_buckets": [
     {
       "binding": "ARTIFACTS",
-      "bucket_name": "mercury-artifacts"
+      "bucket_name": "crowclaw-artifacts"
     }
   ]
 }

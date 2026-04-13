@@ -1577,6 +1577,84 @@ export function classifyQueryComplexity(message: string): 'simple' | 'complex' {
   return 'simple';
 }
 
+export interface RoutingAnalysis {
+  complexity: 'simple' | 'complex';
+  hasTools: boolean;
+  signals: string[];
+  requiredCapabilities: string[];
+  selectedTier: 'primary' | 'cheap';
+  fallbackTier: 'primary' | 'cheap';
+  recommendedModels: Array<{
+    id: string;
+    family: string;
+    contextWindow: number;
+    supportsTools: boolean;
+    rationale: string;
+  }>;
+}
+
+function analyzeRoutingSignals(message: string): string[] {
+  const signals: string[] = [];
+  const lower = message.toLowerCase();
+  if (message.includes('\n')) signals.push('multi-line');
+  if (message.includes('```') || message.includes('``')) signals.push('code-block');
+  if (/https?:\/\//.test(message)) signals.push('url');
+  if (message.length > 160) signals.push('long-message');
+  if (message.trim().split(/\s+/).length > 28) signals.push('high-word-count');
+  for (const keyword of COMPLEX_KEYWORDS) {
+    if (lower.includes(keyword)) {
+      signals.push(`keyword:${keyword}`);
+    }
+  }
+  if (/\b(test|pytest|tsc|vitest|stack trace|traceback)\b/i.test(message)) {
+    signals.push('debug-artifact');
+  }
+  if (/\b(tool|browser|terminal|mcp|workspace)\b/i.test(message)) {
+    signals.push('tool-oriented');
+  }
+  return [...new Set(signals)];
+}
+
+function inferRequiredCapabilities(message: string, hasTools: boolean): string[] {
+  const required = new Set<string>();
+  if (hasTools) required.add('tools');
+  if (/\b(code|debug|refactor|implement|test|typescript|python|terminal)\b/i.test(message)) {
+    required.add('reasoning');
+  }
+  if (/\b(vision|image|screenshot)\b/i.test(message)) {
+    required.add('vision');
+  }
+  if (/https?:\/\//.test(message) || /\bweb\b/i.test(message)) {
+    required.add('long-context');
+  }
+  return [...required];
+}
+
+function recommendModelsForRouting(complexity: 'simple' | 'complex', requiredCapabilities: string[]): RoutingAnalysis['recommendedModels'] {
+  const known = listKnownModelMetadata()
+    .filter((item) => !requiredCapabilities.includes('tools') || item.supportsTools)
+    .sort((a, b) => b.contextWindow - a.contextWindow);
+
+  const preferred = complexity === 'complex'
+    ? ['gpt-4.1', 'claude-3-7-sonnet', 'claude-3-5-sonnet', 'gpt-4o']
+    : ['gpt-4o-mini', 'claude-3-5-haiku', 'gemini-2.5-flash', 'gpt-4o'];
+
+  const picks = preferred
+    .map((id) => known.find((item) => item.id === id))
+    .filter((item): item is ModelMetadata => Boolean(item))
+    .slice(0, 3);
+
+  return picks.map((item) => ({
+    id: item.id,
+    family: item.family,
+    contextWindow: item.contextWindow,
+    supportsTools: item.supportsTools,
+    rationale: complexity === 'complex'
+      ? 'Prioritized for harder reasoning or larger context.'
+      : 'Prioritized for lower-latency or lower-cost routing.'
+  }));
+}
+
 export class SmartModelRouter {
   constructor(
     private primaryProvider: ProviderAdapter,
@@ -1584,23 +1662,31 @@ export class SmartModelRouter {
   ) {}
 
   routeRequest(request: ProviderRequest): ProviderAdapter {
+    return this.explainRoute(request).selectedTier === 'primary'
+      ? this.primaryProvider
+      : this.cheapProvider;
+  }
+
+  explainRoute(request: ProviderRequest): RoutingAnalysis {
     const lastUserMessage = [...request.messages]
       .reverse()
       .find((m) => m.role === 'user')?.content ?? '';
 
     const complexity = classifyQueryComplexity(lastUserMessage);
-
-    // Use primary (expensive) provider for complex queries, cheap for simple
-    if (complexity === 'complex') {
-      return this.primaryProvider;
-    }
-
-    // If tools are available and the request has tools, prefer primary for reliability
-    if (request.availableTools.length > 0) {
-      return this.primaryProvider;
-    }
-
-    return this.cheapProvider;
+    const hasTools = request.availableTools.length > 0;
+    const signals = analyzeRoutingSignals(lastUserMessage);
+    const requiredCapabilities = inferRequiredCapabilities(lastUserMessage, hasTools);
+    const selectedTier = complexity === 'complex' || hasTools ? 'primary' : 'cheap';
+    const fallbackTier = selectedTier === 'primary' ? 'cheap' : 'primary';
+    return {
+      complexity,
+      hasTools,
+      signals,
+      requiredCapabilities,
+      selectedTier,
+      fallbackTier,
+      recommendedModels: recommendModelsForRouting(complexity, requiredCapabilities)
+    };
   }
 }
 

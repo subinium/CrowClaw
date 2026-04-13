@@ -22,6 +22,7 @@ export const routePaths = {
   terminal: {
     exec: '/api/terminal/exec',
     background: '/api/terminal/background',
+    backends: '/api/terminal/backends',
     processes: '/api/terminal/processes',
     kill: '/api/terminal/kill'
   },
@@ -74,6 +75,18 @@ export const routePaths = {
     list: '/api/personas',
     active: '/api/persona/active',
     switch: '/api/persona/switch'
+  },
+  scheduler: {
+    jobs: '/api/scheduler/jobs',
+    tick: '/api/scheduler/tick',
+    jobPause: '/api/scheduler/jobs/:id/pause',
+    jobResume: '/api/scheduler/jobs/:id/resume',
+    jobDelete: '/api/scheduler/jobs/:id',
+    jobHistory: '/api/scheduler/jobs/:id/history',
+    jobDryRun: '/api/scheduler/jobs/:id/dry-run',
+    start: '/api/scheduler/start',
+    stop: '/api/scheduler/stop',
+    status: '/api/scheduler/status'
   }
 } as const;
 
