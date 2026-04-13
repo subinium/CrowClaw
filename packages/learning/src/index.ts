@@ -516,3 +516,23 @@ export {
   filterByScore,
   rankByScore,
 } from './rl-export.js';
+
+export {
+  SkillMetricsTracker,
+  type SkillUsageRecord,
+  type SkillMetrics,
+} from './skill-metrics.js';
+
+export {
+  skillSimilarity,
+  findDuplicates,
+  mergeSkills,
+  type DedupResult,
+} from './skill-dedup.js';
+
+export {
+  generateImprovementPlan,
+  detectCompletionEnhanced,
+  type ImprovementAction,
+  type ImprovementPlan,
+} from './auto-improver.js';

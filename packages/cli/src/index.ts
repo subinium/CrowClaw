@@ -1494,6 +1494,8 @@ export async function runCliInputLine(
     let target: string | undefined;
     let container: string | undefined;
     let image: string | undefined;
+    let cwd: string | undefined;
+    let timeoutMs: number | undefined;
     let planOnly = false;
     const commandParts: string[] = [];
     for (let index = 0; index < tokens.length; index += 1) {
@@ -1518,6 +1520,17 @@ export async function runCliInputLine(
         index += 1;
         continue;
       }
+      if (token === '--cwd') {
+        cwd = tokens[index + 1];
+        index += 1;
+        continue;
+      }
+      if (token === '--timeout') {
+        const parsed = Number(tokens[index + 1]);
+        timeoutMs = Number.isFinite(parsed) ? parsed : undefined;
+        index += 1;
+        continue;
+      }
       if (token === '--plan') {
         planOnly = true;
         continue;
@@ -1532,6 +1545,8 @@ export async function runCliInputLine(
         target,
         container,
         image,
+        cwd,
+        timeoutMs,
         planOnly,
         command: commandParts.join(' ')
       })

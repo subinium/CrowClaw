@@ -374,8 +374,13 @@ describe('cli package', () => {
     const terminalProbe = await runCliInputLine('/terminal-probe local', chat.state, { runtime });
     expect(terminalProbe.output).toContain('local-ok');
 
-    const terminalExecPlan = await runCliInputLine('/terminal-exec --backend docker --container demo --plan printf hello-terminal-cli', chat.state, { runtime });
+    const terminalExecPlan = await runCliInputLine('/terminal-exec --backend docker --container demo --cwd /workspace --plan printf hello-terminal-cli', chat.state, { runtime });
     expect(terminalExecPlan.output).toContain('docker exec demo');
+    expect(terminalExecPlan.output).toContain('/workspace');
+
+    const cliTempCwd = await mkdtemp(join(tmpdir(), 'crowclaw-cli-terminal-'));
+    const terminalExecCwd = await runCliInputLine(`/terminal-exec --cwd ${cliTempCwd} pwd`, chat.state, { runtime });
+    expect(terminalExecCwd.output).toContain(cliTempCwd);
 
     const terminalBackground = await runCliInputLine('/terminal-background sleep 5', chat.state, { runtime });
     expect(terminalBackground.output).toContain('"pid"');

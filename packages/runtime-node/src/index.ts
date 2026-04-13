@@ -77,6 +77,9 @@ import { handleCodeBridgeRoutes } from './bridge-routes.js';
 import type { BridgeProcessRecord } from './bridge-process.js';
 import { routePaths } from './route-paths.js';
 import { resolveProviderFromConfig, resolveProvidersFromConfig, createProviderFromSlot } from './provider-factory.js';
+import { SessionController } from './session-controller.js';
+import { WebSocketManager, handleWebSocketUpgrade } from './websocket.js';
+import { generateConfigSchema, validateConfigUpdate, diffConfigs } from './config-schema.js';
 
 const directToolAliases = {
   'browser.wait': 'browser.waitFor',
@@ -91,14 +94,15 @@ function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
 }
 
 function isLocalOperatorBypassRoute(pathname: string): boolean {
-  return pathname === '/api/config/snapshot'
+  return pathname.startsWith('/api/config/')
     || pathname.startsWith('/api/skills')
     || pathname.startsWith('/api/gateway/')
     || pathname.startsWith('/api/providers/')
     || pathname.startsWith('/api/sessions')
     || pathname.startsWith('/api/web/')
     || pathname.startsWith('/api/agent/')
-    || pathname.startsWith('/api/toolset/');
+    || pathname.startsWith('/api/toolset/')
+    || pathname === '/ws';
 }
 
 export interface NodeRuntimeOptions {
@@ -777,6 +781,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
+  const sessionController = new SessionController(eventBus);
+  const wsManager = new WebSocketManager();
+  wsManager.start(eventBus);
+  wsManager.onAbort((sid) => sessionController.abort(sid));
 
   const skillRegistry = new SkillRegistry({ skillStore });
 
@@ -2369,6 +2377,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         });
       }
 
+      if (request.method === 'GET' && url.pathname === '/api/sessions/active') {
+        return Response.json({ sessions: sessionController.getActiveSessions() });
+      }
+
       if (request.method === 'GET' && url.pathname === '/api/sessions') {
         const limitParam = Number(url.searchParams.get('limit') ?? '50');
         const limit = Number.isFinite(limitParam) ? limitParam : 50;
@@ -3866,6 +3878,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         try {
           return await (async (): Promise<Response> => {
 
+        if (action === 'abort') {
+          const result = sessionController.abort(sessionId);
+          return Response.json({ ok: result.aborted, ...result });
+        }
+
+        if (action === 'compact') {
+          const session = await store.get(sessionId);
+          if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
+          const compactBody = (await request.json()) as { keepLastN?: number; summaryMaxLength?: number };
+          const result = sessionController.compact(session, compactBody);
+          await store.put(session);
+          return Response.json({ ok: true, ...result });
+        }
+
+        if (action === 'steer') {
+          const session = await store.get(sessionId);
+          if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
+          const steerBody = (await request.json()) as { directive: string };
+          if (!steerBody.directive) return Response.json({ error: 'Missing directive' }, { status: 400 });
+          const result = sessionController.steer(session, steerBody.directive);
+          await store.put(session);
+          return Response.json({ ok: true, ...result });
+        }
+
         if (action === 'checkpoint') {
           const session = await store.get(sessionId);
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
@@ -3969,6 +4005,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           // For stream actions, release the mutex inside the stream (not the outer finally)
           // because the ReadableStream body runs asynchronously after Response is returned.
           const streamRelease = releaseMutex;
+          const streamAbort = sessionController.registerSession(sessionId);
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             async start(controller) {
@@ -3989,6 +4026,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                     userMessage: body.message,
                     sessionState,
                   })) {
+                    if (streamAbort.signal.aborted) {
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: 'Session aborted' })}\n\n`));
+                      break;
+                    }
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
                   }
                 } else {
@@ -4006,6 +4047,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                 eventBus.emit('chat:error', { sessionId, error: msg });
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`));
               } finally {
+                sessionController.unregisterSession(sessionId);
                 streamRelease?.();
               }
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
@@ -4533,6 +4575,29 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             return Response.json({ ok: false, error: msg }, { status: 404 });
           }
         }
+      }
+
+      // --- WebSocket upgrade ---
+      if (request.method === 'GET' && url.pathname === '/ws') {
+        return handleWebSocketUpgrade(request, eventBus, wsManager);
+      }
+
+      // --- Config schema routes ---
+      if (request.method === 'GET' && url.pathname === '/api/config/schema') {
+        return Response.json(generateConfigSchema());
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/config/validate') {
+        const body = (await request.json()) as { section: string; data: Record<string, unknown> };
+        if (!body.section || !body.data) return Response.json({ error: 'Missing section or data' }, { status: 400 });
+        const result = validateConfigUpdate(body.section, body.data);
+        return Response.json(result);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/config/diff') {
+        const body = (await request.json()) as { before: Record<string, unknown>; after: Record<string, unknown> };
+        if (!body.before || !body.after) return Response.json({ error: 'Missing before or after' }, { status: 400 });
+        return Response.json(diffConfigs(body.before, body.after));
       }
 
       return new Response('Not found', { status: 404 });
