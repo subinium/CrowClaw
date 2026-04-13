@@ -568,13 +568,32 @@ function parseCookieToken(cookieHeader: string | null): string | null {
   return match ? match[1] : null;
 }
 
+/** Constant-time string comparison to prevent timing side-channel attacks. */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  try {
+    const { timingSafeEqual: tse } = require('node:crypto') as { timingSafeEqual: (a: Buffer, b: Buffer) => boolean };
+    return tse(bufA, bufB);
+  } catch {
+    // Fallback: constant-time XOR comparison
+    let result = 0;
+    for (let i = 0; i < bufA.length; i++) {
+      result |= bufA[i]! ^ bufB[i]!;
+    }
+    return result === 0;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Webhook signature verification helpers
 // ---------------------------------------------------------------------------
 
 function verifyTelegramWebhookSecret(request: Request, secret: string): boolean {
   const headerSecret = request.headers.get('x-telegram-bot-api-secret-token');
-  return headerSecret === secret;
+  if (!headerSecret) return false;
+  return timingSafeEqual(headerSecret, secret);
 }
 
 async function verifyDiscordWebhookSignature(
@@ -1307,7 +1326,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN is required when binding to non-localhost' }, { status: 500 });
         }
         const body = (await request.json()) as { token?: string };
-        if (body.token === dashToken) {
+        if (dashToken && timingSafeEqual(body.token ?? '', dashToken)) {
           const headers = new Headers({ 'content-type': 'application/json' });
           headers.set('Set-Cookie', `crowclaw_auth=${dashToken}; HttpOnly; SameSite=Strict; Path=/`);
           return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
@@ -1323,15 +1342,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (!dashToken) {
           return Response.json({ authenticated: isLocalhost });
         }
-        return Response.json({ authenticated: cookieAuth === dashToken || headerAuth === dashToken });
+        return Response.json({ authenticated: (cookieAuth !== null && timingSafeEqual(cookieAuth, dashToken)) || (headerAuth !== null && timingSafeEqual(headerAuth, dashToken)) });
       }
 
       // Auth middleware for /api/* routes
-      if (url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/auth/check' && url.pathname !== '/api/events') {
+      if (url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/auth/check') {
         const authHeader = request.headers.get('authorization');
         const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
         const cookieToken = parseCookieToken(request.headers.get('cookie'));
-        const tokenMatch = dashToken ? (bearerToken === dashToken || cookieToken === dashToken) : false;
+        const tokenMatch = dashToken ? ((bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) || (cookieToken !== null && timingSafeEqual(cookieToken, dashToken))) : false;
 
         // Dangerous routes ALWAYS require auth, regardless of localhost
         if (isDangerousRoute(url.pathname)) {
@@ -3670,6 +3689,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // Acquire per-session mutex for message/stream actions to prevent race conditions
         const needsMutex = action === 'message' || action === 'stream';
         const releaseMutex = needsMutex ? await sessionMutex.acquire(sessionId) : undefined;
+        let releaseHandledByStream = false;
         try {
           return await (async (): Promise<Response> => {
 
@@ -3772,6 +3792,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const body = (await request.json()) as { message: string; userId?: string; workspaceId?: string };
           if (!body.message) return Response.json({ error: 'Missing message' }, { status: 400 });
 
+          // For stream actions, release the mutex inside the stream (not the outer finally)
+          // because the ReadableStream body runs asynchronously after Response is returned.
+          const streamRelease = releaseMutex;
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             async start(controller) {
@@ -3807,12 +3830,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
               } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`));
+              } finally {
+                streamRelease?.();
               }
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
             },
           });
 
+          // Mark that the stream handler owns the release — outer finally should skip
+          releaseHandledByStream = true;
           return new Response(stream, {
             headers: {
               'content-type': 'text/event-stream',
@@ -3841,7 +3868,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
           })(); // end mutex-guarded IIFE
         } finally {
-          releaseMutex?.();
+          if (!releaseHandledByStream) releaseMutex?.();
         }
       }
 

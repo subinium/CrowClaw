@@ -872,9 +872,15 @@ export class AgentLoop {
     }
 
     // Security: build base system prompt, then append injection warning if present
-    const baseSystemPrompt = input.systemPrompt
+    let baseSystemPrompt = input.systemPrompt
       ? (injectionWarning ? `${input.systemPrompt}\n\n${injectionWarning}` : input.systemPrompt)
       : injectionWarning;
+
+    // Plan-before-act: inject planning instructions into the system prompt BEFORE the first LLM call
+    if (this.planBeforeAct) {
+      const planningDirective = '\n\nBefore executing any tools, outline a brief plan: (1) what you intend to accomplish, (2) which tools you will use and in what order, (3) how you will handle potential failures. State your plan first, then proceed.';
+      baseSystemPrompt = baseSystemPrompt ? `${baseSystemPrompt}${planningDirective}` : planningDirective;
+    }
 
     // Track 2.3: Use prompt caching-aware system prompt builder
     let currentResponse = await this.generateWithFallbacks({
@@ -906,16 +912,6 @@ export class AgentLoop {
       session.lineage = {
         ...(session.lineage ?? { rootSessionId: session.sessionId, compressionCount: 0 }),
       };
-    }
-
-    // Plan-before-act: inject planning instructions so the LLM plans its approach
-    if (this.planBeforeAct && currentResponse.toolCalls && currentResponse.toolCalls.length > 0) {
-      nextMessages.push({
-        role: 'system',
-        content: 'Before executing tools, outline a brief plan: (1) what you intend to accomplish, (2) which tools you will use and in what order, (3) how you will handle potential failures. Then proceed with execution.',
-        createdAt: nowIso(),
-        metadata: { planBeforeAct: true },
-      });
     }
 
     let errorReflectionCount = 0;
@@ -1063,7 +1059,8 @@ export class AgentLoop {
 
       currentResponse = await this.generateWithFallbacks({
         systemPrompt: this.buildSystemPromptForRequest({
-          basePrompt: input.systemPrompt,
+          personaPrompt: this.personaPrompt,
+          basePrompt: baseSystemPrompt,
           runtimeName: this.runtimeName,
           sessionId: input.sessionId,
           workspaceId: input.workspaceId,
@@ -1071,6 +1068,7 @@ export class AgentLoop {
           availableTools: this.tools.list(),
           matchedSkills,
           agentPreset: this.agentPreset,
+          memories: input.memories,
         }),
         messages: nextMessages,
         availableTools: this.tools.list(),
@@ -1334,6 +1332,7 @@ export class AgentLoop {
 
         // Execute tool calls
         let encounteredToolError = false;
+        const iterationToolResults: ToolExecutionResult[] = [];
         if (this.concurrentToolCalls && streamToolCalls.length > 1) {
           // Emit all tool-start events
           const concurrentStartTime = Date.now();
@@ -1362,6 +1361,7 @@ export class AgentLoop {
               : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
 
             toolResults.push(result);
+            iterationToolResults.push(result);
             nextMessages.push(toolMessage(result, this.maxToolResultLength));
             yield { type: 'tool-end' as const, toolName: tc.name, toolCallId, result: result.output, ok: result.ok, durationMs: Date.now() - concurrentStartTime };
 
@@ -1439,6 +1439,7 @@ export class AgentLoop {
             toolResult = this.redactToolResult(toolResult);
 
             toolResults.push(toolResult);
+            iterationToolResults.push(toolResult);
             nextMessages.push(toolMessage(toolResult, this.maxToolResultLength));
             yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok, durationMs: Date.now() - toolStartTime };
 
@@ -1459,7 +1460,7 @@ export class AgentLoop {
         if (encounteredToolError) {
           if (this.errorReflection && streamErrorReflectionCount < this.maxErrorReflections) {
             streamErrorReflectionCount++;
-            const failedResults = toolResults.filter(r => !r.ok).slice(-3);
+            const failedResults = iterationToolResults.filter(r => !r.ok);
             const errorSummary = failedResults
               .map(r => `- ${r.toolName}: ${r.output?.slice(0, 500) ?? 'unknown error'}`)
               .join('\n');

@@ -250,18 +250,25 @@ export class GatewayRunner {
             const reply = await this.config.onMessage(normalized);
             typing.stop();
             if (reply) {
-              // Per-platform rate limit check
+              // Per-platform rate limit check — delay instead of dropping
               if (!this.platformRateLimiter.check('telegram')) {
-                // Rate limited — skip this reply silently
-                continue;
+                const limit = this.platformRateLimiter.getLimit('telegram');
+                const delayMs = Math.ceil(60_000 / limit.maxPerMinute);
+                await this.sleep(delayMs, poller.abortController.signal);
               }
               // Retry with exponential backoff on send failure
               const retryPolicy = buildGatewayRetryPolicy('telegram');
-              await executeWithRetry(
+              const result = await executeWithRetry(
                 () => sendTelegramMessage(poller.botToken, normalized.channelId, reply, { parseMode: 'Markdown' }),
                 retryPolicy,
                 poller.abortController.signal,
               );
+              if (!result.ok) {
+                // Log retry exhaustion — reply is lost after all attempts failed
+                const errMsg = result.lastError ?? 'unknown';
+                try { await sendTelegramMessage(poller.botToken, normalized.channelId, 'Sorry, I encountered an error sending my response.', {}); } catch { /* best-effort fallback */ }
+                void errMsg; // Consumed by future structured logging integration
+              }
             }
           } catch {
             typing.stop();

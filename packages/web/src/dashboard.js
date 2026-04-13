@@ -158,7 +158,13 @@ function md(r) {
   t = t.replace(new RegExp('^---$', 'gm'), '<hr class="md-hr">');
   t = t.replace(
     new RegExp('\\[([^\\]]+)\\]\\(([^)]+)\\)', 'g'),
-    '<a href="$2" target="_blank" rel="noopener">$1</a>'
+    function(_, label, url) {
+      var trimmed = url.trim().toLowerCase();
+      if (/^(javascript|vbscript|data):/i.test(trimmed)) {
+        return '<span title="Blocked: unsafe URL scheme">' + label + '</span>';
+      }
+      return '<a href="' + url + '" target="_blank" rel="noopener">' + label + '</a>';
+    }
   );
   var lines = t.split('\n');
   var out = [];
