@@ -120,4 +120,30 @@ describe('runtime provider routes', () => {
     expect(payload.simulation[1]).toMatchObject({ attempt: 2, slot: 'fallback', reason: 'fallback-attempt' });
     expect(payload.notes[0]).toContain('Preview only');
   });
+
+  it('simulates a provider failover run and records attempts', async () => {
+    const runtime = createNodeRuntime({
+      configStorePath: null,
+      initialProviderConfig: {
+        primary: { name: 'Primary', provider: 'openai', model: 'gpt-4o' },
+        fallback: { name: 'Fallback', provider: 'anthropic', model: 'claude-haiku-4' }
+      }
+    });
+
+    const response = await runtime.fetch(new Request(localRoute(routePaths.providers.failoverSimulate), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'simulate provider fallback' })
+    }));
+    const payload = await response.json() as {
+      attempts: Array<{ slot: string; status: string; error?: string }>;
+      final: { slot: string } | null;
+      response: string;
+    };
+
+    expect(payload.attempts[0]).toMatchObject({ slot: 'primary', status: 'failed', error: 'synthetic primary failure' });
+    expect(payload.attempts[1]).toMatchObject({ slot: 'fallback', status: 'succeeded' });
+    expect(payload.final).toMatchObject({ slot: 'fallback' });
+    expect(payload.response).toContain('Simulated reply from fallback');
+  });
 });

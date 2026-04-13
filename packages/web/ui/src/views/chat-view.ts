@@ -542,7 +542,21 @@ export class ChatView extends LitElement {
 
   private async _loadSessions() {
     try {
-      const data = await api<{ sessions: Array<{ sessionId: string; messageCount?: number; updatedAt?: string; preview?: string }> }>('/api/sessions');
+      // Backend returns { ok, supported, count, sessions } from summarizeSessionRecord()
+      const data = await api<{
+        ok: boolean;
+        supported: boolean;
+        count: number;
+        sessions: Array<{
+          sessionId: string;
+          messageCount: number;
+          updatedAt: string;
+          preview?: string;
+          userId?: string;
+          workspaceId?: string;
+          lastRole?: string | null;
+        }>;
+      }>('/api/sessions');
       const existing = this.sessions.map((s) => s.id);
       const newSessions = (data.sessions || [])
         .filter((s) => !existing.includes(s.sessionId))
@@ -560,7 +574,8 @@ export class ChatView extends LitElement {
   private async _loadHistory() {
     if (!this.currentSessionId) return;
     try {
-      const data = await api<{ messages: ChatMessage[] }>(`/api/sessions/${this.currentSessionId}/history`);
+      // Backend returns the full session object { sessionId, messages, updatedAt, ... }
+      const data = await api<{ sessionId: string; messages: ChatMessage[]; updatedAt?: string }>(`/api/sessions/${this.currentSessionId}/history`);
       this.messages = data.messages || [];
       this._scrollToBottom();
     } catch {
@@ -576,6 +591,8 @@ export class ChatView extends LitElement {
   }
 
   private _createSession() {
+    // TODO: Session ID should ideally be generated server-side via POST /api/sessions
+    // to avoid potential collisions and ensure the backend is the source of truth.
     const id = `s-${Date.now().toString(36)}`;
     this.sessions = [
       { id, title: '', preview: '', messageCount: 0, updatedAt: new Date().toISOString() },

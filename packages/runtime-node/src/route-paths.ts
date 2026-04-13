@@ -52,7 +52,8 @@ export const routePaths = {
     route: '/api/providers/route',
     pool: '/api/providers/pool',
     plan: '/api/providers/plan',
-    failoverPreview: '/api/providers/failover-preview'
+    failoverPreview: '/api/providers/failover-preview',
+    failoverSimulate: '/api/providers/failover-simulate'
   },
   config: {
     provider: '/api/config/provider',

@@ -401,7 +401,7 @@ describe('Dashboard HTML lifecycle UI', () => {
     const web = await import('../packages/web/src/index.js');
     DASHBOARD_HTML = web.DASHBOARD_HTML;
 
-    expect(DASHBOARD_HTML).toContain('/api/scheduler/history');
+    expect(DASHBOARD_HTML).toContain('/api/scheduler/jobs');
     expect(DASHBOARD_HTML).toContain('/api/scheduler/tick');
   });
 

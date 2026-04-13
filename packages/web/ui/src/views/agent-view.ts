@@ -25,11 +25,18 @@ interface Preset {
 }
 
 interface PresetsResponse {
-  presets: {
-    agents: Preset[];
-    toolsets: Preset[];
-    mcp: Preset[];
-  };
+  agents: Preset[];
+  toolsets: Preset[];
+  mcp: Preset[];
+}
+
+interface BackendSkill {
+  slug: string;
+  title: string;
+  summary: string;
+  triggerPhrases: string[];
+  steps: string[];
+  requiredTools: string[];
 }
 
 interface Skill {
@@ -42,7 +49,7 @@ interface Skill {
 }
 
 interface SkillsResponse {
-  skills: Skill[];
+  skills: BackendSkill[];
 }
 
 type IdentityTab = 'personas' | 'toolsets' | 'mcp';
@@ -324,10 +331,9 @@ export class AgentView extends LitElement {
     this.configPresetsLoading = true;
     try {
       const data = await api<PresetsResponse>('/api/presets');
-      const presets = data.presets ?? { agents: [], toolsets: [], mcp: [] };
-      this.presetAgents = presets.agents ?? [];
-      this.presetToolsets = presets.toolsets ?? [];
-      this.presetMcp = presets.mcp ?? [];
+      this.presetAgents = data.agents ?? [];
+      this.presetToolsets = data.toolsets ?? [];
+      this.presetMcp = data.mcp ?? [];
 
       // Config presets are those with type "config" across all categories
       const all = [...this.presetAgents, ...this.presetToolsets, ...this.presetMcp];
@@ -346,7 +352,14 @@ export class AgentView extends LitElement {
     this.skillsLoading = true;
     try {
       const data = await api<SkillsResponse>('/api/skills');
-      this.skills = data.skills ?? [];
+      this.skills = (data.skills ?? []).map((s) => ({
+        slug: s.slug,
+        title: s.title,
+        summary: s.summary,
+        triggers: s.triggerPhrases ?? [],
+        steps: s.steps ?? [],
+        tools: s.requiredTools ?? [],
+      }));
     } catch (error: unknown) {
       if (error instanceof Error) {
         console.error('Failed to fetch skills:', error.message);
@@ -370,7 +383,7 @@ export class AgentView extends LitElement {
     try {
       await api('/api/skills', {
         method: 'POST',
-        body: JSON.stringify({ title, summary, triggers, steps, tools }),
+        body: JSON.stringify({ title, summary, triggerPhrases: triggers, steps, requiredTools: tools }),
       });
       this._resetForm();
       await this._fetchSkills();
@@ -393,7 +406,7 @@ export class AgentView extends LitElement {
     try {
       await api(`/api/skills/${slug}`, {
         method: 'PUT',
-        body: JSON.stringify({ title, summary, triggers, steps, tools }),
+        body: JSON.stringify({ title, summary, triggerPhrases: triggers, steps, requiredTools: tools }),
       });
       this._resetForm();
       await this._fetchSkills();
@@ -437,7 +450,13 @@ export class AgentView extends LitElement {
     try {
       await api('/api/skills', {
         method: 'POST',
-        body: JSON.stringify(parsed),
+        body: JSON.stringify({
+          title: parsed.title,
+          summary: parsed.summary,
+          triggerPhrases: parsed.triggers,
+          steps: parsed.steps,
+          requiredTools: parsed.tools,
+        }),
       });
       this.importText = '';
       this.showImportForm = false;
@@ -451,9 +470,18 @@ export class AgentView extends LitElement {
 
   /* ---- Config preset actions ---- */
 
-  private async _activatePreset(id: string) {
+  private async _activatePreset(preset: Preset) {
+    const endpointMap: Record<string, string> = {
+      agent: '/api/agent/preset',
+      toolset: '/api/toolset/select',
+    };
+    const endpoint = endpointMap[preset.type] ?? '/api/config-presets/switch';
+
     try {
-      await api(`/api/presets/${id}/activate`, { method: 'POST' });
+      await api(endpoint, {
+        method: 'POST',
+        body: JSON.stringify({ preset: preset.name }),
+      });
       await this._fetchPresets();
     } catch (error: unknown) {
       if (error instanceof Error) {
@@ -786,7 +814,7 @@ export class AgentView extends LitElement {
         <div class="card-footer">
           ${preset.active
             ? html`<span class="tag ok">Activated</span>`
-            : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset.id)}>Activate</button>`}
+            : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
         </div>
       </div>
     `;

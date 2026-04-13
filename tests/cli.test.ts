@@ -227,6 +227,10 @@ describe('cli package', () => {
     expect(providerFailoverPreview.output).toContain('"simulation"');
     expect(providerFailoverPreview.output).toContain('"fallback-attempt"');
 
+    const providerFailoverSimulate = await runCliInputLine('/provider-failover-simulate prove fallback order', initial, { runtime });
+    expect(providerFailoverSimulate.output).toContain('"attempts"');
+    expect(providerFailoverSimulate.output).toContain('"slot": "fallback"');
+
     const providerRoute = await runCliInputLine('/provider-route debug this tool', initial, { runtime });
     expect(providerRoute.output).toContain('"selectedTier"');
     expect(providerRoute.output).toContain('"fallbackTier"');

@@ -255,6 +255,7 @@ export const builtInCliSlashCommands = [
   '/provider-pool',
   '/provider-plan',
   '/provider-failover-preview',
+  '/provider-failover-simulate',
   '/provider-route',
   '/new',
   '/reset',
@@ -397,7 +398,8 @@ const cliRoutePaths = {
     route: '/api/providers/route',
     pool: '/api/providers/pool',
     plan: '/api/providers/plan',
-    failoverPreview: '/api/providers/failover-preview'
+    failoverPreview: '/api/providers/failover-preview',
+    failoverSimulate: '/api/providers/failover-simulate'
   },
   usage: {
     summary: '/api/usage',
@@ -650,6 +652,7 @@ export function renderCliHelp(): string {
     '  /provider-pool [provider]      Inspect credential pool status',
     '  /provider-plan                 Show effective provider slot/failover plan',
     '  /provider-failover-preview     Show simulated provider failover order',
+    '  /provider-failover-simulate    Execute a synthetic failover run',
     '  /provider-route ...            Inspect smart provider routing',
     '  /new, /reset                   Start a new session',
     '  /resume <id>                   Resume a session by id',
@@ -1805,6 +1808,19 @@ export async function runCliInputLine(
 
   if (trimmed === '/provider-failover-preview') {
     const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.failoverPreview)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/provider-failover-simulate' || trimmed.startsWith('/provider-failover-simulate ')) {
+    const message = trimmed.replace('/provider-failover-simulate', '').trim() || 'simulate provider fallback';
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.failoverSimulate), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message })
+    }));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state

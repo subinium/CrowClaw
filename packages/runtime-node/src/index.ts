@@ -64,7 +64,7 @@ import { CrowClawMcpServer } from '@crowclaw/mcp-server';
 import { MemoryService, EmbeddingMemoryStore, type EmbeddingProvider } from '@crowclaw/memory';
 import { UserModelService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
-import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
+import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, ProviderChain, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
@@ -1944,6 +1944,66 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             'Preview only: no live provider request is executed.',
             'Actual provider retries still depend on runtime errors and AgentLoop retry policy.'
           ]
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.providers.failoverSimulate) {
+        const providerCfg = configStore.getProviderConfig();
+        const body = (await request.json().catch(() => ({}))) as { message?: string };
+        const message = typeof body.message === 'string' ? body.message : 'simulate provider fallback';
+        const chain = providerCfg
+          ? [
+              { slot: 'primary', provider: providerCfg.primary.provider, model: providerCfg.primary.model },
+              ...(providerCfg.fallback ? [{ slot: 'fallback', provider: providerCfg.fallback.provider, model: providerCfg.fallback.model }] : []),
+            ]
+          : [{ slot: 'runtime-default', provider: 'resolved-provider', model: isModelOverridable(provider) ? provider.getModel() : 'default' }];
+
+        const attempts: Array<{ attempt: number; slot: string; provider: string; model: string; status: 'failed' | 'succeeded'; error?: string }> = [];
+        const providers = chain.map((entry, index) => index === 0 && chain.length > 1
+          ? {
+              async generate() {
+                attempts.push({
+                  attempt: index + 1,
+                  slot: entry.slot,
+                  provider: entry.provider,
+                  model: entry.model,
+                  status: 'failed',
+                  error: 'synthetic primary failure'
+                });
+                throw new Error('synthetic primary failure');
+              }
+            }
+          : {
+              async generate() {
+                attempts.push({
+                  attempt: index + 1,
+                  slot: entry.slot,
+                  provider: entry.provider,
+                  model: entry.model,
+                  status: 'succeeded'
+                });
+                return {
+                  assistantMessage: `Simulated reply from ${entry.slot}: ${message}`,
+                  toolCalls: []
+                };
+              }
+            });
+
+        const providerChain = new ProviderChain({
+          providers: providers as ProviderAdapter[],
+        });
+        const response = await providerChain.generate({
+          messages: [{ role: 'user', content: message, createdAt: new Date().toISOString() }],
+          availableTools: [],
+        });
+
+        const winner = attempts.find((attempt) => attempt.status === 'succeeded') ?? attempts.at(-1) ?? null;
+        return Response.json({
+          configured: Boolean(providerCfg),
+          message,
+          attempts,
+          final: winner,
+          response: response.assistantMessage ?? ''
         });
       }
 
