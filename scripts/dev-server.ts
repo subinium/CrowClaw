@@ -43,13 +43,29 @@ import type { ParsedSkillFile } from '../packages/core/src/index.js';
 const PORT = Number(process.env.PORT ?? 4000);
 
 // Mutable runtime state (simulates RuntimeConfigStore for dev mode)
-const runtimeState = {
-  activePreset: null as string | null,
-  agentPreset: null as { role: string; goal: string; backstory?: string } | null,
-  activeToolset: null as string | null,
+// Seed provider config from environment so the dashboard shows it
+const _apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || '';
+const _baseUrl = process.env.OPENROUTER_BASE_URL || process.env.OPENAI_BASE_URL || 'https://openrouter.ai/api/v1';
+const _model = process.env.OPENROUTER_MODEL || process.env.OPENAI_MODEL || 'anthropic/claude-sonnet-4';
+const _providerType = process.env.OPENROUTER_API_KEY ? 'openrouter' : process.env.ANTHROPIC_API_KEY ? 'anthropic' : 'openai';
+
+const runtimeState: Record<string, unknown> & {
+  activePreset: string | null;
+  agentPreset: { role: string; goal: string; backstory?: string } | null;
+  activeToolset: string | null;
+  disabledSkills: Set<string>;
+  gatewayTokens: Map<string, string>;
+  mcpConnections: Map<string, { status: string; connectedAt?: string }>;
+} = {
+  activePreset: null,
+  agentPreset: null,
+  activeToolset: null,
   disabledSkills: new Set<string>(),
   gatewayTokens: new Map<string, string>(),
   mcpConnections: new Map<string, { status: string; connectedAt?: string }>(),
+  devProviderConfig: _apiKey ? {
+    primary: { name: 'Primary', provider: _providerType, model: _model, apiKey: _apiKey, baseUrl: _baseUrl },
+  } : null,
 };
 
 // Persona registry
@@ -682,16 +698,24 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/providers/config') {
-    const cfg = (runtimeState as Record<string, unknown>).devProviderConfig as Record<string, unknown> | null;
+    const cfg = runtimeState.devProviderConfig as Record<string, unknown> | null;
+    const redact = (slot: Record<string, unknown> | null | undefined) =>
+      slot ? { ...slot, apiKey: slot.apiKey ? '***' : undefined } : null;
     return json({
       ok: true,
-      config: cfg ?? null,
+      config: cfg ? {
+        primary: redact((cfg as Record<string, unknown>).primary as Record<string, unknown> | null),
+        fallback: redact((cfg as Record<string, unknown>).fallback as Record<string, unknown> | null),
+        vision: redact((cfg as Record<string, unknown>).vision as Record<string, unknown> | null),
+        compression: redact((cfg as Record<string, unknown>).compression as Record<string, unknown> | null),
+        embedding: redact((cfg as Record<string, unknown>).embedding as Record<string, unknown> | null),
+      } : null,
       slots: {
-        primary: cfg ? (cfg as Record<string, unknown>).primary ?? null : null,
-        fallback: cfg ? (cfg as Record<string, unknown>).fallback ?? null : null,
-        vision: cfg ? (cfg as Record<string, unknown>).vision ?? null : null,
-        compression: cfg ? (cfg as Record<string, unknown>).compression ?? null : null,
-        embedding: cfg ? (cfg as Record<string, unknown>).embedding ?? null : null,
+        primary: cfg ? redact((cfg as Record<string, unknown>).primary as Record<string, unknown> | null) : null,
+        fallback: cfg ? redact((cfg as Record<string, unknown>).fallback as Record<string, unknown> | null) : null,
+        vision: cfg ? redact((cfg as Record<string, unknown>).vision as Record<string, unknown> | null) : null,
+        compression: cfg ? redact((cfg as Record<string, unknown>).compression as Record<string, unknown> | null) : null,
+        embedding: cfg ? redact((cfg as Record<string, unknown>).embedding as Record<string, unknown> | null) : null,
       },
     });
   }
