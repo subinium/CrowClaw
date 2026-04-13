@@ -3657,6 +3657,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           systemPrompt: 'You are CrowClaw running in a generic Node runtime.'
         });
         await memoryService.captureSessionSummary(sessionId, result.session.messages);
+        // Auto-capture skills from completed conversations (Hermes self-improvement pattern)
+        if (result.toolResults.length > 0) {
+          learning.autoCapture(result.session.messages, sessionId).catch(() => { /* best-effort */ });
+        }
         return Response.json(result);
       }
 
