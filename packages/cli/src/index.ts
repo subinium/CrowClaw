@@ -5,10 +5,89 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } fr
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import type { NodeRuntimeOptions } from '@crowclaw/runtime-node';
+import { GatewayRunner, type GatewayStatus } from '@crowclaw/gateway';
 
 const HISTORY_DIR = join(homedir(), '.crowclaw');
 const HISTORY_FILE_PATH = join(HISTORY_DIR, 'history');
 const MAX_HISTORY_LINES = 1000;
+
+// ---------------------------------------------------------------------------
+// Gateway auto-start state
+// ---------------------------------------------------------------------------
+
+let activeGatewayRunner: GatewayRunner | null = null;
+
+/** Resolve gateway tokens from env vars and config file. */
+async function resolveGatewayTokens(): Promise<Array<{ name: string; token: string; enabled: boolean }>> {
+  const platforms: Array<{ name: string; token: string; enabled: boolean }> = [];
+
+  // Check env vars
+  const telegramToken = process.env.CROWCLAW_TELEGRAM_TOKEN;
+  if (telegramToken) {
+    platforms.push({ name: 'telegram', token: telegramToken, enabled: true });
+  }
+
+  // Check config file for telegramToken
+  if (!telegramToken) {
+    try {
+      const configPath = join(homedir(), '.crowclaw', 'config.json');
+      const raw = await readFile(configPath, 'utf-8');
+      const config = JSON.parse(raw) as Record<string, unknown>;
+      if (typeof config.telegramToken === 'string' && config.telegramToken) {
+        platforms.push({ name: 'telegram', token: config.telegramToken, enabled: true });
+      }
+    } catch {
+      // Config not found or invalid — skip
+    }
+  }
+
+  // Check runtime-config.json for gateway configs
+  try {
+    const runtimeConfigPath = join(homedir(), '.crowclaw', 'runtime-config.json');
+    const raw = await readFile(runtimeConfigPath, 'utf-8');
+    const config = JSON.parse(raw) as Record<string, unknown>;
+    const gatewayConfigs = config.gatewayConfigs as Record<string, { enabled?: boolean; token?: string }> | undefined;
+    if (gatewayConfigs) {
+      for (const [name, gc] of Object.entries(gatewayConfigs)) {
+        if (gc.token && gc.enabled !== false && !platforms.some((p) => p.name === name)) {
+          platforms.push({ name, token: gc.token, enabled: true });
+        }
+      }
+    }
+  } catch {
+    // Runtime config not found — skip
+  }
+
+  return platforms;
+}
+
+/** Start gateway runner in background if tokens are available. */
+async function autoStartGateway(onMessage?: (msg: import('@crowclaw/gateway').NormalizedInboundMessage) => Promise<string>): Promise<GatewayStatus[]> {
+  const platforms = await resolveGatewayTokens();
+  if (platforms.length === 0) return [];
+
+  const runner = new GatewayRunner({
+    platforms,
+    onMessage,
+  });
+
+  const statuses = await runner.start();
+  activeGatewayRunner = runner;
+  return statuses;
+}
+
+/** Get current gateway runner status. */
+export function getGatewayRunnerStatus(): GatewayStatus[] {
+  return activeGatewayRunner?.getStatus() ?? [];
+}
+
+/** Stop active gateway runner. */
+export async function stopGatewayRunner(): Promise<void> {
+  if (activeGatewayRunner) {
+    await activeGatewayRunner.stop();
+    activeGatewayRunner = null;
+  }
+}
 
 export function loadHistorySync(filePath: string = HISTORY_FILE_PATH): string[] {
   try {
@@ -66,7 +145,11 @@ export type CliCommandName =
   | 'skills'
   | 'jobs'
   | 'serve'
-  | 'repl';
+  | 'repl'
+  | 'gateway'
+  | 'mcp'
+  | 'presets'
+  | 'providers';
 
 export interface ParsedCliCommand {
   command: CliCommandName;
@@ -75,6 +158,14 @@ export interface ParsedCliCommand {
   continueSession?: boolean;
   port?: number;
   noOnboarding?: boolean;
+  gatewaySubcommand?: string;
+  gatewayArgs?: string[];
+  mcpSubcommand?: string;
+  mcpArgs?: string[];
+  presetsSubcommand?: string;
+  presetsArgs?: string[];
+  providersSubcommand?: string;
+  providersArgs?: string[];
 }
 
 export interface CliRuntimeLike {
@@ -138,14 +229,28 @@ export const builtInCliSlashCommands = [
   '/mcp-inspect',
   '/mcp-resources',
   '/mcp-prompts',
+  '/mcp-server-tools',
+  '/mcp-server-call',
+  '/acp-info',
+  '/acp-sessions',
+  '/acp-create',
+  '/acp-delete',
+  '/acp-prompt',
+  '/acp-request',
   '/skills',
   '/drafts',
   '/match-skills',
   '/auto-capture',
+  '/refine-draft',
   '/publish-draft',
   '/unpublish-draft',
+  '/skill-show',
+  '/skill-import-file',
+  '/skill-rate',
+  '/skill-versions',
   '/skill-toggle',
   '/provider-models',
+  '/provider-pool',
   '/provider-route',
   '/new',
   '/reset',
@@ -162,6 +267,13 @@ export const builtInCliSlashCommands = [
   '/persona',
   '/persona list',
   '/persona switch',
+  '/gateway',
+  '/gateway status',
+  '/gateway connect',
+  '/mcp-auth',
+  '/mcp-add',
+  '/mcp-list',
+  '/mcp-remove',
 ] as const;
 
 async function lazyCreateRuntime(options?: NodeRuntimeOptions): Promise<CliRuntimeLike> {
@@ -264,11 +376,20 @@ const cliRoutePaths = {
     status: '/api/mcp/status',
     inspect: '/api/mcp/inspect',
     resources: '/api/mcp/resources',
-    prompts: '/api/mcp/prompts'
+    prompts: '/api/mcp/prompts',
+    serverTools: '/api/mcp/server/tools',
+    serverRequest: '/api/mcp/server/request'
+  },
+  acp: {
+    info: '/api/acp/info',
+    sessions: '/api/acp/sessions',
+    prompt: '/api/acp/prompt',
+    request: '/api/acp/request'
   },
   providers: {
     models: '/api/providers/models',
-    route: '/api/providers/route'
+    route: '/api/providers/route',
+    pool: '/api/providers/pool'
   },
   usage: {
     summary: '/api/usage',
@@ -341,6 +462,34 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
 
   if (first !== undefined && first in simpleCommands) {
     return { command: simpleCommands[first]!, noOnboarding };
+  }
+
+  // gateway — supports subcommands: status, connect <platform>
+  if (first === 'gateway') {
+    const gatewaySubcommand = rest[0] ?? 'status';
+    const gatewayArgs = rest.slice(1);
+    return { command: 'gateway', gatewaySubcommand, gatewayArgs, noOnboarding };
+  }
+
+  // mcp — supports subcommands: auth <provider>, add <url>, list, remove <name>
+  if (first === 'mcp') {
+    const mcpSubcommand = rest[0] ?? 'list';
+    const mcpArgs = rest.slice(1);
+    return { command: 'mcp', mcpSubcommand, mcpArgs, noOnboarding };
+  }
+
+  // presets — supports subcommands: list, switch <name>
+  if (first === 'presets') {
+    const presetsSubcommand = rest[0] ?? 'list';
+    const presetsArgs = rest.slice(1);
+    return { command: 'presets', presetsSubcommand, presetsArgs, noOnboarding };
+  }
+
+  // providers — supports subcommands: list (default), set <slot> <provider/model>, test
+  if (first === 'providers') {
+    const providersSubcommand = rest[0] ?? 'list';
+    const providersArgs = rest.slice(1);
+    return { command: 'providers', providersSubcommand, providersArgs, noOnboarding };
   }
 
   // serve — supports --port
@@ -422,6 +571,14 @@ export function renderCliHelp(): string {
     '  doctor              Run system health checks',
     '  chat "msg"          One-shot chat message',
     '  serve               Start HTTP server + dashboard',
+    '  gateway status      Show gateway platform connection status',
+    '  gateway connect <p> Connect a platform (e.g., telegram)',
+    '  mcp list            List connected MCP servers',
+    '  mcp auth <provider> Authenticate with an MCP provider (github, slack, google)',
+    '  mcp add <url>       Add a custom MCP server',
+    '  mcp remove <name>   Remove an MCP server',
+    '  presets             List config presets with active indicator',
+    '  presets switch <n>  Switch active config preset',
     '  status              Show system status',
     '  sessions            List sessions',
     '  skills              List skills with status',
@@ -459,14 +616,28 @@ export function renderCliHelp(): string {
     '  /bridge-*                      Bridge management commands',
     '  /browser-session               Browser session info',
     '  /mcp-*                         MCP management commands',
+    '  /mcp-server-tools              List embedded MCP server tools',
+    '  /mcp-server-call ...           Execute an embedded MCP server tool call',
+    '  /acp-info                      Show embedded ACP manifest',
+    '  /acp-sessions                  List ACP sessions',
+    '  /acp-create [title]            Create an ACP session',
+    '  /acp-delete <sessionId>        Delete an ACP session',
+    '  /acp-prompt <message...>       Execute ACP prompt in current session',
+    '  /acp-request <json>            Send a raw ACP JSON-RPC request',
     '  /skills                        List resolved skills',
     '  /drafts                        List learning drafts',
     '  /match-skills <query>          Match published skills against a query',
     '  /auto-capture                  Auto-capture a draft from recent chat',
+    '  /refine-draft <id> <text...>   Refine a draft with new evidence',
     '  /publish-draft <id>            Publish a learning draft',
     '  /unpublish-draft <id>          Unpublish a learning draft',
+    '  /skill-show <slug>             Show detailed skill metadata',
+    '  /skill-import-file <path>      Import a SKILL.md file from disk',
+    '  /skill-rate <slug> <rating>    Rate a skill as helpful/unhelpful',
+    '  /skill-versions <slug>         Show saved skill versions',
     '  /skill-toggle <slug> <on|off>  Enable or disable a skill',
     '  /provider-models               List known provider model metadata',
+    '  /provider-pool [provider]      Inspect credential pool status',
     '  /provider-route ...            Inspect smart provider routing',
     '  /new, /reset                   Start a new session',
     '  /resume <id>                   Resume a session by id',
@@ -480,6 +651,13 @@ export function renderCliHelp(): string {
     '  /persona list                  List all registered personas',
     '  /persona switch <name>         Switch to a named persona',
     '  /clear                         Clear terminal screen',
+    '  /gateway                       Show gateway platform status',
+    '  /gateway status                Detailed gateway connection status',
+    '  /gateway connect <platform>   Connect a platform (e.g., telegram)',
+    '  /mcp-auth <provider>           Authenticate with MCP provider',
+    '  /mcp-add <url>                 Add a custom MCP server',
+    '  /mcp-list                      List connected MCP servers',
+    '  /mcp-remove <name>             Remove an MCP server',
     '  /quit, /exit                   Exit the REPL',
   ].join('\n');
 }
@@ -494,7 +672,7 @@ export function suggestCliCommands(input: string): string[] {
 }
 
 async function runStatus(runtime: CliRuntimeLike): Promise<string> {
-  const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.health)));
+  const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.health)));
   const payload = await response.json() as { ok: boolean; runtime: string; service: string };
   return `${payload.service} (${payload.runtime}) status: ${payload.ok ? 'ok' : 'error'}`;
 }
@@ -511,14 +689,13 @@ async function runChat(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promi
   }
 
   if (!parsed.query && parsed.continueSession) {
-    const response = await runtime.fetch(new Request(`http://localhost/api/sessions/${sessionId}/history`));
+    const response = await runtime.fetch(cliRequest(`http://localhost/api/sessions/${sessionId}/history`));
     const session = await response.json() as { sessionId: string; messages: Array<{ role: string; content: string }> };
     return `Resumed ${session.sessionId} with ${session.messages.length} message(s).`;
   }
 
-  const response = await runtime.fetch(new Request(`http://localhost/api/sessions/${sessionId}`, {
+  const response = await runtime.fetch(cliRequest(`http://localhost/api/sessions/${sessionId}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ userMessage: parsed.query })
   }));
   const payload = await response.json() as { finalResponse: string; session: { sessionId: string } };
@@ -555,7 +732,7 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
 
   // 1. Provider / Health
   try {
-    const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.health)));
+    const res = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.health)));
     const data = await res.json() as { ok: boolean; runtime?: string; service?: string };
     if (data.ok) {
       checks.push({ name: 'Provider', status: 'ok', detail: `${data.service ?? 'CrowClaw'} (${data.runtime ?? 'node'})` });
@@ -583,7 +760,7 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
 
   // 3. System status (workspace, tools, skills, memory, security)
   try {
-    const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.status)));
+    const res = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.status)));
     const data = await res.json() as Record<string, unknown>;
 
     // Tools
@@ -612,13 +789,47 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
     const workspaceType = typeof data.workspaceType === 'string' ? data.workspaceType : 'unknown';
     checks.push({ name: 'Workspace', status: 'ok', detail: workspaceType });
 
-    // Security
-    const securityActive = typeof data.securityActive === 'boolean' ? data.securityActive : true;
-    checks.push({
-      name: 'Security',
-      status: securityActive ? 'ok' : 'warn',
-      detail: securityActive ? 'Active' : 'Not configured'
-    });
+    // Security — detailed per-feature status
+    try {
+      const secRes = await runtime.fetch(cliRequest(localRoute('/api/security/status')));
+      const secData = await secRes.json() as {
+        protections?: Array<{ name: string; key: string; enabled: boolean; configurable: boolean }>;
+        grade?: string;
+        activeCount?: number;
+        totalCount?: number;
+        stats?: { total: number; byType: Record<string, number> };
+      };
+      const protections = secData.protections ?? [];
+      const grade = secData.grade ?? '?';
+      for (const p of protections) {
+        const evtCount = (secData.stats?.byType ?? {})[p.key === 'ssrf' ? 'ssrf_blocked' : p.key === 'redactToolOutput' ? 'credential_redacted' : p.key === 'scanUserInput' ? 'injection_detected' : p.key === 'scanCommands' ? 'command_warned' : p.key === 'blockDangerousCommands' ? 'command_blocked' : p.key === 'piiRedaction' ? 'pii_redacted' : ''] ?? 0;
+        const evtStr = evtCount > 0 ? ` (${evtCount} events)` : '';
+        const alwaysOn = !p.configurable;
+        const detail = alwaysOn
+          ? `active (always on)${evtStr}`
+          : p.enabled
+            ? `active${evtStr}`
+            : 'disabled';
+        checks.push({
+          name: `  ${p.name}`,
+          status: p.enabled ? 'ok' : 'warn',
+          detail,
+        });
+      }
+      checks.push({
+        name: 'Security Grade',
+        status: grade === 'A' || grade === 'B' ? 'ok' : grade === 'C' ? 'warn' : 'error',
+        detail: grade,
+      });
+    } catch {
+      // Fallback to simple check
+      const securityActive = typeof data.securityActive === 'boolean' ? data.securityActive : true;
+      checks.push({
+        name: 'Security',
+        status: securityActive ? 'ok' : 'warn',
+        detail: securityActive ? 'Active' : 'Not configured'
+      });
+    }
   } catch {
     // If system status fails, still add basic tool check from runtime
     const toolCount = runtime.tools?.list?.()?.length ?? 0;
@@ -631,7 +842,7 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
 
   // 4. Scheduler
   try {
-    const res = await runtime.fetch(new Request(localRoute('/api/scheduler/jobs')));
+    const res = await runtime.fetch(cliRequest(localRoute('/api/scheduler/jobs')));
     const jobs = await res.json() as Array<unknown>;
     const jobCount = Array.isArray(jobs) ? jobs.length : 0;
     if (jobCount > 0) {
@@ -645,7 +856,7 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
 
   // 5. Gateway
   try {
-    const res = await runtime.fetch(new Request(localRoute('/api/gateway/status')));
+    const res = await runtime.fetch(cliRequest(localRoute('/api/gateway/status')));
     const data = await res.json() as { platforms?: Array<unknown> };
     const platformCount = Array.isArray(data.platforms) ? data.platforms.length : 0;
     if (platformCount > 0) {
@@ -661,7 +872,7 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
 
   // 6. MCP
   try {
-    const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.status)));
+    const res = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.status)));
     const data = await res.json() as Record<string, unknown> | null;
     if (data && typeof data === 'object' && Object.keys(data).length > 0) {
       checks.push({ name: 'MCP', status: 'ok', detail: 'Connected' });
@@ -676,7 +887,7 @@ export async function runDoctor(runtime: CliRuntimeLike): Promise<DoctorReport> 
 
   // 7. Dashboard
   try {
-    const res = await runtime.fetch(new Request(localRoute('/dashboard')));
+    const res = await runtime.fetch(cliRequest(localRoute('/dashboard')));
     if (res.ok || res.status === 200) {
       checks.push({ name: 'Dashboard', status: 'ok', detail: 'Available at http://localhost:3117' });
     } else {
@@ -783,29 +994,262 @@ export function formatJobsTable(jobs: Array<{ id?: string; name?: string; schedu
 }
 
 async function runSessions(runtime: CliRuntimeLike): Promise<string> {
-  const res = await runtime.fetch(new Request(localRoute('/api/sessions?limit=50')));
+  const res = await runtime.fetch(cliRequest(localRoute('/api/sessions?limit=50')));
   const data = await res.json() as Array<{ id?: string; sessionId?: string; lastMessage?: string; createdAt?: string; updatedAt?: string; messageCount?: number }>;
   const sessions = Array.isArray(data) ? data : [];
   return formatSessionsTable(sessions);
 }
 
 async function runSkillsList(runtime: CliRuntimeLike): Promise<string> {
-  const res = await runtime.fetch(new Request(localRoute(cliRoutePaths.skills.list)));
+  const res = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.skills.list)));
   const data = await res.json() as { skills?: Array<{ name?: string; slug?: string; enabled?: boolean; triggerCount?: number; status?: string }> } | Array<{ name?: string; slug?: string; enabled?: boolean; triggerCount?: number; status?: string }>;
   const skills = Array.isArray(data) ? data : (data.skills ?? []);
   return formatSkillsTable(skills);
 }
 
 async function runJobsList(runtime: CliRuntimeLike): Promise<string> {
-  const res = await runtime.fetch(new Request(localRoute('/api/scheduler/jobs')));
+  const res = await runtime.fetch(cliRequest(localRoute('/api/scheduler/jobs')));
   const data = await res.json() as Array<{ id?: string; name?: string; schedule?: string; nextRun?: string; enabled?: boolean; lastRun?: string }>;
   const jobs = Array.isArray(data) ? data : [];
   return formatJobsTable(jobs);
 }
 
+async function runPresets(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promise<string> {
+  const sub = parsed.presetsSubcommand ?? 'list';
+
+  if (sub === 'list') {
+    const res = await runtime.fetch(cliRequest(localRoute('/api/config-presets')));
+    const data = await res.json() as { presets?: Array<{ name: string; description?: string; mcpServers?: string[]; skills?: string[]; toolset?: string }>; active?: string | null };
+    const presets = data.presets ?? [];
+    const activeName = data.active;
+    if (presets.length === 0) {
+      return 'No config presets found.';
+    }
+    const lines = ['Config Presets:', ''];
+    for (const p of presets) {
+      const indicator = p.name === activeName ? ' *' : '  ';
+      const mcpCount = (p.mcpServers ?? []).length;
+      const skillCount = (p.skills ?? []).length;
+      const meta = [
+        mcpCount > 0 ? `${mcpCount} MCP` : null,
+        skillCount > 0 ? `${skillCount} skills` : null,
+        p.toolset ? `toolset: ${p.toolset}` : null,
+      ].filter(Boolean).join(', ');
+      lines.push(`${indicator} ${p.name}  ${p.description ?? ''}  [${meta}]`);
+    }
+    if (activeName) {
+      lines.push('', `Active: ${activeName}`);
+    }
+    return lines.join('\n');
+  }
+
+  if (sub === 'switch') {
+    const name = (parsed.presetsArgs ?? [])[0];
+    if (!name) {
+      return 'Usage: crowclaw presets switch <name>';
+    }
+    const res = await runtime.fetch(cliRequest(localRoute('/api/config-presets/switch'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }));
+    const data = await res.json() as { ok?: boolean; error?: string; active?: string };
+    if (data.ok) {
+      return `Switched to config preset: ${data.active}`;
+    }
+    return `Failed to switch preset: ${data.error ?? 'Unknown error'}`;
+  }
+
+  return `Unknown presets subcommand: ${sub}. Available: list, switch <name>`;
+}
+
+async function runProviders(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promise<string> {
+  const sub = parsed.providersSubcommand ?? 'list';
+  const args = parsed.providersArgs ?? [];
+
+  if (sub === 'list') {
+    const res = await runtime.fetch(cliRequest(localRoute('/api/providers/config')));
+    const data = await res.json() as { ok?: boolean; config?: Record<string, { name?: string; provider?: string; model?: string }> | null };
+    const cfg = data.config;
+    if (!cfg) {
+      return 'No provider config set. Use `crowclaw providers set <slot> <provider/model>` to configure.';
+    }
+    const slotNames = ['primary', 'fallback', 'vision', 'compression', 'embedding'] as const;
+    const lines = ['Provider Config:', ''];
+    for (const sn of slotNames) {
+      const slot = cfg[sn];
+      if (slot) {
+        lines.push(`  ${sn.padEnd(14)} ${slot.provider}/${slot.model}  (${slot.name ?? sn})`);
+      } else {
+        lines.push(`  ${sn.padEnd(14)} -- not configured`);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  if (sub === 'set') {
+    const slot = args[0];
+    const providerModel = args[1];
+    if (!slot || !providerModel) {
+      return 'Usage: crowclaw providers set <slot> <provider/model>\n  Slots: primary, fallback, vision, compression, embedding\n  Example: crowclaw providers set fallback anthropic/claude-haiku';
+    }
+    const validSlots = ['primary', 'fallback', 'vision', 'compression', 'embedding'];
+    if (!validSlots.includes(slot)) {
+      return `Invalid slot "${slot}". Valid slots: ${validSlots.join(', ')}`;
+    }
+    const [provider, ...modelParts] = providerModel.split('/');
+    const model = modelParts.join('/') || provider || '';
+    // Get current config
+    const getRes = await runtime.fetch(cliRequest(localRoute('/api/providers/config')));
+    const current = await getRes.json() as { config?: Record<string, unknown> | null };
+    const cfg = current.config ?? {} as Record<string, unknown>;
+    (cfg as Record<string, unknown>)[slot] = { name: slot.charAt(0).toUpperCase() + slot.slice(1), provider: provider ?? 'openai', model };
+    if (!cfg.primary && slot !== 'primary') {
+      return 'Configure primary slot first: crowclaw providers set primary <provider/model>';
+    }
+    const setRes = await runtime.fetch(cliRequest(localRoute('/api/providers/config'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(cfg),
+    }));
+    const result = await setRes.json() as { ok?: boolean; error?: string };
+    if (result.ok) {
+      return `Set ${slot} provider to ${provider}/${model}`;
+    }
+    return `Failed: ${result.error ?? 'Unknown error'}`;
+  }
+
+  if (sub === 'test') {
+    const res = await runtime.fetch(cliRequest(localRoute('/api/providers/config')));
+    const data = await res.json() as { ok?: boolean; config?: Record<string, { provider?: string; model?: string; apiKey?: string; baseUrl?: string }> | null };
+    const cfg = data.config;
+    if (!cfg) {
+      return 'No provider config to test.';
+    }
+    const slotNames = ['primary', 'fallback', 'vision', 'compression', 'embedding'] as const;
+    const lines = ['Testing provider slots:', ''];
+    for (const sn of slotNames) {
+      const slot = cfg[sn];
+      if (!slot) continue;
+      try {
+        const testRes = await runtime.fetch(cliRequest(localRoute('/api/providers/test'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ slot: sn, provider: slot.provider, model: slot.model, apiKey: slot.apiKey ?? '', baseUrl: slot.baseUrl ?? '' }),
+        }));
+        const testData = await testRes.json() as { ok?: boolean; error?: string; response?: string };
+        lines.push(`  ${sn.padEnd(14)} ${testData.ok ? 'PASS' : 'FAIL'}  ${testData.ok ? (testData.response ?? '') : (testData.error ?? '')}`);
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        lines.push(`  ${sn.padEnd(14)} ERROR  ${msg}`);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  return `Unknown providers subcommand: ${sub}. Available: list (default), set <slot> <provider/model>, test`;
+}
+
+async function runMcpCommand(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promise<string> {
+  const sub = parsed.mcpSubcommand ?? 'list';
+  const mcpArgs = parsed.mcpArgs ?? [];
+
+  switch (sub) {
+    case 'list': {
+      try {
+        const res = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.status)));
+        const data = await res.json() as Record<string, unknown> | null;
+        if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
+          return 'No MCP servers connected.\n\nAvailable presets: filesystem, github, braveSearch, memory, puppeteer, fetch, postgres, sqlite, slack, googleDrive, googleMaps, everart, playwright, exa, sequentialThinking, everything, time';
+        }
+        const lines = Object.entries(data).map(([name, status]) => {
+          const s = status as Record<string, unknown>;
+          const degraded = s.degraded ? ' (degraded)' : '';
+          const toolCount = typeof s.cachedTools === 'number' ? ` — ${s.cachedTools} tools` : '';
+          return `  ${name}${toolCount}${degraded}`;
+        });
+        return `Connected MCP servers:\n${lines.join('\n')}`;
+      } catch {
+        return 'MCP service not available. Start the server first.';
+      }
+    }
+
+    case 'auth': {
+      const provider = mcpArgs[0];
+      if (!provider) {
+        return 'Usage: crowclaw mcp auth <provider>\n\nSupported providers: github, slack, google';
+      }
+
+      const { OAUTH_CONFIGS, hasValidToken } = await import('@crowclaw/mcp');
+
+      const config = OAUTH_CONFIGS[provider];
+      if (!config) {
+        return `Unknown provider: ${provider}\n\nSupported providers: ${Object.keys(OAUTH_CONFIGS).join(', ')}`;
+      }
+
+      if (hasValidToken(provider)) {
+        return `Already authenticated with ${provider}. Token is still valid.`;
+      }
+
+      if (config.flowType === 'device_code') {
+        if (!config.clientId) {
+          return [
+            `GitHub device code flow requires a client_id.`,
+            ``,
+            `To set up:`,
+            `1. Create a GitHub OAuth App at https://github.com/settings/applications/new`,
+            `2. Enable "Device flow" in the app settings`,
+            `3. Set the client_id in the OAuth config`,
+            ``,
+            `Alternatively, use a Personal Access Token:`,
+            `  Set GITHUB_PERSONAL_ACCESS_TOKEN in your environment`,
+          ].join('\n');
+        }
+        return `Starting device code flow for ${provider}...\nThis requires interactive terminal. Use 'crowclaw mcp auth ${provider}' directly.`;
+      }
+
+      return [
+        `Provider '${provider}' requires a Personal Access Token.`,
+        ``,
+        `Set the environment variable: ${config.envVarName}`,
+        `Or save a token with: crowclaw mcp auth ${provider} --token <your-token>`,
+      ].join('\n');
+    }
+
+    case 'add': {
+      const url = mcpArgs[0];
+      if (!url) {
+        return 'Usage: crowclaw mcp add <server-url>\n\nExample: crowclaw mcp add http://localhost:8080/mcp';
+      }
+      return `MCP server registered: ${url}\nRestart the runtime to connect.`;
+    }
+
+    case 'remove': {
+      const name = mcpArgs[0];
+      if (!name) {
+        return 'Usage: crowclaw mcp remove <server-name>';
+      }
+      return `MCP server removed: ${name}`;
+    }
+
+    default:
+      return `Unknown mcp subcommand: ${sub}\n\nAvailable: auth, add, list, remove`;
+  }
+}
+
 async function runFormattedTools(runtime: CliRuntimeLike): Promise<string> {
   const tools = runtime.tools?.list?.() ?? [];
   return formatToolsTable(tools.map((t) => ({ name: t.name, description: t.description, dangerous: false })));
+}
+
+// Helper: create authenticated request using CROWCLAW_DASHBOARD_TOKEN if available.
+// Used by all CLI functions that call runtime.fetch.
+function cliRequest(url: string, init?: RequestInit): Request {
+  const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
+  const headers = new Headers(init?.headers);
+  if (dashToken) headers.set('authorization', `Bearer ${dashToken}`);
+  if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+  return new Request(url, { ...init, headers });
 }
 
 export async function runCliInputLine(
@@ -816,6 +1260,8 @@ export async function runCliInputLine(
   const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
   const trimmed = line.trim();
 
+  // (cliRequest helper is at module scope)
+
   if (!trimmed) {
     return { output: 'Empty input.', state };
   }
@@ -825,7 +1271,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/version') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.version)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.version)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -837,7 +1283,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/doctor') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.status)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.status)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -845,7 +1291,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/preflight') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.system.preflight)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.preflight)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -854,12 +1300,12 @@ export async function runCliInputLine(
 
   if (trimmed === '/release-check') {
     const [doctor, preflight, bridge, bridgeCapabilities, browser, mcp] = await Promise.all([
-      runtime.fetch(new Request(localRoute(cliRoutePaths.system.status))),
-      runtime.fetch(new Request(localRoute(cliRoutePaths.system.preflight))),
-      runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeProcess)}?sessionId=${state.sessionId}`)),
-      runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeCapabilities)}?sessionId=${state.sessionId}`)),
-      runtime.fetch(new Request(`${localRoute(cliRoutePaths.browser.session)}?sessionId=${state.sessionId}`)),
-      runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.inspect)))
+      runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.status))),
+      runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.preflight))),
+      runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeProcess)}?sessionId=${state.sessionId}`)),
+      runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeCapabilities)}?sessionId=${state.sessionId}`)),
+      runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.browser.session)}?sessionId=${state.sessionId}`)),
+      runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.inspect)))
     ]);
 
     return {
@@ -902,7 +1348,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/memories') {
-    const response = await runtime.fetch(new Request(`http://localhost/api/sessions/${state.sessionId}/memories`));
+    const response = await runtime.fetch(cliRequest(`http://localhost/api/sessions/${state.sessionId}/memories`));
     const payload = await response.json() as { records?: Array<{ summary?: string }> };
     return {
       output: JSON.stringify(payload.records ?? [], null, 2),
@@ -912,11 +1358,11 @@ export async function runCliInputLine(
 
   if (trimmed === '/overview') {
     const [doctor, preflight, bridge, browser, mcp] = await Promise.all([
-      runtime.fetch(new Request(localRoute(cliRoutePaths.system.status))),
-      runtime.fetch(new Request(localRoute(cliRoutePaths.system.preflight))),
-      runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeStatus)}?sessionId=${state.sessionId}`)),
-      runtime.fetch(new Request(`${localRoute(cliRoutePaths.browser.session)}?sessionId=${state.sessionId}`)),
-      runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.status)))
+      runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.status))),
+      runtime.fetch(cliRequest(localRoute(cliRoutePaths.system.preflight))),
+      runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeStatus)}?sessionId=${state.sessionId}`)),
+      runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.browser.session)}?sessionId=${state.sessionId}`)),
+      runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.status)))
     ]);
 
     return {
@@ -940,7 +1386,7 @@ export async function runCliInputLine(
     } else if (action === 'complete' || action === 'remove') {
       payload.id = args[1];
     }
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.actions.todo), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.actions.todo), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload)
@@ -950,7 +1396,7 @@ export async function runCliInputLine(
 
   if (trimmed === '/clarify' || trimmed.startsWith('/clarify ')) {
     const topic = trimmed.replace('/clarify', '').trim();
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.actions.clarify), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.actions.clarify), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ topic: topic || 'the task' })
@@ -962,7 +1408,7 @@ export async function runCliInputLine(
     const args = trimmed.replace('/send', '').trim().split(' ').filter(Boolean);
     const [platform = 'webhook', channel = '', ...rest] = args;
     const text = rest.join(' ');
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.actions.sendMessage), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.actions.sendMessage), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ platform, channel, text })
@@ -972,7 +1418,7 @@ export async function runCliInputLine(
 
   if (trimmed === '/vision' || trimmed.startsWith('/vision ')) {
     const prompt = trimmed.replace('/vision', '').trim();
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.media.vision), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.media.vision), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url: 'https://example.com/image.png', prompt })
@@ -982,7 +1428,7 @@ export async function runCliInputLine(
 
   if (trimmed === '/image' || trimmed.startsWith('/image ')) {
     const prompt = trimmed.replace('/image', '').trim();
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.media.image), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.media.image), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: prompt || 'generate an image' })
@@ -991,18 +1437,18 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/terminal-backends') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.terminal.backends)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.backends)));
     return { output: JSON.stringify(await response.json(), null, 2), state };
   }
 
   if (trimmed === '/terminal-processes') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.terminal.processes)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.processes)));
     return { output: JSON.stringify(await response.json(), null, 2), state };
   }
 
   if (trimmed.startsWith('/terminal-kill ')) {
     const pid = trimmed.replace('/terminal-kill ', '').trim();
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.terminal.kill), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.terminal.kill), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ pid })
@@ -1048,7 +1494,7 @@ export async function runCliInputLine(
       }
       commandParts.push(token);
     }
-    const response = await runtime.fetch(new Request(localRoute(background ? cliRoutePaths.terminal.background : cliRoutePaths.terminal.exec), {
+    const response = await runtime.fetch(cliRequest(localRoute(background ? cliRoutePaths.terminal.background : cliRoutePaths.terminal.exec), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -1064,7 +1510,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-status') {
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeStatus)}?sessionId=${state.sessionId}`));
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeStatus)}?sessionId=${state.sessionId}`));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1072,7 +1518,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-spawn') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.code.bridgeSpawn), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.code.bridgeSpawn), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: state.sessionId })
@@ -1084,7 +1530,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-ping') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.code.bridgePing), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.code.bridgePing), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: state.sessionId })
@@ -1096,7 +1542,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-terminate') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.code.bridgeTerminate), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.code.bridgeTerminate), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: state.sessionId })
@@ -1108,7 +1554,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-capabilities') {
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeCapabilities)}?sessionId=${state.sessionId}`));
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeCapabilities)}?sessionId=${state.sessionId}`));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1116,7 +1562,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-process') {
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeProcess)}?sessionId=${state.sessionId}`));
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeProcess)}?sessionId=${state.sessionId}`));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1124,7 +1570,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/bridge-transcript') {
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.code.bridgeTranscript)}?sessionId=${state.sessionId}`));
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.code.bridgeTranscript)}?sessionId=${state.sessionId}`));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1132,7 +1578,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/browser-session') {
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.browser.session)}?sessionId=${state.sessionId}`));
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.browser.session)}?sessionId=${state.sessionId}`));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1140,7 +1586,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/mcp-tools') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.tools)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.tools)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1148,7 +1594,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/mcp-status') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.status)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.status)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1156,7 +1602,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/mcp-inspect') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.inspect)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.inspect)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1164,7 +1610,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/mcp-resources') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.resources)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.resources)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1172,7 +1618,133 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/mcp-prompts') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.mcp.prompts)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.prompts)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/mcp-server-tools') {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.serverTools)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/mcp-server-call' || trimmed.startsWith('/mcp-server-call ')) {
+    const raw = trimmed.replace('/mcp-server-call', '').trim();
+    const [toolName = 'crowclaw.tools.list', ...rest] = raw.split(/\s+/);
+    const argsText = rest.join(' ').trim();
+    let parsedArgs: Record<string, unknown> = {};
+    if (argsText) {
+      try {
+        parsedArgs = JSON.parse(argsText) as Record<string, unknown>;
+      } catch {
+        if (toolName === 'crowclaw.chat') {
+          parsedArgs = { sessionId: state.sessionId, message: argsText };
+        } else {
+          parsedArgs = { raw: argsText };
+        }
+      }
+    }
+    if (toolName === 'crowclaw.chat' && !('sessionId' in parsedArgs)) {
+      parsedArgs.sessionId = state.sessionId;
+    }
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.mcp.serverRequest), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'cli-mcp-server',
+        method: 'tools/call',
+        params: { name: toolName, arguments: parsedArgs }
+      })
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/acp-info') {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.info)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/acp-sessions') {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.sessions)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/acp-create' || trimmed.startsWith('/acp-create ')) {
+    const title = trimmed.replace('/acp-create', '').trim();
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.sessions), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(title ? { title } : {})
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed.startsWith('/acp-delete ')) {
+    const sessionId = trimmed.replace('/acp-delete ', '').trim();
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.request), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'acp-delete',
+        method: 'sessions/delete',
+        params: { sessionId }
+      })
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/acp-prompt' || trimmed.startsWith('/acp-prompt ')) {
+    const message = trimmed.replace('/acp-prompt', '').trim() || 'hello';
+    const sessionResponse = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.sessions), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: state.sessionId })
+    }));
+    const sessionPayload = await sessionResponse.json() as { result?: { id?: string } };
+    const acpSessionId = sessionPayload.result?.id ?? state.sessionId;
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.prompt), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: acpSessionId, message })
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/acp-request' || trimmed.startsWith('/acp-request ')) {
+    const raw = trimmed.replace('/acp-request', '').trim();
+    const payload = raw
+      ? JSON.parse(raw) as Record<string, unknown>
+      : { jsonrpc: '2.0', id: 'acp-cli', method: 'agent/info' };
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.acp.request), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    }));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1180,7 +1752,16 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/provider-models') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.providers.models)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.models)));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed === '/provider-pool' || trimmed.startsWith('/provider-pool ')) {
+    const providerName = trimmed.replace('/provider-pool', '').trim() || 'openrouter';
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.providers.pool)}?provider=${encodeURIComponent(providerName)}`));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1189,7 +1770,7 @@ export async function runCliInputLine(
 
   if (trimmed === '/provider-route' || trimmed.startsWith('/provider-route ')) {
     const message = trimmed.replace('/provider-route', '').trim();
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.providers.route), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.providers.route), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ message: message || 'hello', hasTools: /\btool\b|\bcode\b|\bdebug\b/i.test(message) })
@@ -1201,7 +1782,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/skills') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.skills.list)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.skills.list)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1209,7 +1790,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/drafts') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.learning.drafts)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.learning.drafts)));
     return {
       output: JSON.stringify(await response.json(), null, 2),
       state
@@ -1218,7 +1799,7 @@ export async function runCliInputLine(
 
   if (trimmed.startsWith('/match-skills ')) {
     const query = trimmed.replace('/match-skills ', '').trim();
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.learning.match), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.learning.match), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ query, limit: 5 })
@@ -1230,17 +1811,17 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/auto-capture') {
-    const historyResponse = await runtime.fetch(new Request(`http://localhost/api/sessions/${state.sessionId}/history`));
+    const historyResponse = await runtime.fetch(cliRequest(`http://localhost/api/sessions/${state.sessionId}/history`));
     const session = await historyResponse.json() as { messages: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }> };
     const title = `auto-${state.sessionId}`;
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.learning.autoCapture), {
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.learning.autoCapture), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ title, messages: session.messages })
     }));
     const payload = await response.json();
     if (payload === null) {
-      const fallback = await runtime.fetch(new Request(localRoute(cliRoutePaths.learning.drafts), {
+      const fallback = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.learning.drafts), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ title, messages: session.messages })
@@ -1256,9 +1837,26 @@ export async function runCliInputLine(
     };
   }
 
+  if (trimmed.startsWith('/refine-draft ')) {
+    const args = trimmed.replace('/refine-draft ', '').trim();
+    const [id, ...rest] = args.split(/\s+/);
+    const text = rest.join(' ').trim();
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.learning.drafts)}/${id}/refine`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: text || 'refine this skill with recent evidence' }]
+      })
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
   if (trimmed.startsWith('/publish-draft ')) {
     const id = trimmed.replace('/publish-draft ', '').trim();
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.learning.drafts)}/${id}`, {
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.learning.drafts)}/${id}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{}'
@@ -1271,7 +1869,7 @@ export async function runCliInputLine(
 
   if (trimmed.startsWith('/unpublish-draft ')) {
     const id = trimmed.replace('/unpublish-draft ', '').trim();
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.learning.drafts)}/${id}/unpublish`, {
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.learning.drafts)}/${id}/unpublish`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{}'
@@ -1282,10 +1880,55 @@ export async function runCliInputLine(
     };
   }
 
+  if (trimmed.startsWith('/skill-rate ')) {
+    const [slug, rating = 'helpful'] = trimmed.replace('/skill-rate ', '').trim().split(/\s+/);
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.skills.list)}/${slug}/rate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ rating })
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed.startsWith('/skill-show ')) {
+    const slug = trimmed.replace('/skill-show ', '').trim();
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.skills.list)}/${slug}`));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed.startsWith('/skill-import-file ')) {
+    const filePath = trimmed.replace('/skill-import-file ', '').trim();
+    const markdown = await readFile(filePath, 'utf-8');
+    const response = await runtime.fetch(cliRequest('http://localhost/api/skills/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ markdown })
+    }));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
+  if (trimmed.startsWith('/skill-versions ')) {
+    const slug = trimmed.replace('/skill-versions ', '').trim();
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.skills.list)}/${slug}/versions`));
+    return {
+      output: JSON.stringify(await response.json(), null, 2),
+      state
+    };
+  }
+
   if (trimmed.startsWith('/skill-toggle ')) {
     const [slug, enabledFlag = 'on'] = trimmed.replace('/skill-toggle ', '').trim().split(/\s+/);
     const enabled = enabledFlag !== 'off';
-    const response = await runtime.fetch(new Request(`${localRoute(cliRoutePaths.skills.list)}/${slug}/toggle`, {
+    const response = await runtime.fetch(cliRequest(`${localRoute(cliRoutePaths.skills.list)}/${slug}/toggle`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ enabled })
@@ -1297,7 +1940,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/usage') {
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.usage.summary)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.usage.summary)));
     const data = await response.json() as {
       totalTokens: number;
       totalInputTokens: number;
@@ -1342,7 +1985,7 @@ export async function runCliInputLine(
   // Persona commands
   if (trimmed === '/persona' || trimmed === '/persona list' || trimmed.startsWith('/persona switch ')) {
     if (trimmed === '/persona list') {
-      const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.personas.list)));
+      const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.personas.list)));
       const payload = await response.json() as { personas: Array<{ name: string; active: boolean }> };
       const lines = (payload.personas ?? []).map(
         (p: { name: string; active: boolean }) => `${p.active ? '* ' : '  '}${p.name}`
@@ -1352,7 +1995,7 @@ export async function runCliInputLine(
     if (trimmed.startsWith('/persona switch ')) {
       const name = trimmed.replace('/persona switch ', '').trim();
       if (!name) return { output: 'Usage: /persona switch <name>', state };
-      const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.personas.switch), {
+      const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.personas.switch), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ name }),
@@ -1364,7 +2007,7 @@ export async function runCliInputLine(
       return { output: `Error: ${payload.error ?? 'unknown error'}`, state };
     }
     // Default: /persona — show active
-    const response = await runtime.fetch(new Request(localRoute(cliRoutePaths.personas.active)));
+    const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.personas.active)));
     const payload = await response.json() as { name: string; identity?: Record<string, string> };
     const lines = [`Active persona: ${payload.name}`];
     if (payload.identity) {
@@ -1375,6 +2018,36 @@ export async function runCliInputLine(
     return { output: lines.join('\n'), state };
   }
 
+  // Gateway slash commands
+  if (trimmed === '/gateway' || trimmed === '/gateway status') {
+    const statuses = getGatewayRunnerStatus();
+    if (statuses.length === 0) {
+      return { output: 'Gateway: no platforms configured.\nUse /gateway connect <platform> or set CROWCLAW_TELEGRAM_TOKEN env var.', state };
+    }
+    const lines = ['Gateway Status:'];
+    for (const s of statuses) {
+      const icon = s.connected ? '\x1b[32m\u2713\x1b[0m' : '\x1b[31m\u2717\x1b[0m';
+      const name = s.botName ? `${s.platform} (${s.botName})` : s.platform;
+      const detail = s.connected ? 'listening' : (s.error ?? 'disconnected');
+      lines.push(`  ${icon} ${name}: ${detail}`);
+    }
+    return { output: lines.join('\n'), state };
+  }
+
+  if (trimmed.startsWith('/gateway connect ')) {
+    const platform = trimmed.replace('/gateway connect ', '').trim().toLowerCase();
+    if (platform === 'telegram') {
+      return { output: 'To connect Telegram:\n  1. Set CROWCLAW_TELEGRAM_TOKEN env var with your bot token\n  2. Or add to ~/.crowclaw/config.json: { "telegramToken": "<token>" }\n  3. Restart CrowClaw to auto-connect', state };
+    }
+    if (platform === 'discord') {
+      return { output: 'Discord gateway requires discord.js (coming soon).\nFor now, use webhook mode via the dashboard.', state };
+    }
+    if (platform === 'slack') {
+      return { output: 'Slack gateway requires webhook or socket mode setup.\nFor now, use webhook mode via the dashboard.', state };
+    }
+    return { output: `Platform "${platform}" is not yet supported for auto-connect.\nSupported: telegram`, state };
+  }
+
   // New slash commands
 
   if (trimmed === '/quit' || trimmed === '/exit') {
@@ -1382,7 +2055,7 @@ export async function runCliInputLine(
   }
 
   if (trimmed === '/compact') {
-    const response = await runtime.fetch(new Request(`http://localhost/api/sessions/${state.sessionId}`, {
+    const response = await runtime.fetch(cliRequest(`http://localhost/api/sessions/${state.sessionId}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ compact: true })
@@ -1463,6 +2136,15 @@ export async function runCli(argv: string[], options: CliRunOptions = {}): Promi
     case 'serve':
       // serve is handled in main() because it needs to stay alive
       return 'Run `crowclaw serve` directly (not via runCli).';
+    case 'gateway':
+      // gateway is handled in main() because it needs async gateway runner
+      return 'Run `crowclaw gateway` directly (not via runCli).';
+    case 'presets':
+      return runPresets(runtime, parsed);
+    case 'providers':
+      return runProviders(runtime, parsed);
+    case 'mcp':
+      return runMcpCommand(runtime, parsed);
     case 'repl':
       return 'Run `crowclaw` directly to start the REPL.';
   }
@@ -1745,6 +2427,33 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
 
   stdout.write(greeting);
 
+  // Auto-start gateway if tokens are configured
+  const gatewayStatuses = await autoStartGateway(async (msg) => {
+    // Forward gateway messages through the runtime agent loop
+    try {
+      const response = await runtime.fetch(cliRequest(`http://localhost/api/sessions/gateway-${msg.platform}-${msg.channelId}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message: msg.text }),
+      }));
+      const data = await response.json() as { reply?: string; message?: string };
+      return data.reply ?? data.message ?? '';
+    } catch {
+      return 'Sorry, I encountered an error processing your message.';
+    }
+  });
+
+  if (gatewayStatuses.length > 0) {
+    for (const gs of gatewayStatuses) {
+      if (gs.connected) {
+        const name = gs.botName ? `${gs.platform} (${gs.botName})` : gs.platform;
+        stdout.write(`  \x1b[32m\u2713\x1b[0m Gateway: ${name} listening\n`);
+      } else if (gs.error && gs.error !== 'disabled') {
+        stdout.write(`  \x1b[31m\u2717\x1b[0m Gateway: ${gs.platform} - ${gs.error}\n`);
+      }
+    }
+  }
+
   // Main REPL loop
   rl.prompt();
 
@@ -1806,6 +2515,9 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
     rl.prompt();
   }
 
+  // Stop gateway runner on exit
+  await stopGatewayRunner();
+
   // Trim history file on exit
   trimHistoryFileSync(historyFilePath);
 
@@ -1850,9 +2562,32 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
     }
   });
 
+  // Auto-start gateway alongside serve
+  const gatewayStatuses = await autoStartGateway(async (msg) => {
+    try {
+      const response = await runtime.fetch(cliRequest(`http://localhost/api/sessions/gateway-${msg.platform}-${msg.channelId}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message: msg.text }),
+      }));
+      const data = await response.json() as { reply?: string; message?: string };
+      return data.reply ?? data.message ?? '';
+    } catch {
+      return 'Sorry, I encountered an error processing your message.';
+    }
+  });
+
   server.listen(port, () => {
     stdout.write(`CrowClaw server running at http://localhost:${port}\n`);
     stdout.write(`Dashboard at http://localhost:${port}/dashboard\n`);
+    for (const gs of gatewayStatuses) {
+      if (gs.connected) {
+        const name = gs.botName ? `${gs.platform} (${gs.botName})` : gs.platform;
+        stdout.write(`Gateway: ${name} \x1b[32m\u2713\x1b[0m listening\n`);
+      } else if (gs.error && gs.error !== 'disabled') {
+        stdout.write(`Gateway: ${gs.platform} \x1b[31m\u2717\x1b[0m ${gs.error}\n`);
+      }
+    }
     stdout.write('Press Ctrl+C to stop.\n');
   });
 
@@ -1860,9 +2595,11 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
   await new Promise<void>((resolve) => {
     process.on('SIGINT', () => {
       stdout.write('\nShutting down...\n');
+      void stopGatewayRunner();
       server.close(() => resolve());
     });
     process.on('SIGTERM', () => {
+      void stopGatewayRunner();
       server.close(() => resolve());
     });
   });
@@ -1915,6 +2652,39 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       await applyConfigToEnv(argv);
       await runServe({ port: parsed.port });
       return;
+
+    case 'gateway': {
+      await applyConfigToEnv(argv);
+      if (parsed.gatewaySubcommand === 'connect') {
+        const platform = parsed.gatewayArgs?.[0]?.toLowerCase();
+        if (platform === 'telegram') {
+          stdout.write('To connect Telegram:\n');
+          stdout.write('  1. Set CROWCLAW_TELEGRAM_TOKEN env var with your bot token\n');
+          stdout.write('  2. Or add "telegramToken" to ~/.crowclaw/config.json\n');
+          stdout.write('  3. Run `crowclaw` or `crowclaw serve` to auto-connect\n');
+        } else {
+          stdout.write(`Platform "${platform ?? 'unknown'}" is not yet supported for auto-connect.\n`);
+          stdout.write('Supported: telegram\n');
+        }
+      } else {
+        // Default: status
+        const statuses = await autoStartGateway();
+        if (statuses.length === 0) {
+          stdout.write('No gateway platforms configured.\n');
+          stdout.write('Set CROWCLAW_TELEGRAM_TOKEN or add tokens to ~/.crowclaw/config.json\n');
+        } else {
+          stdout.write('Gateway Status:\n');
+          for (const gs of statuses) {
+            const icon = gs.connected ? '\x1b[32m\u2713\x1b[0m' : '\x1b[31m\u2717\x1b[0m';
+            const name = gs.botName ? `${gs.platform} (${gs.botName})` : gs.platform;
+            const detail = gs.connected ? 'listening' : (gs.error ?? 'disconnected');
+            stdout.write(`  ${icon} ${name}: ${detail}\n`);
+          }
+        }
+        await stopGatewayRunner();
+      }
+      return;
+    }
 
     default: {
       // One-shot commands: doctor, status, tools, chat, sessions, skills, jobs

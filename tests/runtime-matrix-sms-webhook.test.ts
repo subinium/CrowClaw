@@ -13,7 +13,12 @@ describe('matrix/sms webhook runtime integration', () => {
   });
 
   it('routes Matrix webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ webhookSecrets: { matrix: 'matrix-secret', sms: 'sms-secret' } });
+    await runtime.fetch(new Request('http://localhost/api/gateway/matrix/policy', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
     const payload = {
       eventId: '$matrix-1',
       roomId: '!room:example.com',
@@ -24,7 +29,7 @@ describe('matrix/sms webhook runtime integration', () => {
 
     const response = await runtime.fetch(new Request('http://localhost/webhooks/matrix', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer matrix-secret' },
       body: JSON.stringify(payload)
     }));
 
@@ -34,7 +39,12 @@ describe('matrix/sms webhook runtime integration', () => {
   });
 
   it('routes and deduplicates SMS webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ webhookSecrets: { matrix: 'matrix-secret', sms: 'sms-secret' } });
+    await runtime.fetch(new Request('http://localhost/api/gateway/sms/policy', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
     const payload = {
       messageId: 'sms-1',
       from: '+15550001',
@@ -46,7 +56,7 @@ describe('matrix/sms webhook runtime integration', () => {
 
     const first = await runtime.fetch(new Request('http://localhost/webhooks/sms', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sms-secret' },
       body: JSON.stringify(payload)
     }));
     const firstBody = await first.json() as { finalResponse: string; session: { sessionId: string } };
@@ -55,7 +65,7 @@ describe('matrix/sms webhook runtime integration', () => {
 
     const duplicate = await runtime.fetch(new Request('http://localhost/webhooks/sms', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sms-secret' },
       body: JSON.stringify(payload)
     }));
     expect(await duplicate.json()).toEqual({ ok: true, duplicate: true, sessionId: 'sms:conv-1' });

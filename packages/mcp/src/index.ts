@@ -1,4 +1,3 @@
-import type { SandboxClient } from '@crowclaw/sandbox-executor';
 import { McpJsonRpcStdioTransport, type McpStdioServerConfig } from './stdio-transport.js';
 
 export { McpJsonRpcStdioTransport } from './stdio-transport.js';
@@ -14,8 +13,28 @@ export type {
   SlackPresetConfig,
   GoogleDrivePresetConfig,
   GoogleMapsPresetConfig,
+  PlaywrightPresetConfig,
+  ExaPresetConfig,
   SequentialThinkingPresetConfig,
 } from './presets.js';
+
+export {
+  OAUTH_CONFIGS,
+  startDeviceCodeFlow,
+  saveOAuthToken,
+  hasValidToken,
+  getStoredToken,
+  removeToken,
+  listStoredTokenProviders,
+  requestDeviceCode,
+  pollForToken,
+} from './oauth.js';
+export type {
+  OAuthConfig,
+  DeviceCodeResponse,
+  TokenResponse,
+  RuntimeTokenStore,
+} from './oauth.js';
 
 export interface McpToolDefinition {
   name: string;
@@ -153,58 +172,6 @@ export class McpHttpTransport implements McpTransport {
     }
     const payload = (await response.json()) as { prompts?: McpPromptDefinition[] };
     return payload.prompts ?? [];
-  }
-}
-
-export interface McpCommandRunner {
-  run(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }>;
-}
-
-export class McpStdioTransport implements McpTransport {
-  constructor(private readonly runner: McpCommandRunner) {}
-
-  async listTools(): Promise<McpToolDefinition[]> {
-    const result = await this.runner.run('mcp tools list --json');
-    if (result.exitCode !== 0) {
-      throw new Error(`MCP stdio listTools failed: ${result.stderr || result.stdout}`);
-    }
-    const payload = JSON.parse(result.stdout) as { tools?: McpToolDefinition[] };
-    return payload.tools ?? [];
-  }
-
-  async callTool(name: string, arguments_: Record<string, unknown>): Promise<McpCallResult> {
-    const encodedArgs = JSON.stringify(arguments_).replace(/'/g, "'\''");
-    const result = await this.runner.run(`mcp tools call ${name} '${encodedArgs}' --json`);
-    if (result.exitCode !== 0) {
-      throw new Error(`MCP stdio callTool failed: ${result.stderr || result.stdout}`);
-    }
-    return JSON.parse(result.stdout) as McpCallResult;
-  }
-
-  async listResources(): Promise<McpResourceDefinition[]> {
-    const result = await this.runner.run('mcp resources list --json');
-    if (result.exitCode !== 0) {
-      return [];
-    }
-    const payload = JSON.parse(result.stdout) as { resources?: McpResourceDefinition[] };
-    return payload.resources ?? [];
-  }
-
-  async listPrompts(): Promise<McpPromptDefinition[]> {
-    const result = await this.runner.run('mcp prompts list --json');
-    if (result.exitCode !== 0) {
-      return [];
-    }
-    const payload = JSON.parse(result.stdout) as { prompts?: McpPromptDefinition[] };
-    return payload.prompts ?? [];
-  }
-}
-
-export class SandboxMcpRunner implements McpCommandRunner {
-  constructor(private readonly sandbox: SandboxClient) {}
-
-  async run(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    return this.sandbox.executeCommand(command);
   }
 }
 

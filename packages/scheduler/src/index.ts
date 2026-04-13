@@ -298,8 +298,6 @@ export async function markJobRun(
   return next;
 }
 
-/** @deprecated Use markJobRun instead */
-export const markIntervalJobRun = markJobRun;
 
 // ---------------------------------------------------------------------------
 // Scheduler executor

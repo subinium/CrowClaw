@@ -218,12 +218,11 @@ export class CrowClawMcpServer {
       }
 
       case 'crowclaw.sessions.list':
-        // Sessions are scoped per agent instance — returns active sessions for this server
         return this.respondOk(id, {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ sessions: [] }, null, 2),
+              text: JSON.stringify({ sessions: [], note: 'Session listing not connected — MCP server runs standalone' }, null, 2),
             },
           ],
         });
@@ -242,7 +241,7 @@ export class CrowClawMcpServer {
             {
               type: 'text',
               text: JSON.stringify(
-                { sessionId, messages: [], note: 'Session history not yet persisted via MCP server' },
+                { sessionId, messages: [], note: 'Session history not connected — MCP server runs standalone' },
                 null,
                 2,
               ),
@@ -279,7 +278,7 @@ export class CrowClawMcpServer {
             {
               type: 'text',
               text: JSON.stringify(
-                { query, results: [], note: 'Memory search not yet connected' },
+                { query, results: [], note: 'Memory search not connected — MCP server runs standalone' },
                 null,
                 2,
               ),

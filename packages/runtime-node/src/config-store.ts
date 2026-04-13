@@ -3,6 +3,78 @@
  * The dashboard reads/writes this via REST API, and the runtime watches for changes.
  */
 
+export interface ConfigPreset {
+  name: string;
+  description?: string;
+  model?: string;
+  mcpServers?: string[];
+  skills?: string[];
+  toolset?: string;
+  tools?: string[];
+  systemPromptAppend?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const DEFAULT_CONFIG_PRESETS: ConfigPreset[] = [
+  {
+    name: 'web-research',
+    description: 'Browse and analyze web content',
+    mcpServers: ['braveSearch', 'playwright'],
+    skills: ['web-research', 'summarize-article', 'web-scraping'],
+    toolset: 'research',
+    createdAt: '2025-01-01T00:00:00Z',
+    updatedAt: '2025-01-01T00:00:00Z',
+  },
+  {
+    name: 'code-development',
+    description: 'Write, review, and debug code',
+    mcpServers: ['github', 'filesystem'],
+    skills: ['code-review', 'write-tests', 'debug-error', 'refactor-module'],
+    toolset: 'devops',
+    createdAt: '2025-01-01T00:00:00Z',
+    updatedAt: '2025-01-01T00:00:00Z',
+  },
+  {
+    name: 'data-analysis',
+    description: 'Query databases and analyze data',
+    mcpServers: ['postgres', 'sqlite'],
+    skills: ['database-migration', 'performance-optimization'],
+    toolset: 'full',
+    createdAt: '2025-01-01T00:00:00Z',
+    updatedAt: '2025-01-01T00:00:00Z',
+  },
+  {
+    name: 'minimal',
+    description: 'Basic chat with no extras',
+    mcpServers: [],
+    skills: [],
+    toolset: 'minimal',
+    createdAt: '2025-01-01T00:00:00Z',
+    updatedAt: '2025-01-01T00:00:00Z',
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Provider fallback chain configuration
+// ---------------------------------------------------------------------------
+
+export interface ProviderSlot {
+  name: string;          // display name
+  provider: string;      // 'openai' | 'anthropic' | 'openrouter' | 'custom'
+  model: string;         // e.g., 'gpt-4o', 'claude-sonnet-4'
+  apiKey?: string;       // if different from primary
+  baseUrl?: string;      // if different from primary
+}
+
+export interface ProviderConfig {
+  primary: ProviderSlot;
+  fallback?: ProviderSlot;
+  vision?: ProviderSlot;       // for image analysis
+  compression?: ProviderSlot;  // for context compression (cheap model)
+  embedding?: ProviderSlot;    // for memory embeddings
+}
+
 export interface GatewayPlatformConfig {
   enabled: boolean;
   token?: string;
@@ -23,6 +95,31 @@ export interface McpConnectionState {
   connectedAt?: string;
 }
 
+export interface McpServerConfig {
+  name: string;
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+  description?: string;
+  custom: true;
+}
+
+export interface SecurityPolicyConfig {
+  redactToolOutput: boolean;
+  scanUserInput: boolean;
+  scanCommands: boolean;
+  blockDangerousCommands: boolean;
+  piiRedaction: boolean;
+}
+
+export const DEFAULT_SECURITY_POLICY: SecurityPolicyConfig = {
+  redactToolOutput: true,
+  scanUserInput: false,
+  scanCommands: true,
+  blockDangerousCommands: false,
+  piiRedaction: true,
+};
+
 export interface RuntimeConfig {
   // Agent identity
   activePreset: string | null;
@@ -37,6 +134,9 @@ export interface RuntimeConfig {
   // MCP connections
   mcpConnections: Map<string, McpConnectionState>;
 
+  // Custom MCP servers (persisted)
+  customMcpServers: Map<string, McpServerConfig>;
+
   // Gateway platform configs
   gatewayConfigs: Map<string, GatewayPlatformConfig>;
 
@@ -45,8 +145,18 @@ export interface RuntimeConfig {
   model: string;
   apiKey: string;
 
+  // Provider fallback chain config
+  providerConfig: ProviderConfig | null;
+
   // Pending pairing challenges
   pendingPairings: Map<string, { code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }>;
+
+  // Config presets (MCP+Skill+Tool bundles)
+  configPresets: Map<string, ConfigPreset>;
+  activeConfigPreset: string | null;
+
+  // Security policy
+  securityPolicy: SecurityPolicyConfig;
 }
 
 type ConfigChangeListener = (key: string, value: unknown) => void;
@@ -56,17 +166,26 @@ export class RuntimeConfigStore {
   private listeners: ConfigChangeListener[] = [];
 
   constructor() {
+    const defaultPresets = new Map<string, ConfigPreset>();
+    for (const preset of DEFAULT_CONFIG_PRESETS) {
+      defaultPresets.set(preset.name, preset);
+    }
     this.config = {
       activePreset: null,
       agentPreset: null,
       activeToolset: null,
       disabledSkills: new Set(),
       mcpConnections: new Map(),
+      customMcpServers: new Map(),
       gatewayConfigs: new Map(),
       providerType: 'none',
       model: 'unknown',
       apiKey: '',
+      providerConfig: null,
       pendingPairings: new Map(),
+      configPresets: defaultPresets,
+      activeConfigPreset: null,
+      securityPolicy: { ...DEFAULT_SECURITY_POLICY },
     };
   }
 
@@ -83,9 +202,58 @@ export class RuntimeConfigStore {
   getProviderInfo(): { type: string; model: string; configured: boolean } {
     return { type: this.config.providerType, model: this.config.model, configured: !!this.config.apiKey };
   }
+  getSecurityPolicy(): SecurityPolicyConfig { return { ...this.config.securityPolicy }; }
+  // --- Provider Config ---
+  getProviderConfig(): ProviderConfig | null { return this.config.providerConfig; }
+
+  setProviderConfig(config: ProviderConfig | null): void {
+    // Deep clone to avoid external mutation of the stored config
+    this.config.providerConfig = config ? JSON.parse(JSON.stringify(config)) as ProviderConfig : null;
+    this.emit('providerConfig', config);
+  }
+
+  setProviderSlot(slot: keyof ProviderConfig, slotConfig: ProviderSlot | undefined): void {
+    if (!this.config.providerConfig && slotConfig && slot === 'primary') {
+      this.config.providerConfig = { primary: { ...slotConfig } };
+    } else if (this.config.providerConfig) {
+      if (slotConfig) {
+        (this.config.providerConfig as unknown as Record<string, ProviderSlot | undefined>)[slot] = { ...slotConfig };
+      } else {
+        delete (this.config.providerConfig as unknown as Record<string, ProviderSlot | undefined>)[slot];
+      }
+    }
+    this.emit('providerSlot', { slot, config: slotConfig });
+  }
+
   getPendingPairingsMap(): Map<string, { code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }> {
     return this.config.pendingPairings;
   }
+
+  // --- Custom MCP Servers ---
+  getMcpServers(): McpServerConfig[] { return [...this.config.customMcpServers.values()]; }
+  getMcpServer(name: string): McpServerConfig | undefined { return this.config.customMcpServers.get(name); }
+
+  saveMcpServer(config: McpServerConfig): void {
+    this.config.customMcpServers.set(config.name, config);
+    this.emit('customMcpServer', { name: config.name, config });
+  }
+
+  deleteMcpServer(name: string): boolean {
+    const existed = this.config.customMcpServers.delete(name);
+    if (existed) {
+      this.emit('customMcpServerDeleted', name);
+    }
+    return existed;
+  }
+
+  // --- Config Presets ---
+  getConfigPresets(): ConfigPreset[] { return [...this.config.configPresets.values()]; }
+  getConfigPreset(name: string): ConfigPreset | undefined { return this.config.configPresets.get(name); }
+  getActiveConfigPreset(): ConfigPreset | null {
+    if (!this.config.activeConfigPreset) return null;
+    return this.config.configPresets.get(this.config.activeConfigPreset) ?? null;
+  }
+  getActiveConfigPresetName(): string | null { return this.config.activeConfigPreset; }
 
   // --- Pairings ---
   getPendingPairings(): Array<{ code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }> {
@@ -164,6 +332,35 @@ export class RuntimeConfigStore {
     this.emit('provider', { type, model });
   }
 
+  setActiveConfigPreset(name: string | null): void {
+    if (name !== null && !this.config.configPresets.has(name)) {
+      throw new Error(`Config preset '${name}' not found`);
+    }
+    this.config.activeConfigPreset = name;
+    this.emit('activeConfigPreset', name);
+  }
+
+  saveConfigPreset(preset: ConfigPreset): void {
+    this.config.configPresets.set(preset.name, preset);
+    this.emit('configPreset', { name: preset.name, preset });
+  }
+
+  deleteConfigPreset(name: string): boolean {
+    const existed = this.config.configPresets.delete(name);
+    if (this.config.activeConfigPreset === name) {
+      this.config.activeConfigPreset = null;
+    }
+    if (existed) {
+      this.emit('configPresetDeleted', name);
+    }
+    return existed;
+  }
+
+  setSecurityPolicy(policy: Partial<SecurityPolicyConfig>): void {
+    this.config.securityPolicy = { ...this.config.securityPolicy, ...policy };
+    this.emit('securityPolicy', this.config.securityPolicy);
+  }
+
   // --- Snapshot (for API responses) ---
   snapshot(): Record<string, unknown> {
     return {
@@ -172,11 +369,22 @@ export class RuntimeConfigStore {
       activeToolset: this.config.activeToolset,
       disabledSkills: [...this.config.disabledSkills],
       mcpConnections: Object.fromEntries(this.config.mcpConnections),
+      customMcpServers: [...this.config.customMcpServers.values()],
       gatewayConfigs: Object.fromEntries(
         [...this.config.gatewayConfigs].map(([k, v]) => [k, { ...v, token: v.token ? '***' : undefined }])
       ),
       provider: this.getProviderInfo(),
+      providerConfig: this.config.providerConfig ? {
+        primary: { ...this.config.providerConfig.primary, apiKey: this.config.providerConfig.primary.apiKey ? '***' : undefined },
+        fallback: this.config.providerConfig.fallback ? { ...this.config.providerConfig.fallback, apiKey: this.config.providerConfig.fallback.apiKey ? '***' : undefined } : undefined,
+        vision: this.config.providerConfig.vision ? { ...this.config.providerConfig.vision, apiKey: this.config.providerConfig.vision.apiKey ? '***' : undefined } : undefined,
+        compression: this.config.providerConfig.compression ? { ...this.config.providerConfig.compression, apiKey: this.config.providerConfig.compression.apiKey ? '***' : undefined } : undefined,
+        embedding: this.config.providerConfig.embedding ? { ...this.config.providerConfig.embedding, apiKey: this.config.providerConfig.embedding.apiKey ? '***' : undefined } : undefined,
+      } : null,
       pendingPairings: this.getPendingPairings(),
+      configPresets: [...this.config.configPresets.values()],
+      activeConfigPreset: this.config.activeConfigPreset,
+      securityPolicy: this.config.securityPolicy,
     };
   }
 
@@ -204,11 +412,16 @@ interface SerializedConfig {
   activeToolset: string | null;
   disabledSkills: string[];
   mcpConnections: Record<string, McpConnectionState>;
+  customMcpServers?: McpServerConfig[];
   gatewayConfigs: Record<string, GatewayPlatformConfig>;
   providerType: string;
   model: string;
   apiKey: string;
+  providerConfig?: ProviderConfig | null;
   pendingPairings: Record<string, { code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }>;
+  configPresets?: ConfigPreset[];
+  activeConfigPreset?: string | null;
+  securityPolicy?: SecurityPolicyConfig;
 }
 
 /**
@@ -262,6 +475,11 @@ export class FileConfigStore extends RuntimeConfigStore {
         super.setMcpConnection(name, state);
       }
     }
+    if (Array.isArray(data.customMcpServers)) {
+      for (const server of data.customMcpServers) {
+        super.saveMcpServer(server);
+      }
+    }
     if (data.gatewayConfigs) {
       for (const [platform, config] of Object.entries(data.gatewayConfigs)) {
         super.setGatewayConfig(platform, config);
@@ -270,10 +488,28 @@ export class FileConfigStore extends RuntimeConfigStore {
     if (data.providerType !== undefined) {
       super.setProvider(data.providerType, data.model ?? 'unknown', data.apiKey ?? '');
     }
+    if (data.providerConfig !== undefined) {
+      super.setProviderConfig(data.providerConfig ?? null);
+    }
     if (data.pendingPairings) {
       for (const [key, pairing] of Object.entries(data.pendingPairings)) {
         super.addPairing(key, pairing);
       }
+    }
+    if (Array.isArray(data.configPresets)) {
+      for (const preset of data.configPresets) {
+        super.saveConfigPreset(preset);
+      }
+    }
+    if (data.activeConfigPreset !== undefined) {
+      try {
+        super.setActiveConfigPreset(data.activeConfigPreset ?? null);
+      } catch {
+        // Preset may not exist — ignore
+      }
+    }
+    if (data.securityPolicy) {
+      super.setSecurityPolicy(data.securityPolicy);
     }
   }
 
@@ -289,14 +525,19 @@ export class FileConfigStore extends RuntimeConfigStore {
         activeToolset: snapshot.activeToolset as string | null,
         disabledSkills: snapshot.disabledSkills as string[],
         mcpConnections: snapshot.mcpConnections as Record<string, McpConnectionState>,
+        customMcpServers: snapshot.customMcpServers as McpServerConfig[],
         gatewayConfigs: snapshot.gatewayConfigs as Record<string, GatewayPlatformConfig>,
         providerType: (snapshot.provider as { type: string }).type,
         model: (snapshot.provider as { model: string }).model,
         apiKey: '', // Never persist API keys to the runtime config snapshot
+        providerConfig: snapshot.providerConfig as ProviderConfig | null,
         pendingPairings: Object.fromEntries(
           (snapshot.pendingPairings as Array<{ code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }>)
             .map((p) => [`${p.platform}:${p.senderId}`, p])
         ),
+        configPresets: snapshot.configPresets as ConfigPreset[],
+        activeConfigPreset: snapshot.activeConfigPreset as string | null,
+        securityPolicy: snapshot.securityPolicy as SecurityPolicyConfig,
       };
       await mkdir(dirname(this.filePath), { recursive: true });
       await writeFile(this.filePath, JSON.stringify(serialized, null, 2), { mode: 0o600 });
@@ -341,6 +582,19 @@ export class FileConfigStore extends RuntimeConfigStore {
     void this.persistToDisk();
   }
 
+  override saveMcpServer(config: McpServerConfig): void {
+    super.saveMcpServer(config);
+    void this.persistToDisk();
+  }
+
+  override deleteMcpServer(name: string): boolean {
+    const result = super.deleteMcpServer(name);
+    if (result) {
+      void this.persistToDisk();
+    }
+    return result;
+  }
+
   override setGatewayConfig(platform: string, config: GatewayPlatformConfig): void {
     super.setGatewayConfig(platform, config);
     void this.persistToDisk();
@@ -348,6 +602,16 @@ export class FileConfigStore extends RuntimeConfigStore {
 
   override setProvider(type: string, model: string, apiKey: string): void {
     super.setProvider(type, model, apiKey);
+    void this.persistToDisk();
+  }
+
+  override setProviderConfig(config: ProviderConfig | null): void {
+    super.setProviderConfig(config);
+    void this.persistToDisk();
+  }
+
+  override setProviderSlot(slot: keyof ProviderConfig, slotConfig: ProviderSlot | undefined): void {
+    super.setProviderSlot(slot, slotConfig);
     void this.persistToDisk();
   }
 
@@ -362,6 +626,29 @@ export class FileConfigStore extends RuntimeConfigStore {
       void this.persistToDisk();
     }
     return result;
+  }
+
+  override setActiveConfigPreset(name: string | null): void {
+    super.setActiveConfigPreset(name);
+    void this.persistToDisk();
+  }
+
+  override saveConfigPreset(preset: ConfigPreset): void {
+    super.saveConfigPreset(preset);
+    void this.persistToDisk();
+  }
+
+  override deleteConfigPreset(name: string): boolean {
+    const result = super.deleteConfigPreset(name);
+    if (result) {
+      void this.persistToDisk();
+    }
+    return result;
+  }
+
+  override setSecurityPolicy(policy: Partial<SecurityPolicyConfig>): void {
+    super.setSecurityPolicy(policy);
+    void this.persistToDisk();
   }
 
   /** Returns number of consecutive write failures (0 means healthy). */

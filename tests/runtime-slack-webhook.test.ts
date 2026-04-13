@@ -15,14 +15,24 @@ describe('slack webhook runtime integration', () => {
   });
 
   it('routes slack webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime();
-    const response = await runtime.fetch(new Request('http://localhost/webhooks/slack', {
+    const signingSecret = 'slack-test-secret';
+    const runtime = createNodeRuntime({ slackSigningSecret: signingSecret });
+    await runtime.fetch(new Request('http://localhost/api/gateway/slack/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'event_callback',
-        event: { channel: 'C-1', user: 'U-1', text: 'deploy slack' }
-      })
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+    const body = JSON.stringify({
+      type: 'event_callback',
+      event: { channel: 'C-1', user: 'U-1', text: 'deploy slack' }
+    });
+    const timestamp = '1700000000';
+    const signature = await buildSlackSignature(signingSecret, timestamp, body);
+
+    const response = await runtime.fetch(new Request('http://localhost/webhooks/slack', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature },
+      body
     }));
 
     const payload = await response.json() as { finalResponse: string; session: { sessionId: string } };
@@ -65,11 +75,16 @@ describe('slack webhook runtime integration', () => {
   });
 
   it('responds to slack url verification without dispatching', async () => {
-    const runtime = createNodeRuntime();
+    const signingSecret = 'slack-test-secret';
+    const runtime = createNodeRuntime({ slackSigningSecret: signingSecret });
+    const body = JSON.stringify({ type: 'url_verification', challenge: 'challenge-123' });
+    const timestamp = '1700000000';
+    const signature = await buildSlackSignature(signingSecret, timestamp, body);
+
     const response = await runtime.fetch(new Request('http://localhost/webhooks/slack', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'url_verification', challenge: 'challenge-123' })
+      headers: { 'content-type': 'application/json', 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature },
+      body
     }));
 
     expect(await response.json()).toEqual({ challenge: 'challenge-123' });
@@ -98,6 +113,11 @@ describe('slack webhook runtime integration', () => {
 
   it('accepts valid slack signatures when verification is configured', async () => {
     const runtime = createNodeRuntime({ slackSigningSecret: 'correct-secret' });
+    await runtime.fetch(new Request('http://localhost/api/gateway/slack/policy', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
     const body = JSON.stringify({
       type: 'event_callback',
       event: { channel: 'C-4', user: 'U-4', text: 'deploy signed slack ok' }

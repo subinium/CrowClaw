@@ -403,3 +403,76 @@ export function scanCommand(command: string): CommandScanResult {
     risks,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Security Audit Log
+// ---------------------------------------------------------------------------
+
+export type SecurityEventType =
+  | 'credential_redacted'
+  | 'injection_detected'
+  | 'command_blocked'
+  | 'command_warned'
+  | 'pii_redacted'
+  | 'ssrf_blocked'
+  | 'approval_required'
+  | 'approval_denied';
+
+export type SecurityEventSeverity = 'info' | 'warning' | 'critical';
+
+export interface SecurityEvent {
+  timestamp: string;
+  type: SecurityEventType;
+  severity: SecurityEventSeverity;
+  detail: string;
+  sessionId?: string;
+}
+
+export class SecurityAuditLog {
+  private events: SecurityEvent[] = [];
+  private maxEvents: number;
+
+  constructor(maxEvents = 500) {
+    this.maxEvents = maxEvents;
+  }
+
+  record(event: Omit<SecurityEvent, 'timestamp'>): void {
+    const entry: SecurityEvent = {
+      ...event,
+      timestamp: new Date().toISOString(),
+    };
+    this.events.push(entry);
+    if (this.events.length > this.maxEvents) {
+      this.events = this.events.slice(-this.maxEvents);
+    }
+  }
+
+  getEvents(limit?: number): SecurityEvent[] {
+    if (limit === undefined) return [...this.events].reverse();
+    return [...this.events].reverse().slice(0, limit);
+  }
+
+  getEventsByType(type: string): SecurityEvent[] {
+    return [...this.events].reverse().filter((e) => e.type === type);
+  }
+
+  getStats(): {
+    total: number;
+    byType: Record<string, number>;
+    bySeverity: Record<string, number>;
+  } {
+    const byType: Record<string, number> = {};
+    const bySeverity: Record<string, number> = {};
+
+    for (const event of this.events) {
+      byType[event.type] = (byType[event.type] ?? 0) + 1;
+      bySeverity[event.severity] = (bySeverity[event.severity] ?? 0) + 1;
+    }
+
+    return { total: this.events.length, byType, bySeverity };
+  }
+
+  clear(): void {
+    this.events = [];
+  }
+}

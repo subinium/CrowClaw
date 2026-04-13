@@ -1,4 +1,4 @@
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
 import {
   buildDiscordDispatch,
   buildDiscordEditPayload,
@@ -50,20 +50,23 @@ import {
 } from '@crowclaw/gateway';
 import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
-import { MemoryService } from '@crowclaw/memory';
+import { CrowClawMcpServer } from '@crowclaw/mcp-server';
+import { MemoryService, EmbeddingMemoryStore, type EmbeddingProvider } from '@crowclaw/memory';
+import { UserModelService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
-import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
+import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
-import { InMemorySchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markIntervalJobRun } from '@crowclaw/scheduler';
+import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun } from '@crowclaw/scheduler';
+import { AcpServer } from '@crowclaw/acp';
 import { RuntimeConfigStore, FileConfigStore } from './config-store.js';
 import type { CodeBridgeSession } from './bridge-state.js';
 import { ensureBrowserSession, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
 import { handleCodeBridgeRoutes } from './bridge-routes.js';
 import type { BridgeProcessRecord } from './bridge-process.js';
 import { routePaths } from './route-paths.js';
-import { resolveProviderFromConfig } from './provider-factory.js';
+import { resolveProviderFromConfig, resolveProvidersFromConfig, createProviderFromSlot } from './provider-factory.js';
 
 const directToolAliases = {
   'browser.wait': 'browser.waitFor',
@@ -107,6 +110,18 @@ export interface NodeRuntimeOptions {
   usageTracker?: DetailedUsageTracker;
   /** Path for persistent config store. Defaults to ~/.crowclaw/runtime-config.json. Set to null to use in-memory only. */
   configStorePath?: string | null;
+  /** Use embedding-based memory store for similarity search. Defaults to true. */
+  useEmbeddingMemory?: boolean;
+  /** Path for persistent scheduler store. Defaults to ~/.crowclaw/scheduler-jobs.json. Set to null to use in-memory only. */
+  schedulerStorePath?: string | null;
+  /** Hostname/address to bind to. Used for security checks. Defaults to '127.0.0.1'. */
+  hostname?: string;
+  /** Telegram webhook secret token (set via setWebhook secret_token parameter). */
+  telegramWebhookSecret?: string;
+  /** Discord application public key for webhook signature verification. */
+  discordPublicKey?: string;
+  /** Per-platform webhook secrets. Used for platforms without built-in signature verification. */
+  webhookSecrets?: Record<string, string>;
 }
 
 function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
@@ -462,14 +477,179 @@ function renderBrowserClickRefResult(url: string, ref: string) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Rate Limiter — simple in-memory, per-key, sliding-window
+// ---------------------------------------------------------------------------
+
+class RateLimiter {
+  private requests = new Map<string, number[]>();
+
+  check(key: string, maxRequests: number, windowMs: number): boolean {
+    const now = Date.now();
+    const timestamps = this.requests.get(key) ?? [];
+    const windowStart = now - windowMs;
+    const recent = timestamps.filter((t) => t > windowStart);
+    if (recent.length >= maxRequests) {
+      this.requests.set(key, recent);
+      return false; // rate limited
+    }
+    recent.push(now);
+    this.requests.set(key, recent);
+    return true; // allowed
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Security headers helper
+// ---------------------------------------------------------------------------
+
+const SECURITY_HEADERS: Record<string, string> = {
+  'Content-Security-Policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'X-XSS-Protection': '1; mode=block',
+};
+
+// ---------------------------------------------------------------------------
+// Route classification — dangerous routes always require authentication
+// ---------------------------------------------------------------------------
+
+const DANGEROUS_ROUTES = [
+  '/api/terminal/',
+  '/api/workspace/write', '/api/workspace/delete', '/api/workspace/rename',
+  '/api/workspace/patchLines', '/api/workspace/patchText',
+  '/api/workspace/patch', '/api/workspace/patch-text',
+  '/api/scheduler/start', '/api/scheduler/stop',
+  '/api/mcp/connect', '/api/mcp/disconnect',
+  '/api/providers/config',
+  '/api/config/provider',
+  '/api/security/policy',
+];
+
+function isDangerousRoute(pathname: string): boolean {
+  return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route));
+}
+
+function isLocalhostAddress(hostname: string): boolean {
+  return hostname === '127.0.0.1' || hostname === '::1' || hostname === 'localhost';
+}
+
+function parseCookieToken(cookieHeader: string | null): string | null {
+  if (!cookieHeader) return null;
+  const match = cookieHeader.match(/(?:^|;\s*)crowclaw_auth=([^;]+)/);
+  return match ? match[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// Webhook signature verification helpers
+// ---------------------------------------------------------------------------
+
+function verifyTelegramWebhookSecret(request: Request, secret: string): boolean {
+  const headerSecret = request.headers.get('x-telegram-bot-api-secret-token');
+  return headerSecret === secret;
+}
+
+async function verifyDiscordWebhookSignature(
+  request: Request,
+  publicKey: string,
+  body: string
+): Promise<boolean> {
+  const signature = request.headers.get('x-signature-ed25519');
+  const timestamp = request.headers.get('x-signature-timestamp');
+  if (!signature || !timestamp) return false;
+
+  try {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      hexToUint8Array(publicKey).buffer as ArrayBuffer,
+      { name: 'Ed25519', namedCurve: 'Ed25519' } as EcKeyImportParams,
+      false,
+      ['verify']
+    );
+    const encoder = new TextEncoder();
+    const message = encoder.encode(timestamp + body);
+    return await crypto.subtle.verify(
+      'Ed25519',
+      key,
+      hexToUint8Array(signature).buffer as ArrayBuffer,
+      message
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hexToUint8Array(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function verifyWebhookBearerSecret(request: Request, secret: string): boolean {
+  const auth = request.headers.get('authorization');
+  if (auth?.startsWith('Bearer ')) {
+    return auth.slice(7) === secret;
+  }
+  // Also check custom header
+  const customSecret = request.headers.get('x-webhook-secret');
+  return customSecret === secret;
+}
+
 export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const store = options.sessionStore ?? new InMemorySessionStore();
-  const memoryStore = options.memoryStore ?? new InMemoryMemoryStore();
+
+  // Memory store: wrap with EmbeddingMemoryStore by default for similarity search
+  const useEmbeddingMemory = options.useEmbeddingMemory ?? true;
+  const baseMemoryStore = options.memoryStore ?? new InMemoryMemoryStore();
+  const memoryStore: InMemoryMemoryStore | EmbeddingMemoryStore = (() => {
+    if (!useEmbeddingMemory || options.memoryStore) {
+      return baseMemoryStore;
+    }
+    // Simple bag-of-words embedding (no external API needed)
+    const simpleEmbeddingProvider: EmbeddingProvider = {
+      async embed(texts: string[]): Promise<number[][]> {
+        return texts.map(text => {
+          const words = text.toLowerCase().split(/\s+/);
+          // Simple hash-based embedding into 128-dim vector
+          const vec = new Array(128).fill(0) as number[];
+          for (const word of words) {
+            for (let i = 0; i < word.length; i++) {
+              vec[(word.charCodeAt(i) * 31 + i) % 128] += 1;
+            }
+          }
+          // Normalize
+          const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0)) || 1;
+          return vec.map(v => v / norm);
+        });
+      }
+    };
+    return new EmbeddingMemoryStore({
+      baseStore: baseMemoryStore,
+      embeddingProvider: simpleEmbeddingProvider,
+      similarityThreshold: 0.3,
+    });
+  })();
+
   const workspaceStore = options.workspaceStore
     ?? (options.workspaceDir
       ? new FileWorkspaceStore(options.workspaceDir)
       : new InMemoryWorkspaceStore());
-  const schedulerStore = options.schedulerStore ?? new InMemorySchedulerStore();
+
+  // Scheduler store: use FileSchedulerStore by default for persistence across restarts
+  const schedulerStore = (() => {
+    if (options.schedulerStore) return options.schedulerStore;
+    if (options.schedulerStorePath === null) return new InMemorySchedulerStore();
+    try {
+      const os = require('node:os') as { homedir(): string };
+      const path = require('node:path') as { join(...parts: string[]): string };
+      const schedulerPath = options.schedulerStorePath ?? path.join(os.homedir(), '.crowclaw', 'scheduler-jobs.json');
+      return new FileSchedulerStore(schedulerPath);
+    } catch {
+      return new InMemorySchedulerStore();
+    }
+  })();
   const skillStore = options.skillStore ?? new InMemorySkillStore();
   const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
 
@@ -493,10 +673,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     void configStore.load();
   }
 
+  // Security audit log and rate limiter
+  const securityAuditLog = new SecurityAuditLog(500);
+  const rateLimiter = new RateLimiter();
+
   const skillRegistry = new SkillRegistry({ skillStore });
   const learning = new LearningPipeline(skillStore);
   learning.setRegistry(skillRegistry);
   const memoryService = new MemoryService(memoryStore);
+  const userModelService = new UserModelService(memoryStore);
   const mcpClient = options.mcpClient ?? new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
   const plugins = options.plugins ?? new PluginManager().register(new MemoryCapturePlugin());
   const tools = options.tools ?? createDefaultWorkerRegistry({
@@ -525,6 +710,50 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const usageTracker = options.usageTracker ?? new DetailedUsageTracker();
   const deploymentName = options.deploymentName ?? 'crowclaw-node';
   const version = options.version ?? '0.1.0';
+
+  const runtimeEnv = (globalThis as Record<string, unknown>).process
+    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env
+    : {};
+
+  function collectProviderKeys(prefix: string): string[] {
+    const direct = runtimeEnv[prefix];
+    const numbered = Object.entries(runtimeEnv)
+      .filter(([key, value]) => key.startsWith(`${prefix}_`) && typeof value === 'string' && value.trim().length > 0)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, value]) => value!.trim());
+    return [
+      ...(typeof direct === 'string' && direct.trim().length > 0 ? [direct.trim()] : []),
+      ...numbered
+    ];
+  }
+
+  function summarizeProviderPool(providerName: string) {
+    const normalized = providerName.toLowerCase();
+    const prefix = normalized === 'openai'
+      ? 'OPENAI_API_KEY'
+      : normalized === 'anthropic'
+        ? 'ANTHROPIC_API_KEY'
+        : 'OPENROUTER_API_KEY';
+    const keys = collectProviderKeys(prefix);
+    if (keys.length === 0) {
+      return {
+        provider: normalized,
+        configured: false,
+        strategy: 'round-robin',
+        total: 0,
+        active: 0,
+        coolingDown: 0,
+        disabled: 0,
+        status: []
+      };
+    }
+    const pool = new CredentialPool({ keys, strategy: 'round-robin' });
+    return {
+      provider: normalized,
+      configured: true,
+      ...pool.summary()
+    };
+  }
 
   // Initialize skill registry: load built-in skills and refresh learned from store
   skillRegistry.loadBuiltIn(getBuiltInSkills());
@@ -690,6 +919,21 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   function createConfiguredAgent(overrides?: ExecutionOverrides): AgentLoop {
     // Use persona registry's active prompt, falling back to the legacy personaPrompt
     const activePersonaPrompt = personaRegistry.getActive().prompt || personaPrompt;
+
+    // Resolve fallback/compression providers from config store
+    const providerCfg = configStore.getProviderConfig();
+    const fallbackProviders: ProviderAdapter[] = [];
+    let compressionProvider: ProviderAdapter | undefined;
+
+    if (providerCfg) {
+      if (providerCfg.fallback) {
+        fallbackProviders.push(createProviderFromSlot(providerCfg.fallback));
+      }
+      if (providerCfg.compression) {
+        compressionProvider = createProviderFromSlot(providerCfg.compression);
+      }
+    }
+
     return new AgentLoop(resolveProvider(overrides), buildConfiguredToolRegistry(overrides), store, {
       plugins,
       runtimeName: 'node',
@@ -698,6 +942,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       personaPrompt: activePersonaPrompt,
       requireApprovalForDangerousTools: true,
       approvalDecider: defaultApprovalDecider,
+      securityAuditLog,
+      securityPolicy: {
+        redactToolOutput: configStore.getSecurityPolicy().redactToolOutput,
+        scanUserInput: configStore.getSecurityPolicy().scanUserInput,
+        scanCommands: configStore.getSecurityPolicy().scanCommands,
+        blockDangerousCommands: configStore.getSecurityPolicy().blockDangerousCommands,
+      },
+      ...(fallbackProviders.length > 0 ? { fallbackProviders } : {}),
+      ...(compressionProvider ? { compressionProvider } : {}),
     });
   }
 
@@ -708,11 +961,46 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     workspaceId?: string;
     systemPrompt: string;
   }, overrides?: ExecutionOverrides) {
-    return createConfiguredAgent(overrides).run({
+    const result = await createConfiguredAgent(overrides).run({
       agentId: options.agentId ?? 'crowclaw',
       ...input
     });
+    // Update user model from conversation (fire-and-forget)
+    void userModelService.updateFromConversation(result.session.messages, input.sessionId).catch(() => {});
+    return result;
   }
+
+  const embeddedMcpServer = new CrowClawMcpServer({
+    run: async ({ sessionId, userMessage }) => {
+      const result = await runConfiguredAgent({
+        sessionId,
+        userMessage,
+        systemPrompt: 'You are CrowClaw running in embedded MCP server mode.'
+      });
+      return { finalResponse: result.finalResponse };
+    }
+  }, {
+    name: options.agentId ?? 'crowclaw-mcp-server',
+    version,
+  });
+
+  const embeddedAcpServer = new AcpServer({
+    run: async ({ sessionId, userMessage, systemPrompt }) => {
+      const result = await runConfiguredAgent({
+        sessionId,
+        userMessage,
+        systemPrompt: systemPrompt ?? 'You are CrowClaw running in embedded ACP server mode.'
+      });
+      return {
+        finalResponse: result.finalResponse,
+        toolResults: result.toolResults
+      };
+    }
+  }, {
+    agentId: options.agentId ?? 'crowclaw-acp',
+    displayName: 'CrowClaw ACP',
+    version,
+  });
 
   function getGatewayAccessPolicy(platform: GatewayPlatform): ChannelAccessPolicy | null {
     const config = configStore.getGatewayConfig(platform);
@@ -749,7 +1037,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   function enforceGatewayAccess(message: NormalizedInboundMessage): Response | null {
     const policy = getGatewayAccessPolicy(message.platform);
     if (!policy) {
-      return null;
+      // Deny-by-default: if no policy is configured, reject the message
+      return Response.json(
+        { ok: false, error: 'No access policy configured', platform: message.platform },
+        { status: 403 }
+      );
     }
 
     // Prune expired challenges before evaluating a new message.
@@ -819,29 +1111,77 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     schedulerStore,
     skillStore,
     configStore,
+    securityAuditLog,
+    userModelService,
     mcpClient,
     plugins,
     autonomousScheduler,
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
+      const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
+      const bindHostname = options.hostname ?? '127.0.0.1';
+      const isLocalhost = isLocalhostAddress(bindHostname);
 
       // Auth verification endpoint
       if (request.method === 'POST' && url.pathname === '/api/auth/verify') {
-        const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
         if (!dashToken) {
-          return Response.json({ ok: true, bypass: true });
+          if (isLocalhost) {
+            return Response.json({ ok: true, bypass: true });
+          }
+          return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN is required when binding to non-localhost' }, { status: 500 });
         }
         const body = (await request.json()) as { token?: string };
-        return Response.json({ ok: body.token === dashToken });
+        if (body.token === dashToken) {
+          const headers = new Headers({ 'content-type': 'application/json' });
+          headers.set('Set-Cookie', `crowclaw_auth=${dashToken}; HttpOnly; SameSite=Strict; Path=/`);
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+        }
+        return Response.json({ ok: false });
+      }
+
+      // Auth check endpoint (cookie-based, does not leak token)
+      if (request.method === 'GET' && url.pathname === '/api/auth/check') {
+        const cookieAuth = parseCookieToken(request.headers.get('cookie'));
+        const headerAuth = request.headers.get('authorization')?.startsWith('Bearer ')
+          ? request.headers.get('authorization')!.slice(7) : null;
+        if (!dashToken) {
+          return Response.json({ authenticated: isLocalhost });
+        }
+        return Response.json({ authenticated: cookieAuth === dashToken || headerAuth === dashToken });
       }
 
       // Auth middleware for /api/* routes
-      const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
-      if (dashToken && url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/events') {
+      if (url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/auth/check' && url.pathname !== '/api/events') {
         const authHeader = request.headers.get('authorization');
-        const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-        if (token !== dashToken) {
+        const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        const cookieToken = parseCookieToken(request.headers.get('cookie'));
+        const tokenMatch = dashToken ? (bearerToken === dashToken || cookieToken === dashToken) : false;
+
+        // Dangerous routes ALWAYS require auth, regardless of localhost
+        if (isDangerousRoute(url.pathname)) {
+          if (!dashToken) {
+            return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
+          }
+          if (!tokenMatch) {
+            return Response.json({ error: 'Unauthorized' }, { status: 401 });
+          }
+        } else if (dashToken && !tokenMatch) {
+          // Non-dangerous routes: require auth if token is configured
+          // On localhost without token: allow (dev convenience for read-only routes)
           return Response.json({ error: 'Unauthorized' }, { status: 401 });
+        }
+      }
+
+      // Rate limiting for /api/* routes: 100 requests per minute per IP
+      if (url.pathname.startsWith('/api/')) {
+        const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+          ?? request.headers.get('x-real-ip')
+          ?? '127.0.0.1';
+        if (!rateLimiter.check(clientIp, 100, 60_000)) {
+          return Response.json(
+            { error: 'Too many requests. Limit: 100 per minute.' },
+            { status: 429, headers: { 'Retry-After': '60' } }
+          );
         }
       }
 
@@ -877,7 +1217,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
         const { DASHBOARD_HTML } = await import('@crowclaw/web');
         return new Response(DASHBOARD_HTML, {
-          headers: { 'content-type': 'text/html; charset=utf-8' },
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            ...SECURITY_HEADERS,
+          },
         });
       }
 
@@ -895,6 +1238,79 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         } catch {
           return new Response('Not found', { status: 404 });
         }
+      }
+
+      // --- Security API endpoints ---
+
+      if (request.method === 'GET' && url.pathname === '/api/security/status') {
+        const policy = configStore.getSecurityPolicy();
+        const stats = securityAuditLog.getStats();
+        const protections = [
+          { name: 'Tool Output Redaction', key: 'redactToolOutput', enabled: policy.redactToolOutput, configurable: true },
+          { name: 'Command Scanning', key: 'scanCommands', enabled: policy.scanCommands, configurable: true },
+          { name: 'User Input Scanning', key: 'scanUserInput', enabled: policy.scanUserInput, configurable: true },
+          { name: 'Dangerous Command Blocking', key: 'blockDangerousCommands', enabled: policy.blockDangerousCommands, configurable: true },
+          { name: 'SSRF Protection', key: 'ssrf', enabled: true, configurable: false },
+          { name: 'PII Redaction', key: 'piiRedaction', enabled: policy.piiRedaction, configurable: true },
+        ];
+        const activeCount = protections.filter((p) => p.enabled).length;
+        const totalCount = protections.length;
+        let grade: string;
+        if (activeCount === totalCount) grade = 'A';
+        else if (activeCount >= 4) grade = 'B';
+        else if (activeCount >= 2) grade = 'C';
+        else if (activeCount >= 1) grade = 'D';
+        else grade = 'F';
+        return Response.json({
+          policy,
+          protections,
+          activeCount,
+          totalCount,
+          grade,
+          stats,
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/security/events') {
+        const limitParam = url.searchParams.get('limit');
+        const typeParam = url.searchParams.get('type');
+        const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+        let events;
+        if (typeParam) {
+          events = securityAuditLog.getEventsByType(typeParam);
+          if (limit) events = events.slice(0, limit);
+        } else {
+          events = securityAuditLog.getEvents(limit);
+        }
+        return Response.json({ events });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/security/policy') {
+        const body = (await request.json()) as Record<string, unknown>;
+        const update: Record<string, boolean> = {};
+        for (const key of ['redactToolOutput', 'scanUserInput', 'scanCommands', 'blockDangerousCommands', 'piiRedaction']) {
+          if (typeof body[key] === 'boolean') {
+            update[key] = body[key] as boolean;
+          }
+        }
+        configStore.setSecurityPolicy(update);
+        return Response.json({ ok: true, policy: configStore.getSecurityPolicy() });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/security/events/clear') {
+        securityAuditLog.clear();
+        return Response.json({ ok: true });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/security/stats') {
+        return Response.json(securityAuditLog.getStats());
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/user/profile') {
+        const sessionId = url.searchParams.get('sessionId') ?? 'default';
+        const scopeKey = url.searchParams.get('scopeKey') ?? 'default-user';
+        const profile = await userModelService.getProfile(sessionId, scopeKey);
+        return Response.json(profile);
       }
 
       if (request.method === 'GET' && url.pathname === '/health') {
@@ -1200,6 +1616,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         });
       }
 
+      if (request.method === 'GET' && url.pathname === routePaths.providers.pool) {
+        const providerName = url.searchParams.get('provider') ?? 'openrouter';
+        return Response.json(summarizeProviderPool(providerName));
+      }
+
       if (request.method === 'POST' && url.pathname === routePaths.providers.route) {
         const body = (await request.json()) as { message?: string; hasTools?: boolean };
         // Use the resolved provider instead of always defaulting to EchoProvider
@@ -1226,6 +1647,55 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           requiredCapabilities: analysis.requiredCapabilities,
           recommendedModels: analysis.recommendedModels
         });
+      }
+
+      // --- Provider Config API ---
+      if (request.method === 'GET' && url.pathname === '/api/providers/config') {
+        const providerCfg = configStore.getProviderConfig();
+        return Response.json({
+          ok: true,
+          config: providerCfg ?? null,
+          slots: {
+            primary: providerCfg?.primary ?? null,
+            fallback: providerCfg?.fallback ?? null,
+            vision: providerCfg?.vision ?? null,
+            compression: providerCfg?.compression ?? null,
+            embedding: providerCfg?.embedding ?? null,
+          },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/providers/config') {
+        const body = await request.json() as Record<string, unknown>;
+        const newConfig = body as unknown as import('./config-store.js').ProviderConfig;
+        if (!newConfig.primary || typeof newConfig.primary.provider !== 'string' || typeof newConfig.primary.model !== 'string') {
+          return Response.json({ ok: false, error: 'primary slot with provider and model is required' }, { status: 400 });
+        }
+        configStore.setProviderConfig(newConfig);
+        return Response.json({ ok: true, config: configStore.getProviderConfig() });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/providers/test') {
+        const body = await request.json() as Record<string, unknown>;
+        const slot = body.slot as string;
+        const providerType = body.provider as string;
+        const model = body.model as string;
+        const apiKey = body.apiKey as string;
+        const baseUrl = body.baseUrl as string | undefined;
+        if (!providerType || !model) {
+          return Response.json({ ok: false, error: 'provider and model are required' }, { status: 400 });
+        }
+        try {
+          const testProvider = createProviderFromSlot({ name: slot || 'test', provider: providerType, model, apiKey, baseUrl });
+          const testResponse = await testProvider.generate({
+            messages: [{ role: 'user', content: 'Say "ok" in one word.', createdAt: new Date().toISOString() }],
+            availableTools: [],
+          });
+          return Response.json({ ok: true, slot: slot || 'test', response: testResponse.assistantMessage?.slice(0, 100) });
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: false, slot: slot || 'test', error: message });
+        }
       }
 
       if (request.method === 'GET' && url.pathname === '/api/plugins') {
@@ -1286,6 +1756,104 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const msg = err instanceof Error ? err.message : String(err);
           return Response.json({ ok: false, error: msg }, { status: 400 });
         }
+      }
+
+      // --- Config Presets API ---
+
+      if (request.method === 'GET' && url.pathname === routePaths.configPresets.list) {
+        return Response.json({
+          presets: configStore.getConfigPresets(),
+          active: configStore.getActiveConfigPresetName(),
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === routePaths.configPresets.active) {
+        const active = configStore.getActiveConfigPreset();
+        return Response.json({ preset: active, name: configStore.getActiveConfigPresetName() });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.configPresets.switch) {
+        const body = await request.json() as { name: string | null };
+        if (body.name === null) {
+          configStore.setActiveConfigPreset(null);
+          return Response.json({ ok: true, active: null });
+        }
+        const preset = configStore.getConfigPreset(body.name);
+        if (!preset) {
+          return Response.json({ ok: false, error: `Config preset '${body.name}' not found` }, { status: 404 });
+        }
+        try {
+          configStore.setActiveConfigPreset(body.name);
+          // Apply the preset: toolset
+          if (preset.toolset) {
+            configStore.setActiveToolset(preset.toolset);
+          }
+          // Apply the preset: enable specified skills, disable others
+          if (preset.skills) {
+            const allSkills = skillRegistry.resolve();
+            const presetSkillSet = new Set(preset.skills);
+            for (const skill of allSkills) {
+              const shouldEnable = presetSkillSet.has(skill.manifest.name);
+              configStore.toggleSkill(skill.manifest.name, shouldEnable);
+              skillRegistry.toggleSkill(skill.manifest.name, shouldEnable);
+            }
+          }
+          // Apply the preset: connect MCP servers
+          if (preset.mcpServers) {
+            for (const serverName of preset.mcpServers) {
+              configStore.setMcpConnection(serverName, {
+                presetName: serverName,
+                status: 'connecting',
+              });
+            }
+          }
+          return Response.json({ ok: true, active: body.name, preset });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ ok: false, error: msg }, { status: 400 });
+        }
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.configPresets.save) {
+        const body = await request.json() as {
+          name: string;
+          description?: string;
+          model?: string;
+          mcpServers?: string[];
+          skills?: string[];
+          toolset?: string;
+          tools?: string[];
+          systemPromptAppend?: string;
+        };
+        if (!body.name) {
+          return Response.json({ ok: false, error: 'Missing preset name' }, { status: 400 });
+        }
+        const now = new Date().toISOString();
+        const existing = configStore.getConfigPreset(body.name);
+        const preset = {
+          name: body.name,
+          description: body.description,
+          model: body.model,
+          mcpServers: body.mcpServers,
+          skills: body.skills,
+          toolset: body.toolset,
+          tools: body.tools,
+          systemPromptAppend: body.systemPromptAppend,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        };
+        configStore.saveConfigPreset(preset);
+        return Response.json({ ok: true, preset });
+      }
+
+      const configPresetDeleteMatch = url.pathname.match(/^\/api\/config-presets\/([^/]+)$/);
+      if (request.method === 'DELETE' && configPresetDeleteMatch) {
+        const name = decodeURIComponent(configPresetDeleteMatch[1]!);
+        const deleted = configStore.deleteConfigPreset(name);
+        if (!deleted) {
+          return Response.json({ ok: false, error: `Config preset '${name}' not found` }, { status: 404 });
+        }
+        return Response.json({ ok: true, deleted: name });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/gateway/status') {
@@ -1468,6 +2036,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/api/discord/send') {
         const body = (await request.json()) as { webhookUrl: string; content: string };
+        const ssrfCheck = validateFetchUrl(body.webhookUrl);
+        if (!ssrfCheck.safe) {
+          return new Response(JSON.stringify({ error: 'SSRF blocked', reason: ssrfCheck.reason }), { status: 403 });
+        }
         const response = await fetch(buildDiscordWebhookSendUrl(body.webhookUrl), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -1481,6 +2053,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/api/discord/edit') {
         const body = (await request.json()) as { webhookUrl: string; messageId: string; content: string };
+        const ssrfCheck = validateFetchUrl(body.webhookUrl);
+        if (!ssrfCheck.safe) {
+          return new Response(JSON.stringify({ error: 'SSRF blocked', reason: ssrfCheck.reason }), { status: 403 });
+        }
         const response = await fetch(buildDiscordWebhookEditUrl(body.webhookUrl, body.messageId), {
           method: 'PATCH',
           headers: { 'content-type': 'application/json' },
@@ -1572,7 +2148,19 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/discord') {
-        const payload = await request.json();
+        // Discord webhook Ed25519 signature verification
+        const discordPubKey = options.discordPublicKey
+          ?? configStore.getGatewayConfig('discord')?.webhookSecret;
+        if (!discordPubKey) {
+          return Response.json({ ok: false, error: 'Discord public key not configured' }, { status: 403 });
+        }
+        const discordRawBody = await request.text();
+        const discordSigValid = await verifyDiscordWebhookSignature(request, discordPubKey, discordRawBody);
+        if (!discordSigValid) {
+          return Response.json({ ok: false, error: 'Invalid Discord webhook signature' }, { status: 403 });
+        }
+
+        const payload = JSON.parse(discordRawBody);
         const message = normalizeDiscordWebhook(payload as never);
         if (!message) {
           return Response.json({ ok: false, ignored: true });
@@ -1594,6 +2182,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/telegram') {
+        // Telegram webhook signature verification
+        const telegramSecret = options.telegramWebhookSecret
+          ?? configStore.getGatewayConfig('telegram')?.webhookSecret;
+        if (!telegramSecret) {
+          return Response.json({ ok: false, error: 'Telegram webhook secret not configured' }, { status: 403 });
+        }
+        if (!verifyTelegramWebhookSecret(request, telegramSecret)) {
+          return Response.json({ ok: false, error: 'Invalid Telegram webhook secret' }, { status: 403 });
+        }
+
         const payload = await request.json();
         const message = normalizeTelegramWebhook(payload as never);
         if (!message) {
@@ -1623,12 +2221,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/slack') {
+        // Slack webhook signature verification — deny if no signing secret configured
+        const slackSecret = options.slackSigningSecret
+          ?? configStore.getGatewayConfig('slack')?.webhookSecret;
+        if (!slackSecret) {
+          return Response.json({ ok: false, error: 'Slack signing secret not configured' }, { status: 403 });
+        }
         const rawBody = await request.text();
-        if (options.slackSigningSecret) {
+        {
           const signature = request.headers.get('x-slack-signature') ?? '';
           const timestamp = request.headers.get('x-slack-request-timestamp') ?? '';
           const verified = await verifySlackSignature({
-            signingSecret: options.slackSigningSecret,
+            signingSecret: slackSecret,
             timestamp,
             body: rawBody,
             signature
@@ -1669,6 +2273,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/whatsapp') {
+        // WhatsApp webhook secret verification
+        const whatsappSecret = options.webhookSecrets?.whatsapp
+          ?? configStore.getGatewayConfig('whatsapp')?.webhookSecret;
+        if (!whatsappSecret) {
+          return Response.json({ ok: false, error: 'WhatsApp webhook secret not configured' }, { status: 403 });
+        }
+        if (!verifyWebhookBearerSecret(request, whatsappSecret)) {
+          return Response.json({ ok: false, error: 'Invalid WhatsApp webhook secret' }, { status: 403 });
+        }
+
         const payload = await request.json();
         const message = normalizeWhatsAppWebhook(payload as never);
         if (!message) {
@@ -1698,6 +2312,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/signal') {
+        // Signal webhook secret verification
+        const signalSecret = options.webhookSecrets?.signal
+          ?? configStore.getGatewayConfig('signal')?.webhookSecret;
+        if (!signalSecret) {
+          return Response.json({ ok: false, error: 'Signal webhook secret not configured' }, { status: 403 });
+        }
+        if (!verifyWebhookBearerSecret(request, signalSecret)) {
+          return Response.json({ ok: false, error: 'Invalid Signal webhook secret' }, { status: 403 });
+        }
+
         const payload = await request.json();
         const message = normalizeSignalWebhook(payload as never);
         if (!message) {
@@ -1727,6 +2351,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/email') {
+        // Email webhook secret verification
+        const emailSecret = options.webhookSecrets?.email
+          ?? configStore.getGatewayConfig('email')?.webhookSecret;
+        if (!emailSecret) {
+          return Response.json({ ok: false, error: 'Email webhook secret not configured' }, { status: 403 });
+        }
+        if (!verifyWebhookBearerSecret(request, emailSecret)) {
+          return Response.json({ ok: false, error: 'Invalid Email webhook secret' }, { status: 403 });
+        }
+
         const payload = await request.json();
         const message = normalizeEmailWebhook(payload as never);
         if (!message) {
@@ -1756,6 +2390,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/matrix') {
+        // Matrix webhook secret verification
+        const matrixSecret = options.webhookSecrets?.matrix
+          ?? configStore.getGatewayConfig('matrix')?.webhookSecret;
+        if (!matrixSecret) {
+          return Response.json({ ok: false, error: 'Matrix webhook secret not configured' }, { status: 403 });
+        }
+        if (!verifyWebhookBearerSecret(request, matrixSecret)) {
+          return Response.json({ ok: false, error: 'Invalid Matrix webhook secret' }, { status: 403 });
+        }
+
         const payload = await request.json();
         const message = normalizeMatrixWebhook(payload as never);
         if (!message) {
@@ -1785,6 +2429,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/sms') {
+        // SMS webhook secret verification
+        const smsSecret = options.webhookSecrets?.sms
+          ?? configStore.getGatewayConfig('sms')?.webhookSecret;
+        if (!smsSecret) {
+          return Response.json({ ok: false, error: 'SMS webhook secret not configured' }, { status: 403 });
+        }
+        if (!verifyWebhookBearerSecret(request, smsSecret)) {
+          return Response.json({ ok: false, error: 'Invalid SMS webhook secret' }, { status: 403 });
+        }
+
         const payload = await request.json();
         const message = normalizeSmsWebhook(payload as never);
         if (!message) {
@@ -2362,6 +3016,76 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json(dynamicClient.listPrompts ? await dynamicClient.listPrompts() : []);
       }
 
+      if (request.method === 'GET' && url.pathname === routePaths.mcp.serverTools) {
+        return Response.json({
+          server: {
+            name: options.agentId ?? 'crowclaw-mcp-server',
+            version,
+          },
+          tools: embeddedMcpServer.getToolDefinitions()
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.mcp.serverRequest) {
+        const body = (await request.json()) as {
+          jsonrpc: '2.0';
+          id: number | string;
+          method: string;
+          params?: Record<string, unknown>;
+        };
+        return Response.json(await embeddedMcpServer.handleRequest(body));
+      }
+
+      if (request.method === 'GET' && url.pathname === routePaths.acp.info) {
+        return Response.json(await embeddedAcpServer.handleRequest({
+          jsonrpc: '2.0',
+          id: 'acp-info',
+          method: 'agent/info'
+        }));
+      }
+
+      if (request.method === 'GET' && url.pathname === routePaths.acp.sessions) {
+        return Response.json(await embeddedAcpServer.handleRequest({
+          jsonrpc: '2.0',
+          id: 'acp-sessions',
+          method: 'sessions/list'
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.acp.sessions) {
+        const body = (await request.json().catch(() => ({}))) as { title?: string };
+        return Response.json(await embeddedAcpServer.handleRequest({
+          jsonrpc: '2.0',
+          id: 'acp-create',
+          method: 'sessions/create',
+          params: typeof body.title === 'string' ? { title: body.title } : {}
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.acp.prompt) {
+        const body = (await request.json()) as { sessionId: string; message: string; systemPrompt?: string };
+        return Response.json(await embeddedAcpServer.handleRequest({
+          jsonrpc: '2.0',
+          id: 'acp-prompt',
+          method: 'prompt/execute',
+          params: {
+            sessionId: body.sessionId,
+            message: body.message,
+            ...(typeof body.systemPrompt === 'string' ? { systemPrompt: body.systemPrompt } : {})
+          }
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.acp.request) {
+        const body = (await request.json()) as {
+          jsonrpc: '2.0';
+          id: number | string;
+          method: string;
+          params?: Record<string, unknown>;
+        };
+        return Response.json(await embeddedAcpServer.handleRequest(body));
+      }
+
       if (request.method === 'GET' && url.pathname === '/api/mcp/status') {
         const dynamicClient = mcpClient as unknown as { getStatus?: () => unknown };
         return Response.json(dynamicClient.getStatus ? dynamicClient.getStatus() : null);
@@ -2458,6 +3182,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const action = segments[4] ?? 'publish';
         if (action === 'unpublish') {
           const result = await learning.unpublishDraft(id);
+          await skillRegistry.refreshLearned();
+          return Response.json(result);
+        }
+        if (action === 'refine') {
+          const body = (await request.json()) as {
+            messages: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }>;
+          };
+          const result = await learning.refineDraft(
+            id,
+            (body.messages ?? []).map((message) => ({ ...message, createdAt: message.createdAt ?? new Date().toISOString() }))
+          );
           await skillRegistry.refreshLearned();
           return Response.json(result);
         }
@@ -3033,6 +3768,223 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'POST' && url.pathname === '/api/usage/reset') {
         usageTracker.reset();
         return Response.json({ ok: true });
+      }
+
+      // --- MCP Server CRUD ---
+
+      if (request.method === 'POST' && url.pathname === '/api/mcp/servers') {
+        const body = (await request.json()) as { name: string; command: string; args?: string | string[]; env?: Record<string, string>; description?: string };
+        if (!body.name || !body.command) {
+          return Response.json({ ok: false, error: 'name and command are required' }, { status: 400 });
+        }
+        const args = Array.isArray(body.args) ? body.args : typeof body.args === 'string' ? body.args.split(',').map((s: string) => s.trim()).filter(Boolean) : [];
+        const serverConfig = { name: body.name, command: body.command, args, env: body.env, description: body.description, custom: true as const };
+        configStore.saveMcpServer(serverConfig);
+        return Response.json({ ok: true, server: serverConfig });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/servers') {
+        return Response.json({ servers: configStore.getMcpServers() });
+      }
+
+      {
+        const mcpServerMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)$/);
+        if (request.method === 'DELETE' && mcpServerMatch) {
+          const name = decodeURIComponent(mcpServerMatch[1]);
+          const deleted = configStore.deleteMcpServer(name);
+          if (!deleted) return Response.json({ ok: false, error: 'Server not found' }, { status: 404 });
+          configStore.removeMcpConnection(name);
+          return Response.json({ ok: true, name });
+        }
+      }
+
+      {
+        const mcpServerToolsMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/tools$/);
+        if (request.method === 'GET' && mcpServerToolsMatch) {
+          const name = decodeURIComponent(mcpServerToolsMatch[1]);
+          try {
+            const tools = await mcpClient.listTools({ refresh: true });
+            return Response.json({ server: name, tools });
+          } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : String(error);
+            return Response.json({ server: name, tools: [], error: msg });
+          }
+        }
+      }
+
+      {
+        const mcpServerReconnectMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/reconnect$/);
+        if (request.method === 'POST' && mcpServerReconnectMatch) {
+          const name = decodeURIComponent(mcpServerReconnectMatch[1]);
+          configStore.setMcpConnection(name, { presetName: name, status: 'connecting', connectedAt: new Date().toISOString() });
+          try {
+            await mcpClient.refreshTools();
+            configStore.setMcpConnection(name, { presetName: name, status: 'connected', connectedAt: new Date().toISOString() });
+            return Response.json({ ok: true, name, status: 'connected' });
+          } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : String(error);
+            configStore.setMcpConnection(name, { presetName: name, status: 'error', error: msg, connectedAt: new Date().toISOString() });
+            return Response.json({ ok: false, name, status: 'error', error: msg });
+          }
+        }
+      }
+
+      // --- Skill CRUD ---
+
+      if (request.method === 'POST' && url.pathname === '/api/skills') {
+        const body = (await request.json()) as { slug?: string; title: string; summary: string; triggerPhrases?: string[]; steps?: string[]; requiredTools?: string[] };
+        if (!body.title) {
+          return Response.json({ ok: false, error: 'title is required' }, { status: 400 });
+        }
+        const slug = body.slug || body.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        const now = new Date().toISOString();
+        const stored = {
+          id: crypto.randomUUID(),
+          slug,
+          title: body.title,
+          summary: body.summary || '',
+          triggerPhrases: body.triggerPhrases || [],
+          steps: body.steps || [],
+          sourceMessages: 0,
+          status: 'published' as const,
+          createdAt: now,
+          updatedAt: now,
+          markdown: `# ${body.title}\n\n${body.summary || ''}`,
+          version: 1,
+          ratings: { helpful: 0, unhelpful: 0 },
+          requiredTools: body.requiredTools,
+        };
+        await skillStore.save(stored);
+        await skillRegistry.refreshLearned();
+        return Response.json({ ok: true, skill: stored });
+      }
+
+      {
+        const skillSlugMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
+
+        if (request.method === 'PUT' && skillSlugMatch) {
+          const slug = decodeURIComponent(skillSlugMatch[1]);
+          const body = (await request.json()) as { title?: string; summary?: string; triggerPhrases?: string[]; steps?: string[]; requiredTools?: string[] };
+          const allSkills = await skillStore.list();
+          const existing = allSkills.find((s) => s.slug === slug);
+          if (!existing) {
+            return Response.json({ ok: false, error: 'Skill not found' }, { status: 404 });
+          }
+          const updated = {
+            ...existing,
+            title: body.title ?? existing.title,
+            summary: body.summary ?? existing.summary,
+            triggerPhrases: body.triggerPhrases ?? existing.triggerPhrases,
+            steps: body.steps ?? existing.steps,
+            requiredTools: body.requiredTools ?? existing.requiredTools,
+            updatedAt: new Date().toISOString(),
+            version: (existing.version ?? 1) + 1,
+            markdown: `# ${body.title ?? existing.title}\n\n${body.summary ?? existing.summary}`,
+          };
+          await skillStore.save(updated);
+          await skillRegistry.refreshLearned();
+          return Response.json({ ok: true, skill: updated });
+        }
+
+        if (request.method === 'DELETE' && skillSlugMatch) {
+          const slug = decodeURIComponent(skillSlugMatch[1]);
+          // Check if built-in — built-in skills cannot be deleted
+          const resolved = skillRegistry.resolveAll();
+          const match = resolved.find((s) => s.skill.manifest.name === slug);
+          if (match && (match.skill.manifest.category === 'builtin')) {
+            return Response.json({ ok: false, error: 'Cannot delete built-in skill. Use disable instead.' }, { status: 400 });
+          }
+          const allSkills = await skillStore.list();
+          const existing = allSkills.find((s) => s.slug === slug);
+          if (!existing) {
+            return Response.json({ ok: false, error: 'Skill not found' }, { status: 404 });
+          }
+          // Mark as deleted by removing from store (save with deleted status)
+          existing.status = 'draft';
+          existing.updatedAt = new Date().toISOString();
+          await skillStore.save(existing);
+          skillRegistry.removeLearnedSkill(slug);
+          return Response.json({ ok: true, slug });
+        }
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/skills/import') {
+        const body = (await request.json()) as { markdown: string };
+        if (!body.markdown) {
+          return Response.json({ ok: false, error: 'markdown content is required' }, { status: 400 });
+        }
+        // Parse SKILL.md format
+        const lines = body.markdown.split('\n');
+        const titleLine = lines.find((l) => l.startsWith('# '));
+        const title = titleLine ? titleLine.replace(/^#\s+/, '').trim() : 'Imported Skill';
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        const summaryStart = lines.findIndex((l) => /^##\s+summary/i.test(l));
+        const triggerStart = lines.findIndex((l) => /^##\s+trigger/i.test(l));
+        const stepsStart = lines.findIndex((l) => /^##\s+steps/i.test(l));
+        const summary = summaryStart >= 0 ? lines.slice(summaryStart + 1, triggerStart >= 0 ? triggerStart : stepsStart >= 0 ? stepsStart : lines.length).filter(Boolean).join(' ').trim() : '';
+        const triggers = triggerStart >= 0 ? lines.slice(triggerStart + 1, stepsStart >= 0 ? stepsStart : lines.length).filter((l) => l.startsWith('- ')).map((l) => l.replace(/^-\s+/, '').trim()) : [];
+        const steps = stepsStart >= 0 ? lines.slice(stepsStart + 1).filter((l) => /^\d+\.\s/.test(l)).map((l) => l.replace(/^\d+\.\s+/, '').trim()) : [];
+        const now = new Date().toISOString();
+        const stored = {
+          id: crypto.randomUUID(),
+          slug,
+          title,
+          summary,
+          triggerPhrases: triggers,
+          steps,
+          sourceMessages: 0,
+          status: 'published' as const,
+          createdAt: now,
+          updatedAt: now,
+          markdown: body.markdown,
+          version: 1,
+          ratings: { helpful: 0, unhelpful: 0 },
+        };
+        await skillStore.save(stored);
+        await skillRegistry.refreshLearned();
+        return Response.json({ ok: true, skill: stored });
+      }
+
+      {
+        const skillDetailMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
+        if (request.method === 'GET' && skillDetailMatch) {
+          const slug = decodeURIComponent(skillDetailMatch[1]);
+          const allSkills = await skillStore.list();
+          const match = allSkills.find((s) => s.slug === slug);
+          if (!match) {
+            return Response.json({ ok: false, error: 'Skill not found' }, { status: 404 });
+          }
+          return Response.json({ ok: true, skill: match });
+        }
+      }
+
+      {
+        const skillVersionsMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/versions$/);
+        if (request.method === 'GET' && skillVersionsMatch) {
+          const slug = decodeURIComponent(skillVersionsMatch[1]);
+          const allSkills = await skillStore.list();
+          const match = allSkills.find((s) => s.slug === slug);
+          if (!match) return Response.json({ versions: [] });
+          return Response.json({ versions: [{ version: match.version ?? 1, updatedAt: match.updatedAt, status: match.status }] });
+        }
+      }
+
+      {
+        const skillRateMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/rate$/);
+        if (request.method === 'POST' && skillRateMatch) {
+          const slug = decodeURIComponent(skillRateMatch[1]);
+          const body = (await request.json()) as { rating: 'helpful' | 'unhelpful' };
+          if (body.rating !== 'helpful' && body.rating !== 'unhelpful') {
+            return Response.json({ ok: false, error: 'rating must be helpful or unhelpful' }, { status: 400 });
+          }
+          try {
+            await learning.rateSkill(slug, body.rating);
+            return Response.json({ ok: true, slug, rating: body.rating });
+          } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : String(error);
+            return Response.json({ ok: false, error: msg }, { status: 404 });
+          }
+        }
       }
 
       return new Response('Not found', { status: 404 });

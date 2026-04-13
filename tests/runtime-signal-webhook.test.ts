@@ -22,10 +22,15 @@ describe('signal webhook runtime integration', () => {
   });
 
   it('routes Signal webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime();
-    const response = await runtime.fetch(new Request('http://localhost/webhooks/signal', {
+    const runtime = createNodeRuntime({ webhookSecrets: { signal: 'sig-secret' } });
+    await runtime.fetch(new Request('http://localhost/api/gateway/signal/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+    const response = await runtime.fetch(new Request('http://localhost/webhooks/signal', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sig-secret' },
       body: JSON.stringify(signalPayload)
     }));
 
@@ -35,16 +40,21 @@ describe('signal webhook runtime integration', () => {
   });
 
   it('deduplicates Signal webhook payloads in the node runtime', async () => {
-    const runtime = createNodeRuntime();
-    await runtime.fetch(new Request('http://localhost/webhooks/signal', {
+    const runtime = createNodeRuntime({ webhookSecrets: { signal: 'sig-secret' } });
+    await runtime.fetch(new Request('http://localhost/api/gateway/signal/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+    await runtime.fetch(new Request('http://localhost/webhooks/signal', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sig-secret' },
       body: JSON.stringify(signalPayload)
     }));
 
     const duplicate = await runtime.fetch(new Request('http://localhost/webhooks/signal', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sig-secret' },
       body: JSON.stringify(signalPayload)
     }));
 
@@ -74,7 +84,7 @@ describe('signal webhook runtime integration', () => {
 
     const first = await runtimeCloudflare.fetch(new Request('https://example.com/webhooks/signal', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sig-secret' },
       body: JSON.stringify(signalPayload)
     }), env as never);
     const firstPayload = await first.json() as { forwardedTo: string; body: { userMessage: string; userId: string; workspaceId: string } };
@@ -87,7 +97,7 @@ describe('signal webhook runtime integration', () => {
 
     const duplicate = await runtimeCloudflare.fetch(new Request('https://example.com/webhooks/signal', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer sig-secret' },
       body: JSON.stringify(signalPayload)
     }), env as never);
     expect(await duplicate.json()).toEqual({ ok: true, duplicate: true, sessionId: 'signal:+15550001' });

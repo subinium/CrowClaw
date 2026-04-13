@@ -66,7 +66,7 @@ describe('runtime wiring e2e', () => {
 
   it('runtime-node enforces pairing policy before agent execution and approves via gateway approvePairing', async () => {
     const provider = new InspectingProvider();
-    const runtime = createNodeRuntime({ provider });
+    const runtime = createNodeRuntime({ provider, telegramWebhookSecret: 'tg-wiring-secret' });
 
     const firstPolicyResponse = await runtime.fetch(new Request('http://localhost/api/gateway/telegram/policy', {
       method: 'POST',
@@ -77,7 +77,7 @@ describe('runtime wiring e2e', () => {
 
     const firstAttempt = await runtime.fetch(new Request('http://localhost/webhooks/telegram', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'tg-wiring-secret' },
       body: JSON.stringify(telegramWebhook(1))
     }));
     expect(firstAttempt.status).toBe(403);
@@ -111,7 +111,7 @@ describe('runtime wiring e2e', () => {
 
     const secondAttempt = await runtime.fetch(new Request('http://localhost/webhooks/telegram', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'tg-wiring-secret' },
       body: JSON.stringify(telegramWebhook(2))
     }));
     expect(secondAttempt.ok).toBe(true);

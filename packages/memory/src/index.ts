@@ -13,7 +13,7 @@ function uniqueTags(values: string[]): string[] {
 }
 
 /** Check whether a record has expired based on its TTL metadata. */
-export function isExpired(record: MemoryRecord): boolean {
+function isExpired(record: MemoryRecord): boolean {
   const ttlMs = record.metadata?.ttlMs;
   if (typeof ttlMs !== 'number' || ttlMs <= 0) {
     return false;
@@ -168,7 +168,6 @@ export class MemoryService {
   }
 }
 
-export { MarkdownMemoryStore, type MarkdownMemoryRecord, type MarkdownMemoryFileSystem } from './markdown-store.js';
 export {
   EmbeddingMemoryStore,
   EmbeddingIndex,

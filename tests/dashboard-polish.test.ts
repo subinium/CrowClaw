@@ -174,11 +174,11 @@ describe('Dashboard UX Polish', () => {
       expect(DASHBOARD_HTML).toContain('checkAuth');
     });
 
-    it('stores token in sessionStorage and adds to fetch headers', () => {
-      expect(DASHBOARD_HTML).toContain('cc_auth_token');
-      expect(DASHBOARD_HTML).toContain('sessionStorage');
+    it('uses cookie-based auth and adds Bearer header for API requests', () => {
       expect(DASHBOARD_HTML).toContain("'Authorization'");
       expect(DASHBOARD_HTML).toContain("'Bearer '");
+      expect(DASHBOARD_HTML).toContain('credentials');
+      expect(DASHBOARD_HTML).toContain('/api/auth/check');
     });
 
     it('has shake animation on invalid token', () => {

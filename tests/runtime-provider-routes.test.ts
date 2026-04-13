@@ -39,4 +39,34 @@ describe('runtime provider routes', () => {
       signals: expect.arrayContaining([expect.stringContaining('keyword:debug')])
     });
   });
+
+  it('summarizes configured credential pool state for a provider', async () => {
+    const prevPrimary = process.env.OPENAI_API_KEY;
+    const prevSecondary = process.env.OPENAI_API_KEY_2;
+    process.env.OPENAI_API_KEY = 'sk-openai-primary-1234';
+    process.env.OPENAI_API_KEY_2 = 'sk-openai-secondary-5678';
+    try {
+      const runtime = createNodeRuntime();
+      const response = await runtime.fetch(new Request(`${localRoute(routePaths.providers.pool)}?provider=openai`));
+      const payload = await response.json() as {
+        provider: string;
+        configured: boolean;
+        total: number;
+        active: number;
+        status: Array<{ key: string }>;
+      };
+      expect(payload).toMatchObject({
+        provider: 'openai',
+        configured: true,
+        total: 2,
+        active: 2
+      });
+      expect(payload.status[0]?.key).toContain('1234');
+    } finally {
+      if (prevPrimary === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevPrimary;
+      if (prevSecondary === undefined) delete process.env.OPENAI_API_KEY_2;
+      else process.env.OPENAI_API_KEY_2 = prevSecondary;
+    }
+  });
 });

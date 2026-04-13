@@ -115,6 +115,21 @@ function unique(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
 }
 
+function mergeSkillDrafts(existing: StoredSkillDraft, incoming: SkillDraft): StoredSkillDraft {
+  const merged: StoredSkillDraft = {
+    ...existing,
+    title: existing.title || incoming.title,
+    summary: incoming.summary.length > existing.summary.length ? incoming.summary : existing.summary,
+    triggerPhrases: unique([...existing.triggerPhrases, ...incoming.triggerPhrases]),
+    steps: unique([...existing.steps, ...incoming.steps]),
+    sourceMessages: existing.sourceMessages + incoming.sourceMessages,
+    updatedAt: new Date().toISOString(),
+    version: (existing.version ?? 1) + 1,
+  };
+  merged.markdown = renderSkillMarkdown(merged);
+  return merged;
+}
+
 export function detectTaskCompletion(messages: ConversationMessage[]): CompletionSignal {
   const assistantMessages = messages.filter((m) => m.role === 'assistant');
   const final = assistantMessages.at(-1)?.content.toLowerCase() ?? '';
@@ -405,6 +420,36 @@ export class LearningPipeline {
     const signal = detectTaskCompletion(messages);
     if (!signal.completed || signal.confidence === 'low') return null;
     return this.captureDraft(messages, title ?? 'auto-captured-skill');
+  }
+
+  async refineDraft(id: string, newMessages: ConversationMessage[]): Promise<StoredSkillDraft> {
+    const existing = await this.store.get(id);
+    if (!existing) {
+      throw new Error(`Skill draft not found: ${id}`);
+    }
+
+    let refined: StoredSkillDraft;
+    if (this.extractionProvider) {
+      refined = await this.extractionProvider.refineSkill(existing, newMessages);
+    } else {
+      const heuristic = extractSkillDraft(newMessages, existing.title);
+      refined = mergeSkillDrafts(existing, heuristic);
+    }
+
+    refined.id = existing.id;
+    refined.slug = existing.slug || refined.slug;
+    refined.status = existing.status;
+    refined.createdAt = existing.createdAt;
+    refined.ratings = existing.ratings ?? { helpful: 0, unhelpful: 0 };
+    if (!refined.markdown) {
+      refined.markdown = renderSkillMarkdown(refined);
+    }
+
+    await this.store.save(refined);
+    if (refined.status === 'published') {
+      this.registry?.addPublishedSkill(refined);
+    }
+    return refined;
   }
 
   listDrafts(): Promise<StoredSkillDraft[]> {

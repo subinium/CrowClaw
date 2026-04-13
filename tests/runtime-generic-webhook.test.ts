@@ -15,6 +15,13 @@ describe('generic webhook runtime integration', () => {
 
   it('routes generic webhook payloads through the node runtime', async () => {
     const runtime = createNodeRuntime();
+    // Configure a gateway policy for the 'webhook' platform so deny-by-default doesn't block
+    await runtime.fetch(new Request('http://localhost/api/gateway/webhook/policy', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+
     const response = await runtime.fetch(new Request('http://localhost/api/gateway/webhook', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

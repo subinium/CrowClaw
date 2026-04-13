@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 import { runCliInputLine } from '../packages/cli/src/index.js';
+import { EchoProvider } from '@crowclaw/providers';
 
 vi.mock('@cloudflare/sandbox', () => ({
   Sandbox: class Sandbox {},
@@ -12,6 +13,7 @@ describe('e2e node runtime integration', () => {
   it('connects bridge, browser, gateway, MCP, CLI, memory, and system status in one flow', async () => {
     const runtime = createNodeRuntime({
       deploymentName: 'crowclaw-e2e',
+      provider: new EchoProvider(),
       mcpClient: {
         listTools: async () => [{ name: 'mcp-docs.search', originalName: 'search', registeredName: 'mcp-docs.search' }],
         listResources: async () => [{ uri: 'file://repo', name: 'Repo' }],
