@@ -405,7 +405,7 @@ function ago(d){if(!d)return'--';var s=Math.floor((Date.now()-new Date(d).getTim
 function showAuth(){$('authOv').classList.add('on')}
 function hideAuth(){$('authOv').classList.remove('on')}
 function authSubmit(){var tok=$('authIn').value.trim();if(!tok){$('authErr').textContent='Please enter a token';return}$('authErr').textContent='';fetch(B+'/api/auth/verify',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({token:tok})}).then(function(r){return r.json()}).then(function(d){if(d.ok){authToken=tok;hideAuth();initApp()}else{$('authErr').textContent='Invalid token';$('authBox').classList.add('shake');setTimeout(function(){$('authBox').classList.remove('shake')},500)}}).catch(function(){$('authErr').textContent='Connection error'})}
-function checkAuth(){fetch(B+'/api/auth/check',{method:'GET',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){if(d.authenticated){hideAuth();initApp()}else{showAuth()}}).catch(function(){initApp()})}
+function checkAuth(){chk();connectSSE();fetch(B+'/api/auth/check',{method:'GET',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){if(d.authenticated){hideAuth();initApp()}else{showAuth()}}).catch(function(){initApp()})}
 function toggleMobileSb(){var sb=$('sbEl');sb.classList.toggle('mobile-open');$('mobBack').classList.toggle('on',sb.classList.contains('mobile-open'))}
 function closeMobileSb(){$('sbEl').classList.remove('mobile-open');$('mobBack').classList.remove('on')}
 function toggleSessSidebar(){var sb=$('sessSb');sb.style.display=sb.style.display==='none'?'flex':'none'}
