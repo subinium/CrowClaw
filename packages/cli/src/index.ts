@@ -2610,17 +2610,46 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
     stdout.write('Press Ctrl+C to stop.\n');
   });
 
+  // Track in-flight requests for graceful drain
+  let inFlight = 0;
+  const origListeners = server.listeners('request') as Array<(...args: unknown[]) => void>;
+  server.removeAllListeners('request');
+  for (const listener of origListeners) {
+    server.on('request', (req: unknown, res: unknown) => {
+      inFlight++;
+      const httpRes = res as import('node:http').ServerResponse;
+      httpRes.on('close', () => { inFlight--; });
+      listener(req, res);
+    });
+  }
+
   // Keep process alive
   await new Promise<void>((resolve) => {
-    process.on('SIGINT', () => {
-      stdout.write('\nShutting down...\n');
+    let shuttingDown = false;
+
+    const shutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      stdout.write(`\n[shutdown] ${signal} received, draining ${inFlight} in-flight request(s)...\n`);
+
       void stopGatewayRunner();
-      server.close(() => resolve());
-    });
-    process.on('SIGTERM', () => {
-      void stopGatewayRunner();
-      server.close(() => resolve());
-    });
+
+      server.close(() => {
+        stdout.write('[shutdown] Server closed gracefully.\n');
+        resolve();
+      });
+
+      // Force exit after 10 seconds if drain stalls
+      const forceTimer = setTimeout(() => {
+        stdout.write(`[shutdown] Force exit after 10s timeout (${inFlight} request(s) still in-flight).\n`);
+        resolve();
+      }, 10_000);
+      // Don't let the timer keep the process alive if everything else finishes
+      forceTimer.unref();
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   });
 }
 

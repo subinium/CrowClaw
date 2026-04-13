@@ -1,29 +1,36 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const webSrc = path.resolve(__dirname, '..', 'packages', 'web', 'src');
+const repoRoot = path.resolve(__dirname, '..');
+const webSrc = path.resolve(repoRoot, 'packages', 'web', 'src');
+const uiDir = path.resolve(repoRoot, 'packages', 'web', 'ui');
+const viteConfig = path.join(uiDir, 'vite.config.mjs');
+const viteBin = path.resolve(repoRoot, 'node_modules', '.bin', 'vite');
 
 async function main() {
-  const [html, css, js] = await Promise.all([
-    fs.readFile(path.join(webSrc, 'dashboard.html'), 'utf-8'),
-    fs.readFile(path.join(webSrc, 'dashboard.css'), 'utf-8'),
-    fs.readFile(path.join(webSrc, 'dashboard.js'), 'utf-8'),
-  ]);
+  // Build the Lit SPA via Vite (produces single-file HTML)
+  console.log('Building Lit UI with Vite...');
+  execSync(`${viteBin} build --config ${viteConfig}`, {
+    cwd: repoRoot,
+    stdio: 'inherit',
+  });
 
-  const combined = html
-    .replace('%%CSS%%', css)
-    .replace('%%JS%%', js);
+  // Read the built single-file HTML
+  const singleFileHtml = await fs.readFile(
+    path.join(uiDir, 'dist', 'index.html'),
+    'utf-8',
+  );
 
-  // JSON.stringify handles all escaping (backslashes, quotes, newlines)
-  // automatically — safer than manual template literal escaping.
+  // JSON.stringify handles all escaping automatically
   const output =
     '// AUTO-GENERATED — do not edit directly.\n' +
-    '// Edit dashboard.html, dashboard.css, and dashboard.js instead.\n' +
+    '// Built from packages/web/ui/ via Vite + vite-plugin-singlefile.\n' +
     '// Rebuild with: node scripts/build-dashboard.mjs\n' +
     '\n' +
-    'export const DASHBOARD_HTML = ' + JSON.stringify(combined) + ';\n';
+    'export const DASHBOARD_HTML = ' + JSON.stringify(singleFileHtml) + ';\n';
 
   await fs.writeFile(path.join(webSrc, 'generated.ts'), output, 'utf-8');
   console.log('Dashboard built: packages/web/src/generated.ts');

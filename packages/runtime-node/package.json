@@ -12,6 +12,18 @@
     "./route-paths": {
       "types": "./src/route-paths.ts",
       "import": "./dist/route-paths.js"
+    },
+    "./logger": {
+      "types": "./src/logger.ts",
+      "import": "./dist/logger.js"
+    },
+    "./session-mutex": {
+      "types": "./src/session-mutex.ts",
+      "import": "./dist/session-mutex.js"
+    },
+    "./event-bus": {
+      "types": "./src/event-bus.ts",
+      "import": "./dist/event-bus.js"
     }
   },
   "files": [

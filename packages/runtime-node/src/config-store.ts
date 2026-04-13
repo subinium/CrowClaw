@@ -121,7 +121,7 @@ export interface AgentConfig {
 }
 
 export const DEFAULT_AGENT_CONFIG: AgentConfig = {
-  maxToolIterations: 5,
+  maxToolIterations: 12,
   concurrentToolCalls: false,
   synthesizeOnExhaustion: true,
   maxToolResultLength: 2000,

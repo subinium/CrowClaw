@@ -32,4 +32,66 @@ describe('prompt builder', () => {
     expect(prompt).toContain('Available tools:');
     expect(prompt).toContain('- echo (worker, danger:low)');
   });
+
+  it('injects recalled memories into the system prompt', () => {
+    const prompt = buildSystemPrompt({
+      basePrompt: 'You are CrowClaw.',
+      runtimeName: 'node',
+      sessionId: 'session-1',
+      memories: [
+        'User prefers TypeScript over JavaScript',
+        'Previous session discussed Cloudflare Workers deployment',
+      ],
+    });
+
+    expect(prompt).toContain('## Relevant Memories');
+    expect(prompt).toContain('- User prefers TypeScript over JavaScript');
+    expect(prompt).toContain('- Previous session discussed Cloudflare Workers deployment');
+  });
+
+  it('omits memory section when memories array is empty', () => {
+    const prompt = buildSystemPrompt({
+      basePrompt: 'You are CrowClaw.',
+      memories: [],
+    });
+
+    expect(prompt).not.toContain('Relevant Memories');
+  });
+
+  it('omits memory section when memories is undefined', () => {
+    const prompt = buildSystemPrompt({
+      basePrompt: 'You are CrowClaw.',
+    });
+
+    expect(prompt).not.toContain('Relevant Memories');
+  });
+
+  it('places memories after runtime context and before tools', () => {
+    const prompt = buildSystemPrompt({
+      basePrompt: 'You are CrowClaw.',
+      runtimeName: 'node',
+      sessionId: 'session-1',
+      memories: ['User expertise: TypeScript, React'],
+      availableTools: [
+        {
+          name: 'echo',
+          description: 'Echo tool',
+          runtime: 'worker',
+          streaming: false,
+          stateful: false,
+          requiresWorkspace: false,
+          requiresNetwork: false,
+          dangerLevel: 'low',
+        },
+      ],
+      reasoningGuidance: false,
+    });
+
+    const runtimeIdx = prompt!.indexOf('Runtime context:');
+    const memoryIdx = prompt!.indexOf('## Relevant Memories');
+    const toolsIdx = prompt!.indexOf('Available tools:');
+
+    expect(runtimeIdx).toBeLessThan(memoryIdx);
+    expect(memoryIdx).toBeLessThan(toolsIdx);
+  });
 });

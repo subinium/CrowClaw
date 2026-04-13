@@ -20,6 +20,8 @@ export interface PromptBuilderInput {
   personaPrompt?: string;
   /** Include reasoning guidance for tool usage. true = built-in, string = custom. Default: true when tools present. */
   reasoningGuidance?: boolean | string;
+  /** Recalled memories to inject as context. Max ~5 entries recommended. */
+  memories?: string[];
 }
 
 export function buildSystemPrompt(input: PromptBuilderInput): string | undefined {
@@ -59,6 +61,11 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
 
   if (runtimeLines.length > 0) {
     sections.push(['Runtime context:', ...runtimeLines].join('\n'));
+  }
+
+  // Memory context (auto-recalled)
+  if (input.memories && input.memories.length > 0) {
+    sections.push('## Relevant Memories\n' + input.memories.map(m => `- ${m}`).join('\n'));
   }
 
   if (input.availableTools && input.availableTools.length > 0) {
@@ -111,6 +118,19 @@ function buildReasoningGuidance(tools: ToolManifest[]): string {
       '- List or search files first to understand structure.',
       '- Read specific files rather than guessing contents.',
       '- Make targeted edits rather than rewriting entire files.',
+    );
+  }
+
+  const hasSchedulerTools = tools.some((t) => t.name.startsWith('scheduler.'));
+  if (hasSchedulerTools) {
+    lines.push(
+      '',
+      'Scheduling workflow:',
+      '- You CAN set up recurring scheduled tasks using scheduler tools.',
+      '- When users ask for reminders, recurring tasks, or periodic actions, use scheduler.create.',
+      '- Schedule format: cron (e.g. "0 9 * * *" for daily 9am), interval (e.g. "every:1h"), or alias (@daily, @hourly).',
+      '- Always confirm what was scheduled and when it will next run.',
+      '- Use scheduler.list to show existing jobs, scheduler.delete to remove them.',
     );
   }
 

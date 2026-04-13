@@ -123,6 +123,8 @@ export interface AgentRunInput {
   userId?: string;
   env?: unknown;
   signal?: AbortSignal;
+  /** Pre-recalled memories to inject into the system prompt. */
+  memories?: string[];
 }
 
 export interface AgentRunResult {
@@ -194,6 +196,12 @@ export interface AgentLoopOptions {
   maxToolResultLength?: number;
   /** Max approximate tokens for all skills in system prompt. Default: 4000 */
   skillTokenBudget?: number;
+  /** Inject error reflection prompt on tool failure instead of stopping immediately. Default: true */
+  errorReflection?: boolean;
+  /** Max number of error reflections before stopping. Default: 3 */
+  maxErrorReflections?: number;
+  /** Enable plan-before-act: inject planning instructions and replan on failure. Default: false */
+  planBeforeAct?: boolean;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -405,6 +413,9 @@ export class AgentLoop {
   private readonly securityAuditLog?: SecurityAuditLog;
   private readonly synthesizeOnExhaustion: boolean;
   private readonly maxToolResultLength: number;
+  private readonly errorReflection: boolean;
+  private readonly maxErrorReflections: number;
+  private readonly planBeforeAct: boolean;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -412,7 +423,7 @@ export class AgentLoop {
     private readonly sessions: SessionStore,
     options: AgentLoopOptions = {}
   ) {
-    this.maxToolIterations = options.maxToolIterations ?? 4;
+    this.maxToolIterations = options.maxToolIterations ?? 12;
     this.stopOnToolError = options.stopOnToolError ?? true;
     this.concurrentToolCalls = options.concurrentToolCalls ?? true;
     this.requireApprovalForDangerousTools = options.requireApprovalForDangerousTools ?? false;
@@ -450,6 +461,9 @@ export class AgentLoop {
     this.securityAuditLog = options.securityAuditLog;
     this.synthesizeOnExhaustion = options.synthesizeOnExhaustion ?? true;
     this.maxToolResultLength = options.maxToolResultLength ?? 2000;
+    this.errorReflection = options.errorReflection ?? true;
+    this.maxErrorReflections = options.maxErrorReflections ?? 3;
+    this.planBeforeAct = options.planBeforeAct ?? false;
   }
 
   /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
@@ -577,6 +591,7 @@ export class AgentLoop {
     matchedSkills?: MatchedSkill[];
     agentPreset?: { role: string; goal: string; backstory?: string };
     personaPrompt?: string;
+    memories?: string[];
   }): string | undefined {
     const prompt = buildSystemPrompt(promptParams);
     if (!prompt) return prompt;
@@ -873,6 +888,7 @@ export class AgentLoop {
         availableTools: this.tools.list(),
         matchedSkills,
         agentPreset: this.agentPreset,
+        memories: input.memories,
       }),
       messages: nextMessages,
       availableTools: this.tools.list(),
@@ -891,6 +907,18 @@ export class AgentLoop {
         ...(session.lineage ?? { rootSessionId: session.sessionId, compressionCount: 0 }),
       };
     }
+
+    // Plan-before-act: inject planning instructions so the LLM plans its approach
+    if (this.planBeforeAct && currentResponse.toolCalls && currentResponse.toolCalls.length > 0) {
+      nextMessages.push({
+        role: 'system',
+        content: 'Before executing tools, outline a brief plan: (1) what you intend to accomplish, (2) which tools you will use and in what order, (3) how you will handle potential failures. Then proceed with execution.',
+        createdAt: nowIso(),
+        metadata: { planBeforeAct: true },
+      });
+    }
+
+    let errorReflectionCount = 0;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
       ensureNotAborted(input.signal);
@@ -989,9 +1017,26 @@ export class AgentLoop {
         });
       }
 
-      if (encounteredToolError && this.stopOnToolError) {
-        finalResponse = 'Stopped after tool failure.';
-        break;
+      if (encounteredToolError) {
+        if (this.errorReflection && errorReflectionCount < this.maxErrorReflections) {
+          errorReflectionCount++;
+          const failedResults = iterationResults.filter(r => !r.ok);
+          const errorSummary = failedResults
+            .map(r => `- ${r.toolName}: ${r.output?.slice(0, 500) ?? 'unknown error'}`)
+            .join('\n');
+          const reflectionContent = this.planBeforeAct
+            ? `Tool execution failed (reflection ${errorReflectionCount}/${this.maxErrorReflections}):\n${errorSummary}\n\nReplan your approach: (1) analyze what went wrong, (2) devise an alternative strategy, (3) proceed with different parameters or tools. Do not retry the exact same call.`
+            : `Tool execution failed (reflection ${errorReflectionCount}/${this.maxErrorReflections}):\n${errorSummary}\n\nAnalyze what went wrong and try a different approach. Do not retry the exact same operation.`;
+          nextMessages.push({
+            role: 'system',
+            content: reflectionContent,
+            createdAt: nowIso(),
+            metadata: { errorReflection: true, reflectionCount: errorReflectionCount },
+          });
+        } else if (this.stopOnToolError) {
+          finalResponse = 'Stopped after tool failure.';
+          break;
+        }
       }
 
       // Track 2.1: Token-aware compression trigger
@@ -1199,6 +1244,8 @@ export class AgentLoop {
       }
     }
 
+    let streamErrorReflectionCount = 0;
+
     try {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
         ensureNotAborted(signal);
@@ -1395,20 +1442,39 @@ export class AgentLoop {
             nextMessages.push(toolMessage(toolResult, this.maxToolResultLength));
             yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok, durationMs: Date.now() - toolStartTime };
 
-            if (!toolResult.ok && this.stopOnToolError) {
-              finalResponse = 'Stopped after tool failure.';
-              yield { type: 'iteration-end', iteration };
-              yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
-              return;
+            if (!toolResult.ok) {
+              encounteredToolError = true;
+              if (this.errorReflection && streamErrorReflectionCount < this.maxErrorReflections) {
+                // Will be handled after all sequential tool calls complete
+              } else if (this.stopOnToolError) {
+                finalResponse = 'Stopped after tool failure.';
+                yield { type: 'iteration-end', iteration };
+                yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+                return;
+              }
             }
           }
         }
 
-        if (encounteredToolError && this.stopOnToolError) {
-          finalResponse = 'Stopped after tool failure.';
-          yield { type: 'iteration-end', iteration };
-          yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
-          return;
+        if (encounteredToolError) {
+          if (this.errorReflection && streamErrorReflectionCount < this.maxErrorReflections) {
+            streamErrorReflectionCount++;
+            const failedResults = toolResults.filter(r => !r.ok).slice(-3);
+            const errorSummary = failedResults
+              .map(r => `- ${r.toolName}: ${r.output?.slice(0, 500) ?? 'unknown error'}`)
+              .join('\n');
+            nextMessages.push({
+              role: 'system',
+              content: `Tool execution failed (reflection ${streamErrorReflectionCount}/${this.maxErrorReflections}):\n${errorSummary}\n\nAnalyze what went wrong and try a different approach. Do not retry the exact same operation.`,
+              createdAt: nowIso(),
+              metadata: { errorReflection: true, reflectionCount: streamErrorReflectionCount },
+            });
+          } else if (this.stopOnToolError) {
+            finalResponse = 'Stopped after tool failure.';
+            yield { type: 'iteration-end', iteration };
+            yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+            return;
+          }
         }
 
         // Track 1.4: Auto-checkpoint at end of iteration

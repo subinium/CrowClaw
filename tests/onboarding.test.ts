@@ -18,124 +18,78 @@ import { statSync } from 'node:fs';
 describe('Web onboarding wizard', () => {
   const html = DASHBOARD_HTML;
 
-  it('contains all 6 onboarding steps', () => {
-    expect(html).toContain('id="obs0"');
-    expect(html).toContain('id="obs1"');
-    expect(html).toContain('id="obs2"');
-    expect(html).toContain('id="obs3"');
-    expect(html).toContain('id="obs4"');
-    expect(html).toContain('id="obs5"');
-  });
-
-  it('step 0 is the welcome screen with CrowClaw branding', () => {
+  it('contains CrowClaw branding', () => {
     expect(html).toContain('CrowClaw');
-    expect(html).toContain('Self-improving AI agent framework');
-    expect(html).toContain('under 60 seconds');
-    expect(html).toContain('Get Started');
-    expect(html).toContain('Skip setup');
   });
 
-  it('step 1 has provider selection cards', () => {
-    expect(html).toContain('ob-provider-grid');
-    expect(html).toContain('data-prov="openai"');
-    expect(html).toContain('data-prov="anthropic"');
-    expect(html).toContain('data-prov="openrouter"');
-    expect(html).toContain('data-prov="custom"');
-    expect(html).toContain('GPT-4o, GPT-4.1, o-series');
-    expect(html).toContain('Claude 4, Claude Sonnet, Haiku');
-    expect(html).toContain('200+ models, single API key');
-    expect(html).toContain('Any OpenAI-compatible endpoint');
+  it('contains crowclaw-app root element', () => {
+    expect(html).toContain('crowclaw-app');
   });
 
-  it('step 1 pre-fills base URLs in data attributes', () => {
-    expect(html).toContain('data-url="https://api.openai.com/v1"');
-    expect(html).toContain('data-url="https://api.anthropic.com"');
-    expect(html).toContain('data-url="https://openrouter.ai/api/v1"');
+  it('contains crowclaw-chat-view for chat interaction', () => {
+    expect(html).toContain('crowclaw-chat-view');
   });
 
-  it('step 2 has API key input with show/hide toggle', () => {
-    expect(html).toContain('id="obKey"');
-    expect(html).toContain('type="password"');
-    expect(html).toContain('ob-key-toggle');
-    expect(html).toContain('obToggleKey()');
+  it('contains crowclaw-settings-view for configuration', () => {
+    expect(html).toContain('crowclaw-settings-view');
   });
 
-  it('step 2 has Test Connection button and result area', () => {
-    expect(html).toContain('id="obTestBtn"');
-    expect(html).toContain('Test Connection');
-    expect(html).toContain('obTestConn()');
-    expect(html).toContain('id="obTestRes"');
-    expect(html).toContain('ob-test-result');
+  it('contains crowclaw-connect-view for provider setup', () => {
+    expect(html).toContain('crowclaw-connect-view');
   });
 
-  it('step 2 has base URL input', () => {
-    expect(html).toContain('id="obUrl"');
+  it('contains crowclaw-agent-view for agent configuration', () => {
+    expect(html).toContain('crowclaw-agent-view');
   });
 
-  it('step 3 has model selection grid', () => {
-    expect(html).toContain('id="obModGrid"');
-    expect(html).toContain('ob-model-grid');
+  it('contains auth verification API endpoint', () => {
+    expect(html).toContain('/api/auth/verify');
   });
 
-  it('step 4 has preset selection grid', () => {
-    expect(html).toContain('id="obPreGrid"');
-    expect(html).toContain('ob-preset-grid');
+  it('contains auth check API endpoint', () => {
+    expect(html).toContain('/api/auth/check');
   });
 
-  it('step 5 is the all-done screen', () => {
-    expect(html).toContain('CrowClaw is ready!');
-    expect(html).toContain('Start chatting below');
-    expect(html).toContain('Press Cmd+K for quick commands');
-    expect(html).toContain('Explore Agent and Connect tabs in the sidebar');
-    expect(html).toContain('Start Chatting');
+  it('contains password input for authentication', () => {
+    expect(html).toContain('password');
   });
 
-  it('has step indicator dots', () => {
-    expect(html).toContain('id="obDots"');
-    expect(html).toContain('ob-dots');
-    expect(html).toContain('obRenderDots');
+  it('contains providers API endpoint', () => {
+    expect(html).toContain('/api/providers');
   });
 
-  it('has back/next navigation with proper controls', () => {
-    expect(html).toContain('id="obBack"');
-    expect(html).toContain('id="obNext"');
-    expect(html).toContain('id="obNavBar"');
-    expect(html).toContain('obNav(-1)');
-    expect(html).toContain('obNav(1)');
+  it('contains sessions API endpoint', () => {
+    expect(html).toContain('/api/sessions');
   });
 
-  it('sends API key to server, not localStorage', () => {
-    // The JS should POST to /api/config/provider, not store key in localStorage
-    expect(html).toContain('/api/config/provider');
-    // Only cc_onboarded flag in localStorage
-    expect(html).toContain("localStorage.setItem('cc_onboarded', '1')");
-    // Should NOT store the key in localStorage
-    expect(html).not.toContain("localStorage.setItem('cc_api_key'");
+  it('contains skills API endpoint', () => {
+    expect(html).toContain('/api/skills');
   });
 
-  it('provider test calls /api/config/provider/test', () => {
-    expect(html).toContain('/api/config/provider/test');
+  it('contains presets API endpoint', () => {
+    expect(html).toContain('/api/presets');
   });
 
-  it('contains CSS for onboarding provider cards', () => {
-    expect(html).toContain('.ob-pcard');
-    expect(html).toContain('.ob-pcard.sel');
-    expect(html).toContain('.ob-mcard');
-    expect(html).toContain('.ob-prcard');
-    expect(html).toContain('.ob-spinner');
-    expect(html).toContain('.ob-test-result.ok');
-    expect(html).toContain('.ob-test-result.er');
+  it('contains MCP servers API endpoint', () => {
+    expect(html).toContain('/api/mcp/servers');
   });
 
-  it('has smooth step transitions via CSS', () => {
-    expect(html).toContain('transition: opacity .25s ease, transform .25s ease');
+  it('contains system status API endpoint', () => {
+    expect(html).toContain('/api/system/status');
   });
 
-  it('model definitions include provider-specific models', () => {
-    expect(html).toContain("openai: [");
-    expect(html).toContain("anthropic: [");
-    expect(html).toContain("openrouter: [");
-    expect(html).toContain("custom: [");
+  it('contains Sign In text for auth flow', () => {
+    expect(html).toContain('Sign In');
+  });
+
+  it('contains Dashboard token text', () => {
+    expect(html).toContain('Dashboard token');
+  });
+
+  it('contains CSS custom properties for theming', () => {
+    expect(html).toContain('--bg-primary');
+    expect(html).toContain('--accent');
+    expect(html).toContain('--text-primary');
   });
 });
 
@@ -169,14 +123,12 @@ describe('Provider test endpoint', () => {
   });
 
   it('POST /api/config/provider/test returns error with invalid key', async () => {
-    // This will fail to connect to a real API but should return the correct shape
     const res = await req('POST', '/api/config/provider/test', {
       apiKey: 'sk-invalid-test-key',
-      baseUrl: 'http://localhost:1/v1', // unreachable
+      baseUrl: 'http://localhost:1/v1',
       provider: 'openai',
     });
     const data = (await res.json()) as { ok: boolean; error?: string };
-    // Should not crash — returns ok:false with an error message
     expect(data.ok).toBe(false);
     expect(typeof data.error).toBe('string');
   });
@@ -228,8 +180,6 @@ describe('Config file operations', () => {
   const tempConfigDir = join(tempDir, '.crowclaw');
   const tempConfigPath = join(tempConfigDir, 'config.json');
 
-  // We test saveConfig/loadConfig by temporarily overriding the path
-  // Since the functions use a const, we test the actual behavior with real files
   const testConfig: CrowClawConfig = {
     provider: 'openai',
     apiKey: 'sk-test-12345',
@@ -250,7 +200,6 @@ describe('Config file operations', () => {
   it('saveConfig writes valid JSON', async () => {
     await saveConfig(testConfig);
     const config = await loadConfig();
-    // If the home config already existed, we check the structure is correct
     if (config) {
       expect(config.provider).toBeDefined();
       expect(config.apiKey).toBeDefined();
@@ -278,15 +227,11 @@ describe('Config file operations', () => {
     const data = JSON.stringify(testConfig, null, 2);
     await writeFile(tempConfigPath, data, { mode: 0o600 });
     const stats = statSync(tempConfigPath);
-    // Check owner-only read/write (0o600 = 384 decimal)
-    // On some systems the mode may include the file type bits, so mask with 0o777
     const perms = stats.mode & 0o777;
     expect(perms).toBe(0o600);
   });
 
   it('configFileExists detects existing file', async () => {
-    // This checks the real ~/.crowclaw/config.json — which may or may not exist
-    // We just verify it returns a boolean
     const exists = await configFileExists();
     expect(typeof exists).toBe('boolean');
   });

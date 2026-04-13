@@ -3010,7 +3010,24 @@ select.form-input {
 }
 
 .iter-sep {
-  display: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 24px 0;
+  padding: 8px 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ac);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+}
+
+.iter-sep::before,
+.iter-sep::after {
+  content: '';
+  flex: 1;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(224, 85, 69, 0.3), transparent);
 }
 
 /* Toast */

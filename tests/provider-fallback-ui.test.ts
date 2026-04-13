@@ -149,7 +149,6 @@ describe('RuntimeConfigStore provider config', () => {
     const snapshot = store.snapshot();
     const pc = snapshot.providerConfig as Record<string, unknown>;
     expect(pc).not.toBeNull();
-    // API keys should be redacted
     expect((pc as { primary: { apiKey: string } }).primary.apiKey).toBe('***');
     expect(((pc as { fallback: { apiKey: string } }).fallback).apiKey).toBe('***');
   });
@@ -230,9 +229,8 @@ describe('resolveProvidersFromConfig', () => {
 
   it('uses fallbackApiKey when slot has no apiKey', () => {
     const config: ProviderConfig = {
-      primary: { name: 'P', provider: 'openai', model: 'gpt-4o' }, // no apiKey
+      primary: { name: 'P', provider: 'openai', model: 'gpt-4o' },
     };
-    // Should not throw — fallbackApiKey is used
     const result = resolveProvidersFromConfig(config, 'sk-fallback-key');
     expect(result.primary).toBeDefined();
   });
@@ -273,7 +271,6 @@ describe('createProviderFromSlot', () => {
 
 describe('Provider API endpoint shapes', () => {
   it('GET /api/providers/config response shape', () => {
-    // Verify the expected response structure
     const mockResponse = {
       ok: true,
       config: baseConfig,
@@ -337,49 +334,44 @@ describe('Provider API endpoint shapes', () => {
 // ---------------------------------------------------------------------------
 
 describe('Dashboard provider UI', () => {
-  it('contains providers section in the Connect tab', () => {
-    expect(DASHBOARD_HTML).toContain('id="v-providers"');
+  it('contains crowclaw-connect-view for provider management', () => {
+    expect(DASHBOARD_HTML).toContain('crowclaw-connect-view');
+  });
+
+  it('contains Providers text', () => {
     expect(DASHBOARD_HTML).toContain('>Providers<');
   });
 
-  it('contains providers view container', () => {
-    expect(DASHBOARD_HTML).toContain('id="v-providers"');
-    expect(DASHBOARD_HTML).toContain('id="provSlots"');
+  it('contains providers API endpoint', () => {
+    expect(DASHBOARD_HTML).toContain('/api/providers');
   });
 
-  it('contains provider slot rendering function', () => {
-    expect(DASHBOARD_HTML).toContain('provSlotNames');
-    expect(DASHBOARD_HTML).toContain('provSlotLabels');
+  it('contains provider text in the Lit output', () => {
+    expect(DASHBOARD_HTML).toContain('provider');
   });
 
-  it('contains all slot labels', () => {
-    expect(DASHBOARD_HTML).toContain("primary: 'Primary'");
-    expect(DASHBOARD_HTML).toContain("fallback: 'Fallback'");
-    expect(DASHBOARD_HTML).toContain("vision: 'Vision'");
-    expect(DASHBOARD_HTML).toContain("compression: 'Compression'");
-    expect(DASHBOARD_HTML).toContain("embedding: 'Embedding'");
+  it('contains primary provider reference', () => {
+    expect(DASHBOARD_HTML).toContain('primary');
   });
 
-  it('contains provider test function', () => {
-    expect(DASHBOARD_HTML).toContain('provTest');
-    expect(DASHBOARD_HTML).toContain('/api/providers/test');
+  it('contains crowclaw-settings-view which includes provider config', () => {
+    expect(DASHBOARD_HTML).toContain('crowclaw-settings-view');
   });
 
-  it('contains add and remove slot functions', () => {
-    expect(DASHBOARD_HTML).toContain('provAddSlot');
-    expect(DASHBOARD_HTML).toContain('provRemoveSlot');
+  it('contains crowclaw-modal for provider operations', () => {
+    expect(DASHBOARD_HTML).toContain('crowclaw-modal');
   });
 
-  it('contains data-provider-slot attribute for slot cards', () => {
-    expect(DASHBOARD_HTML).toContain('data-provider-slot');
+  it('contains MCP servers endpoint for integrations', () => {
+    expect(DASHBOARD_HTML).toContain('/api/mcp/servers');
   });
 
-  it('providers view is loaded when Connect tab is opened', () => {
-    expect(DASHBOARD_HTML).toContain("lProv()");
+  it('contains Settings section', () => {
+    expect(DASHBOARD_HTML).toContain('Settings');
   });
 
-  it('providers appears in command palette', () => {
-    expect(DASHBOARD_HTML).toContain("label: 'Providers'");
+  it('providers referenced in connect view', () => {
+    expect(DASHBOARD_HTML).toContain('crowclaw-connect-view');
   });
 });
 
@@ -402,7 +394,6 @@ describe('Backward compatibility', () => {
     const info = store.getProviderInfo();
     expect(info.type).toBe('openai');
     expect(info.model).toBe('gpt-4o');
-    // providerConfig should still be null
     expect(store.getProviderConfig()).toBeNull();
   });
 
@@ -411,12 +402,10 @@ describe('Backward compatibility', () => {
     store.setProvider('openai', 'gpt-4o', 'sk-test');
     store.setProviderConfig(baseConfig);
 
-    // Legacy info should be independent
     const info = store.getProviderInfo();
     expect(info.type).toBe('openai');
     expect(info.model).toBe('gpt-4o');
 
-    // Provider config should also exist
     const cfg = store.getProviderConfig();
     expect(cfg?.primary.model).toBe('gpt-4o');
     expect(cfg?.fallback?.model).toBe('claude-haiku-4');

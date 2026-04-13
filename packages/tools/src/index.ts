@@ -16,6 +16,8 @@ import {
   buildTelegramSendUrl
 } from '@crowclaw/gateway';
 import type { McpClient } from '@crowclaw/mcp';
+import type { SchedulerStore } from '@crowclaw/scheduler';
+import { createScheduledAgentJob } from '@crowclaw/scheduler';
 import type { MemoryRecord, MemoryStore, SessionSearchStore } from '@crowclaw/storage';
 import type { WorkspaceStore } from '@crowclaw/workspace';
 
@@ -2324,6 +2326,317 @@ export function createGitBranchTool(): ToolDefinition {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler tools — LLM-callable tools for managing scheduled jobs
+// ---------------------------------------------------------------------------
+
+export function createSchedulerCreateTool(
+  schedulerStore: SchedulerStore,
+  autonomousScheduler: { start: () => void; isRunning: () => boolean },
+): ToolDefinition {
+  return {
+    manifest: {
+      name: 'scheduler.create',
+      description:
+        'Creates a new scheduled job. The schedule can be an interval (every:5m, every:1h), a cron expression (0 9 * * *), or a cron alias (@daily, @hourly). Optionally deliver results to Telegram, Discord, or Slack.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Human-readable name for the job (used as ID)' },
+          task: { type: 'string', description: 'The prompt/message the agent will execute on each run' },
+          schedule: {
+            type: 'string',
+            description: 'Schedule expression: "every:5m", "every:1h", "0 9 * * *", "@daily", "@hourly"',
+          },
+          deliverTo: {
+            type: 'object',
+            description: 'Optional delivery target for results',
+            properties: {
+              platform: { type: 'string', description: 'Platform: "telegram", "discord", "slack"' },
+              channel: { type: 'string', description: 'Chat ID, channel ID, or webhook URL' },
+            },
+          },
+          model: { type: 'string', description: 'Optional model override for the agent' },
+        },
+        required: ['name', 'task', 'schedule'],
+      },
+    },
+    async execute(input) {
+      const name = typeof input.name === 'string' ? input.name.trim() : '';
+      const task = typeof input.task === 'string' ? input.task.trim() : '';
+      const schedule = typeof input.schedule === 'string' ? input.schedule.trim() : '';
+
+      if (!name || !task || !schedule) {
+        return {
+          toolName: 'scheduler.create',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing required fields: name, task, and schedule are all required.',
+        };
+      }
+
+      const id = name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '');
+
+      const deliverTo =
+        input.deliverTo &&
+        typeof input.deliverTo === 'object' &&
+        'platform' in (input.deliverTo as Record<string, unknown>) &&
+        'channel' in (input.deliverTo as Record<string, unknown>)
+          ? {
+              platform: String((input.deliverTo as Record<string, unknown>).platform),
+              config: { channel: String((input.deliverTo as Record<string, unknown>).channel) },
+            }
+          : undefined;
+
+      const model = typeof input.model === 'string' ? input.model : undefined;
+
+      try {
+        const job = createScheduledAgentJob({
+          id,
+          schedule,
+          task,
+          model,
+          deliverTo,
+        });
+
+        await schedulerStore.saveJob(job);
+
+        // Auto-start the scheduler if not already running
+        if (!autonomousScheduler.isRunning()) {
+          autonomousScheduler.start();
+        }
+
+        return {
+          toolName: 'scheduler.create',
+          runtime: 'worker',
+          ok: true,
+          output: JSON.stringify({
+            id: job.id,
+            schedule: job.schedule,
+            task: job.task,
+            enabled: job.enabled,
+            nextRunAt: job.nextRunAt,
+            deliverTo: job.deliverTo,
+            model: job.model,
+          }),
+          metadata: { jobId: job.id },
+        };
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          toolName: 'scheduler.create',
+          runtime: 'worker',
+          ok: false,
+          output: `Failed to create job: ${msg}`,
+        };
+      }
+    },
+  };
+}
+
+export function createSchedulerListTool(schedulerStore: SchedulerStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'scheduler.list',
+      description:
+        'Lists all scheduled jobs with their id, schedule, task, status, next run time, and delivery target.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    async execute() {
+      try {
+        const jobs = await schedulerStore.listJobs();
+        if (jobs.length === 0) {
+          return {
+            toolName: 'scheduler.list',
+            runtime: 'worker',
+            ok: true,
+            output: 'No scheduled jobs.',
+          };
+        }
+
+        const formatted = jobs.map((job) => ({
+          id: job.id,
+          schedule: job.schedule,
+          task: job.task,
+          enabled: job.enabled,
+          nextRunAt: job.nextRunAt ?? null,
+          lastRunAt: job.lastRunAt ?? null,
+          lastRunStatus: job.lastRunStatus ?? null,
+          runCount: job.runCount ?? 0,
+          deliverTo: job.deliverTo ?? null,
+          model: job.model ?? null,
+        }));
+
+        return {
+          toolName: 'scheduler.list',
+          runtime: 'worker',
+          ok: true,
+          output: JSON.stringify(formatted, null, 2),
+          metadata: { count: jobs.length },
+        };
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          toolName: 'scheduler.list',
+          runtime: 'worker',
+          ok: false,
+          output: `Failed to list jobs: ${msg}`,
+        };
+      }
+    },
+  };
+}
+
+export function createSchedulerDeleteTool(schedulerStore: SchedulerStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'scheduler.delete',
+      description: 'Deletes a scheduled job permanently by its ID.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'medium',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          jobId: { type: 'string', description: 'The ID of the job to delete' },
+        },
+        required: ['jobId'],
+      },
+    },
+    async execute(input) {
+      const jobId = typeof input.jobId === 'string' ? input.jobId.trim() : '';
+      if (!jobId) {
+        return {
+          toolName: 'scheduler.delete',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing required field: jobId.',
+        };
+      }
+
+      try {
+        const deleted = await schedulerStore.deleteJob(jobId);
+        return {
+          toolName: 'scheduler.delete',
+          runtime: 'worker',
+          ok: deleted,
+          output: deleted
+            ? `Job '${jobId}' deleted successfully.`
+            : `Job '${jobId}' not found.`,
+          metadata: { jobId, deleted },
+        };
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          toolName: 'scheduler.delete',
+          runtime: 'worker',
+          ok: false,
+          output: `Failed to delete job: ${msg}`,
+        };
+      }
+    },
+  };
+}
+
+export function createSchedulerToggleTool(schedulerStore: SchedulerStore): ToolDefinition {
+  return {
+    manifest: {
+      name: 'scheduler.toggle',
+      description: 'Pauses or resumes a scheduled job by its ID.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          jobId: { type: 'string', description: 'The ID of the job to pause or resume' },
+          action: { type: 'string', description: '"pause" or "resume"' },
+        },
+        required: ['jobId', 'action'],
+      },
+    },
+    async execute(input) {
+      const jobId = typeof input.jobId === 'string' ? input.jobId.trim() : '';
+      const action = typeof input.action === 'string' ? input.action.trim() : '';
+
+      if (!jobId || (action !== 'pause' && action !== 'resume')) {
+        return {
+          toolName: 'scheduler.toggle',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing or invalid fields: jobId (string) and action ("pause" | "resume") are required.',
+        };
+      }
+
+      try {
+        const updated =
+          action === 'pause'
+            ? await schedulerStore.pauseJob(jobId)
+            : await schedulerStore.resumeJob(jobId);
+
+        if (!updated) {
+          return {
+            toolName: 'scheduler.toggle',
+            runtime: 'worker',
+            ok: false,
+            output: `Job '${jobId}' not found.`,
+            metadata: { jobId, action },
+          };
+        }
+
+        return {
+          toolName: 'scheduler.toggle',
+          runtime: 'worker',
+          ok: true,
+          output: `Job '${jobId}' ${action === 'pause' ? 'paused' : 'resumed'}. Enabled: ${updated.enabled}`,
+          metadata: { jobId, action, enabled: updated.enabled },
+        };
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          toolName: 'scheduler.toggle',
+          runtime: 'worker',
+          ok: false,
+          output: `Failed to ${action} job: ${msg}`,
+        };
+      }
+    },
+  };
+}
+
+export function registerSchedulerTools(
+  registry: ToolRegistry,
+  schedulerStore: SchedulerStore,
+  autonomousScheduler: { start: () => void; isRunning: () => boolean },
+): ToolRegistry {
+  registry.register(createSchedulerCreateTool(schedulerStore, autonomousScheduler));
+  registry.register(createSchedulerListTool(schedulerStore));
+  registry.register(createSchedulerDeleteTool(schedulerStore));
+  registry.register(createSchedulerToggleTool(schedulerStore));
+  return registry;
+}
+
 export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createEchoTool());
   registry.register(createTimeTool());
@@ -2397,6 +2710,8 @@ export function createDefaultWorkerRegistry(options?: {
   workspaceStore?: WorkspaceStore;
   mcpClient?: McpClient;
   recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]>;
+  schedulerStore?: SchedulerStore;
+  autonomousScheduler?: { start: () => void; isRunning: () => boolean };
 }): ToolRegistry {
   const registry = registerCoreTools(new ToolRegistry());
   if (options?.sessionSearchStore && options.memoryStore) {
@@ -2409,6 +2724,9 @@ export function createDefaultWorkerRegistry(options?: {
   }
   if (options?.mcpClient) {
     registerMcpTools(registry, options.mcpClient);
+  }
+  if (options?.schedulerStore && options?.autonomousScheduler) {
+    registerSchedulerTools(registry, options.schedulerStore, options.autonomousScheduler);
   }
   return registry;
 }
@@ -2463,8 +2781,8 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   },
   devops: {
     name: 'devops',
-    description: 'DevOps workflow — terminal, files, web fetch, git, process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch'],
+    description: 'DevOps workflow — terminal, files, web fetch, git, process management, scheduler',
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch', 'scheduler.create', 'scheduler.list', 'scheduler.delete', 'scheduler.toggle'],
   },
   creative: {
     name: 'creative',

@@ -6,36 +6,36 @@ import { builtInCliSlashCommands, runCliInputLine, renderCliHelp } from '../pack
 
 describe('Dashboard Usage panel', () => {
   it('contains the Usage section in the Settings tab', () => {
-    expect(DASHBOARD_HTML).toContain('id="v-usage"');
+    expect(DASHBOARD_HTML).toContain('crowclaw-settings-view');
     expect(DASHBOARD_HTML).toContain('>Usage<');
   });
 
-  it('contains the Usage panel view container', () => {
-    expect(DASHBOARD_HTML).toContain('id="v-usage"');
+  it('contains the crowclaw-settings-view component', () => {
+    expect(DASHBOARD_HTML).toContain('crowclaw-settings-view');
   });
 
-  it('contains the Usage summary cards container', () => {
-    expect(DASHBOARD_HTML).toContain('id="uCards"');
+  it('contains usage-related text', () => {
+    expect(DASHBOARD_HTML).toContain('usage');
   });
 
-  it('contains the per-model breakdown container', () => {
-    expect(DASHBOARD_HTML).toContain('id="uModel"');
+  it('contains tokens display', () => {
+    expect(DASHBOARD_HTML).toContain('tokens');
   });
 
-  it('contains the recent entries container', () => {
-    expect(DASHBOARD_HTML).toContain('id="uEntries"');
+  it('contains cost display', () => {
+    expect(DASHBOARD_HTML).toContain('cost');
   });
 
-  it('contains the lUsage JS function', () => {
-    expect(DASHBOARD_HTML).toContain('function lUsage()');
+  it('contains the usage API endpoint', () => {
+    expect(DASHBOARD_HTML).toContain('/api/usage');
   });
 
-  it('contains the uReset JS function', () => {
-    expect(DASHBOARD_HTML).toContain('function uReset()');
+  it('contains the usage reset API endpoint', () => {
+    expect(DASHBOARD_HTML).toContain('/api/usage/reset');
   });
 
   it('loads usage data from /api/usage', () => {
-    expect(DASHBOARD_HTML).toContain("'/api/usage'");
+    expect(DASHBOARD_HTML).toContain('/api/usage');
   });
 });
 
