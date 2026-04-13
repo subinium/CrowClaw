@@ -15,19 +15,37 @@
 
 ---
 
-> **Beta.** Core systems are functional and tested (1626 tests), but APIs may change before 1.0. Not recommended for production without review.
+> **Beta.** Core systems are functional and tested (1626 tests). APIs may change before 1.0 -- pin to minor versions for stability.
 
-CrowClaw started as an effort to bring [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Python) to Cloudflare Workers. Porting it to TypeScript opened up a chance to rethink the architecture — so we [studied dozens of agent frameworks](https://github.com/subinium/awesome-agent-frameworks), distilled the best patterns from each, and built a framework that actually closes the loop: your agent gets better every time it completes a task.
+## Why CrowClaw
+
+Most agent frameworks give you a tool loop and stop there. CrowClaw closes the loop: your agent extracts reusable skills from conversations, publishes them, and injects them into future runs -- automatically. The more it works, the better it gets.
+
+We [studied 30+ agent frameworks](https://github.com/subinium/awesome-agent-frameworks), identified what each one does best, and built one that combines them:
+
+| What you need | CrowClaw | Typical frameworks |
+|---|---|---|
+| **Learning from conversations** | Auto-extracts skills, publishes to registry, injects into future prompts | Manual prompt engineering |
+| **Multi-platform delivery** | 8 platforms (Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS) with webhook normalization, rate limiting, retry | Usually 1-2, or BYO |
+| **Operator surface** | Web dashboard, CLI REPL, scheduled execution, batch processing, checkpoint/rollback | API-only or minimal UI |
+| **Production hardening** | SSRF protection, CSP nonce, prompt injection scanning, auth rate limiting, session mutex, graceful shutdown | Security as afterthought |
+| **Runs anywhere** | Node.js, Cloudflare Workers, CLI, Docker | Usually single runtime |
+
+<details>
+<summary><strong>How CrowClaw compares to specific frameworks</strong></summary>
+
+- **vs LangChain/LlamaIndex**: CrowClaw is opinionated where they are flexible. You get a working agent with 50+ tools, a dashboard, and a learning loop out of the box -- not a toolkit to assemble one.
+- **vs Vercel AI SDK**: Vercel focuses on frontend AI UX. CrowClaw focuses on backend agent autonomy -- scheduled tasks, multi-turn tool loops, cross-platform delivery.
+- **vs CrewAI/AutoGen**: Multi-agent orchestration frameworks. CrowClaw is a single-agent framework with delegation, designed for depth (learning, checkpoints, security) over breadth (agent graphs).
+- **vs OpenClaw/Hermes Agent**: CrowClaw is a direct evolution. TypeScript-native, runs on Cloudflare Workers, adds security hardening, batch processing, and checkpoint/rollback that the originals don't have.
+
+</details>
+
+## The Story
+
+CrowClaw started as an effort to bring [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Python) to Cloudflare Workers. Porting it to TypeScript opened up a chance to rethink the architecture -- so we [studied dozens of agent frameworks](https://github.com/subinium/awesome-agent-frameworks), distilled the best patterns from each, and built a framework that actually closes the loop: your agent gets better every time it completes a task.
 
 It runs a multi-turn tool loop, learns skills from conversations, schedules autonomous tasks, and delivers results across 8 messaging platforms.
-
-**What makes it different:**
-
-- **Learns and improves** -- conversations become reusable skills, automatically injected into future runs
-- **Runs anywhere** -- Node.js server, Cloudflare Workers, CLI, or Docker
-- **Full operator surface** -- web dashboard, scheduled execution, batch processing, checkpoint/rollback
-- **38+ tools built in** -- web, terminal, workspace, memory, vision, TTS, MCP, delegation
-- **No vendor lock-in** -- works with any OpenAI-compatible API, Anthropic, or local models
 
 ## Quickstart
 
@@ -97,6 +115,8 @@ const tools = createDefaultWorkerRegistry()
 // 3. Create agent loop
 const agent = new AgentLoop(provider, tools, new InMemorySessionStore(), {
   maxToolIterations: 8,
+  errorReflection: true,
+  synthesizeOnExhaustion: true,
   runtimeName: 'my-agent',
 })
 
@@ -108,29 +128,64 @@ const result = await agent.run({
 })
 
 console.log(result.finalResponse)
-// "The current time is 2026-04-12T15:30:00.000Z"
+// "The current time is 2026-04-14T09:30:00.000Z"
 console.log(result.toolResults)
-// [{ toolName: 'time', ok: true, output: '2026-04-12T15:30:00.000Z' }]
+// [{ toolName: 'time', ok: true, output: '2026-04-14T09:30:00.000Z' }]
 ```
 
-## What CrowClaw Does
+## Features
 
-- **Multi-turn agent loop** — tool dispatch, retries, fallbacks, approval gates, budget control
-- **Tool registry** — terminal execution, file I/O, web search/crawl, browser automation, vision, TTS, delegation
-- **Provider abstraction** — OpenAI-compatible + Anthropic with native tool calling and streaming
-- **Gateway** — webhook normalization and outbound message sending for Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS
-- **MCP support** — consume external tools via Model Context Protocol (HTTP + stdio transports)
-- **Skill system** — Markdown-based skill definitions (SKILL.md) that inject domain knowledge into the agent's system prompt
-- **Learning loop** — extract skills from conversations, publish them, and have them automatically influence future agent behavior
-- **Batch processing** — process JSONL prompt datasets through the agent, export trajectories in JSONL or ShareGPT format
-- **Checkpoint/rollback** — save session state at any point, restore to a checkpoint, replay with different configuration
-- **Scheduled execution** — cron-style jobs that run the agent on a schedule with optional gateway delivery
-- **Presets** — agent identity presets, toolset bundles, MCP server configurations
-- **Security** — SSRF protection, prompt injection scanning, PII redaction, auth rate limiting, XSS prevention
-- **Structured logging** — JSON logger with request correlation, replacing console.log
-- **SSE event bus** — real-time push for chat, gateway, job, and session events via `/api/events`
-- **CLI** — interactive REPL with tab completion, slash commands, streaming display
-- **Web dashboard** — Lit Web Components UI for tools, skills, gateway, MCP, presets, and settings
+### Agent Loop & Intelligence
+
+- **Multi-turn tool loop** -- dispatch, retries, fallbacks, approval gates, budget control
+- **Error reflection** -- on tool failure, injects "analyze and retry differently" before giving up
+- **Plan-before-act** -- optional planning step before tool execution
+- **Synthesis on exhaustion** -- final LLM call to summarize findings when iterations run out
+- **Concurrent tool execution** -- run independent tool calls in parallel
+- **Session mutex** -- serializes concurrent requests to the same session
+- **Checkpoint/rollback** -- save state at any point, restore, or replay with different config
+
+### Tools & Providers
+
+- **50+ tools built in** -- web, terminal, workspace, memory, vision, TTS, MCP, git, delegation, scheduler
+- **Provider abstraction** -- OpenAI-compatible + Anthropic with native tool calling and streaming
+- **Credential pooling** -- round-robin rotation with 429 cooldown and rate limit header tracking
+- **MCP support** -- consume external tools via Model Context Protocol (HTTP + stdio transports)
+
+### Skills & Learning
+
+- **Skill system** -- Markdown-based SKILL.md definitions that inject domain knowledge into system prompts
+- **Closed learning loop** -- extract skills from conversations, publish, auto-inject into future runs
+- **Batch processing** -- JSONL prompt datasets, trajectory export (JSONL/ShareGPT format)
+- **User model service** -- tracks expertise areas and preferences across conversations
+
+### Gateway & Delivery
+
+- **8 platforms** -- Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS
+- **Webhook normalization** -- consistent inbound message format across all platforms
+- **Per-platform rate limiting** -- outbound message throttling with exponential backoff retry
+- **Deny-by-default access** -- platform-specific signature verification before messages reach the agent
+- **Pairing system** -- DM/group access control with challenge codes
+
+### Operator Surface
+
+- **Web dashboard** -- Lit Web Components UI (Chat / Agent / Connect / Automate / Settings) with SSE streaming
+- **CLI** -- interactive REPL with tab completion, slash commands, streaming display
+- **Scheduled execution** -- cron-style jobs with optional gateway delivery
+- **SSE event bus** -- 14 real-time event types (chat, gateway, job, session lifecycle)
+- **Structured JSON logging** -- request correlation, replacing console.log
+- **Persistent config store** -- survives restarts without environment variables
+
+### Security
+
+- **SSRF protection** -- every outbound fetch validated against private networks
+- **CSP nonce** -- per-request nonce-based Content Security Policy for dashboard
+- **Auth hardening** -- HMAC-derived cookie tokens, timing-safe comparisons, rate limiting (5/min)
+- **Prompt injection scanning** -- pattern-based detection (fast, not ML)
+- **PII redaction** -- common US patterns (SSN, email, phone)
+- **XSS prevention** -- javascript:/vbscript:/data: blocked in markdown renderer
+- **Trust proxy** -- x-forwarded-for only trusted when explicitly enabled
+- **Graceful shutdown** -- SIGTERM/SIGINT handlers drain in-flight requests
 
 ## Architecture
 
@@ -145,7 +200,7 @@ console.log(result.toolResults)
               v       v       v           v       v       v
         +----------+ +-----+ +--------+ +------+ +----------+
         | Providers| |Tools| | Memory | |Skills| | Gateway  |
-        | OpenAI   | |38+  | | scoped | |learn | | webhook  |
+        | OpenAI   | |50+  | | scoped | |learn | | webhook  |
         | Anthropic| |MCP  | | recall | |match | | outbound |
         +----------+ +-----+ +--------+ +------+ +----------+
                                             |           |
@@ -234,7 +289,7 @@ Available: `filesystem` . `github` . `braveSearch` . `memory` . `puppeteer` . `f
 
 ## Gateway
 
-CrowClaw's gateway handles webhook normalization (inbound) and message delivery (outbound) for messaging platforms. It is **not** a persistent connection manager like some frameworks — it operates on a request/response model, which makes it compatible with serverless deployments.
+CrowClaw's gateway handles webhook normalization (inbound) and message delivery (outbound) for messaging platforms. It is **not** a persistent connection manager like some frameworks -- it operates on a request/response model, which makes it compatible with serverless deployments.
 
 ```typescript
 import {
@@ -275,7 +330,7 @@ Outbound messages include per-platform rate limiting and retry with exponential 
 
 ## Security
 
-Every outbound `fetch()` in web tools goes through SSRF validation. Prompt injection detection uses pattern matching (not ML — fast but has limits). PII redaction covers common US patterns.
+Every outbound `fetch()` in web tools goes through SSRF validation. Prompt injection detection uses pattern matching (not ML -- fast but has limits). PII redaction covers common US patterns.
 
 ```typescript
 import {
@@ -304,7 +359,7 @@ redactPII('SSN: 123-45-6789')
 
 ## Skills & Learning
 
-Skills are Markdown files with YAML frontmatter (SKILL.md format). The agent reads them as instructions — they don't execute code. Built-in skills cover common developer workflows.
+Skills are Markdown files with YAML frontmatter (SKILL.md format). The agent reads them as instructions -- they don't execute code. Built-in skills cover common developer workflows.
 
 ```typescript
 import {
@@ -327,9 +382,9 @@ Skill matching uses keyword overlap (not embeddings). It works well for exact tr
 CrowClaw implements a closed learning loop:
 
 ```
-Conversation → Skill Draft → Review → Publish → SkillRegistry → Agent Prompt
-     ↑                                                              |
-     └──────────────────── improved behavior ───────────────────────┘
+Conversation -> Skill Draft -> Review -> Publish -> SkillRegistry -> Agent Prompt
+     ^                                                              |
+     +---------------------- improved behavior ---------------------+
 ```
 
 ```typescript
@@ -356,7 +411,7 @@ if (draft) {
 
 // Skills from all sources are resolved for AgentLoop
 const skills = registry.resolve()
-// → [built-in skills] + [learned skills] + [local SKILL.md files]
+// -> [built-in skills] + [learned skills] + [local SKILL.md files]
 ```
 
 ## Batch Processing
@@ -469,7 +524,7 @@ OPENAI_BASE_URL=          # Default: https://api.openai.com/v1
 OPENAI_MODEL=             # Default: gpt-4o
 ANTHROPIC_API_KEY=        # Anthropic API key
 
-# Gateway (optional — needed only if using platform integrations)
+# Gateway (optional -- needed only if using platform integrations)
 TELEGRAM_BOT_TOKEN=       # From @BotFather
 SLACK_SIGNING_SECRET=     # From Slack app settings
 
@@ -480,7 +535,7 @@ MCP_BASE_URL=             # MCP server URL for HTTP transport
 CROWCLAW_PERSONA_DIR=     # Path to persona markdown files (SOUL.md, IDENTITY.md, etc.)
 CROWCLAW_SKILL_DIR=       # Path to local SKILL.md directory
 
-# Media tools (optional — tools degrade gracefully without these)
+# Media tools (optional -- tools degrade gracefully without these)
 VISION_API_KEY=           # OpenAI API key for vision analysis
 IMAGE_GEN_API_KEY=        # OpenAI API key for DALL-E image generation
 ```
@@ -489,39 +544,39 @@ IMAGE_GEN_API_KEY=        # OpenAI API key for DALL-E image generation
 
 ```bash
 npm run typecheck   # TypeScript type checking
-npm test            # Vitest — covers all subsystems
+npm test            # Vitest -- covers all subsystems
 ```
 
-Test coverage includes: agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF wiring), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and E2E wiring.
+Test coverage includes: agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF wiring, auth rate limiting, cookie hardening, CSP), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and E2E wiring.
 
 ## Project Structure
 
 ```
 crowclaw/
-├── packages/
-│   ├── core/              # Agent loop, types, prompt builder, security, presets
-│   ├── providers/         # OpenAI-compatible, Anthropic, streaming, model catalog
-│   ├── tools/             # Tool definitions, toolset presets, pipelines
-│   ├── sandbox-executor/  # Local, Docker, SSH, Playwright execution
-│   ├── storage/           # Session + memory stores (in-memory, D1)
-│   ├── memory/            # Scoped remember/recall
-│   ├── learning/          # Skill extraction, matching, registry, batch runner, trajectory
-│   ├── mcp/               # MCP client (HTTP + stdio), presets
-│   ├── mcp-server/        # MCP server (expose CrowClaw as MCP provider)
-│   ├── acp/               # ACP adapter (Zed, JetBrains, Neovim)
-│   ├── gateway/           # Webhook normalization, outbound send, access policy
-│   ├── plugins/           # Lifecycle hooks
-│   ├── scheduler/         # Cron/interval job scheduling
-│   ├── workspace/         # Runtime-neutral file abstraction
-│   ├── runtime-node/      # Node.js HTTP runtime + config store
-│   ├── runtime-cloudflare/ # Cloudflare Workers + Durable Objects
-│   ├── cli/               # Interactive REPL + slash commands
-│   ├── shared/            # Cross-runtime type abstractions
-│   └── web/               # Web dashboard
-├── tests/
-├── docs/
-├── Dockerfile
-└── .github/workflows/ci.yml
++-- packages/
+|   +-- core/              # Agent loop, types, prompt builder, security, presets
+|   +-- providers/         # OpenAI-compatible, Anthropic, streaming, model catalog
+|   +-- tools/             # Tool definitions, toolset presets, pipelines
+|   +-- sandbox-executor/  # Local, Docker, SSH, Playwright execution
+|   +-- storage/           # Session + memory stores (in-memory, D1)
+|   +-- memory/            # Scoped remember/recall
+|   +-- learning/          # Skill extraction, matching, registry, batch runner, trajectory
+|   +-- mcp/               # MCP client (HTTP + stdio), presets
+|   +-- mcp-server/        # MCP server (expose CrowClaw as MCP provider)
+|   +-- acp/               # ACP adapter (Zed, JetBrains, Neovim)
+|   +-- gateway/           # Webhook normalization, outbound send, access policy
+|   +-- plugins/           # Lifecycle hooks
+|   +-- scheduler/         # Cron/interval job scheduling
+|   +-- workspace/         # Runtime-neutral file abstraction
+|   +-- runtime-node/      # Node.js HTTP runtime + config store
+|   +-- runtime-cloudflare/ # Cloudflare Workers + Durable Objects
+|   +-- cli/               # Interactive REPL + slash commands
+|   +-- shared/            # Cross-runtime type abstractions
+|   +-- web/               # Web dashboard (Lit Web Components)
++-- tests/
++-- docs/
++-- Dockerfile
++-- .github/workflows/ci.yml
 ```
 
 ## Contributing
@@ -558,7 +613,7 @@ The original foundation. CrowClaw started as a TypeScript port of [Hermes Agent]
 | Prompt caching (Anthropic cache breakpoints) | `AnthropicProvider` with `cache_control` on system prompt and tool definitions |
 | Real cron expressions for scheduled tasks | `parseCron()` in `@crowclaw/scheduler` -- standard 5-field cron |
 | Batch processing and trajectory export | `runBatch()` + `exportTrajectoryJsonl()` in `@crowclaw/learning` |
-| Extensive built-in tool set | 39+ tools including 5 git tools, vision (real API), TTS, delegation |
+| Extensive built-in tool set | 50+ tools including git, vision (real API), TTS, delegation |
 | Token budget and context compression | Token-aware budget with LLM-powered summarization fallback |
 
 ### OpenClaw
@@ -597,6 +652,7 @@ While building CrowClaw we noticed common gaps that no single reference framewor
 - **Security audit transparency** -- `SecurityAuditLog` records every redaction, scan, and block decision. The dashboard exposes a security grade (A-F) so operators can see what the security layer is actually doing.
 - **Deny-by-default webhooks** -- all inbound gateway messages require platform-specific signature verification before reaching the agent.
 - **Persistent config store** -- `FileConfigStore` survives restarts without requiring environment variables or re-configuration.
+- **Error reflection** -- most frameworks stop or retry blindly on tool failure. CrowClaw injects a reflection prompt asking the LLM to analyze what went wrong and try a different approach.
 
 ## License
 
