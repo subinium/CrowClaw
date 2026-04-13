@@ -22,7 +22,10 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install
-        run: npm ci
+        run: npm install
+
+      - name: Build
+        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
@@ -30,7 +33,7 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Publish
-        run: npm publish --access public
+      - name: Publish workspace packages
+        run: npm publish --workspaces --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

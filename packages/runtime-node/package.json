@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/runtime-node",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -34,15 +34,15 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.1.0",
-    "@crowclaw/providers": "0.1.0",
-    "@crowclaw/storage": "0.1.0",
-    "@crowclaw/tools": "0.1.0",
-    "@crowclaw/workspace": "0.1.0",
-    "@crowclaw/scheduler": "0.1.0",
-    "@crowclaw/learning": "0.1.0",
-    "@crowclaw/mcp": "0.1.0",
-    "@crowclaw/mcp-server": "0.1.0",
-    "@crowclaw/plugins": "0.1.0"
+    "@crowclaw/core": "0.2.0",
+    "@crowclaw/providers": "0.2.0",
+    "@crowclaw/storage": "0.2.0",
+    "@crowclaw/tools": "0.2.0",
+    "@crowclaw/workspace": "0.2.0",
+    "@crowclaw/scheduler": "0.2.0",
+    "@crowclaw/learning": "0.2.0",
+    "@crowclaw/mcp": "0.2.0",
+    "@crowclaw/mcp-server": "0.2.0",
+    "@crowclaw/plugins": "0.2.0"
   }
 }
