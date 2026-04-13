@@ -226,15 +226,38 @@ const server = createServer(async (req, res) => {
     const dt = process.env.CROWCLAW_DASHBOARD_TOKEN;
     if (!dt) { return json({ ok: true, bypass: true }); }
     const body = safeJson(await readBody(req));
-    return json({ ok: body.token === dt });
+    if (body.token === dt) {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'set-cookie': `crowclaw_auth=${dt}; HttpOnly; SameSite=Strict; Path=/`,
+      });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    return json({ ok: false });
+  }
+
+  // Auth check endpoint (cookie-based, does not leak token)
+  if (req.method === 'GET' && url.pathname === '/api/auth/check') {
+    const dt = process.env.CROWCLAW_DASHBOARD_TOKEN;
+    const cookieHeader = req.headers['cookie'] ?? '';
+    const cookieMatch = cookieHeader.match(/(?:^|;\s*)crowclaw_auth=([^;]+)/);
+    const cookieToken = cookieMatch ? cookieMatch[1] : null;
+    const ah = req.headers['authorization'];
+    const bearerToken = typeof ah === 'string' && ah.startsWith('Bearer ') ? ah.slice(7) : null;
+    if (!dt) { return json({ authenticated: true }); }
+    return json({ authenticated: cookieToken === dt || bearerToken === dt });
   }
 
   // Auth middleware for /api/* routes
   const dt = process.env.CROWCLAW_DASHBOARD_TOKEN;
-  if (dt && url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/events') {
+  if (dt && url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/auth/check' && url.pathname !== '/api/events') {
     const ah = req.headers['authorization'];
     const tk = typeof ah === 'string' && ah.startsWith('Bearer ') ? ah.slice(7) : null;
-    if (tk !== dt) { return json({ error: 'Unauthorized' }, 401); }
+    const cookieHeader = req.headers['cookie'] ?? '';
+    const cookieMatch = cookieHeader.match(/(?:^|;\s*)crowclaw_auth=([^;]+)/);
+    const cookieToken = cookieMatch ? cookieMatch[1] : null;
+    if (tk !== dt && cookieToken !== dt) { return json({ error: 'Unauthorized' }, 401); }
   }
 
   // Session rename
