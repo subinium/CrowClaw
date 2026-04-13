@@ -19,6 +19,22 @@ describe('auth rate limiting', () => {
     expect(body.error).toContain('authentication attempts');
   });
 
+  it('6th request returns 429 and subsequent ones also return 429', async () => {
+    const runtime = createNodeRuntime({ provider: new EchoProvider() });
+
+    // First 5 succeed
+    for (let i = 0; i < 5; i++) {
+      const res = await runtime.fetch(new Request('http://localhost/api/auth/check'));
+      expect(res.status).toBe(200);
+    }
+
+    // 6th, 7th, 8th should all be 429
+    for (let i = 0; i < 3; i++) {
+      const res = await runtime.fetch(new Request('http://localhost/api/auth/check'));
+      expect(res.status).toBe(429);
+    }
+  });
+
   it('auth rate limit is separate from general API rate limit', async () => {
     const runtime = createNodeRuntime({ provider: new EchoProvider() });
 
@@ -27,8 +43,25 @@ describe('auth rate limiting', () => {
       await runtime.fetch(new Request('http://localhost/api/auth/check'));
     }
 
-    // General API endpoint should still work
+    // General API endpoint should still work (200, not 429)
     const res = await runtime.fetch(new Request('http://localhost/api/sessions'));
     expect(res.status).not.toBe(429);
+    expect(res.status).toBe(200);
+  });
+
+  it('different auth endpoints share the same rate limit bucket', async () => {
+    const runtime = createNodeRuntime({ provider: new EchoProvider() });
+
+    // 3 requests to /verify, 2 to /check = 5 total
+    for (let i = 0; i < 3; i++) {
+      await runtime.fetch(new Request('http://localhost/api/auth/verify', { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } }));
+    }
+    for (let i = 0; i < 2; i++) {
+      await runtime.fetch(new Request('http://localhost/api/auth/check'));
+    }
+
+    // 6th should be rate limited
+    const res = await runtime.fetch(new Request('http://localhost/api/auth/check'));
+    expect(res.status).toBe(429);
   });
 });

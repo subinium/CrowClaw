@@ -66,4 +66,23 @@ describe('SessionMutex', () => {
     release();
     expect(mutex.activeCount).toBe(0);
   });
+
+  it('double-release is idempotent (does not throw or corrupt state)', async () => {
+    const mutex = new SessionMutex();
+    const release = await mutex.acquire('s1');
+
+    // First release — normal
+    release();
+    expect(mutex.activeCount).toBe(0);
+
+    // Second release — should be safe (no throw, no state corruption)
+    release();
+    expect(mutex.activeCount).toBe(0);
+
+    // Mutex should still work for new acquires
+    const r2 = await mutex.acquire('s1');
+    expect(mutex.activeCount).toBe(1);
+    r2();
+    expect(mutex.activeCount).toBe(0);
+  });
 });

@@ -915,6 +915,7 @@ export class AgentLoop {
     }
 
     let errorReflectionCount = 0;
+    let iterationsCompleted = 0;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
       ensureNotAborted(input.signal);
@@ -1081,9 +1082,10 @@ export class AgentLoop {
       // Track 1.2: Record usage from subsequent provider calls
       totalTokensConsumed = this.recordUsage(currentResponse);
       finalResponse = currentResponse.assistantMessage ?? finalResponse;
+      iterationsCompleted = iteration + 1;
     }
 
-    if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && toolResults.length >= this.maxToolIterations) {
+    if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && iterationsCompleted >= this.maxToolIterations) {
       if (this.synthesizeOnExhaustion) {
         // Exhaustion synthesis: one final call with no tools to force a text answer
         nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
@@ -1243,6 +1245,8 @@ export class AgentLoop {
     }
 
     let streamErrorReflectionCount = 0;
+    let streamIterationsCompleted = 0;
+    let lastStreamHadToolCalls = false;
 
     try {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
@@ -1319,9 +1323,12 @@ export class AgentLoop {
 
         // If no tool calls, we're done
         if (streamToolCalls.length === 0) {
+          lastStreamHadToolCalls = false;
           yield { type: 'iteration-end', iteration };
           break;
         }
+
+        lastStreamHadToolCalls = true;
 
         // Push assistant message
         nextMessages.push({
@@ -1483,7 +1490,35 @@ export class AgentLoop {
           await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
         }
 
+        streamIterationsCompleted = iteration + 1;
         yield { type: 'iteration-end', iteration };
+      }
+
+      // Synthesize on exhaustion (mirrors run() behavior)
+      if (lastStreamHadToolCalls && streamIterationsCompleted >= this.maxToolIterations && this.synthesizeOnExhaustion) {
+        nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
+        const synthesisRequest: ProviderRequest = {
+          systemPrompt: this.buildSystemPromptForRequest({
+            basePrompt: userMessage,
+            runtimeName: this.runtimeName,
+            sessionId: session.sessionId,
+            availableTools: [],
+            agentPreset: this.agentPreset,
+          }),
+          messages: nextMessages,
+          availableTools: [],
+          signal,
+        };
+        if (streamingProvider) {
+          let synthesisText = '';
+          for await (const chunk of streamingProvider.generateStream(synthesisRequest)) {
+            if (chunk.type === 'text' && chunk.text) {
+              synthesisText += chunk.text;
+              yield { type: 'text-delta', content: chunk.text };
+            }
+          }
+          if (synthesisText) finalResponse = synthesisText;
+        }
       }
 
       // Save completion checkpoint

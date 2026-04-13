@@ -146,6 +146,8 @@ export interface NodeRuntimeOptions {
   webhookSecrets?: Record<string, string>;
   /** Public HTTPS URL for this server. Used for auto-registering Telegram webhooks on startup. */
   publicUrl?: string;
+  /** Trust x-forwarded-for header for client IP detection (enable behind a reverse proxy). Default: false */
+  trustProxy?: boolean;
 }
 
 function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
@@ -507,6 +509,11 @@ function renderBrowserClickRefResult(url: string, ref: string) {
 
 class RateLimiter {
   private requests = new Map<string, number[]>();
+  private readonly maxKeys: number;
+
+  constructor(options?: { maxKeys?: number }) {
+    this.maxKeys = options?.maxKeys ?? 50_000;
+  }
 
   check(key: string, maxRequests: number, windowMs: number): boolean {
     const now = Date.now();
@@ -519,6 +526,11 @@ class RateLimiter {
     }
     recent.push(now);
     this.requests.set(key, recent);
+    // Evict oldest entry if at capacity (prevents unbounded memory growth)
+    if (this.requests.size > this.maxKeys && !this.requests.has(key)) {
+      const oldest = this.requests.keys().next().value;
+      if (oldest !== undefined) this.requests.delete(oldest);
+    }
     return true; // allowed
   }
 }
@@ -527,12 +539,30 @@ class RateLimiter {
 // Security headers helper
 // ---------------------------------------------------------------------------
 
-const SECURITY_HEADERS: Record<string, string> = {
-  'Content-Security-Policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+/** Base security headers (CSP added per-request with nonce for dashboard, strict for API). */
+const SECURITY_HEADERS_BASE: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'X-XSS-Protection': '1; mode=block',
 };
+
+/** CSP for API routes (no scripts needed). */
+const API_CSP = "default-src 'none'; frame-ancestors 'none'";
+
+/** Generate a cryptographic nonce for CSP. */
+function generateNonce(): string {
+  try {
+    const { randomBytes } = require('node:crypto') as { randomBytes: (size: number) => Buffer };
+    return randomBytes(16).toString('base64');
+  } catch {
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  }
+}
+
+/** CSP for dashboard pages (nonce-based script-src, unsafe-inline for styles). */
+function dashboardCSP(nonce: string): string {
+  return `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'`;
+}
 
 // ---------------------------------------------------------------------------
 // Route classification — dangerous routes always require authentication
@@ -566,6 +596,22 @@ function parseCookieToken(cookieHeader: string | null): string | null {
   if (!cookieHeader) return null;
   const match = cookieHeader.match(/(?:^|;\s*)crowclaw_auth=([^;]+)/);
   return match ? match[1] : null;
+}
+
+/** Derive a cookie-safe token from the dashboard token (never store raw token in cookie). */
+function deriveCookieToken(dashToken: string): string {
+  try {
+    const { createHmac } = require('node:crypto') as { createHmac: (algo: string, key: string) => { update: (data: string) => { digest: (enc: string) => string } } };
+    return createHmac('sha256', dashToken).update('crowclaw:cookie').digest('hex');
+  } catch {
+    // Fallback: simple hash (not cryptographically ideal, but better than raw token)
+    let hash = 0;
+    const str = dashToken + ':cookie';
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return 'ck_' + Math.abs(hash).toString(36);
+  }
 }
 
 /** Constant-time string comparison to prevent timing side-channel attacks. */
@@ -1126,6 +1172,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
 
   function enforceGatewayAccess(message: NormalizedInboundMessage): Response | null {
+    eventBus.emit('gateway:inbound', { platform: message.platform, channelId: message.channelId, userId: message.userId });
     const policy = getGatewayAccessPolicy(message.platform);
     if (!policy) {
       // Deny-by-default: if no policy is configured, reject the message
@@ -1165,6 +1212,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // Delivery function — routes scheduled job results to gateway platforms
   const deliverToGateway: DeliveryFn = async (target: DeliveryTarget, content: string) => {
     const { platform, config: cfg } = target;
+    eventBus.emit('gateway:outbound', { platform, contentLength: content.length });
     try {
       switch (platform) {
         case 'telegram': {
@@ -1173,13 +1221,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!token || !chatId) return { ok: false, error: 'Missing Telegram token or chatId' };
           // sendTelegramMessage handles splitting and Markdown fallback internally
           const result = await sendTelegramMessage(token, chatId, content, { parseMode: 'Markdown' });
-          if (!result.ok) return { ok: false, error: result.error ?? 'Telegram send failed' };
+          if (!result.ok) {
+            eventBus.emit('gateway:error', { platform, error: result.error ?? 'send failed' });
+            return { ok: false, error: result.error ?? 'Telegram send failed' };
+          }
           return { ok: true };
         }
         case 'discord': {
           const webhookUrl = cfg.webhookUrl ?? cfg.channel;
           if (!webhookUrl) return { ok: false, error: 'Missing Discord webhook URL' };
           const result = await sendDiscordMessage(webhookUrl, content);
+          if (!result.ok) eventBus.emit('gateway:error', { platform, error: result.error });
           return { ok: result.ok, error: result.error };
         }
         case 'slack': {
@@ -1187,13 +1239,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const channel = cfg.channel;
           if (!token || !channel) return { ok: false, error: 'Missing Slack token or channel' };
           const result = await sendSlackMessage(token, channel, content);
+          if (!result.ok) eventBus.emit('gateway:error', { platform, error: result.error });
           return { ok: result.ok, error: result.error };
         }
         default:
           return { ok: false, error: `Unsupported delivery platform: ${platform}` };
       }
     } catch (err: unknown) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      const error = err instanceof Error ? err.message : String(err);
+      eventBus.emit('gateway:error', { platform, error });
+      return { ok: false, error };
     }
   };
 
@@ -1202,6 +1257,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const schedulerExecutor = new SchedulerExecutor(
     schedulerStore,
     async (input) => {
+      eventBus.emit('job:start', { sessionId: input.sessionId, agentId: input.agentId });
       const overrides: ExecutionOverrides = {
         agentPreset: input.agentPreset,
         toolsetPreset: input.toolsetPreset,
@@ -1209,21 +1265,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         model: input.model,
       };
 
-      const result = await createConfiguredAgent(overrides).run({
-        agentId: input.agentId,
-        sessionId: input.sessionId,
-        userMessage: input.userMessage,
-        systemPrompt: 'You are CrowClaw executing a scheduled task.',
-      });
+      try {
+        const result = await createConfiguredAgent(overrides).run({
+          agentId: input.agentId,
+          sessionId: input.sessionId,
+          userMessage: input.userMessage,
+          systemPrompt: 'You are CrowClaw executing a scheduled task.',
+        });
 
-      return {
-        finalResponse: result.finalResponse,
-        toolResults: result.toolResults.map((r) => ({
-          toolName: r.toolName,
-          ok: r.ok,
-          output: r.output,
-        })),
-      };
+        eventBus.emit('job:complete', { sessionId: input.sessionId, toolCount: result.toolResults.length });
+        return {
+          finalResponse: result.finalResponse,
+          toolResults: result.toolResults.map((r) => ({
+            toolName: r.toolName,
+            ok: r.ok,
+            output: r.output,
+          })),
+        };
+      } catch (err: unknown) {
+        eventBus.emit('job:error', { sessionId: input.sessionId, error: err instanceof Error ? err.message : String(err) });
+        throw err;
+      }
     },
     deliverToGateway,
   );
@@ -1301,13 +1363,22 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
       const bindHostname = options.hostname ?? '127.0.0.1';
       const isLocalhost = isLocalhostAddress(bindHostname);
+      const trustProxy = options.trustProxy ?? false;
+
+      // Extract client IP — only trust proxy headers when trustProxy is enabled
+      const getClientIp = (req: Request): string => {
+        if (trustProxy) {
+          return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+            ?? req.headers.get('x-real-ip')
+            ?? '127.0.0.1';
+        }
+        return '127.0.0.1';
+      };
 
       // Stricter rate limit for auth endpoints: 5 requests per minute per IP
       // Must run before auth handlers which return early
       if (url.pathname.startsWith('/api/auth/')) {
-        const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-          ?? request.headers.get('x-real-ip')
-          ?? '127.0.0.1';
+        const clientIp = getClientIp(request);
         if (!authRateLimiter.check(clientIp, 5, 60_000)) {
           log.warn('Auth rate limit exceeded', { component: 'security', clientIp, path: url.pathname });
           return Response.json(
@@ -1327,8 +1398,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
         const body = (await request.json()) as { token?: string };
         if (dashToken && timingSafeEqual(body.token ?? '', dashToken)) {
+          const cookieValue = deriveCookieToken(dashToken);
+          const secureSuffix = isLocalhost ? '' : '; Secure';
           const headers = new Headers({ 'content-type': 'application/json' });
-          headers.set('Set-Cookie', `crowclaw_auth=${dashToken}; HttpOnly; SameSite=Strict; Path=/`);
+          headers.set('Set-Cookie', `crowclaw_auth=${cookieValue}; HttpOnly; SameSite=Strict; Path=/${secureSuffix}`);
           return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
         }
         return Response.json({ ok: false });
@@ -1342,7 +1415,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (!dashToken) {
           return Response.json({ authenticated: isLocalhost });
         }
-        return Response.json({ authenticated: (cookieAuth !== null && timingSafeEqual(cookieAuth, dashToken)) || (headerAuth !== null && timingSafeEqual(headerAuth, dashToken)) });
+        const derivedCookie = deriveCookieToken(dashToken);
+        return Response.json({ authenticated: (cookieAuth !== null && timingSafeEqual(cookieAuth, derivedCookie)) || (headerAuth !== null && timingSafeEqual(headerAuth, dashToken)) });
       }
 
       // Auth middleware for /api/* routes
@@ -1350,7 +1424,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const authHeader = request.headers.get('authorization');
         const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
         const cookieToken = parseCookieToken(request.headers.get('cookie'));
-        const tokenMatch = dashToken ? ((bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) || (cookieToken !== null && timingSafeEqual(cookieToken, dashToken))) : false;
+        const derivedCookie = dashToken ? deriveCookieToken(dashToken) : '';
+        const tokenMatch = dashToken ? ((bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) || (cookieToken !== null && timingSafeEqual(cookieToken, derivedCookie))) : false;
 
         // Dangerous routes ALWAYS require auth, regardless of localhost
         if (isDangerousRoute(url.pathname)) {
@@ -1369,9 +1444,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       // General rate limiting for /api/* routes: 100 requests per minute per IP
       if (url.pathname.startsWith('/api/')) {
-        const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-          ?? request.headers.get('x-real-ip')
-          ?? '127.0.0.1';
+        const clientIp = getClientIp(request);
         if (!rateLimiter.check(clientIp, 100, 60_000)) {
           return Response.json(
             { error: 'Too many requests. Limit: 100 per minute.' },
@@ -1411,10 +1484,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Dashboard — serve web UI at root and /dashboard
       if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
         const { DASHBOARD_HTML } = await import('@crowclaw/web');
-        return new Response(DASHBOARD_HTML, {
+        const nonce = generateNonce();
+        // Inject nonce into inline <script> tags for CSP compliance
+        const nonceHtml = DASHBOARD_HTML.replace(/<script(?![^>]*\bsrc\b)/g, `<script nonce="${nonce}"`);
+        return new Response(nonceHtml, {
           headers: {
             'content-type': 'text/html; charset=utf-8',
-            ...SECURITY_HEADERS,
+            'Content-Security-Policy': dashboardCSP(nonce),
+            ...SECURITY_HEADERS_BASE,
           },
         });
       }
@@ -2240,6 +2317,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         } satisfies SessionState;
         if (!existing) {
           await store.put(session);
+          eventBus.emit('session:created', { sessionId });
         }
         return Response.json({
           ok: true,
@@ -3791,6 +3869,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (action === 'stream') {
           const body = (await request.json()) as { message: string; userId?: string; workspaceId?: string };
           if (!body.message) return Response.json({ error: 'Missing message' }, { status: 400 });
+          eventBus.emit('chat:stream', { sessionId, userMessage: body.message });
 
           // For stream actions, release the mutex inside the stream (not the outer finally)
           // because the ReadableStream body runs asynchronously after Response is returned.
@@ -3829,6 +3908,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                 }
               } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
+                eventBus.emit('chat:error', { sessionId, error: msg });
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`));
               } finally {
                 streamRelease?.();
@@ -3864,6 +3944,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           learning.autoCapture(result.session.messages, sessionId).catch(() => { /* best-effort */ });
         }
         eventBus.emit('chat:complete', { sessionId, toolCount: result.toolResults.length });
+        eventBus.emit('session:updated', { sessionId, messageCount: result.session.messages.length });
         return Response.json(result);
 
           })(); // end mutex-guarded IIFE
@@ -3984,6 +4065,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           enabled: body.enabled ?? existing?.enabled ?? true,
           token: body.token ?? existing?.token,
         });
+        eventBus.emit('gateway:status', { platform, enabled: body.enabled ?? existing?.enabled ?? true });
         return Response.json({ ok: true, platform, configured: Boolean(configStore.getGatewayConfig(platform)) });
       }
 

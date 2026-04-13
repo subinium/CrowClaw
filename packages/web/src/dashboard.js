@@ -2186,7 +2186,7 @@ function lAgentCfg() {
       var cfg = d.config || {};
       var h = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
       h += '<div class="card"><div style="font-size:11px;color:var(--t2);margin-bottom:6px">Max Tool Iterations</div>';
-      h += '<input class="form-input" type="number" id="acMaxIter" value="' + (cfg.maxToolIterations || 5) + '" min="1" max="20" style="width:80px" onchange="saveAgentCfg()"></div>';
+      h += '<input class="form-input" type="number" id="acMaxIter" value="' + (cfg.maxToolIterations || 12) + '" min="1" max="20" style="width:80px" onchange="saveAgentCfg()"></div>';
       h += '<div class="card"><div style="font-size:11px;color:var(--t2);margin-bottom:6px">Max Result Length</div>';
       h += '<input class="form-input" type="number" id="acMaxResult" value="' + (cfg.maxToolResultLength || 2000) + '" min="500" max="10000" step="500" style="width:100px" onchange="saveAgentCfg()"></div>';
       h += '<div class="card"><div style="display:flex;align-items:center;justify-content:space-between"><span style="font-size:11px;color:var(--t2)">Concurrent Tools</span>';
@@ -2205,7 +2205,7 @@ function lAgentCfg() {
 
 function saveAgentCfg() {
   var cfg = {
-    maxToolIterations: parseInt($('acMaxIter').value) || 5,
+    maxToolIterations: parseInt($('acMaxIter').value) || 12,
     maxToolResultLength: parseInt($('acMaxResult').value) || 2000,
     concurrentToolCalls: $('acConcurrent').checked,
     synthesizeOnExhaustion: $('acSynthesize').checked,

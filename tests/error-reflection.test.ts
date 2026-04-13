@@ -39,6 +39,7 @@ describe('error reflection', () => {
     const tools = new ToolRegistry().register(createEchoTool());
     const agent = new AgentLoop(provider, tools, new InMemorySessionStore(), {
       errorReflection: true,
+      stopOnToolError: true,
       maxErrorReflections: 2,
       maxToolIterations: 10,
     });
@@ -65,6 +66,7 @@ describe('error reflection', () => {
     const tools = new ToolRegistry().register(createEchoTool());
     const agent = new AgentLoop(provider, tools, new InMemorySessionStore(), {
       errorReflection: true,
+      stopOnToolError: true,
       maxErrorReflections: 3,
       maxToolIterations: 10,
     });
@@ -83,6 +85,7 @@ describe('error reflection', () => {
     const tools = new ToolRegistry().register(createEchoTool());
     const agent = new AgentLoop(new AlwaysFailProvider(), tools, new InMemorySessionStore(), {
       errorReflection: false,
+      stopOnToolError: true,
       maxToolIterations: 5,
     });
 
