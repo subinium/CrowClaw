@@ -711,8 +711,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
               const idx = (tc.index as number) ?? 0;
               const fn = tc.function as { name?: string; arguments?: string } | undefined;
               if (fn?.name) {
-                toolAccumulators.set(idx, { name: fn.name, args: '', id: tc.id as string | undefined });
-                yield { type: 'tool_use_start', toolName: fn.name, toolCallId: tc.id as string | undefined };
+                // Reverse-map sanitized name (web_search → web.search) for streaming tool calls
+                const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === fn.name)?.name ?? fn.name;
+                toolAccumulators.set(idx, { name: originalName, args: '', id: tc.id as string | undefined });
+                yield { type: 'tool_use_start', toolName: originalName, toolCallId: tc.id as string | undefined };
               }
               if (fn?.arguments) {
                 const acc = toolAccumulators.get(idx);

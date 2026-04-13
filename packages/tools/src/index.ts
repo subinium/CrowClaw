@@ -936,18 +936,35 @@ export function createWebSearchTool(): ToolDefinition {
         return { toolName: 'web.search', runtime: 'worker', ok: false, output: `Search request failed: HTTP ${response.status}` };
       }
       const html = await response.text();
-      const results = [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
-        .map((match) => {
-          const href = resolveHref(searchUrl.toString(), match[1]) ?? match[1];
-          const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-          return href && title ? {
-            title,
-            url: href,
-            snippet: title
-          } : null;
-        })
-        .filter((value): value is { title: string; url: string; snippet: string } => Boolean(value))
-        .slice(0, limit);
+
+      // Pass 1: Parse DuckDuckGo structured results (class="result" containers with snippets)
+      const ddgResults: Array<{ title: string; url: string; snippet: string }> = [];
+      const resultBlockRegex = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
+      for (const block of html.matchAll(resultBlockRegex)) {
+        const content = block[1];
+        const linkMatch = content.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+        const snippetMatch = content.match(/<(?:a|td|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|span)>/i);
+        if (linkMatch) {
+          const href = resolveHref(searchUrl.toString(), linkMatch[1]) ?? linkMatch[1];
+          const title = linkMatch[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          const snippet = snippetMatch
+            ? snippetMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+            : title;
+          if (href && title) ddgResults.push({ title, url: href, snippet });
+        }
+      }
+
+      // Pass 2: Fallback to generic <a> parsing if DDG structure not found
+      const results = ddgResults.length > 0
+        ? ddgResults.slice(0, limit)
+        : [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
+            .map((match) => {
+              const href = resolveHref(searchUrl.toString(), match[1]) ?? match[1];
+              const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+              return href && title ? { title, url: href, snippet: title } : null;
+            })
+            .filter((value): value is { title: string; url: string; snippet: string } => Boolean(value))
+            .slice(0, limit);
 
       return {
         toolName: 'web.search',

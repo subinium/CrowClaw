@@ -36,6 +36,17 @@ export interface SkillManifest {
   category?: string;
   version?: string;
   author?: string;
+  /** OpenClaw-style activation gates — skill excluded if requirements not met */
+  requires?: {
+    /** Binary commands that must be available (checked via `which`) */
+    bins?: string[];
+    /** Environment variables that must be set */
+    env?: string[];
+    /** Tool names that must be registered */
+    tools?: string[];
+  };
+  /** If true, always include this skill regardless of matching */
+  always?: boolean;
 }
 
 export interface ParsedSkillFile {
@@ -205,6 +216,84 @@ export function matchSkillManifests(
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+}
+
+/**
+ * OpenClaw-style activation gate check.
+ * Returns true if the skill's requirements are met, false if it should be excluded.
+ */
+export function checkSkillGates(
+  skill: ParsedSkillFile,
+  context: {
+    availableToolNames?: string[];
+    envVars?: Record<string, string | undefined>;
+  } = {}
+): { eligible: boolean; reason?: string } {
+  const requires = skill.manifest.requires;
+  if (!requires) return { eligible: true };
+
+  // Check required environment variables
+  if (requires.env && requires.env.length > 0) {
+    const env = context.envVars ?? {};
+    for (const key of requires.env) {
+      if (!env[key]) {
+        return { eligible: false, reason: `Missing env var: ${key}` };
+      }
+    }
+  }
+
+  // Check required tools
+  if (requires.tools && requires.tools.length > 0 && context.availableToolNames) {
+    for (const tool of requires.tools) {
+      if (!context.availableToolNames.includes(tool)) {
+        return { eligible: false, reason: `Missing tool: ${tool}` };
+      }
+    }
+  }
+
+  return { eligible: true };
+}
+
+/**
+ * Filter skills by activation gates and apply token budget.
+ * OpenClaw pattern: deterministic ordering + budget guard.
+ */
+export function filterAndBudgetSkills(
+  skills: ParsedSkillFile[],
+  options: {
+    availableToolNames?: string[];
+    envVars?: Record<string, string | undefined>;
+    maxTokenBudget?: number; // approximate max tokens for all skills combined
+  } = {}
+): ParsedSkillFile[] {
+  const maxBudget = options.maxTokenBudget ?? 16000;
+
+  // Filter by activation gates
+  const eligible = skills.filter((skill) => {
+    const gate = checkSkillGates(skill, options);
+    return gate.eligible;
+  });
+
+  // Deterministic ordering: always-on first, then by name (prompt caching stability)
+  eligible.sort((a, b) => {
+    if (a.manifest.always && !b.manifest.always) return -1;
+    if (!a.manifest.always && b.manifest.always) return 1;
+    return a.manifest.name.localeCompare(b.manifest.name);
+  });
+
+  // Token budget guard — estimate ~4 tokens per word
+  let usedTokens = 0;
+  const budgeted: ParsedSkillFile[] = [];
+  for (const skill of eligible) {
+    const estimatedTokens = Math.ceil((skill.manifest.name.length + skill.manifest.description.length + skill.instructions.length) / 4);
+    if (usedTokens + estimatedTokens > maxBudget && budgeted.length > 0) {
+      break; // Stop adding skills when budget exceeded
+    }
+    usedTokens += estimatedTokens;
+    budgeted.push(skill);
+  }
+
+  return budgeted;
 }
 
 // Simple YAML parser for frontmatter (no external dependency)

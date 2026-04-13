@@ -5,7 +5,7 @@
     <strong>A self-improving TypeScript agent framework that learns from every conversation.</strong>
   </p>
   <p align="center">
-    <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/badge/npm-v0.1.3-cb3837.svg" alt="npm v0.1.3" /></a>
+    <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/badge/npm-v0.1.4-cb3837.svg" alt="npm v0.1.3" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>

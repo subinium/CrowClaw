@@ -1,6 +1,6 @@
 import { PluginManager } from '@crowclaw/plugins';
 import { buildSystemPrompt } from './prompt-builder.js';
-import { matchSkillManifests, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
+import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
@@ -188,6 +188,12 @@ export interface AgentLoopOptions {
   securityPolicy?: SecurityPolicy;
   /** Security audit log for recording security events */
   securityAuditLog?: SecurityAuditLog;
+  /** Make a final synthesis call when the loop exhausts maxToolIterations. Default: true */
+  synthesizeOnExhaustion?: boolean;
+  /** Max characters per tool result before truncation. Default: 2000 */
+  maxToolResultLength?: number;
+  /** Max approximate tokens for all skills in system prompt. Default: 4000 */
+  skillTokenBudget?: number;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -216,11 +222,15 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function toolMessage(result: ToolExecutionResult): ConversationMessage {
+function toolMessage(result: ToolExecutionResult, maxLength?: number): ConversationMessage {
+  let content = result.output;
+  if (maxLength && content.length > maxLength) {
+    content = content.slice(0, maxLength) + `\n\n[Truncated — ${content.length} chars total, showing first ${maxLength}]`;
+  }
   return {
     role: 'tool',
     name: result.toolName,
-    content: result.output,
+    content,
     createdAt: nowIso(),
     metadata: result.metadata
   };
@@ -393,6 +403,8 @@ export class AgentLoop {
   private readonly contextWindowSize?: number;
   private readonly securityPolicy: Required<SecurityPolicy>;
   private readonly securityAuditLog?: SecurityAuditLog;
+  private readonly synthesizeOnExhaustion: boolean;
+  private readonly maxToolResultLength: number;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -415,7 +427,11 @@ export class AgentLoop {
     this.protectLastMessages = options.protectLastMessages ?? 12;
     this.plugins = options.plugins;
     this.runtimeName = options.runtimeName ?? 'unknown';
-    this.skills = options.skills ?? [];
+    // OpenClaw pattern: filter skills by activation gates + apply token budget
+    this.skills = filterAndBudgetSkills(options.skills ?? [], {
+      availableToolNames: this.tools.list().map(t => t.name),
+      maxTokenBudget: options.skillTokenBudget ?? 16000,
+    });
     this.agentPreset = options.agentPreset;
     this.personaPrompt = options.personaPrompt;
     this.maxTokens = options.maxTokens;
@@ -432,6 +448,25 @@ export class AgentLoop {
       blockDangerousCommands: options.securityPolicy?.blockDangerousCommands ?? false,
     };
     this.securityAuditLog = options.securityAuditLog;
+    this.synthesizeOnExhaustion = options.synthesizeOnExhaustion ?? true;
+    this.maxToolResultLength = options.maxToolResultLength ?? 2000;
+  }
+
+  /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
+  private getBudgetHint(iteration: number, maxIterations: number): string | null {
+    if (maxIterations <= 2) return null; // Too few iterations for tiered hints
+    const remaining = maxIterations - iteration - 1;
+    const ratio = (iteration + 1) / maxIterations;
+    if (remaining === 0) {
+      return 'This is your final tool iteration. Provide your best answer with what you have gathered so far.';
+    }
+    if (ratio >= 0.75) {
+      return `You have ${remaining} tool iteration(s) remaining. Start synthesizing your findings into a clear answer.`;
+    }
+    if (ratio >= 0.5) {
+      return 'You are halfway through your tool budget. Focus on the most important remaining steps.';
+    }
+    return null;
   }
 
   /** Track 1.2: Record usage from a provider response and return total tokens consumed so far */
@@ -920,7 +955,7 @@ export class AgentLoop {
             }
           : rawResult;
         toolResults.push(result);
-        nextMessages.push(toolMessage(result));
+        nextMessages.push(toolMessage(result, this.maxToolResultLength));
         if (!result.ok) {
           await this.plugins?.emit('tool:error', {
             result,
@@ -964,6 +999,12 @@ export class AgentLoop {
         await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
       }
 
+      // Tiered budget warnings (Hermes pattern) — inject ephemeral hints
+      const budgetHint = this.getBudgetHint(iteration, this.maxToolIterations);
+      if (budgetHint) {
+        nextMessages.push({ role: 'system', content: budgetHint, createdAt: nowIso(), metadata: { budgetHint: true } });
+      }
+
       currentResponse = await this.generateWithFallbacks({
         systemPrompt: this.buildSystemPromptForRequest({
           basePrompt: input.systemPrompt,
@@ -989,9 +1030,25 @@ export class AgentLoop {
     }
 
     if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && toolResults.length >= this.maxToolIterations) {
-      finalResponse = finalResponse
-        ? `${finalResponse}\nReached maximum tool iterations.`
-        : 'Reached maximum tool iterations.';
+      if (this.synthesizeOnExhaustion) {
+        // Exhaustion synthesis: one final call with no tools to force a text answer
+        nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
+        const synthesisResponse = await this.generateWithFallbacks({
+          systemPrompt: this.buildSystemPromptForRequest({
+            basePrompt: input.systemPrompt, runtimeName: this.runtimeName,
+            sessionId: input.sessionId, availableTools: [],
+            agentPreset: this.agentPreset,
+          }),
+          messages: nextMessages,
+          availableTools: [], // No tools — force text response
+          signal: input.signal
+        }, { sessionId: input.sessionId, agentId: input.agentId });
+        finalResponse = synthesisResponse.assistantMessage ?? finalResponse ?? 'Reached maximum tool iterations.';
+      } else {
+        finalResponse = finalResponse
+          ? `${finalResponse}\nReached maximum tool iterations.`
+          : 'Reached maximum tool iterations.';
+      }
     }
 
     if (!finalResponse) {
@@ -1233,7 +1290,7 @@ export class AgentLoop {
               metadata: { blockedBySecurity: true, securityWarnings: streamCmdScan.warnings },
             };
             toolResults.push(blockedResult);
-            nextMessages.push(toolMessage(blockedResult));
+            nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
             yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false };
             continue;
           }
@@ -1266,7 +1323,7 @@ export class AgentLoop {
                 output: `Tool requires approval: ${tc.name}`,
               };
               toolResults.push(blockedResult);
-              nextMessages.push(toolMessage(blockedResult));
+              nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
               yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false };
               continue;
             }
@@ -1288,7 +1345,7 @@ export class AgentLoop {
           toolResult = this.redactToolResult(toolResult);
 
           toolResults.push(toolResult);
-          nextMessages.push(toolMessage(toolResult));
+          nextMessages.push(toolMessage(toolResult, this.maxToolResultLength));
           yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok };
 
           if (!toolResult.ok && this.stopOnToolError) {
@@ -1343,7 +1400,7 @@ export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSumma
 export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usage-tracker.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
-export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry } from './skill-manifest.js';
+export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry } from './skill-manifest.js';
 
 export { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames, type AgentPreset } from './agent-presets.js';
 
