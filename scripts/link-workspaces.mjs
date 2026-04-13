@@ -22,7 +22,7 @@ async function safeRemove(target) {
 
 async function main() {
   await ensureDir(nodeModulesDir);
-  const scopeDir = path.join(nodeModulesDir, '@mercury');
+  const scopeDir = path.join(nodeModulesDir, '@crowclaw');
   await ensureDir(scopeDir);
 
   const entries = await fs.readdir(packagesDir, { withFileTypes: true });
@@ -33,7 +33,7 @@ async function main() {
     const packageJsonPath = path.join(packageDir, 'package.json');
     try {
       const pkg = await readJson(packageJsonPath);
-      if (typeof pkg.name !== 'string' || !pkg.name.startsWith('@mercury/')) continue;
+      if (typeof pkg.name !== 'string' || !pkg.name.startsWith('@crowclaw/')) continue;
       const packageName = pkg.name.split('/')[1];
       const linkPath = path.join(scopeDir, packageName);
       await safeRemove(linkPath);
@@ -45,7 +45,7 @@ async function main() {
     }
   }
 
-  console.log(`Linked ${linked.length} Mercury workspaces.`);
+  console.log(`Linked ${linked.length} CrowClaw workspaces.`);
 }
 
 main().catch((error) => {

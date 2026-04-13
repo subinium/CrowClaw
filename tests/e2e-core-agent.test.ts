@@ -648,11 +648,12 @@ describe('E2E: CLI system', () => {
   });
 
   it('parses all command forms', () => {
-    expect(parseCliArgs([]).command).toBe('help');
+    expect(parseCliArgs([]).command).toBe('repl');
     expect(parseCliArgs(['status']).command).toBe('status');
     expect(parseCliArgs(['tools']).command).toBe('tools');
-    expect(parseCliArgs(['chat', '-q', 'hello']).query).toBe('hello');
-    expect(parseCliArgs(['chat', '--session', 'demo']).sessionId).toBe('demo');
+    const chatParsed = parseCliArgs(['chat', '-q', 'hello']);
+    expect(chatParsed.query).toBe('hello');
+    expect(parseCliArgs(['chat']).command).toBe('repl');
   });
 
   it('suggests commands for partial input', () => {

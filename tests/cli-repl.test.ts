@@ -31,6 +31,6 @@ describe('CLI REPL enhancements', () => {
     expect(parseCliArgs(['status']).command).toBe('status');
     expect(parseCliArgs(['tools']).command).toBe('tools');
     expect(parseCliArgs(['chat', '-q', 'hello']).query).toBe('hello');
-    expect(parseCliArgs([]).command).toBe('help');
+    expect(parseCliArgs([]).command).toBe('repl');
   });
 });

@@ -52,17 +52,18 @@ import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry }
 import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { MemoryService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
-import { EchoProvider, OpenAICompatibleProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
+import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
-import { InMemorySchedulerStore, SchedulerExecutor, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markIntervalJobRun } from '@crowclaw/scheduler';
-import { RuntimeConfigStore } from './config-store.js';
+import { InMemorySchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markIntervalJobRun } from '@crowclaw/scheduler';
+import { RuntimeConfigStore, FileConfigStore } from './config-store.js';
 import type { CodeBridgeSession } from './bridge-state.js';
 import { ensureBrowserSession, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
 import { handleCodeBridgeRoutes } from './bridge-routes.js';
 import type { BridgeProcessRecord } from './bridge-process.js';
 import { routePaths } from './route-paths.js';
+import { resolveProviderFromConfig } from './provider-factory.js';
 
 const directToolAliases = {
   'browser.wait': 'browser.waitFor',
@@ -104,6 +105,8 @@ export interface NodeRuntimeOptions {
   personaFs?: { readFile(path: string): Promise<string>; joinPath(...parts: string[]): string };
   /** Optional usage tracker for cost/token tracking. Created automatically if not provided. */
   usageTracker?: DetailedUsageTracker;
+  /** Path for persistent config store. Defaults to ~/.crowclaw/runtime-config.json. Set to null to use in-memory only. */
+  configStorePath?: string | null;
 }
 
 function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
@@ -469,7 +472,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const schedulerStore = options.schedulerStore ?? new InMemorySchedulerStore();
   const skillStore = options.skillStore ?? new InMemorySkillStore();
   const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
-  const configStore = new RuntimeConfigStore();
+
+  // Config store: FileConfigStore for persistence, or in-memory if null
+  const defaultConfigPath = (() => {
+    try {
+      const os = require('node:os') as { homedir(): string };
+      const path = require('node:path') as { join(...parts: string[]): string };
+      return path.join(os.homedir(), '.crowclaw', 'runtime-config.json');
+    } catch {
+      return null;
+    }
+  })();
+  const configStore: RuntimeConfigStore =
+    options.configStorePath === null
+      ? new RuntimeConfigStore()
+      : new FileConfigStore(options.configStorePath ?? defaultConfigPath ?? '');
+
+  // If FileConfigStore, trigger lazy load
+  if (configStore instanceof FileConfigStore) {
+    void configStore.load();
+  }
+
   const skillRegistry = new SkillRegistry({ skillStore });
   const learning = new LearningPipeline(skillStore);
   learning.setRegistry(skillRegistry);
@@ -482,7 +505,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     workspaceStore,
     mcpClient
   });
-  const provider = options.provider ?? new EchoProvider();
+
+  // Provider: resolve from env/config if not explicitly provided
+  let provider = options.provider ?? new EchoProvider();
+  let providerReady = !!options.provider;
+  if (!options.provider) {
+    void resolveProviderFromConfig().then((resolved) => {
+      provider = resolved.provider;
+      providerReady = true;
+    });
+  }
+
   const toolsetPresets = new Map<string, (ReturnType<typeof listToolsetPresets>)[number]>(
     listToolsetPresets().map((preset) => [preset.name, preset])
   );
@@ -497,9 +530,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   skillRegistry.loadBuiltIn(getBuiltInSkills());
   void skillRegistry.refreshLearned();
 
-  // Load local skills from workspace if skillDir option or MERCURY_SKILL_DIR env var is set
+  // Load local skills from workspace if skillDir option or CROWCLAW_SKILL_DIR env var is set
   const envSkillDir = (globalThis as Record<string, unknown>).process
-    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env.MERCURY_SKILL_DIR
+    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env.CROWCLAW_SKILL_DIR
     : undefined;
   const skillDir = options.skillDir ?? envSkillDir;
   if (skillDir) {
@@ -639,6 +672,21 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     return provider;
   }
 
+  /** Default approval decider: auto-approve low/undefined, warn medium, reject high/critical */
+  function defaultApprovalDecider(tool: { manifest: { dangerLevel?: string } }): Promise<boolean> {
+    const level = tool.manifest.dangerLevel;
+    if (!level || level === 'low') {
+      return Promise.resolve(true);
+    }
+    if (level === 'medium') {
+      console.warn(`[CrowClaw] Tool with medium danger level — auto-approved with warning.`);
+      return Promise.resolve(true);
+    }
+    // high or critical: reject in non-interactive mode
+    console.warn(`[CrowClaw] Tool with danger level "${level}" rejected by default approval decider.`);
+    return Promise.resolve(false);
+  }
+
   function createConfiguredAgent(overrides?: ExecutionOverrides): AgentLoop {
     // Use persona registry's active prompt, falling back to the legacy personaPrompt
     const activePersonaPrompt = personaRegistry.getActive().prompt || personaPrompt;
@@ -648,6 +696,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       skills: buildConfiguredSkillManifests(overrides),
       agentPreset: resolveConfiguredAgentPreset(overrides),
       personaPrompt: activePersonaPrompt,
+      requireApprovalForDangerousTools: true,
+      approvalDecider: defaultApprovalDecider,
     });
   }
 
@@ -759,6 +809,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     },
   );
 
+  const autonomousScheduler = new AutonomousScheduler(schedulerExecutor);
+
   return {
     tools,
     store,
@@ -769,6 +821,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     configStore,
     mcpClient,
     plugins,
+    autonomousScheduler,
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
 
@@ -926,6 +979,46 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
               note: 'typecheck and tests passed at build time'
             }
           }
+        });
+      }
+
+      // Capabilities — runtime status of each subsystem for dashboard badges
+      if (request.method === 'GET' && url.pathname === '/api/capabilities') {
+        const providerName = typeof options.provider === 'object' && 'name' in (options.provider as unknown as Record<string, unknown>)
+          ? String((options.provider as unknown as Record<string, unknown>).name)
+          : '';
+        const providerModel = typeof options.provider === 'object' && 'model' in (options.provider as unknown as Record<string, unknown>)
+          ? String((options.provider as unknown as Record<string, unknown>).model)
+          : 'unknown';
+        const isEcho = providerName.toLowerCase().includes('echo') || !options.provider;
+        const dynamicMcpCap = mcpClient as unknown as { getStatus?: () => unknown };
+        const mcpStatus = dynamicMcpCap.getStatus ? dynamicMcpCap.getStatus() : null;
+        const hasMcp = Boolean(mcpStatus);
+        const hasGateway = Boolean(options.slackSigningSecret);
+        const toolCount = tools.list().length;
+        const skillCount = skillRegistry.resolve().length;
+
+        return Response.json({
+          provider: {
+            status: isEcho ? 'simulated' : 'live',
+            detail: isEcho ? 'EchoProvider' : `${providerName} ${providerModel}`.trim(),
+          },
+          chat: { status: isEcho ? 'simulated' : 'live' },
+          streaming: { status: 'live' },
+          tools: { status: 'live', detail: `${toolCount} registered` },
+          memory: { status: 'simulated', detail: 'In-memory only' },
+          skills: { status: 'live', detail: `${skillCount} built-in` },
+          scheduler: { status: 'live' },
+          gateway: {
+            status: hasGateway ? 'live' : 'disconnected',
+            detail: hasGateway ? 'Platform(s) configured' : 'No platforms configured',
+          },
+          mcp: {
+            status: hasMcp ? 'live' : 'disconnected',
+            detail: hasMcp ? 'Server(s) connected' : 'No servers connected',
+          },
+          browser: { status: 'simulated' },
+          workspace: { status: 'live', detail: 'File-backed' },
         });
       }
 
@@ -1109,21 +1202,29 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === routePaths.providers.route) {
         const body = (await request.json()) as { message?: string; hasTools?: boolean };
-        const primary = new EchoProvider();
-        const cheap = new EchoProvider();
+        // Use the resolved provider instead of always defaulting to EchoProvider
+        const primary = provider;
+        const cheap = provider instanceof AnthropicProvider
+          ? new AnthropicProvider({ apiKey: '', baseUrl: 'https://api.anthropic.com', model: 'claude-haiku-4' })
+          : provider instanceof OpenAICompatibleProvider
+            ? provider.withModel('gpt-4o-mini')
+            : provider;
         const router = new SmartModelRouter(primary, cheap);
         const message = typeof body.message === 'string' ? body.message : '';
         const hasTools = Boolean(body.hasTools);
-        const complexity = classifyQueryComplexity(message);
-        const selected = router.routeRequest({
+        const analysis = router.explainRoute({
           messages: [{ role: 'user', content: message, createdAt: new Date().toISOString() }],
           availableTools: hasTools ? [{ name: 'echo', description: 'Echo', runtime: 'worker', streaming: false, stateful: false, requiresWorkspace: false, requiresNetwork: false, dangerLevel: 'low' }] : []
         });
         return Response.json({
           message,
-          complexity,
-          hasTools,
-          selectedTier: selected === primary ? 'primary' : 'cheap'
+          complexity: analysis.complexity,
+          hasTools: analysis.hasTools,
+          selectedTier: analysis.selectedTier,
+          fallbackTier: analysis.fallbackTier,
+          signals: analysis.signals,
+          requiredCapabilities: analysis.requiredCapabilities,
+          recommendedModels: analysis.recommendedModels
         });
       }
 
@@ -1789,6 +1890,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }));
       }
 
+      if (request.method === 'GET' && url.pathname === '/api/terminal/backends') {
+        return Response.json(await tools.execute('terminal.backends', {}, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-backends',
+        }));
+      }
+
       if (request.method === 'GET' && url.pathname === '/api/terminal/processes') {
         return Response.json(await tools.execute('terminal.processes', {}, {
           agentId: options.agentId ?? 'crowclaw',
@@ -2398,6 +2506,77 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'POST' && url.pathname === '/api/scheduler/tick') {
         const results = await schedulerExecutor.tick();
         return Response.json({ ok: true, results });
+      }
+
+      // Scheduler job lifecycle routes
+      {
+        const jobActionMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)\/(pause|resume|history|dry-run)$/);
+        const jobDeleteMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)$/);
+
+        if (request.method === 'POST' && jobActionMatch) {
+          const jobId = decodeURIComponent(jobActionMatch[1]);
+          const action = jobActionMatch[2];
+
+          if (action === 'pause') {
+            const result = await schedulerExecutor.pauseJob(jobId);
+            if (!result) return Response.json({ error: 'Job not found' }, { status: 404 });
+            return Response.json(result);
+          }
+
+          if (action === 'resume') {
+            const result = await schedulerExecutor.resumeJob(jobId);
+            if (!result) return Response.json({ error: 'Job not found' }, { status: 404 });
+            return Response.json(result);
+          }
+
+          if (action === 'dry-run') {
+            try {
+              const record = await schedulerExecutor.dryRun(jobId);
+              return Response.json(record);
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : String(err);
+              return Response.json({ error: msg }, { status: 404 });
+            }
+          }
+        }
+
+        if (request.method === 'GET' && jobActionMatch) {
+          const jobId = decodeURIComponent(jobActionMatch[1]);
+          const action = jobActionMatch[2];
+
+          if (action === 'history') {
+            const limitParam = url.searchParams.get('limit');
+            const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+            const history = await schedulerStore.getRunHistory(jobId, limit);
+            return Response.json(history);
+          }
+        }
+
+        if (request.method === 'DELETE' && jobDeleteMatch) {
+          const jobId = decodeURIComponent(jobDeleteMatch[1]);
+          const deleted = await schedulerExecutor.deleteJob(jobId);
+          if (!deleted) return Response.json({ error: 'Job not found' }, { status: 404 });
+          return Response.json({ ok: true });
+        }
+      }
+
+      // Autonomous scheduler control
+      if (request.method === 'POST' && url.pathname === '/api/scheduler/start') {
+        autonomousScheduler.start();
+        return Response.json({ ok: true, running: true });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/scheduler/stop') {
+        autonomousScheduler.stop();
+        return Response.json({ ok: true, running: false });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/scheduler/status') {
+        return Response.json({
+          running: autonomousScheduler.isRunning(),
+          interval: autonomousScheduler.interval,
+          lastTick: autonomousScheduler.lastTick,
+        });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/workspace') {

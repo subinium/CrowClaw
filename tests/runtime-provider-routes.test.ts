@@ -18,7 +18,8 @@ describe('runtime provider routes', () => {
     }));
     expect(await simple.json()).toMatchObject({
       complexity: 'simple',
-      selectedTier: 'cheap'
+      selectedTier: 'cheap',
+      fallbackTier: 'primary'
     });
 
     const complex = await runtime.fetch(new Request(localRoute(routePaths.providers.route), {
@@ -29,7 +30,13 @@ describe('runtime provider routes', () => {
     expect(await complex.json()).toMatchObject({
       complexity: 'complex',
       selectedTier: 'primary',
-      hasTools: true
+      hasTools: true,
+      fallbackTier: 'cheap',
+      requiredCapabilities: expect.arrayContaining(['tools', 'reasoning']),
+      recommendedModels: expect.arrayContaining([
+        expect.objectContaining({ id: expect.any(String), rationale: expect.any(String) })
+      ]),
+      signals: expect.arrayContaining([expect.stringContaining('keyword:debug')])
     });
   });
 });

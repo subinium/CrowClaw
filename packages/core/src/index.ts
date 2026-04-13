@@ -5,6 +5,7 @@ import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
 import type { DetailedUsageTracker } from './usage-tracker.js';
+import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand } from './security.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -139,6 +140,17 @@ export type AgentStreamEvent =
   | { type: 'done'; response: string; usage?: ProviderResponseUsage }
   | { type: 'error'; error: string };
 
+export interface SecurityPolicy {
+  /** Redact credentials and PII from tool output before adding to conversation. Default: true */
+  redactToolOutput?: boolean;
+  /** Scan user input for prompt injection and add warnings to system context. Default: false */
+  scanUserInput?: boolean;
+  /** Scan commands before execution for dangerous patterns. Default: true */
+  scanCommands?: boolean;
+  /** Block tool calls when critical command risks are detected. Default: false (warn only) */
+  blockDangerousCommands?: boolean;
+}
+
 export interface AgentLoopOptions {
   maxToolIterations?: number;
   stopOnToolError?: boolean;
@@ -172,6 +184,8 @@ export interface AgentLoopOptions {
   enablePromptCaching?: boolean;
   /** Context window size for token-aware compression trigger. Track 2.1 */
   contextWindowSize?: number;
+  /** Security policy for runtime enforcement of credential redaction, injection scanning, and command scanning */
+  securityPolicy?: SecurityPolicy;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -375,6 +389,7 @@ export class AgentLoop {
   private readonly compressionProvider?: ProviderAdapter;
   private readonly enablePromptCaching: boolean;
   private readonly contextWindowSize?: number;
+  private readonly securityPolicy: Required<SecurityPolicy>;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -407,6 +422,12 @@ export class AgentLoop {
     this.compressionProvider = options.compressionProvider;
     this.enablePromptCaching = options.enablePromptCaching ?? false;
     this.contextWindowSize = options.contextWindowSize;
+    this.securityPolicy = {
+      redactToolOutput: options.securityPolicy?.redactToolOutput ?? true,
+      scanUserInput: options.securityPolicy?.scanUserInput ?? false,
+      scanCommands: options.securityPolicy?.scanCommands ?? true,
+      blockDangerousCommands: options.securityPolicy?.blockDangerousCommands ?? false,
+    };
   }
 
   /** Track 1.2: Record usage from a provider response and return total tokens consumed so far */
@@ -591,6 +612,39 @@ export class AgentLoop {
     throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'Provider generation failed.'));
   }
 
+  /** Scan a command string in tool input for dangerous patterns */
+  private scanToolCommandInput(toolCall: ToolCall): { blocked: boolean; warnings: string[] } {
+    if (!this.securityPolicy.scanCommands) return { blocked: false, warnings: [] };
+
+    const commandFields = ['command', 'cmd', 'script', 'code', 'shell', 'exec'];
+    const warnings: string[] = [];
+    let hasCritical = false;
+
+    for (const field of commandFields) {
+      const value = toolCall.input[field];
+      if (typeof value !== 'string') continue;
+
+      const result = scanCommand(value);
+      if (!result.safe) {
+        for (const risk of result.risks) {
+          warnings.push(`[SECURITY] Command risk (${risk.severity}): ${risk.description}`);
+          if (risk.severity === 'critical') hasCritical = true;
+        }
+      }
+    }
+
+    const blocked = hasCritical && this.securityPolicy.blockDangerousCommands;
+    return { blocked, warnings };
+  }
+
+  /** Apply redaction to tool output if security policy requires it */
+  private redactToolResult(result: ToolExecutionResult): ToolExecutionResult {
+    if (!this.securityPolicy.redactToolOutput) return result;
+    const redacted = redactToolOutputFn(result.output);
+    if (redacted === result.output) return result;
+    return { ...result, output: redacted, metadata: { ...result.metadata, securityRedacted: true } };
+  }
+
   private async executeToolCall(toolCall: ToolCall, input: AgentRunInput): Promise<ToolExecutionResult> {
     const context: ToolExecutionContext = {
       agentId: input.agentId,
@@ -615,7 +669,20 @@ export class AgentLoop {
 
     const definition = this.tools.get(toolCall.name);
     if (!definition) {
-      return this.tools.execute(toolCall.name, toolCall.input, context);
+      const rawResult = await this.tools.execute(toolCall.name, toolCall.input, context);
+      return this.redactToolResult(rawResult);
+    }
+
+    // Command scanning: check tool input for dangerous commands
+    const commandScan = this.scanToolCommandInput(toolCall);
+    if (commandScan.blocked) {
+      return {
+        toolName: definition.manifest.name,
+        runtime: definition.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
+        ok: false,
+        output: `Tool call blocked by security policy: ${commandScan.warnings.join('; ')}`,
+        metadata: { blockedBySecurity: true, securityWarnings: commandScan.warnings }
+      };
     }
 
     const dangerousSignals = collectDangerousInputSignals(toolCall.input);
@@ -637,7 +704,15 @@ export class AgentLoop {
       }
     }
 
-    return this.tools.execute(toolCall.name, toolCall.input, context);
+    const rawResult = await this.tools.execute(toolCall.name, toolCall.input, context);
+
+    // Append command scan warnings to output if present
+    if (commandScan.warnings.length > 0) {
+      const warned = { ...rawResult, output: `${rawResult.output}\n${commandScan.warnings.join('\n')}` };
+      return this.redactToolResult(warned);
+    }
+
+    return this.redactToolResult(rawResult);
   }
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
@@ -670,6 +745,18 @@ export class AgentLoop {
       createdAt: nowIso()
     } satisfies ConversationMessage];
 
+    // Security: scan user input for prompt injection
+    let injectionWarning: string | undefined;
+    if (this.securityPolicy.scanUserInput) {
+      const injectionScan = scanForEnhancedInjection(input.userMessage);
+      if (injectionScan.detected) {
+        const threatSummary = injectionScan.threats
+          .map(t => `${t.severity}: ${t.description}`)
+          .join('; ');
+        injectionWarning = `[SECURITY WARNING] Potential prompt injection detected in user input: ${threatSummary}`;
+      }
+    }
+
     const toolResults: ToolExecutionResult[] = [];
     let finalResponse: string | undefined;
     let tokenBudgetExceeded = false;
@@ -700,11 +787,16 @@ export class AgentLoop {
       }
     }
 
+    // Security: build base system prompt, then append injection warning if present
+    const baseSystemPrompt = input.systemPrompt
+      ? (injectionWarning ? `${input.systemPrompt}\n\n${injectionWarning}` : input.systemPrompt)
+      : injectionWarning;
+
     // Track 2.3: Use prompt caching-aware system prompt builder
     let currentResponse = await this.generateWithFallbacks({
       systemPrompt: this.buildSystemPromptForRequest({
         personaPrompt: this.personaPrompt,
-        basePrompt: input.systemPrompt,
+        basePrompt: baseSystemPrompt,
         runtimeName: this.runtimeName,
         sessionId: input.sessionId,
         workspaceId: input.workspaceId,
@@ -958,6 +1050,18 @@ export class AgentLoop {
       createdAt: nowIso(),
     }];
 
+    // Security: scan user input for prompt injection in streaming mode
+    let streamInjectionWarning: string | undefined;
+    if (this.securityPolicy.scanUserInput) {
+      const injectionScan = scanForEnhancedInjection(userMessage);
+      if (injectionScan.detected) {
+        const threatSummary = injectionScan.threats
+          .map(t => `${t.severity}: ${t.description}`)
+          .join('; ');
+        streamInjectionWarning = `[SECURITY WARNING] Potential prompt injection detected in user input: ${threatSummary}`;
+      }
+    }
+
     let finalResponse = '';
     let accumulatedUsage: ProviderResponseUsage | undefined;
     const toolResults: ToolExecutionResult[] = [];
@@ -995,7 +1099,7 @@ export class AgentLoop {
 
         // Stream from provider
         const systemPrompt = this.buildSystemPromptForRequest({
-          basePrompt: undefined,
+          basePrompt: streamInjectionWarning,
           runtimeName: this.runtimeName,
           sessionId: session.sessionId,
           workspaceId: session.workspaceId,
@@ -1079,6 +1183,22 @@ export class AgentLoop {
           const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
           yield { type: 'tool-start', toolName: tc.name, toolCallId };
 
+          // Security: command scanning in streaming path
+          const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input });
+          if (streamCmdScan.blocked) {
+            const blockedResult: ToolExecutionResult = {
+              toolName: tc.name,
+              runtime: 'worker',
+              ok: false,
+              output: `Tool call blocked by security policy: ${streamCmdScan.warnings.join('; ')}`,
+              metadata: { blockedBySecurity: true, securityWarnings: streamCmdScan.warnings },
+            };
+            toolResults.push(blockedResult);
+            nextMessages.push(toolMessage(blockedResult));
+            yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false };
+            continue;
+          }
+
           // Check approval gate
           const def = this.tools.get(tc.name);
           const dangerousSignals = collectDangerousInputSignals(tc.input);
@@ -1118,7 +1238,16 @@ export class AgentLoop {
             sessionId: session.sessionId,
             signal,
           };
-          const toolResult = await this.tools.execute(tc.name, tc.input, context);
+          let toolResult = await this.tools.execute(tc.name, tc.input, context);
+
+          // Security: append command scan warnings
+          if (streamCmdScan.warnings.length > 0) {
+            toolResult = { ...toolResult, output: `${toolResult.output}\n${streamCmdScan.warnings.join('\n')}` };
+          }
+
+          // Security: redact tool output in streaming path
+          toolResult = this.redactToolResult(toolResult);
+
           toolResults.push(toolResult);
           nextMessages.push(toolMessage(toolResult));
           yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok };
