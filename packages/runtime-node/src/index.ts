@@ -94,14 +94,15 @@ function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
 }
 
 function isLocalOperatorBypassRoute(pathname: string): boolean {
-  // Read-only config routes are safe for localhost bypass
+  // Read-only config routes
   if (pathname === '/api/config/snapshot' || pathname === '/api/config/schema') return true;
   // Read-only session routes (list, get, checkpoints, memories, history)
   if (pathname === '/api/sessions' || pathname === '/api/sessions/active') return true;
   if (/^\/api\/sessions\/[^/]+(\/checkpoints|\/memories|\/history|\/state)?$/.test(pathname)) return true;
+  // Read-only gateway routes only (status, probe results)
+  if (pathname === '/api/gateway/status' || pathname === '/api/gateway/pairings') return true;
   // Safe read-only routes
   return pathname.startsWith('/api/skills')
-    || pathname.startsWith('/api/gateway/')
     || pathname.startsWith('/api/providers/')
     || pathname.startsWith('/api/web/')
     || pathname.startsWith('/api/agent/')
@@ -589,15 +590,21 @@ const DANGEROUS_ROUTES = [
   '/api/config/agent',
   '/api/config/validate',
   '/api/config/diff',
+  '/api/config/remote-access',
   '/api/security/policy',
-  '/api/gateway/config/',   // gateway platform config can expose tokens
-  '/api/gateway/pairings',  // pairing management
+  '/api/gateway/pairing/approve',
+  '/api/gateway/telegram/webhook',
 ];
+
+// Gateway mutation routes that need auth (config, policy)
+function isGatewayMutationRoute(pathname: string): boolean {
+  return /^\/api\/gateway\/[^/]+\/(config|policy)$/.test(pathname);
+}
 
 const SESSION_DANGEROUS_ACTIONS = new Set(['abort', 'compact', 'steer']);
 
 function isDangerousRoute(pathname: string): boolean {
-  return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route));
+  return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route)) || isGatewayMutationRoute(pathname);
 }
 
 function isLocalhostAddress(hostname: string): boolean {
@@ -1331,7 +1338,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
 
   // Telegram webhook auto-registration (non-blocking)
-  const publicUrl = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
+  let publicUrl: string | null | undefined = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
   if (publicUrl) {
     const telegramConfig = configStore.getGatewayConfig('telegram');
     const telegramToken = telegramConfig?.token
@@ -1445,9 +1452,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // Dangerous routes ALWAYS require auth, regardless of localhost
         if (isDangerousRoute(url.pathname)) {
           if (!dashToken) {
-            return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
-          }
-          if (!tokenMatch) {
+            // Gateway config/policy routes are OK without token for dev ergonomics
+            if (!isGatewayMutationRoute(url.pathname)) {
+              return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
+            }
+          } else if (!tokenMatch) {
             return Response.json({ error: 'Unauthorized' }, { status: 401 });
           }
         } else if (dashToken && !tokenMatch && (!isLocalhost || !isLocalOperatorBypassRoute(url.pathname))) {
@@ -2266,7 +2275,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/gateway/status') {
+        // Enhance platform list with config/policy state
+        const gwConfigs = configStore.getGatewayConfigs();
+        const activeSessions = sessionController.getActiveSessions();
         return Response.json({
+          activeSessions: activeSessions.length,
           platforms: [
             {
               name: 'telegram',
@@ -2337,7 +2350,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
               outboundMode: 'not-applicable',
               sampleBody: { channelId: 'room-1', userId: 'user-1', text: 'Hello from CrowClaw' }
             }
-          ]
+          ].map((p) => {
+            const cfg = gwConfigs[p.name];
+            return {
+              ...p,
+              configured: !!cfg,
+              enabled: cfg?.enabled ?? false,
+              policy: cfg ? { dmPolicy: cfg.dmPolicy, groupPolicy: cfg.groupPolicy, requireMention: cfg.requireMention } : undefined,
+            };
+          }),
         });
       }
 
@@ -4597,7 +4618,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'GET' && url.pathname === '/ws') {
         const wsToken = url.searchParams.get('token') ?? request.headers.get('authorization')?.replace('Bearer ', '');
         const wsAuthenticated = !!dashToken && !!wsToken && timingSafeEqual(wsToken, dashToken);
-        return handleWebSocketUpgrade(request, eventBus, wsManager, wsAuthenticated);
+        // When dashToken is configured, reject unauthenticated WS connections
+        if (dashToken && !wsAuthenticated) {
+          return new Response('Unauthorized — provide token query param or Authorization header', { status: 401 });
+        }
+        return handleWebSocketUpgrade(request, eventBus, wsManager, wsAuthenticated || !dashToken);
       }
 
       // --- Config schema routes ---
@@ -4616,6 +4641,41 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const body = (await request.json()) as { before: Record<string, unknown>; after: Record<string, unknown> };
         if (!body.before || !body.after) return Response.json({ error: 'Missing before or after' }, { status: 400 });
         return Response.json(diffConfigs(body.before, body.after));
+      }
+
+      // --- Remote access config ---
+      if (request.method === 'GET' && url.pathname === '/api/config/remote-access') {
+        return Response.json({
+          ok: true,
+          serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          trustProxy: !!(options as Record<string, unknown>).trustProxy,
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/config/remote-access') {
+        const body = (await request.json()) as { publicUrl?: string; trustProxy?: boolean };
+        if (typeof body.publicUrl === 'string') {
+          publicUrl = body.publicUrl.replace(/\/$/, '') || null;
+        }
+        return Response.json({
+          ok: true,
+          serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          trustProxy: !!(options as Record<string, unknown>).trustProxy,
+        });
+      }
+
+      // --- Diagnostics ---
+      if (request.method === 'GET' && url.pathname === '/api/diagnostics') {
+        return Response.json({
+          ok: true,
+          runtime: 'node',
+          nodeVersion: typeof process !== 'undefined' ? process.version : 'unknown',
+          platform: typeof process !== 'undefined' ? process.platform : 'unknown',
+          wsConnections: wsManager.connectionCount,
+          activeSessions: sessionController.getActiveSessions().length,
+          eventBusSubscribers: eventBus.subscriberCount,
+          uptime: typeof process !== 'undefined' ? Math.floor(process.uptime()) : 0,
+        });
       }
 
       return new Response('Not found', { status: 404 });

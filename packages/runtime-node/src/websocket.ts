@@ -127,6 +127,8 @@ export class WebSocketManager {
     const message = JSON.stringify({ type, data });
     const toRemove: WebSocket[] = [];
     for (const [ws, conn] of this.connections) {
+      // Only broadcast to authenticated connections
+      if (!conn.authenticated) continue;
       if (conn.channels !== null && !conn.channels.has(type)) {
         continue;
       }

@@ -15,8 +15,10 @@ interface PairingEntry {
 
 interface ActiveSession {
   id: string;
+  sessionId?: string;
   model?: string;
   createdAt?: string;
+  startedAt?: string;
   status?: string;
 }
 
@@ -619,8 +621,13 @@ export class CrowClawApp extends LitElement {
     this.presenceOpen = !this.presenceOpen;
     if (this.presenceOpen) {
       try {
-        const res = await api<{ sessions: ActiveSession[] }>('/api/sessions/active');
-        this.activeSessions = res.sessions ?? [];
+        const res = await api<{ sessions: Array<{ sessionId: string; status: string; startedAt: string }> }>('/api/sessions/active');
+        this.activeSessions = (res.sessions ?? []).map((s) => ({
+          id: s.sessionId,
+          sessionId: s.sessionId,
+          status: s.status,
+          startedAt: s.startedAt,
+        }));
       } catch {
         this.activeSessions = [];
       }

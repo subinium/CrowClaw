@@ -71,9 +71,16 @@ interface UsageData {
 
 interface MemoryRecord {
   id: string;
+  sessionId: string;
+  scope: string;
+  scopeKey?: string;
+  summary: string;
+  tags: string[];
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+  // Computed aliases for UI compatibility
   key: string;
   value: string;
-  scope: string;
   timestamp: string;
 }
 
@@ -753,10 +760,15 @@ export class SettingsView extends LitElement {
       const params = new URLSearchParams();
       if (this.memoryScope !== 'All') params.set('scope', this.memoryScope);
       const q = params.toString();
-      const data = await api<{ records: MemoryRecord[] }>(
+      const data = await api<{ records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }> }>(
         `/api/sessions/${this.memorySessionId}/memories${q ? `?${q}` : ''}`,
       );
-      let records = data.records || [];
+      let records: MemoryRecord[] = (data.records || []).map((r) => ({
+        ...r,
+        key: r.tags?.[0] ?? r.id?.slice(0, 8) ?? 'memory',
+        value: r.summary ?? '',
+        timestamp: r.createdAt ?? '',
+      }));
       // Client-side search filter
       if (this.memorySearch) {
         const term = this.memorySearch.toLowerCase();
