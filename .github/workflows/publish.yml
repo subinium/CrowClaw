@@ -33,7 +33,7 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Publish workspace packages
-        run: npm publish --workspaces --access public
+      - name: Publish
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
