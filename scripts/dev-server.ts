@@ -153,6 +153,8 @@ function createAgentLoop(): AgentLoop {
     runtimeName: 'dev-server',
     skills,
     agentPreset: runtimeState.agentPreset ?? undefined,
+    synthesizeOnExhaustion: true,
+    maxToolResultLength: 2000,
   });
 }
 

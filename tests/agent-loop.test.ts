@@ -325,7 +325,8 @@ describe('AgentLoop', () => {
   it('stops when max tool iterations are exhausted', async () => {
     const tools = new ToolRegistry().register(createEchoTool());
     const agent = new AgentLoop(new ScriptedLoopProvider(), tools, new InMemorySessionStore(), {
-      maxToolIterations: 1
+      maxToolIterations: 1,
+      synthesizeOnExhaustion: false,
     });
 
     const result = await agent.run({

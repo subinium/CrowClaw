@@ -18,6 +18,8 @@ export interface PromptBuilderInput {
   matchedSkills?: MatchedSkill[];
   agentPreset?: { role: string; goal: string; backstory?: string };
   personaPrompt?: string;
+  /** Include reasoning guidance for tool usage. true = built-in, string = custom. Default: true when tools present. */
+  reasoningGuidance?: boolean | string;
 }
 
 export function buildSystemPrompt(input: PromptBuilderInput): string | undefined {
@@ -60,6 +62,13 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
   }
 
   if (input.availableTools && input.availableTools.length > 0) {
+    // Reasoning guidance — injected before tool list so the LLM reads behavior rules first
+    const includeGuidance = input.reasoningGuidance ?? true;
+    if (includeGuidance) {
+      const guidance = typeof includeGuidance === 'string' ? includeGuidance : buildReasoningGuidance(input.availableTools);
+      sections.push(guidance);
+    }
+
     const toolLines = input.availableTools
       .slice(0, 24)
       .map((tool) => `- ${tool.name} (${tool.runtime}, danger:${tool.dangerLevel})`);
@@ -67,4 +76,50 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
   }
 
   return sections.length > 0 ? sections.join('\n\n') : undefined;
+}
+
+function buildReasoningGuidance(tools: ToolManifest[]): string {
+  const hasWebTools = tools.some((t) => t.name.startsWith('web.'));
+  const hasWorkspaceTools = tools.some((t) => t.name.startsWith('workspace.'));
+
+  const lines: string[] = [
+    'Approach:',
+    '- Before calling a tool, briefly state what you need and why.',
+    '- After receiving results, summarize key findings before deciding next steps.',
+    '- Prefer a clear, well-sourced answer over exhaustive searching.',
+    '- Do not call the same tool with the same arguments twice.',
+  ];
+
+  if (hasWebTools) {
+    lines.push(
+      '',
+      'Research workflow:',
+      '- Search with a specific, well-formed query.',
+      '- Review results and pick 2-3 most relevant URLs.',
+      '- Fetch content from those URLs for details.',
+      '- Synthesize findings into a clear answer.',
+      '- If results are insufficient, try different search terms rather than repeating the same query.',
+    );
+  }
+
+  if (hasWorkspaceTools) {
+    lines.push(
+      '',
+      'File workflow:',
+      '- List or search files first to understand structure.',
+      '- Read specific files rather than guessing contents.',
+      '- Make targeted edits rather than rewriting entire files.',
+    );
+  }
+
+  lines.push(
+    '',
+    'When to stop using tools:',
+    '- You have enough information to answer the question confidently.',
+    '- Multiple sources confirm the same facts.',
+    '- Additional tool calls are unlikely to add significant new information.',
+    '- Do not exhaust your tool budget just because iterations remain.',
+  );
+
+  return lines.join('\n');
 }
