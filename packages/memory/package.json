@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/memory",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -18,7 +18,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.2.1",
-    "@crowclaw/storage": "0.2.1"
+    "@crowclaw/core": "0.3.0",
+    "@crowclaw/storage": "0.3.0"
   }
 }

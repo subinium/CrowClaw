@@ -41,6 +41,15 @@ describe('runtime terminal integration', () => {
     expect(backendStatusPayload.output).toContain('"installed"');
     expect(backendStatusPayload.output).toContain('"local"');
 
+    const probeResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.probe), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ backend: 'local' })
+    }));
+    const probePayload = await probeResponse.json() as { ok: boolean; output: string };
+    expect(probePayload.ok).toBe(true);
+    expect(probePayload.output).toContain('local-ok');
+
     const execResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',
       body: JSON.stringify({ command: 'printf "hello-terminal"' })

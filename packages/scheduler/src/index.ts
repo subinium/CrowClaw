@@ -25,6 +25,15 @@ export interface DeliveryTarget {
   config: Record<string, string>; // platform-specific (token, chatId, webhookUrl, etc.)
 }
 
+export interface JobRun {
+  runId: string;
+  startedAt: string;
+  completedAt: string;
+  success: boolean;
+  response?: string;
+  error?: string;
+}
+
 export interface CronJobDefinition {
   id: string;
   schedule: string;
@@ -46,6 +55,13 @@ export interface CronJobDefinition {
   runCount?: number;
   maxRuns?: number; // Auto-disable after N runs
   timeoutMs?: number; // Per-run timeout (default: 60000)
+  // Grace window
+  graceWindowMs?: number; // Default: 300_000 (5 min). Skip job if overdue by more than this.
+  // Run archival
+  runs?: JobRun[];
+  totalRuns?: number;
+  // One-shot completion
+  completedAt?: string;
 }
 
 export interface DueJob {
@@ -175,12 +191,22 @@ export class InMemorySchedulerStore implements SchedulerStore {
 // Schedule type detection
 // ---------------------------------------------------------------------------
 
+/** Returns true if the schedule is a one-shot format: once:<ts>, at:<ts>, after:<dur> */
+export function isOneShotSchedule(schedule: string): boolean {
+  const trimmed = schedule.trim().toLowerCase();
+  return (
+    trimmed.startsWith('once:') ||
+    trimmed.startsWith('at:') ||
+    trimmed.startsWith('after:')
+  );
+}
+
 /** Returns true if the schedule is a cron expression or cron alias */
 export function isCronSchedule(schedule: string): boolean {
   const trimmed = schedule.trim().toLowerCase();
   if (trimmed.startsWith('@')) return true;
   // 5-field cron: contains spaces and is not an interval format
-  return !trimmed.startsWith('every:') && trimmed.includes(' ');
+  return !trimmed.startsWith('every:') && !isOneShotSchedule(trimmed) && trimmed.includes(' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +226,58 @@ export function computeNextIntervalRun(
   intervalMinutes: number,
 ): string {
   return new Date(now.getTime() + intervalMinutes * 60_000).toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// One-shot schedule helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a duration string like '30m', '2h', '1d' into milliseconds.
+ * Supports m (minutes), h (hours), d (days).
+ */
+export function parseDurationMs(duration: string): number {
+  const match = duration.match(/^(\d+)(m|h|d)$/);
+  if (!match) throw new Error(`Invalid duration format: ${duration}`);
+  const value = Number(match[1]);
+  const unit = match[2];
+  switch (unit) {
+    case 'm': return value * 60_000;
+    case 'h': return value * 3_600_000;
+    case 'd': return value * 86_400_000;
+    default: throw new Error(`Unknown duration unit: ${unit}`);
+  }
+}
+
+/**
+ * Parse one-shot schedule formats and return an absolute ISO timestamp.
+ * - `once:<ISO timestamp>` — fire at exact time
+ * - `at:<ISO timestamp>` — alias for once:
+ * - `after:<duration>` — relative to `now`, e.g. `after:30m`, `after:2h`, `after:1d`
+ *
+ * Returns null if the schedule is not a one-shot format.
+ */
+export function parseOneShotSchedule(schedule: string, now = new Date()): string | null {
+  const trimmed = schedule.trim();
+
+  if (trimmed.startsWith('once:') || trimmed.startsWith('at:')) {
+    const prefix = trimmed.startsWith('once:') ? 'once:' : 'at:';
+    const timestamp = trimmed.slice(prefix.length).trim();
+    // Validate it parses as a date
+    const d = new Date(timestamp);
+    if (isNaN(d.getTime())) {
+      throw new Error(`Invalid ISO timestamp in schedule: ${timestamp}`);
+    }
+    return d.toISOString();
+  }
+
+  if (trimmed.startsWith('after:')) {
+    const durationStr = trimmed.slice('after:'.length).trim();
+    const ms = parseDurationMs(durationStr);
+    return new Date(now.getTime() + ms).toISOString();
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +310,7 @@ export function createEveryNMinutesJob(
 
 export function createScheduledAgentJob(options: {
   id: string;
-  schedule: string; // 'every:5m', 'every:1h', '0 9 * * *', '@daily'
+  schedule: string; // 'every:5m', 'every:1h', '0 9 * * *', '@daily', 'once:<ts>', 'at:<ts>', 'after:<dur>'
   task: string;
   skillSlugs?: string[];
   toolsetPreset?: string;
@@ -241,11 +319,19 @@ export function createScheduledAgentJob(options: {
   deliverTo?: DeliveryTarget;
   maxRuns?: number;
   timeoutMs?: number;
+  graceWindowMs?: number;
 }): CronJobDefinition {
   const now = new Date();
-  const nextRunAt = isCronSchedule(options.schedule)
-    ? computeNextCronRun(options.schedule, now)
-    : computeNextIntervalRun(now, parseIntervalMinutes(options.schedule));
+
+  let nextRunAt: string;
+  const oneShotTs = parseOneShotSchedule(options.schedule, now);
+  if (oneShotTs) {
+    nextRunAt = oneShotTs;
+  } else if (isCronSchedule(options.schedule)) {
+    nextRunAt = computeNextCronRun(options.schedule, now);
+  } else {
+    nextRunAt = computeNextIntervalRun(now, parseIntervalMinutes(options.schedule));
+  }
 
   return {
     id: options.id,
@@ -260,7 +346,10 @@ export function createScheduledAgentJob(options: {
     deliverTo: options.deliverTo,
     maxRuns: options.maxRuns,
     timeoutMs: options.timeoutMs,
+    graceWindowMs: options.graceWindowMs,
     runCount: 0,
+    totalRuns: 0,
+    runs: [],
     metadata: {},
   };
 }
@@ -269,19 +358,53 @@ export function createScheduledAgentJob(options: {
 // Due-job evaluation
 // ---------------------------------------------------------------------------
 
-export function isJobDue(job: CronJobDefinition, now = new Date()): boolean {
+/**
+ * Check if a job is due. Returns 'due', 'not-due', or 'overdue' (past grace window).
+ *
+ * Grace window only applies when `graceWindowMs` is explicitly set on the job.
+ * Jobs without a grace window configured are always 'due' once past their nextRunAt,
+ * preserving backward compatibility.
+ */
+export function checkJobDueStatus(
+  job: CronJobDefinition,
+  now = new Date(),
+): 'due' | 'not-due' | 'overdue' {
   if (!job.enabled || !job.nextRunAt) {
-    return false;
+    return 'not-due';
   }
-  return new Date(job.nextRunAt).getTime() <= now.getTime();
+  const dueTime = new Date(job.nextRunAt).getTime();
+  const nowMs = now.getTime();
+  if (dueTime > nowMs) {
+    return 'not-due';
+  }
+  // Grace window only enforced when explicitly configured
+  if (job.graceWindowMs !== undefined && nowMs - dueTime > job.graceWindowMs) {
+    return 'overdue';
+  }
+  return 'due';
+}
+
+export function isJobDue(job: CronJobDefinition, now = new Date()): boolean {
+  return checkJobDueStatus(job, now) === 'due';
 }
 
 export async function collectDueJobs(
   store: SchedulerStore,
   now = new Date(),
+  log?: (msg: string) => void,
 ): Promise<DueJob[]> {
   const jobs = await store.listJobs();
-  return jobs.map((job) => ({ job, due: isJobDue(job, now) }));
+  const result: DueJob[] = [];
+  for (const job of jobs) {
+    const status = checkJobDueStatus(job, now);
+    if (status === 'overdue') {
+      log?.(`Job "${job.id}" skipped: overdue by more than grace window (${job.graceWindowMs}ms)`);
+      result.push({ job, due: false });
+    } else {
+      result.push({ job, due: status === 'due' });
+    }
+  }
+  return result;
 }
 
 export async function markJobRun(
@@ -289,9 +412,16 @@ export async function markJobRun(
   job: CronJobDefinition,
   now = new Date(),
 ): Promise<CronJobDefinition> {
-  const nextRunAt = isCronSchedule(job.schedule)
-    ? computeNextCronRun(job.schedule, now)
-    : computeNextIntervalRun(now, parseIntervalMinutes(job.schedule));
+  let nextRunAt: string | undefined;
+
+  if (isOneShotSchedule(job.schedule)) {
+    // One-shot jobs don't get a next run — they are completed after execution
+    nextRunAt = undefined;
+  } else if (isCronSchedule(job.schedule)) {
+    nextRunAt = computeNextCronRun(job.schedule, now);
+  } else {
+    nextRunAt = computeNextIntervalRun(now, parseIntervalMinutes(job.schedule));
+  }
 
   const next = { ...job, nextRunAt };
   await store.saveJob(next);
@@ -324,7 +454,7 @@ export class SchedulerExecutor {
       const durationMs = Date.now() - startMs;
       results.push(result);
 
-      // Record run history
+      // Record run history (store-level)
       const runRecord: JobRunRecord = {
         jobId: job.id,
         runId: result.sessionId,
@@ -337,6 +467,21 @@ export class SchedulerExecutor {
       };
       await this.store.recordRun(runRecord);
 
+      // Build run archival entry
+      const jobRun: JobRun = {
+        runId: result.sessionId,
+        startedAt,
+        completedAt: result.executedAt,
+        success: result.ok,
+        response: result.response,
+        error: result.error,
+      };
+
+      // Keep last 10 runs
+      const existingRuns = [...(job.runs ?? [])];
+      existingRuns.push(jobRun);
+      const archivedRuns = existingRuns.slice(-10);
+
       // Update job state
       const updated: CronJobDefinition = {
         ...job,
@@ -345,11 +490,19 @@ export class SchedulerExecutor {
         lastRunError: result.error,
         lastRunResult: result.response?.slice(0, 500),
         runCount: (job.runCount ?? 0) + 1,
+        runs: archivedRuns,
+        totalRuns: (job.totalRuns ?? 0) + 1,
       };
 
       // Auto-disable if max runs reached
       if (job.maxRuns && updated.runCount! >= job.maxRuns) {
         updated.enabled = false;
+      }
+
+      // One-shot completion: disable after successful execution
+      if (isOneShotSchedule(job.schedule) && result.ok) {
+        updated.enabled = false;
+        updated.completedAt = new Date().toISOString();
       }
 
       await markJobRun(this.store, updated, now);

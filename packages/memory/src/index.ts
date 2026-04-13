@@ -1,5 +1,5 @@
 import type { ConversationMessage } from '@crowclaw/core';
-import type { MemoryRecord, MemoryStore } from '@crowclaw/storage';
+import type { MemoryRecord, MemoryStore, InMemorySessionStore } from '@crowclaw/storage';
 
 export interface MemoryNote {
   scope: 'session' | 'user' | 'workspace';
@@ -23,7 +23,13 @@ function isExpired(record: MemoryRecord): boolean {
 }
 
 export class MemoryService {
-  constructor(private readonly store?: MemoryStore) {}
+  private readonly store?: MemoryStore;
+  private readonly sessionStore?: InMemorySessionStore;
+
+  constructor(store?: MemoryStore, sessionStore?: InMemorySessionStore) {
+    this.store = store;
+    this.sessionStore = sessionStore;
+  }
 
   summarize(messages: ConversationMessage[], scope: MemoryNote['scope'] = 'session'): MemoryNote {
     const recentText = messages
@@ -141,6 +147,40 @@ export class MemoryService {
     return results.filter((r) => !isExpired(r)).slice(0, limit);
   }
 
+  async crossSessionRecall(query: string, limit = 5): Promise<Array<{ sessionId: string; summary: string; relevance: number }>> {
+    const results: Array<{ sessionId: string; summary: string; relevance: number }> = [];
+
+    // Gather matches from session store (message-level search across all sessions)
+    if (this.sessionStore) {
+      const sessionHits = await this.sessionStore.searchAll(query, limit * 2);
+      for (const hit of sessionHits) {
+        const bestScore = hit.matches[0]?.score ?? 0;
+        const preview = hit.matches
+          .slice(0, 2)
+          .map((m) => m.content.slice(0, 100))
+          .join(' | ');
+        results.push({ sessionId: hit.sessionId, summary: preview, relevance: bestScore });
+      }
+    }
+
+    // Gather matches from memory store (scope-level search across all scopes)
+    if (this.store) {
+      const memoryHits = await this.store.searchByScope('session', query, limit * 2);
+      for (const record of memoryHits) {
+        const existing = results.find((r) => r.sessionId === record.sessionId);
+        if (existing) {
+          // Boost relevance when both stores match the same session
+          existing.relevance += 1;
+        } else {
+          results.push({ sessionId: record.sessionId, summary: record.summary.slice(0, 200), relevance: 1 });
+        }
+      }
+    }
+
+    results.sort((a, b) => b.relevance - a.relevance);
+    return results.slice(0, limit);
+  }
+
   /** Remove all expired memories from the store. Returns the count of cleaned records. */
   async cleanup(sessionId: string): Promise<number> {
     if (!this.store) {
@@ -176,3 +216,10 @@ export {
   type EmbeddingMemoryStoreOptions
 } from './embedding-store.js';
 export { UserModelService, type UserProfile } from './user-model.js';
+export {
+  type MemoryRecord as ManagerMemoryRecord,
+  type MemoryProvider,
+  BuiltInMemoryProvider,
+  EmbeddingMemoryProvider,
+} from './memory-provider.js';
+export { MemoryManager } from './memory-manager.js';

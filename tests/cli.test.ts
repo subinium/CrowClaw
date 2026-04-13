@@ -31,7 +31,7 @@ describe('cli package', () => {
   it('suggests slash commands by prefix', () => {
     expect(suggestCliCommands('/mcp-')).toEqual(['/mcp-tools', '/mcp-status', '/mcp-inspect', '/mcp-resources', '/mcp-prompts', '/mcp-server-tools', '/mcp-server-call', '/mcp-auth', '/mcp-add', '/mcp-list', '/mcp-remove']);
     expect(suggestCliCommands('/bridge-')).toEqual(['/bridge-status', '/bridge-spawn', '/bridge-ping', '/bridge-terminate', '/bridge-capabilities', '/bridge-process', '/bridge-transcript']);
-    expect(suggestCliCommands('/terminal-')).toEqual(['/terminal-backends', '/terminal-backend-status', '/terminal-exec', '/terminal-background', '/terminal-processes', '/terminal-kill']);
+    expect(suggestCliCommands('/terminal-')).toEqual(['/terminal-backends', '/terminal-backend-status', '/terminal-probe', '/terminal-exec', '/terminal-background', '/terminal-processes', '/terminal-kill']);
     expect(suggestCliCommands('/pre')).toEqual(['/preflight']);
     expect(suggestCliCommands('/ver')).toEqual(['/version']);
     expect(suggestCliCommands('/release')).toEqual(['/release-check']);
@@ -70,7 +70,13 @@ describe('cli package', () => {
       return Response.json({});
     }));
 
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({
+      configStorePath: null,
+      initialProviderConfig: {
+        primary: { name: 'Primary', provider: 'openai', model: 'gpt-4o' },
+        fallback: { name: 'Fallback', provider: 'anthropic', model: 'claude-haiku-4' }
+      }
+    });
     const initial = { sessionId: 'cli-line-demo' };
 
     const help = await runCliInputLine('/help', initial, { runtime });
@@ -217,6 +223,10 @@ describe('cli package', () => {
     expect(providerPlan.output).toContain('"executionPlan"');
     expect(providerPlan.output).toContain('"fallbackChain"');
 
+    const providerFailoverPreview = await runCliInputLine('/provider-failover-preview', initial, { runtime });
+    expect(providerFailoverPreview.output).toContain('"simulation"');
+    expect(providerFailoverPreview.output).toContain('"fallback-attempt"');
+
     const providerRoute = await runCliInputLine('/provider-route debug this tool', initial, { runtime });
     expect(providerRoute.output).toContain('"selectedTier"');
     expect(providerRoute.output).toContain('"fallbackTier"');
@@ -225,7 +235,7 @@ describe('cli package', () => {
     const skills = await runCliInputLine('/skills', initial, { runtime });
     expect(skills.output).toContain('"skills"');
 
-    const draftCreateRuntime = createNodeRuntime();
+    const draftCreateRuntime = createNodeRuntime({ configStorePath: null });
     await draftCreateRuntime.fetch(new Request('http://localhost/api/learning/drafts', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'authorization': `Bearer ${cliToken}` },
@@ -356,6 +366,9 @@ describe('cli package', () => {
     const terminalBackendStatus = await runCliInputLine('/terminal-backend-status', chat.state, { runtime });
     expect(terminalBackendStatus.output).toContain('"installed"');
     expect(terminalBackendStatus.output).toContain('"local"');
+
+    const terminalProbe = await runCliInputLine('/terminal-probe local', chat.state, { runtime });
+    expect(terminalProbe.output).toContain('local-ok');
 
     const terminalExecPlan = await runCliInputLine('/terminal-exec --backend docker --container demo --plan printf hello-terminal-cli', chat.state, { runtime });
     expect(terminalExecPlan.output).toContain('docker exec demo');

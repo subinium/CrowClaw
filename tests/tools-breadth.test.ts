@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
+import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -223,6 +223,7 @@ describe('tool breadth extensions', () => {
       .register(createTerminalBackgroundTool())
       .register(createTerminalBackendsTool())
       .register(createTerminalBackendStatusTool())
+      .register(createTerminalProbeTool())
       .register(createTerminalProcessesTool())
       .register(createTerminalKillTool());
 
@@ -242,6 +243,13 @@ describe('tool breadth extensions', () => {
     expect(backendStatus.ok).toBe(true);
     expect(backendStatus.output).toContain('"installed"');
     expect(backendStatus.output).toContain('"local"');
+
+    const localProbe = await registry.execute('terminal.probe', { backend: 'local' }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-probe'
+    });
+    expect(localProbe.ok).toBe(true);
+    expect(localProbe.output).toContain('local-ok');
 
     const execResult = await registry.execute('terminal.exec', { command: 'printf "hello"' }, {
       agentId: 'crowclaw',

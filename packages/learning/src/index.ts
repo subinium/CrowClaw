@@ -498,3 +498,21 @@ export {
   createLlmSkillExtractor,
   type SkillExtractionProvider,
 } from './refinement.js';
+
+export {
+  compressTrajectory,
+  type CompressionStrategy,
+  type CompressedTrajectory,
+} from './trajectory-compressor.js';
+
+export {
+  scoreTrajectory,
+  type TrajectoryScore,
+} from './trajectory-scorer.js';
+
+export {
+  exportDPO,
+  exportSFT,
+  filterByScore,
+  rankByScore,
+} from './rl-export.js';

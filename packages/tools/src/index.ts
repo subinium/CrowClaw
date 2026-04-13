@@ -1,7 +1,7 @@
 import type { ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
 import { validateFetchUrl } from '@crowclaw/core';
 
-export { createDelegateTool, type DelegateToolOptions } from './delegate.js';
+export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
 export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js';
 import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision.js';
 export { createImageGenerateTool, type ImageGenerationOptions } from './image-gen.js';
@@ -617,6 +617,56 @@ export function createTerminalBackendStatusTool(): ToolDefinition {
           unavailable: statuses.filter((status) => !status.installed).map((status) => status.backend)
         }
       };
+    }
+  };
+}
+
+export function createTerminalProbeTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'terminal.probe',
+      description: 'Runs a benign probe for a terminal backend to confirm basic execution availability.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'medium'
+    },
+    async execute(input) {
+      const backend = normalizeTerminalBackend(input.backend);
+      const cp = await loadChildProcessModule();
+      const probeCommand = backend === 'local'
+        ? 'printf "local-ok"'
+        : backend === 'docker'
+          ? 'docker --version'
+          : backend === 'ssh'
+            ? 'ssh -V'
+            : '';
+      if (!probeCommand) {
+        return {
+          toolName: 'terminal.probe',
+          runtime: 'worker',
+          ok: false,
+          output: `${backend} backend is planned but has no executable probe yet.`,
+          metadata: { backend, planned: true }
+        };
+      }
+      return await new Promise<ToolExecutionResult>((resolve) => {
+        cp.exec(probeCommand, (error, stdout, stderr) => {
+          resolve({
+            toolName: 'terminal.probe',
+            runtime: 'worker',
+            ok: !error,
+            output: [stdout, stderr].filter(Boolean).join('').trim() || (error ? String(error.message) : ''),
+            metadata: {
+              backend,
+              probeCommand,
+              exitCode: error ? 1 : 0
+            }
+          });
+        });
+      });
     }
   };
 }
@@ -2644,6 +2694,7 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createTerminalBackgroundTool());
   registry.register(createTerminalBackendsTool());
   registry.register(createTerminalBackendStatusTool());
+  registry.register(createTerminalProbeTool());
   registry.register(createTerminalProcessesTool());
   registry.register(createTerminalKillTool());
   registry.register(createTodoTool());
@@ -2757,7 +2808,7 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   terminal: {
     name: 'terminal',
     description: 'Shell execution — terminal commands and process management',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.processes', 'terminal.kill'],
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.probe', 'terminal.processes', 'terminal.kill'],
   },
   workspace: {
     name: 'workspace',
@@ -2782,7 +2833,7 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
   devops: {
     name: 'devops',
     description: 'DevOps workflow — terminal, files, web fetch, git, process management, scheduler',
-    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch', 'scheduler.create', 'scheduler.list', 'scheduler.delete', 'scheduler.toggle'],
+    toolNames: ['echo', 'time', 'tool.list', 'terminal.exec', 'terminal.background', 'terminal.backends', 'terminal.backendStatus', 'terminal.probe', 'terminal.processes', 'terminal.kill', 'workspace.read', 'workspace.write', 'workspace.list', 'workspace.searchFiles', 'web.fetch', 'git.status', 'git.diff', 'git.log', 'git.commit', 'git.branch', 'scheduler.create', 'scheduler.list', 'scheduler.delete', 'scheduler.toggle'],
   },
   creative: {
     name: 'creative',

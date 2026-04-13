@@ -94,4 +94,30 @@ describe('runtime provider routes', () => {
     expect(payload.executionPlan.fallbackChain).toContain('anthropic');
     expect(payload.executionPlan.usesCompressionProvider).toBe(true);
   });
+
+  it('shows a simulated provider failover chain preview', async () => {
+    const runtime = createNodeRuntime({
+      configStorePath: null,
+      initialProviderConfig: {
+        primary: { name: 'Primary', provider: 'openai', model: 'gpt-4o' },
+        fallback: { name: 'Fallback', provider: 'anthropic', model: 'claude-haiku-4' }
+      }
+    });
+
+    const response = await runtime.fetch(new Request(localRoute(routePaths.providers.failoverPreview)));
+    const payload = await response.json() as {
+      configured: boolean;
+      chain: Array<{ slot: string; provider: string; model: string }>;
+      simulation: Array<{ attempt: number; slot: string; reason: string }>;
+      notes: string[];
+    };
+
+    expect(payload.configured).toBe(true);
+    expect(payload.chain).toEqual([
+      { slot: 'primary', provider: 'openai', model: 'gpt-4o' },
+      { slot: 'fallback', provider: 'anthropic', model: 'claude-haiku-4' }
+    ]);
+    expect(payload.simulation[1]).toMatchObject({ attempt: 2, slot: 'fallback', reason: 'fallback-attempt' });
+    expect(payload.notes[0]).toContain('Preview only');
+  });
 });

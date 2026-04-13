@@ -94,6 +94,7 @@ function isLocalOperatorBypassRoute(pathname: string): boolean {
   return pathname === '/api/config/snapshot'
     || pathname.startsWith('/api/skills')
     || pathname.startsWith('/api/gateway/')
+    || pathname.startsWith('/api/providers/')
     || pathname.startsWith('/api/sessions')
     || pathname.startsWith('/api/web/')
     || pathname.startsWith('/api/agent/')
@@ -1920,6 +1921,32 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         });
       }
 
+      if (request.method === 'GET' && url.pathname === routePaths.providers.failoverPreview) {
+        const providerCfg = configStore.getProviderConfig();
+        const chain = providerCfg
+          ? [
+              { slot: 'primary', provider: providerCfg.primary.provider, model: providerCfg.primary.model },
+              ...(providerCfg.fallback ? [{ slot: 'fallback', provider: providerCfg.fallback.provider, model: providerCfg.fallback.model }] : []),
+              ...(providerCfg.compression ? [{ slot: 'compression', provider: providerCfg.compression.provider, model: providerCfg.compression.model }] : [])
+            ]
+          : [{ slot: 'runtime-default', provider: 'resolved-provider', model: isModelOverridable(provider) ? provider.getModel() : 'default' }];
+        return Response.json({
+          configured: Boolean(providerCfg),
+          chain,
+          simulation: chain.map((entry, index) => ({
+            attempt: index + 1,
+            slot: entry.slot,
+            provider: entry.provider,
+            model: entry.model,
+            reason: index === 0 ? 'primary-attempt' : 'fallback-attempt'
+          })),
+          notes: [
+            'Preview only: no live provider request is executed.',
+            'Actual provider retries still depend on runtime errors and AgentLoop retry policy.'
+          ]
+        });
+      }
+
       if (request.method === 'POST' && url.pathname === routePaths.providers.route) {
         const body = (await request.json()) as { message?: string; hasTools?: boolean };
         // Use the resolved provider instead of always defaulting to EchoProvider
@@ -2913,6 +2940,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json(await tools.execute('terminal.backendStatus', {}, {
           agentId: options.agentId ?? 'crowclaw',
           sessionId: 'terminal-backend-status',
+        }));
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.terminal.probe) {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return Response.json(await tools.execute('terminal.probe', body, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'terminal-probe',
         }));
       }
 
