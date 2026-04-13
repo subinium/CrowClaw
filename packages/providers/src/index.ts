@@ -135,14 +135,24 @@ function normalizeToolShortcut(toolCall: ToolCall): ToolCall {
 }
 
 function resolveKnownTool(toolCall: ToolCall, availableTools: ToolManifest[]): ProviderResponse {
-  const known = availableTools.some((tool) => tool.name === toolCall.name) || availableTools.length === 0;
+  // Match by exact name or sanitized name (e.g., web_search → web.search)
+  const exactMatch = availableTools.find((tool) => tool.name === toolCall.name);
+  const sanitizedMatch = !exactMatch
+    ? availableTools.find((tool) => sanitizeToolName(tool.name) === toolCall.name)
+    : null;
+  const known = exactMatch || sanitizedMatch || availableTools.length === 0;
   if (!known) {
     return {
       assistantMessage: `Unknown tool: ${toolCall.name}`
     };
   }
 
-  const normalized = normalizeToolShortcut(toolCall);
+  // Restore original name if matched via sanitized form
+  const resolvedCall = sanitizedMatch
+    ? { ...toolCall, name: sanitizedMatch.name }
+    : toolCall;
+
+  const normalized = normalizeToolShortcut(resolvedCall);
   return {
     assistantMessage: `Scheduling tool ${normalized.name}.`,
     toolCalls: [normalized]
@@ -266,7 +276,7 @@ function buildAnthropicTools(availableTools: ToolManifest[]): AnthropicTool[] {
   return availableTools.map((tool) => ({
     name: tool.name,
     description: tool.description,
-    input_schema: {
+    input_schema: (tool.inputSchema as AnthropicTool['input_schema']) ?? {
       type: 'object' as const,
       properties: {}
     }
