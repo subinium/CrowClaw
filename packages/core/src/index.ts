@@ -1693,3 +1693,7 @@ export {
 export { collectStream, textStream, type StreamChunk, type StreamingProviderAdapter } from './streaming.js';
 
 export { compressWithStructure, mergeStructuredSummaries, formatStructuredSummary, type StructuredSummary, type StructuredCompressionResult, type StructuredCompressionOptions } from './structured-compression.js';
+
+export { ContextEngine, loadContextFiles, formatContextForPrompt, type ContextFile, type ContextEngineOptions, type ContextEngineResult } from './context-engine.js';
+
+export { identifyToolPairs, splitWithPairPreservation, extractPreflightFacts, createCompressionChild, type ToolCallPair, type ChildSessionResult } from './compression-utils.js';

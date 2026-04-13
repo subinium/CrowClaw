@@ -605,6 +605,7 @@ export class AgentView extends LitElement {
     return html`
       <div class="section-block">
         <div class="section-header">Identity</div>
+        <p style="font-size:var(--text-xs);color:var(--text-muted);margin-bottom:var(--sp-3)">Manage agent personas, toolsets, and MCP server configurations.</p>
         <div class="tabs">
           <div class="tab ${this.identityTab === 'personas' ? 'active' : ''}"
                @click=${() => { this.identityTab = 'personas'; }}>Personas</div>
@@ -647,18 +648,22 @@ export class AgentView extends LitElement {
     return html`
       <div class="section-block">
         <div class="section-header">Skills</div>
+        <p style="font-size:var(--text-xs);color:var(--text-muted);margin-bottom:var(--sp-3)">Reusable skill definitions that map trigger phrases to tool execution steps.</p>
 
         <div class="toolbar">
           <input class="srch"
                  type="text"
                  placeholder="Search skills..."
+                 aria-label="Search skills"
                  .value=${this.skillSearch}
                  @input=${(e: InputEvent) => { this.skillSearch = (e.target as HTMLInputElement).value; }}>
           <button class="btn btn-p"
+                  aria-label="Create skill"
                   @click=${() => { this._resetForm(); this.showSkillForm = true; this.showImportForm = false; }}>
             Create Skill
           </button>
           <button class="btn"
+                  aria-label="Import skill from markdown"
                   @click=${() => { this.showImportForm = !this.showImportForm; this.showSkillForm = false; this._resetForm(); }}>
             Import SKILL.md
           </button>
@@ -696,8 +701,8 @@ export class AgentView extends LitElement {
             `
           : nothing}
         <div class="skill-actions">
-          <button class="btn" @click=${() => this._editSkill(skill)}>Edit</button>
-          <button class="btn btn-danger" @click=${() => this._deleteSkill(skill.slug)}>Delete</button>
+          <button class="btn" aria-label="Edit skill" @click=${() => this._editSkill(skill)}>Edit</button>
+          <button class="btn btn-danger" aria-label="Delete skill" @click=${() => this._deleteSkill(skill.slug)}>Delete</button>
         </div>
       </div>
     `;
@@ -787,6 +792,7 @@ export class AgentView extends LitElement {
     return html`
       <div class="section-block">
         <div class="section-header">Config Presets</div>
+        <p style="font-size:var(--text-xs);color:var(--text-muted);margin-bottom:var(--sp-3)">Bundled configurations that combine MCP servers, skills, and tools into a single activatable preset.</p>
         ${this.configPresetsLoading
           ? html`<div class="loading">Loading config presets</div>`
           : this.configPresets.length === 0

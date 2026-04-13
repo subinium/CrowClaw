@@ -1891,3 +1891,10 @@ export interface ModelOverridable {
 export function isModelOverridable(provider: ProviderAdapter): provider is ProviderAdapter & ModelOverridable {
   return 'withModel' in provider && typeof (provider as unknown as ModelOverridable).withModel === 'function';
 }
+
+// ---------------------------------------------------------------------------
+// API mode resolver
+// ---------------------------------------------------------------------------
+
+export { resolveApiMode, modelSupports, getEndpointForModel, listApiModes, getRequestShape } from './api-mode.js';
+export type { ApiMode, ApiModeCapabilities, ResolvedMode, ModeRequestShape } from './api-mode.js';
