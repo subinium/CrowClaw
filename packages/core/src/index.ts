@@ -123,6 +123,8 @@ export interface AgentRunInput {
   userId?: string;
   env?: unknown;
   signal?: AbortSignal;
+  /** Pre-recalled memories to inject into the system prompt. */
+  memories?: string[];
 }
 
 export interface AgentRunResult {
@@ -133,8 +135,8 @@ export interface AgentRunResult {
 
 export type AgentStreamEvent =
   | { type: 'text-delta'; content: string }
-  | { type: 'tool-start'; toolName: string; toolCallId: string }
-  | { type: 'tool-end'; toolName: string; toolCallId: string; result: string; ok: boolean }
+  | { type: 'tool-start'; toolName: string; toolCallId: string; input?: Record<string, unknown> }
+  | { type: 'tool-end'; toolName: string; toolCallId: string; result: string; ok: boolean; durationMs?: number }
   | { type: 'iteration-start'; iteration: number }
   | { type: 'iteration-end'; iteration: number }
   | { type: 'done'; response: string; usage?: ProviderResponseUsage }
@@ -194,6 +196,12 @@ export interface AgentLoopOptions {
   maxToolResultLength?: number;
   /** Max approximate tokens for all skills in system prompt. Default: 4000 */
   skillTokenBudget?: number;
+  /** Inject error reflection prompt on tool failure instead of stopping immediately. Default: true */
+  errorReflection?: boolean;
+  /** Max number of error reflections before stopping. Default: 3 */
+  maxErrorReflections?: number;
+  /** Enable plan-before-act: inject planning instructions and replan on failure. Default: false */
+  planBeforeAct?: boolean;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -405,6 +413,9 @@ export class AgentLoop {
   private readonly securityAuditLog?: SecurityAuditLog;
   private readonly synthesizeOnExhaustion: boolean;
   private readonly maxToolResultLength: number;
+  private readonly errorReflection: boolean;
+  private readonly maxErrorReflections: number;
+  private readonly planBeforeAct: boolean;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -412,7 +423,7 @@ export class AgentLoop {
     private readonly sessions: SessionStore,
     options: AgentLoopOptions = {}
   ) {
-    this.maxToolIterations = options.maxToolIterations ?? 4;
+    this.maxToolIterations = options.maxToolIterations ?? 12;
     this.stopOnToolError = options.stopOnToolError ?? true;
     this.concurrentToolCalls = options.concurrentToolCalls ?? true;
     this.requireApprovalForDangerousTools = options.requireApprovalForDangerousTools ?? false;
@@ -450,6 +461,9 @@ export class AgentLoop {
     this.securityAuditLog = options.securityAuditLog;
     this.synthesizeOnExhaustion = options.synthesizeOnExhaustion ?? true;
     this.maxToolResultLength = options.maxToolResultLength ?? 2000;
+    this.errorReflection = options.errorReflection ?? true;
+    this.maxErrorReflections = options.maxErrorReflections ?? 3;
+    this.planBeforeAct = options.planBeforeAct ?? false;
   }
 
   /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
@@ -577,6 +591,7 @@ export class AgentLoop {
     matchedSkills?: MatchedSkill[];
     agentPreset?: { role: string; goal: string; backstory?: string };
     personaPrompt?: string;
+    memories?: string[];
   }): string | undefined {
     const prompt = buildSystemPrompt(promptParams);
     if (!prompt) return prompt;
@@ -873,6 +888,7 @@ export class AgentLoop {
         availableTools: this.tools.list(),
         matchedSkills,
         agentPreset: this.agentPreset,
+        memories: input.memories,
       }),
       messages: nextMessages,
       availableTools: this.tools.list(),
@@ -891,6 +907,18 @@ export class AgentLoop {
         ...(session.lineage ?? { rootSessionId: session.sessionId, compressionCount: 0 }),
       };
     }
+
+    // Plan-before-act: inject planning instructions so the LLM plans its approach
+    if (this.planBeforeAct && currentResponse.toolCalls && currentResponse.toolCalls.length > 0) {
+      nextMessages.push({
+        role: 'system',
+        content: 'Before executing tools, outline a brief plan: (1) what you intend to accomplish, (2) which tools you will use and in what order, (3) how you will handle potential failures. Then proceed with execution.',
+        createdAt: nowIso(),
+        metadata: { planBeforeAct: true },
+      });
+    }
+
+    let errorReflectionCount = 0;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
       ensureNotAborted(input.signal);
@@ -923,7 +951,8 @@ export class AgentLoop {
       if (this.autoCheckpoint && this.checkpointStore && currentResponse.toolCalls) {
         for (const tc of currentResponse.toolCalls) {
           const def = this.tools.get(tc.name);
-          if (def?.manifest.dangerLevel === 'high') {
+          const dangerousSignals = collectDangerousInputSignals(tc.input);
+          if (def?.manifest.dangerLevel === 'high' || dangerousSignals.length > 0) {
             await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
             break; // Only one pre-dangerous checkpoint per iteration
           }
@@ -931,7 +960,17 @@ export class AgentLoop {
       }
 
       const iterationResults = this.concurrentToolCalls && currentResponse.toolCalls.length > 1
-        ? await Promise.all(currentResponse.toolCalls.map((toolCall) => this.executeToolCall(toolCall, input)))
+        ? await Promise.allSettled(currentResponse.toolCalls.map((toolCall) => this.executeToolCall(toolCall, input)))
+            .then((settled) => settled.map((s, i) =>
+              s.status === 'fulfilled'
+                ? s.value
+                : {
+                    toolName: currentResponse.toolCalls![i]?.name ?? 'unknown',
+                    runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
+                    ok: false,
+                    output: s.reason instanceof Error ? s.reason.message : String(s.reason),
+                  }
+            ))
         : await currentResponse.toolCalls.reduce<Promise<ToolExecutionResult[]>>(async (accPromise, toolCall) => {
             const acc = await accPromise;
             const result = await this.executeToolCall(toolCall, input);
@@ -978,9 +1017,26 @@ export class AgentLoop {
         });
       }
 
-      if (encounteredToolError && this.stopOnToolError) {
-        finalResponse = 'Stopped after tool failure.';
-        break;
+      if (encounteredToolError) {
+        if (this.errorReflection && errorReflectionCount < this.maxErrorReflections) {
+          errorReflectionCount++;
+          const failedResults = iterationResults.filter(r => !r.ok);
+          const errorSummary = failedResults
+            .map(r => `- ${r.toolName}: ${r.output?.slice(0, 500) ?? 'unknown error'}`)
+            .join('\n');
+          const reflectionContent = this.planBeforeAct
+            ? `Tool execution failed (reflection ${errorReflectionCount}/${this.maxErrorReflections}):\n${errorSummary}\n\nReplan your approach: (1) analyze what went wrong, (2) devise an alternative strategy, (3) proceed with different parameters or tools. Do not retry the exact same call.`
+            : `Tool execution failed (reflection ${errorReflectionCount}/${this.maxErrorReflections}):\n${errorSummary}\n\nAnalyze what went wrong and try a different approach. Do not retry the exact same operation.`;
+          nextMessages.push({
+            role: 'system',
+            content: reflectionContent,
+            createdAt: nowIso(),
+            metadata: { errorReflection: true, reflectionCount: errorReflectionCount },
+          });
+        } else if (this.stopOnToolError) {
+          finalResponse = 'Stopped after tool failure.';
+          break;
+        }
       }
 
       // Track 2.1: Token-aware compression trigger
@@ -1188,6 +1244,8 @@ export class AgentLoop {
       }
     }
 
+    let streamErrorReflectionCount = 0;
+
     try {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
         ensureNotAborted(signal);
@@ -1275,80 +1333,143 @@ export class AgentLoop {
         });
 
         // Execute tool calls
-        for (const tc of streamToolCalls) {
-          const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
-          yield { type: 'tool-start', toolName: tc.name, toolCallId };
-
-          // Security: command scanning in streaming path
-          const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input });
-          if (streamCmdScan.blocked) {
-            const blockedResult: ToolExecutionResult = {
-              toolName: tc.name,
-              runtime: 'worker',
-              ok: false,
-              output: `Tool call blocked by security policy: ${streamCmdScan.warnings.join('; ')}`,
-              metadata: { blockedBySecurity: true, securityWarnings: streamCmdScan.warnings },
-            };
-            toolResults.push(blockedResult);
-            nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
-            yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false };
-            continue;
+        let encounteredToolError = false;
+        if (this.concurrentToolCalls && streamToolCalls.length > 1) {
+          // Emit all tool-start events
+          const concurrentStartTime = Date.now();
+          for (const tc of streamToolCalls) {
+            const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
+            (tc as any)._resolvedId = toolCallId;
+            yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
           }
+          // Execute all in parallel
+          const runInput: AgentRunInput = {
+            agentId: session.agentId,
+            sessionId: session.sessionId,
+            userMessage,
+            signal,
+          };
+          const settled = await Promise.allSettled(
+            streamToolCalls.map((tc) => this.executeToolCall(tc, runInput))
+          );
+          // Emit all tool-end events and collect results
+          for (let i = 0; i < settled.length; i++) {
+            const tc = streamToolCalls[i];
+            const toolCallId = (tc as any)._resolvedId ?? `tc-${tc.name}`;
+            const s = settled[i];
+            const result: ToolExecutionResult = s.status === 'fulfilled'
+              ? s.value
+              : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
 
-          // Check approval gate
-          const def = this.tools.get(tc.name);
-          const dangerousSignals = collectDangerousInputSignals(tc.input);
-          const needsApproval = this.requireApprovalForDangerousTools
-            && def && (def.manifest.dangerLevel === 'high' || dangerousSignals.length > 0);
+            toolResults.push(result);
+            nextMessages.push(toolMessage(result, this.maxToolResultLength));
+            yield { type: 'tool-end' as const, toolName: tc.name, toolCallId, result: result.output, ok: result.ok, durationMs: Date.now() - concurrentStartTime };
 
-          if (needsApproval) {
-            // Track 1.4: Checkpoint before dangerous tool
-            if (this.autoCheckpoint && this.checkpointStore) {
-              await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
+            if (!result.ok) encounteredToolError = true;
+          }
+        } else {
+          for (const tc of streamToolCalls) {
+            const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
+            const toolStartTime = Date.now();
+            yield { type: 'tool-start', toolName: tc.name, toolCallId, input: tc.input };
+
+            // Security: command scanning in streaming path
+            const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input });
+            if (streamCmdScan.blocked) {
+              const blockedResult: ToolExecutionResult = {
+                toolName: tc.name,
+                runtime: 'worker',
+                ok: false,
+                output: `Tool call blocked by security policy: ${streamCmdScan.warnings.join('; ')}`,
+                metadata: { blockedBySecurity: true, securityWarnings: streamCmdScan.warnings },
+              };
+              toolResults.push(blockedResult);
+              nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
+              yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false, durationMs: Date.now() - toolStartTime };
+              continue;
+            }
+
+            // Check approval gate
+            const def = this.tools.get(tc.name);
+            const dangerousSignals = collectDangerousInputSignals(tc.input);
+            const needsApproval = this.requireApprovalForDangerousTools
+              && def && (def.manifest.dangerLevel === 'high' || dangerousSignals.length > 0);
+
+            if (needsApproval) {
+              // Track 1.4: Checkpoint before dangerous tool
+              if (this.autoCheckpoint && this.checkpointStore) {
+                await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
+              }
+
+              const context: ToolExecutionContext = {
+                agentId: session.agentId,
+                sessionId: session.sessionId,
+              };
+              const approved = this.approvalDecider
+                ? await this.approvalDecider(def!, tc.input, context)
+                : false;
+
+              if (!approved) {
+                const blockedResult: ToolExecutionResult = {
+                  toolName: tc.name,
+                  runtime: 'worker',
+                  ok: false,
+                  output: `Tool requires approval: ${tc.name}`,
+                };
+                toolResults.push(blockedResult);
+                nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
+                yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false, durationMs: Date.now() - toolStartTime };
+                continue;
+              }
             }
 
             const context: ToolExecutionContext = {
               agentId: session.agentId,
               sessionId: session.sessionId,
+              signal,
             };
-            const approved = this.approvalDecider
-              ? await this.approvalDecider(def!, tc.input, context)
-              : false;
+            let toolResult = await this.tools.execute(tc.name, tc.input, context);
 
-            if (!approved) {
-              const blockedResult: ToolExecutionResult = {
-                toolName: tc.name,
-                runtime: 'worker',
-                ok: false,
-                output: `Tool requires approval: ${tc.name}`,
-              };
-              toolResults.push(blockedResult);
-              nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
-              yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false };
-              continue;
+            // Security: append command scan warnings
+            if (streamCmdScan.warnings.length > 0) {
+              toolResult = { ...toolResult, output: `${toolResult.output}\n${streamCmdScan.warnings.join('\n')}` };
+            }
+
+            // Security: redact tool output in streaming path
+            toolResult = this.redactToolResult(toolResult);
+
+            toolResults.push(toolResult);
+            nextMessages.push(toolMessage(toolResult, this.maxToolResultLength));
+            yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok, durationMs: Date.now() - toolStartTime };
+
+            if (!toolResult.ok) {
+              encounteredToolError = true;
+              if (this.errorReflection && streamErrorReflectionCount < this.maxErrorReflections) {
+                // Will be handled after all sequential tool calls complete
+              } else if (this.stopOnToolError) {
+                finalResponse = 'Stopped after tool failure.';
+                yield { type: 'iteration-end', iteration };
+                yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+                return;
+              }
             }
           }
+        }
 
-          const context: ToolExecutionContext = {
-            agentId: session.agentId,
-            sessionId: session.sessionId,
-            signal,
-          };
-          let toolResult = await this.tools.execute(tc.name, tc.input, context);
-
-          // Security: append command scan warnings
-          if (streamCmdScan.warnings.length > 0) {
-            toolResult = { ...toolResult, output: `${toolResult.output}\n${streamCmdScan.warnings.join('\n')}` };
-          }
-
-          // Security: redact tool output in streaming path
-          toolResult = this.redactToolResult(toolResult);
-
-          toolResults.push(toolResult);
-          nextMessages.push(toolMessage(toolResult, this.maxToolResultLength));
-          yield { type: 'tool-end', toolName: tc.name, toolCallId, result: toolResult.output, ok: toolResult.ok };
-
-          if (!toolResult.ok && this.stopOnToolError) {
+        if (encounteredToolError) {
+          if (this.errorReflection && streamErrorReflectionCount < this.maxErrorReflections) {
+            streamErrorReflectionCount++;
+            const failedResults = toolResults.filter(r => !r.ok).slice(-3);
+            const errorSummary = failedResults
+              .map(r => `- ${r.toolName}: ${r.output?.slice(0, 500) ?? 'unknown error'}`)
+              .join('\n');
+            nextMessages.push({
+              role: 'system',
+              content: `Tool execution failed (reflection ${streamErrorReflectionCount}/${this.maxErrorReflections}):\n${errorSummary}\n\nAnalyze what went wrong and try a different approach. Do not retry the exact same operation.`,
+              createdAt: nowIso(),
+              metadata: { errorReflection: true, reflectionCount: streamErrorReflectionCount },
+            });
+          } else if (this.stopOnToolError) {
             finalResponse = 'Stopped after tool failure.';
             yield { type: 'iteration-end', iteration };
             yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
@@ -1364,6 +1485,12 @@ export class AgentLoop {
         yield { type: 'iteration-end', iteration };
       }
 
+      // Save completion checkpoint
+      if (this.autoCheckpoint && this.checkpointStore) {
+        await this.checkpointStore.save(
+          createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, this.maxToolIterations, 'completion')
+        );
+      }
       yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
     } catch (error: unknown) {
       yield { type: 'error', error: error instanceof Error ? error.message : String(error) };

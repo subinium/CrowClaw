@@ -456,7 +456,6 @@ const results = await executor.tick()
 - **In-memory checkpoint and memory stores** -- conversation state and memories are lost on restart (except scheduler jobs, which use `FileSchedulerStore`). Persistent SQLite backend is planned for v0.2.0.
 - **Bag-of-words embeddings** -- `EmbeddingMemoryStore` uses a lightweight hash-based approach, not a real embedding model. Adequate for keyword-heavy recall but misses semantic similarity. Real embedding provider planned for v0.2.0.
 - **Cloudflare runtime** is functional but has narrower override support than Node.js -- local SKILL.md loading, persona directories, and some execution overrides are Node-only.
-- **Single-file dashboard** -- the web dashboard is a single HTML template literal (~2500 lines). Works but limits contributor velocity. Component extraction planned for v0.2.0.
 
 ## Environment Variables
 

@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/runtime-node",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -12,6 +12,18 @@
     "./route-paths": {
       "types": "./src/route-paths.ts",
       "import": "./dist/route-paths.js"
+    },
+    "./logger": {
+      "types": "./src/logger.ts",
+      "import": "./dist/logger.js"
+    },
+    "./session-mutex": {
+      "types": "./src/session-mutex.ts",
+      "import": "./dist/session-mutex.js"
+    },
+    "./event-bus": {
+      "types": "./src/event-bus.ts",
+      "import": "./dist/event-bus.js"
     }
   },
   "files": [

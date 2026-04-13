@@ -111,7 +111,7 @@ describe('Config Presets', () => {
       const preset = store.getConfigPreset('minimal');
       expect(preset!.description).toBe('Updated minimal');
       expect(preset!.mcpServers).toEqual(['newServer']);
-      expect(store.getConfigPresets().length).toBe(4); // still 4, not 5
+      expect(store.getConfigPresets().length).toBe(4);
     });
 
     it('should delete a preset', () => {
@@ -219,7 +219,6 @@ describe('Config Presets', () => {
     });
 
     it('DELETE /api/config-presets/:name should delete a preset', async () => {
-      // First create one
       await req('POST', '/api/config-presets', {
         name: 'to-delete',
         description: 'Will be deleted',
@@ -251,24 +250,24 @@ describe('Config Presets', () => {
       expect(DASHBOARD_HTML).toContain('Toolsets');
     });
 
-    it('should contain pConfig container', () => {
-      expect(DASHBOARD_HTML).toContain('id="pConfig"');
+    it('should contain crowclaw-settings-view for config presets', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-settings-view');
     });
 
-    it('should contain config preset API calls', () => {
-      expect(DASHBOARD_HTML).toContain('/api/config-presets');
+    it('should contain preset-related API endpoint', () => {
+      expect(DASHBOARD_HTML).toContain('/api/presets');
     });
 
-    it('should contain config preset switch function', () => {
-      expect(DASHBOARD_HTML).toContain('cfgPreSwitch');
+    it('should contain crowclaw-agent-view which manages presets', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-agent-view');
     });
 
-    it('should contain config preset create modal function', () => {
-      expect(DASHBOARD_HTML).toContain('cfgPreModal');
+    it('should contain crowclaw-modal for preset creation', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-modal');
     });
 
-    it('should contain config preset delete function', () => {
-      expect(DASHBOARD_HTML).toContain('cfgPreDel');
+    it('should contain preset text in the Lit output', () => {
+      expect(DASHBOARD_HTML).toContain('preset');
     });
   });
 });

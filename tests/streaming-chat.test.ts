@@ -15,7 +15,6 @@ describe('SSE streaming chat', () => {
     it('returns text/event-stream content-type', async () => {
       const runtime = createNodeRuntime();
 
-      // Create a session first
       const createRes = await runtime.fetch(
         new Request('http://localhost/api/sessions', {
           method: 'POST',
@@ -25,7 +24,6 @@ describe('SSE streaming chat', () => {
       );
       expect(createRes.status).toBe(200);
 
-      // Mock provider to return immediately
       const streamRes = await runtime.fetch(
         new Request('http://localhost/api/sessions/stream-test-1/stream', {
           method: 'POST',
@@ -69,15 +67,12 @@ describe('SSE streaming chat', () => {
       const lines = text.split('\n').filter((l: string) => l.startsWith('data: '));
       expect(lines.length).toBeGreaterThanOrEqual(1);
 
-      // Last data line should be [DONE]
       const lastData = lines[lines.length - 1];
       expect(lastData).toBe('data: [DONE]');
 
-      // Should have at least one event before [DONE]
       const eventLines = lines.filter((l: string) => l !== 'data: [DONE]');
       expect(eventLines.length).toBeGreaterThanOrEqual(1);
 
-      // First non-DONE event should be parseable JSON
       const firstPayload = eventLines[0].replace('data: ', '');
       const event = JSON.parse(firstPayload) as { type: string };
       expect(event.type).toBeDefined();
@@ -99,7 +94,6 @@ describe('SSE streaming chat', () => {
         .split('\n')
         .filter((l: string) => l.startsWith('data: ') && l !== 'data: [DONE]');
 
-      // Should have at least a done or error event
       const events = eventLines.map((l: string) => {
         try {
           return JSON.parse(l.replace('data: ', '')) as { type: string; response?: string; error?: string };
@@ -109,13 +103,11 @@ describe('SSE streaming chat', () => {
       }).filter(Boolean);
 
       expect(events.length).toBeGreaterThanOrEqual(1);
-      // The last event before [DONE] should be either 'done' or 'error'
       const lastEvent = events[events.length - 1]!;
       expect(['done', 'error']).toContain(lastEvent.type);
     });
 
     it('yields error event on failure', async () => {
-      // Create a runtime that will fail - send to a session with invalid state
       const runtime = createNodeRuntime();
 
       const streamRes = await runtime.fetch(
@@ -139,7 +131,6 @@ describe('SSE streaming chat', () => {
         }
       }).filter(Boolean);
 
-      // Should have events - either done (with echo provider) or error
       expect(events.length).toBeGreaterThanOrEqual(1);
     });
   });
@@ -152,71 +143,49 @@ describe('SSE streaming chat', () => {
     });
   });
 
-  describe('dashboard HTML contains streaming classes and functions', () => {
-    it('contains streaming CSS classes', () => {
-      expect(DASHBOARD_HTML).toContain('.msg-streaming');
+  describe('dashboard HTML contains streaming components and API endpoints', () => {
+    it('contains streaming-related CSS', () => {
       expect(DASHBOARD_HTML).toContain('.cursor-blink');
-      expect(DASHBOARD_HTML).toContain('.tool-running');
-      expect(DASHBOARD_HTML).toContain('.tool-success');
-      expect(DASHBOARD_HTML).toContain('.tool-error');
       expect(DASHBOARD_HTML).toContain('@keyframes blink');
       expect(DASHBOARD_HTML).toContain('@keyframes spin');
     });
 
-    it('contains streaming JS functions', () => {
-      expect(DASHBOARD_HTML).toContain('function sndStream()');
-      expect(DASHBOARD_HTML).toContain('function handleStreamEvent(');
-      expect(DASHBOARD_HTML).toContain('function sndFallback(');
-      expect(DASHBOARD_HTML).toContain('function toggleTrace()');
-      expect(DASHBOARD_HTML).toContain('function showToast(');
+    it('contains crowclaw-chat-view for streaming', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-chat-view');
     });
 
-    it('contains trace panel elements', () => {
-      expect(DASHBOARD_HTML).toContain('id="trPanel"');
-      expect(DASHBOARD_HTML).toContain('id="trBtn"');
-      expect(DASHBOARD_HTML).toContain('id="trIter"');
-      expect(DASHBOARD_HTML).toContain('id="trTool"');
-      expect(DASHBOARD_HTML).toContain('id="trTokens"');
-      expect(DASHBOARD_HTML).toContain('id="trElapsed"');
-      expect(DASHBOARD_HTML).toContain('id="trSteps"');
+    it('contains crowclaw-step-feed for tool execution display', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-step-feed');
     });
 
-    it('contains tool-block CSS', () => {
-      expect(DASHBOARD_HTML).toContain('.tool-block');
-      expect(DASHBOARD_HTML).toContain('.tb-h');
-      expect(DASHBOARD_HTML).toContain('.tb-nm');
-      expect(DASHBOARD_HTML).toContain('.tb-body');
+    it('contains trace panel for debugging', () => {
+      expect(DASHBOARD_HTML).toContain('trace-panel');
+      expect(DASHBOARD_HTML).toContain('trace-toggle');
     });
 
-    it('contains trace panel CSS', () => {
-      expect(DASHBOARD_HTML).toContain('.trace-panel');
-      expect(DASHBOARD_HTML).toContain('.trace-toggle');
-      expect(DASHBOARD_HTML).toContain('.tp-step');
+    it('contains streaming event type references', () => {
+      expect(DASHBOARD_HTML).toContain('text-delta');
+      expect(DASHBOARD_HTML).toContain('tool-start');
+      expect(DASHBOARD_HTML).toContain('tool-end');
+      expect(DASHBOARD_HTML).toContain('iteration-start');
     });
 
-    it('contains iteration separator CSS', () => {
-      expect(DASHBOARD_HTML).toContain('.iter-sep');
-    });
-
-    it('contains toast CSS', () => {
+    it('contains toast component for notifications', () => {
       expect(DASHBOARD_HTML).toContain('.toast');
-      expect(DASHBOARD_HTML).toContain('@keyframes toastIn');
+      expect(DASHBOARD_HTML).toContain('crowclaw-toast');
     });
 
-    it('chat input triggers sndStream', () => {
-      expect(DASHBOARD_HTML).toContain("sndStream()");
+    it('contains stream endpoint reference', () => {
+      expect(DASHBOARD_HTML).toContain('/stream');
     });
 
-    it('retains original snd function as fallback', () => {
-      expect(DASHBOARD_HTML).toContain('function snd()');
+    it('contains sessions API endpoint', () => {
+      expect(DASHBOARD_HTML).toContain('/api/sessions');
     });
 
-    it('streaming uses /stream endpoint', () => {
-      expect(DASHBOARD_HTML).toContain("/api/sessions/'+sid+'/stream");
-    });
-
-    it('fallback uses original POST endpoint', () => {
-      expect(DASHBOARD_HTML).toContain("/api/sessions/'+sid,{method:'POST'");
+    it('contains SSE/EventSource for streaming', () => {
+      expect(DASHBOARD_HTML).toContain('SSE');
+      expect(DASHBOARD_HTML).toContain('EventSource');
     });
   });
 

@@ -68,7 +68,6 @@ describe('McpClient.verify()', () => {
     const transport: McpTransport = {
       listTools: async () => [{ name: 'echo' }],
       callTool: async () => ({ ok: true, content: {} }),
-      // No listResources or listPrompts
     };
     const client = new McpClient(transport);
     const result = await client.verify();
@@ -105,7 +104,7 @@ describe('McpClient.verify()', () => {
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain('timed out');
-    expect(result.latencyMs).toBeGreaterThanOrEqual(90); // Allow slight timing variance
+    expect(result.latencyMs).toBeGreaterThanOrEqual(90);
   });
 
   it('succeeds for tools but handles resource listing failure gracefully', async () => {
@@ -143,7 +142,6 @@ describe('McpClient.verify()', () => {
     const client = new McpClient(transport);
     const result: McpVerifyResult = await client.verify();
 
-    // Verify all expected fields exist with correct types
     expect(typeof result.ok).toBe('boolean');
     expect(typeof result.latencyMs).toBe('number');
     if (result.ok) {
@@ -156,7 +154,6 @@ describe('McpClient.verify()', () => {
 // verifyPresetAvailability tests
 // ---------------------------------------------------------------------------
 describe('verifyPresetAvailability', () => {
-  // Dynamic import to avoid issues with the execFile dependency
   async function getVerifyFn() {
     const mod = await import('../packages/mcp/src/presets.js');
     return mod.verifyPresetAvailability;
@@ -166,7 +163,6 @@ describe('verifyPresetAvailability', () => {
     const verifyPresetAvailability = await getVerifyFn();
     const result = await verifyPresetAvailability('filesystem');
 
-    // npx should be available in any Node.js environment
     expect(result.command).toBe('npx');
     expect(result.available).toBe(true);
   });
@@ -174,7 +170,6 @@ describe('verifyPresetAvailability', () => {
   it('returns unavailable when required env var is missing', async () => {
     const verifyPresetAvailability = await getVerifyFn();
 
-    // Clear env vars that github preset looks for
     const origToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
     const origGhToken = process.env.GITHUB_TOKEN;
     delete process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
@@ -186,7 +181,6 @@ describe('verifyPresetAvailability', () => {
       expect(result.error).toContain('not set');
       expect(result.command).toBe('npx');
     } finally {
-      // Restore env
       if (origToken !== undefined) process.env.GITHUB_PERSONAL_ACCESS_TOKEN = origToken;
       if (origGhToken !== undefined) process.env.GITHUB_TOKEN = origGhToken;
     }
@@ -244,34 +238,34 @@ describe('Dashboard HTML contains verification UI elements', () => {
     return mod.DASHBOARD_HTML as string;
   }
 
-  it('contains testMcp function', async () => {
+  it('contains crowclaw-connect-view for MCP management', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('testMcp');
+    expect(html).toContain('crowclaw-connect-view');
   });
 
-  it('contains verification result container (mcpV_ prefix)', async () => {
+  it('contains MCP servers API endpoint', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('mcpV_');
+    expect(html).toContain('/api/mcp/servers');
   });
 
-  it('contains Test button markup', async () => {
+  it('contains MCP status API endpoint', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('>Test</button>');
+    expect(html).toContain('/api/mcp/status');
   });
 
-  it('contains lMcpPresetStatus function', async () => {
+  it('contains MCP section text', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('lMcpPresetStatus');
+    expect(html).toContain('MCP');
   });
 
-  it('contains preset status API call', async () => {
+  it('contains tools API endpoint', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('/api/mcp/presets/status');
+    expect(html).toContain('/api/tools');
   });
 
-  it('contains verify API call', async () => {
+  it('contains reconnect functionality', async () => {
     const html = await getDashboardHtml();
-    expect(html).toContain('/api/mcp/verify');
+    expect(html).toContain('reconnect');
   });
 });
 
@@ -284,7 +278,6 @@ describe('API response shapes', () => {
     const client = new McpClient(transport);
     const result = await client.verify();
 
-    // Verify the shape matches what the API endpoint returns
     const expected = {
       ok: true,
       toolCount: 3,

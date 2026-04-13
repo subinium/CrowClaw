@@ -10,9 +10,13 @@ import {
   type NormalizedInboundMessage,
   type TelegramUpdate,
   buildTelegramApiBase,
+  buildGatewayRetryPolicy,
+  createTypingIndicator,
   normalizeTelegramWebhook,
   sendTelegramMessage,
 } from './index.js';
+import { executeWithRetry } from './retry.js';
+import { PlatformRateLimiter } from './platform-rate-limiter.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -101,6 +105,7 @@ export class GatewayRunner {
   private statuses: Map<string, GatewayStatus> = new Map();
   private telegramPollers: Map<string, TelegramPollerState> = new Map();
   private running = false;
+  private readonly platformRateLimiter = new PlatformRateLimiter();
 
   constructor(config: GatewayRunnerConfig) {
     this.config = config;
@@ -240,12 +245,26 @@ export class GatewayRunner {
         if (!normalized) continue;
 
         if (this.config.onMessage) {
+          const typing = createTypingIndicator(poller.botToken, normalized.channelId);
           try {
             const reply = await this.config.onMessage(normalized);
+            typing.stop();
             if (reply) {
-              await sendTelegramMessage(poller.botToken, normalized.channelId, reply);
+              // Per-platform rate limit check
+              if (!this.platformRateLimiter.check('telegram')) {
+                // Rate limited — skip this reply silently
+                continue;
+              }
+              // Retry with exponential backoff on send failure
+              const retryPolicy = buildGatewayRetryPolicy('telegram');
+              await executeWithRetry(
+                () => sendTelegramMessage(poller.botToken, normalized.channelId, reply, { parseMode: 'Markdown' }),
+                retryPolicy,
+                poller.abortController.signal,
+              );
             }
           } catch {
+            typing.stop();
             // Silently handle callback errors to keep polling alive
           }
         }

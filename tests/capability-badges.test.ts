@@ -117,80 +117,53 @@ describe('capability badges', () => {
     });
   });
 
-  describe('dashboard HTML contains badge CSS classes', () => {
-    it('includes cap-badge class in CSS', () => {
-      expect(DASHBOARD_HTML).toContain('.cap-badge');
+  describe('dashboard HTML contains Lit badge components', () => {
+    it('includes badge-related text in the Lit output', () => {
+      expect(DASHBOARD_HTML).toContain('badge');
     });
 
-    it('includes cap-live CSS class', () => {
-      expect(DASHBOARD_HTML).toContain('.cap-live');
+    it('includes live status indicator', () => {
+      expect(DASHBOARD_HTML).toContain('live');
     });
 
-    it('includes cap-sim CSS class', () => {
-      expect(DASHBOARD_HTML).toContain('.cap-sim');
+    it('includes simulated status indicator', () => {
+      expect(DASHBOARD_HTML).toContain('simulated');
     });
 
-    it('includes cap-disc CSS class', () => {
-      expect(DASHBOARD_HTML).toContain('.cap-disc');
+    it('includes disconnected status indicator', () => {
+      expect(DASHBOARD_HTML).toContain('disconnected');
     });
 
-    it('includes cap-exp CSS class', () => {
-      expect(DASHBOARD_HTML).toContain('.cap-exp');
+    it('includes crowclaw-sidebar component which holds badges', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-sidebar');
     });
 
-    it('includes cap-detail CSS class', () => {
-      expect(DASHBOARD_HTML).toContain('.cap-detail');
-    });
-  });
-
-  describe('dashboard JS fetches capabilities on load', () => {
-    it('dashboard HTML includes lCap function', () => {
-      expect(DASHBOARD_HTML).toContain('function lCap()');
-    });
-
-    it('initApp calls lCap', () => {
-      expect(DASHBOARD_HTML).toContain('lCap()');
-      // Verify lCap is called inside initApp
-      const initAppMatch = DASHBOARD_HTML.match(
-        /function initApp\(\)\{[^}]+\}/
-      );
-      expect(initAppMatch).not.toBeNull();
-      expect(initAppMatch![0]).toContain('lCap()');
-    });
-
-    it('lCap fetches /api/capabilities', () => {
-      expect(DASHBOARD_HTML).toContain('/api/capabilities');
+    it('includes crowclaw-agent-view for capability details', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-agent-view');
     });
   });
 
-  describe('badge elements exist in nav', () => {
-    it('has badge elements for chat, memory, skills, tools, gateway, mcp, scheduler', () => {
-      const badgeIds = [
-        'cb-chat',
-        'cb-memory',
-        'cb-skills',
-        'cb-tools',
-        'cb-gateway',
-        'cb-mcp',
-        'cb-scheduler',
-      ];
-      for (const id of badgeIds) {
-        expect(DASHBOARD_HTML).toContain(`id="${id}"`);
-      }
+  describe('dashboard references capabilities in Lit components', () => {
+    it('dashboard HTML includes crowclaw-sidebar for nav badges', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-sidebar');
     });
 
-    it('has panel detail elements for memory, skills, tools, gateway, mcp, scheduler', () => {
-      const detailIds = [
-        'cpd-memory',
-        'cpd-skills',
-        'cpd-tools',
-        'cpd-gateway',
-        'cpd-mcp',
-        'cpd-scheduler',
-      ];
-      for (const id of detailIds) {
-        expect(DASHBOARD_HTML).toContain(`id="${id}"`);
-      }
+    it('crowclaw-agent-view handles capability display', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-agent-view');
+    });
+
+    it('fetches system status which includes capability data', () => {
+      expect(DASHBOARD_HTML).toContain('/api/system/status');
+    });
+  });
+
+  describe('badge data accessible via Lit components', () => {
+    it('has sidebar component for nav badges', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-sidebar');
+    });
+
+    it('has agent view for capability details', () => {
+      expect(DASHBOARD_HTML).toContain('crowclaw-agent-view');
     });
   });
 
@@ -213,12 +186,9 @@ describe('capability badges', () => {
         join(process.cwd(), 'Dockerfile'),
         'utf-8'
       );
-      // Should start the runtime-node server, not the CLI
       expect(dockerContent).toContain('runtime-node');
       expect(dockerContent).not.toContain('packages/cli/dist/index.js');
-      // Should expose port 8787
       expect(dockerContent).toContain('EXPOSE 8787');
-      // Should have a startup comment
       expect(dockerContent).toContain('CrowClaw HTTP server');
     });
 

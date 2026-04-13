@@ -1,4 +1,7 @@
 import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { createLogger, type Logger } from './logger.js';
+import { SessionMutex } from './session-mutex.js';
+import { EventBus } from './event-bus.js';
 import {
   buildDiscordDispatch,
   buildDiscordEditPayload,
@@ -24,6 +27,7 @@ import {
   buildTelegramDispatch,
   buildTelegramSendPayload,
   buildTelegramSendUrl,
+  createTypingIndicator,
   normalizeGenericWebhook,
   normalizeDiscordWebhook,
   normalizeEmailWebhook,
@@ -47,8 +51,14 @@ import {
   type PairingChallenge,
   type ProbeResult,
   type GatewayPlatform,
+  sendTelegramMessage,
+  sendDiscordMessage,
+  sendSlackMessage,
+  setTelegramWebhook,
+  deleteTelegramWebhook,
+  getTelegramWebhookInfo,
 } from '@crowclaw/gateway';
-import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry } from '@crowclaw/learning';
+import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry, createLlmSkillExtractor } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { CrowClawMcpServer } from '@crowclaw/mcp-server';
 import { MemoryService, EmbeddingMemoryStore, type EmbeddingProvider } from '@crowclaw/memory';
@@ -56,9 +66,9 @@ import { UserModelService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
-import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@crowclaw/tools';
+import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
-import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun } from '@crowclaw/scheduler';
+import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun, type DeliveryFn, type DeliveryTarget } from '@crowclaw/scheduler';
 import { AcpServer } from '@crowclaw/acp';
 import { RuntimeConfigStore, FileConfigStore } from './config-store.js';
 import type { CodeBridgeSession } from './bridge-state.js';
@@ -134,6 +144,8 @@ export interface NodeRuntimeOptions {
   discordPublicKey?: string;
   /** Per-platform webhook secrets. Used for platforms without built-in signature verification. */
   webhookSecrets?: Record<string, string>;
+  /** Public HTTPS URL for this server. Used for auto-registering Telegram webhooks on startup. */
+  publicUrl?: string;
 }
 
 function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
@@ -536,6 +548,7 @@ const DANGEROUS_ROUTES = [
   '/api/mcp/servers',  // CRUD for custom MCP servers — can define commands to spawn
   '/api/providers/config',
   '/api/config/provider',
+  '/api/config/agent',
   '/api/security/policy',
   '/api/gateway/config/',   // gateway platform config can expose tokens
   '/api/gateway/pairings',  // pairing management
@@ -691,12 +704,28 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     configStore.setProviderConfig(options.initialProviderConfig ?? null);
   }
 
-  // Security audit log and rate limiter
+  // Security audit log, rate limiters, logger, and session mutex
   const securityAuditLog = new SecurityAuditLog(500);
   const rateLimiter = new RateLimiter();
+  const authRateLimiter = new RateLimiter();
+  const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
+  const sessionMutex = new SessionMutex();
+  const eventBus = new EventBus();
 
   const skillRegistry = new SkillRegistry({ skillStore });
-  const learning = new LearningPipeline(skillStore);
+
+  // Wire LLM skill extractor — uses the current provider for intelligent skill extraction
+  const llmSkillExtractor = createLlmSkillExtractor(async (prompt: string) => {
+    if (!providerReady) return ''; // provider not resolved yet
+    const result = await provider.generate({
+      messages: [{ role: 'user', content: prompt, createdAt: new Date().toISOString() }],
+      systemPrompt: 'You are a skill extraction assistant. Output valid JSON only.',
+      availableTools: [],
+    });
+    return result.assistantMessage ?? '';
+  });
+
+  const learning = new LearningPipeline(skillStore, { extractionProvider: llmSkillExtractor });
   learning.setRegistry(skillRegistry);
   const memoryService = new MemoryService(memoryStore);
   const userModelService = new UserModelService(memoryStore);
@@ -706,7 +735,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     sessionSearchStore: store,
     memoryStore,
     workspaceStore,
-    mcpClient
+    mcpClient,
+    recallFn: (sessionId: string, query: string, limit: number) => memoryService.recall(sessionId, query, limit)
   });
 
   // Provider: resolve from env/config if not explicitly provided
@@ -914,7 +944,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (isModelOverridable(provider)) {
         return provider.withModel(overrides.model);
       }
-      console.warn(`[crowclaw] Model override '${overrides.model}' requested but provider does not support withModel(). Using default.`);
+      log.warn('Model override requested but provider does not support withModel()', { requestedModel: overrides.model });
     }
     return provider;
   }
@@ -926,11 +956,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       return Promise.resolve(true);
     }
     if (level === 'medium') {
-      console.warn(`[CrowClaw] Tool with medium danger level — auto-approved with warning.`);
+      log.warn('Tool with medium danger level auto-approved', { dangerLevel: 'medium' });
       return Promise.resolve(true);
     }
     // high or critical: reject in non-interactive mode
-    console.warn(`[CrowClaw] Tool with danger level "${level}" rejected by default approval decider.`);
+    log.warn('Tool rejected by default approval decider', { dangerLevel: level });
     return Promise.resolve(false);
   }
 
@@ -979,9 +1009,33 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     workspaceId?: string;
     systemPrompt: string;
   }, overrides?: ExecutionOverrides) {
+    // Auto-recall relevant memories (non-blocking — proceed without memories on failure)
+    let memories: string[] = [];
+    try {
+      const [recalled, profile] = await Promise.all([
+        memoryService.recall(input.sessionId, input.userMessage, 5),
+        userModelService.getProfile(input.sessionId, input.userId ?? 'default-user'),
+      ]);
+      memories = recalled.map(r => r.summary);
+      // Inject user profile context if meaningful data exists
+      if (profile.expertise.length > 0 || profile.preferences.length > 0) {
+        const profileParts: string[] = [];
+        if (profile.expertise.length > 0) {
+          profileParts.push(`User expertise: ${profile.expertise.slice(0, 8).join(', ')}`);
+        }
+        if (profile.preferences.length > 0) {
+          profileParts.push(`User preferences: ${profile.preferences.slice(0, 5).join('; ')}`);
+        }
+        memories.push(...profileParts);
+      }
+    } catch {
+      // Memory recall failed — proceed without memories
+    }
+
     const result = await createConfiguredAgent(overrides).run({
       agentId: options.agentId ?? 'crowclaw',
-      ...input
+      ...input,
+      memories,
     });
     // Update user model from conversation (fire-and-forget)
     void userModelService.updateFromConversation(result.session.messages, input.sessionId).catch(() => {});
@@ -1089,6 +1143,41 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   const checkpointStore = new InMemoryCheckpointStore();
 
+  // Delivery function — routes scheduled job results to gateway platforms
+  const deliverToGateway: DeliveryFn = async (target: DeliveryTarget, content: string) => {
+    const { platform, config: cfg } = target;
+    try {
+      switch (platform) {
+        case 'telegram': {
+          const token = cfg.token ?? configStore.getGatewayConfig('telegram')?.token;
+          const chatId = cfg.channel ?? cfg.chatId;
+          if (!token || !chatId) return { ok: false, error: 'Missing Telegram token or chatId' };
+          // sendTelegramMessage handles splitting and Markdown fallback internally
+          const result = await sendTelegramMessage(token, chatId, content, { parseMode: 'Markdown' });
+          if (!result.ok) return { ok: false, error: result.error ?? 'Telegram send failed' };
+          return { ok: true };
+        }
+        case 'discord': {
+          const webhookUrl = cfg.webhookUrl ?? cfg.channel;
+          if (!webhookUrl) return { ok: false, error: 'Missing Discord webhook URL' };
+          const result = await sendDiscordMessage(webhookUrl, content);
+          return { ok: result.ok, error: result.error };
+        }
+        case 'slack': {
+          const token = cfg.token ?? configStore.getGatewayConfig('slack')?.token;
+          const channel = cfg.channel;
+          if (!token || !channel) return { ok: false, error: 'Missing Slack token or channel' };
+          const result = await sendSlackMessage(token, channel, content);
+          return { ok: result.ok, error: result.error };
+        }
+        default:
+          return { ok: false, error: `Unsupported delivery platform: ${platform}` };
+      }
+    } catch (err: unknown) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+
   // Scheduler executor — runs the real agent for scheduled jobs
   // Uses ExecutionOverrides (no global state mutation)
   const schedulerExecutor = new SchedulerExecutor(
@@ -1117,18 +1206,58 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         })),
       };
     },
+    deliverToGateway,
   );
 
   const autonomousScheduler = new AutonomousScheduler(schedulerExecutor);
+
+  // Register scheduler tools so the LLM can create/list/delete/toggle jobs from chat
+  if (tools instanceof ToolRegistry) {
+    registerSchedulerTools(tools, schedulerStore, autonomousScheduler);
+  }
+
+  // Auto-start scheduler if there are existing jobs
+  schedulerStore.listJobs().then((jobs) => {
+    if (jobs.length > 0) {
+      autonomousScheduler.start();
+    }
+  }).catch(() => { /* scheduler store may not be ready yet */ });
 
   // Startup security check: warn loudly if no dashboard token is set
   const startupDashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
   if (!startupDashToken) {
     const bindHost = options.hostname ?? '127.0.0.1';
     if (!isLocalhostAddress(bindHost)) {
-      console.error('[SECURITY] CROWCLAW_DASHBOARD_TOKEN is not set but server binds to non-localhost (%s). All admin API routes including /api/terminal/exec are UNAUTHENTICATED. Set CROWCLAW_DASHBOARD_TOKEN before deploying.', bindHost);
+      log.error('CROWCLAW_DASHBOARD_TOKEN is not set on non-localhost — admin API routes are unauthenticated', { component: 'security', bindHost });
     } else {
-      console.warn('[SECURITY] CROWCLAW_DASHBOARD_TOKEN is not set. Dangerous routes (/api/terminal/*, /api/workspace/write) are disabled. Set CROWCLAW_DASHBOARD_TOKEN to enable full functionality.');
+      log.warn('CROWCLAW_DASHBOARD_TOKEN is not set — dangerous routes disabled', { component: 'security' });
+    }
+  }
+
+  // Telegram webhook auto-registration (non-blocking)
+  const publicUrl = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
+  if (publicUrl) {
+    const telegramConfig = configStore.getGatewayConfig('telegram');
+    const telegramToken = telegramConfig?.token
+      ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_TELEGRAM_TOKEN;
+    if (telegramToken && telegramConfig?.enabled !== false) {
+      const webhookUrl = `${publicUrl.replace(/\/$/, '')}/webhooks/telegram`;
+      if (!webhookUrl.startsWith('https://')) {
+        log.warn('Telegram webhook auto-registration skipped: publicUrl must use HTTPS', { component: 'gateway', publicUrl });
+      } else {
+        const webhookSecret = options.telegramWebhookSecret ?? telegramConfig?.webhookSecret;
+        setTelegramWebhook(telegramToken, webhookUrl, {
+          secretToken: webhookSecret,
+        }).then((result) => {
+          if (result.ok) {
+            log.info('Telegram webhook registered', { component: 'gateway', webhookUrl });
+          } else {
+            log.error('Telegram webhook registration failed', { component: 'gateway', description: result.description ?? 'unknown error' });
+          }
+        }).catch((error: unknown) => {
+          log.error('Telegram webhook registration error', { component: 'gateway', error: error instanceof Error ? error.message : String(error) });
+        });
+      }
     }
   }
 
@@ -1145,11 +1274,29 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     mcpClient,
     plugins,
     autonomousScheduler,
+    log,
+    sessionMutex,
+    eventBus,
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
       const bindHostname = options.hostname ?? '127.0.0.1';
       const isLocalhost = isLocalhostAddress(bindHostname);
+
+      // Stricter rate limit for auth endpoints: 5 requests per minute per IP
+      // Must run before auth handlers which return early
+      if (url.pathname.startsWith('/api/auth/')) {
+        const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+          ?? request.headers.get('x-real-ip')
+          ?? '127.0.0.1';
+        if (!authRateLimiter.check(clientIp, 5, 60_000)) {
+          log.warn('Auth rate limit exceeded', { component: 'security', clientIp, path: url.pathname });
+          return Response.json(
+            { error: 'Too many authentication attempts. Limit: 5 per minute.' },
+            { status: 429, headers: { 'Retry-After': '60' } }
+          );
+        }
+      }
 
       // Auth verification endpoint
       if (request.method === 'POST' && url.pathname === '/api/auth/verify') {
@@ -1201,7 +1348,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
       }
 
-      // Rate limiting for /api/* routes: 100 requests per minute per IP
+      // General rate limiting for /api/* routes: 100 requests per minute per IP
       if (url.pathname.startsWith('/api/')) {
         const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
           ?? request.headers.get('x-real-ip')
@@ -2002,20 +2149,28 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           start(controller) {
             const encoder = new TextEncoder();
             const send = (event: string, data: unknown) => {
-              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+              try {
+                controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+              } catch { /* stream closed */ }
             };
 
             send('status', { type: 'connected', timestamp: new Date().toISOString() });
 
+            // Subscribe to all runtime events
+            const unsubscribe = eventBus.subscribe((event) => {
+              send(event.type, { ...event.data, timestamp: event.timestamp });
+            });
+
             const heartbeat = setInterval(() => {
-              try {
-                send('heartbeat', { timestamp: new Date().toISOString(), sessions: (store as unknown as { size?: number }).size ?? 0 });
-              } catch {
-                clearInterval(heartbeat);
-              }
+              send('heartbeat', {
+                timestamp: new Date().toISOString(),
+                sessions: (store as unknown as { size?: number }).size ?? 0,
+                subscribers: eventBus.subscriberCount,
+              });
             }, 15000);
 
             request.signal?.addEventListener('abort', () => {
+              unsubscribe();
               clearInterval(heartbeat);
               try { controller.close(); } catch { /* already closed */ }
             });
@@ -2271,18 +2426,31 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildTelegramDispatch(payload as never)!;
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling a Telegram runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        const telegramToken = configStore.getGatewayConfig('telegram')?.token;
+        const chatId = String(message.channelId);
+        const typing = telegramToken ? createTypingIndicator(telegramToken, chatId) : null;
+        try {
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: dispatch.payload.userMessage,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling a Telegram runtime event.'
+          });
+          typing?.stop();
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          if (idempotencyKey) {
+            await gatewayIdempotencyStore.mark(idempotencyKey);
+          }
+          // Send the agent response back to the Telegram chat
+          if (telegramToken && chatId && result.finalResponse) {
+            await sendTelegramMessage(telegramToken, chatId, result.finalResponse, { parseMode: 'Markdown' });
+          }
+          return Response.json(result);
+        } catch (err: unknown) {
+          typing?.stop();
+          throw err;
         }
-        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/slack') {
@@ -3499,6 +3667,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const sessionId = parts[2] ?? crypto.randomUUID();
         const action = parts[3] ?? 'message';
 
+        // Acquire per-session mutex for message/stream actions to prevent race conditions
+        const needsMutex = action === 'message' || action === 'stream';
+        const releaseMutex = needsMutex ? await sessionMutex.acquire(sessionId) : undefined;
+        try {
+          return await (async (): Promise<Response> => {
+
         if (action === 'checkpoint') {
           const session = await store.get(sessionId);
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
@@ -3626,7 +3800,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                     userMessage: body.message,
                     userId: body.userId,
                     workspaceId: body.workspaceId,
-                    systemPrompt: 'You are CrowClaw running in a generic Node runtime.'
+                    systemPrompt: 'You are CrowClaw, an AI assistant with tool-use capabilities. You can search the web, read/write files, manage scheduled tasks and reminders, and more. Use your available tools proactively to fulfill user requests.'
                   });
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', response: result.finalResponse })}\n\n`));
                 }
@@ -3649,19 +3823,26 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
 
         const body = (await request.json()) as { userMessage: string; userId?: string; workspaceId?: string };
+        eventBus.emit('chat:message', { sessionId, userMessage: body.userMessage });
         const result = await runConfiguredAgent({
           sessionId,
           userMessage: body.userMessage,
           userId: body.userId,
           workspaceId: body.workspaceId,
-          systemPrompt: 'You are CrowClaw running in a generic Node runtime.'
+          systemPrompt: 'You are CrowClaw, an AI assistant with tool-use capabilities. You can search the web, read/write files, manage scheduled tasks and reminders, and more. Use your available tools proactively to fulfill user requests.'
         });
         await memoryService.captureSessionSummary(sessionId, result.session.messages);
         // Auto-capture skills from completed conversations (Hermes self-improvement pattern)
         if (result.toolResults.length > 0) {
           learning.autoCapture(result.session.messages, sessionId).catch(() => { /* best-effort */ });
         }
+        eventBus.emit('chat:complete', { sessionId, toolCount: result.toolResults.length });
         return Response.json(result);
+
+          })(); // end mutex-guarded IIFE
+        } finally {
+          releaseMutex?.();
+        }
       }
 
       // --- Mutation API endpoints (dashboard config management) ---
@@ -3831,6 +4012,47 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({ ok: true, platform, policy: configStore.getGatewayConfig(platform) });
       }
 
+      // --- Telegram webhook management routes ---
+
+      if (request.method === 'POST' && url.pathname === '/api/gateway/telegram/webhook') {
+        const body = await request.json() as { url?: string; secretToken?: string; maxConnections?: number; allowedUpdates?: string[] };
+        const telegramConfig = configStore.getGatewayConfig('telegram');
+        const token = telegramConfig?.token;
+        if (!token) {
+          return Response.json({ ok: false, error: 'Telegram bot token not configured' }, { status: 400 });
+        }
+        const targetUrl = body.url ?? (publicUrl ? `${publicUrl.replace(/\/$/, '')}/webhooks/telegram` : undefined);
+        if (!targetUrl) {
+          return Response.json({ ok: false, error: 'No webhook URL provided and no publicUrl configured' }, { status: 400 });
+        }
+        const result = await setTelegramWebhook(token, targetUrl, {
+          secretToken: body.secretToken ?? options.telegramWebhookSecret ?? telegramConfig?.webhookSecret,
+          maxConnections: body.maxConnections,
+          allowedUpdates: body.allowedUpdates,
+        });
+        return Response.json(result, { status: result.ok ? 200 : 400 });
+      }
+
+      if (request.method === 'DELETE' && url.pathname === '/api/gateway/telegram/webhook') {
+        const telegramConfig = configStore.getGatewayConfig('telegram');
+        const token = telegramConfig?.token;
+        if (!token) {
+          return Response.json({ ok: false, error: 'Telegram bot token not configured' }, { status: 400 });
+        }
+        const result = await deleteTelegramWebhook(token);
+        return Response.json(result, { status: result.ok ? 200 : 400 });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/gateway/telegram/webhook') {
+        const telegramConfig = configStore.getGatewayConfig('telegram');
+        const token = telegramConfig?.token;
+        if (!token) {
+          return Response.json({ ok: false, error: 'Telegram bot token not configured' }, { status: 400 });
+        }
+        const result = await getTelegramWebhookInfo(token);
+        return Response.json(result);
+      }
+
       if (request.method === 'POST' && url.pathname === '/api/gateway/pairing/approve') {
         const body = await request.json() as { code: string };
         const challenge = configStore.getPendingPairings().find((pairing) => pairing.code === body.code.toUpperCase());
@@ -3863,6 +4085,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             Object.keys(snapshot.gatewayConfigs as Record<string, unknown>).map((k) => [k, { configured: true }])
           ),
         });
+      }
+
+      // Agent config (loop settings)
+      if (request.method === 'GET' && url.pathname === routePaths.config.agent) {
+        return Response.json({ config: configStore.getAgentConfig() });
+      }
+
+      if (request.method === 'POST' && url.pathname === routePaths.config.agent) {
+        const body = await request.json() as Partial<Record<string, unknown>>;
+        configStore.setAgentConfig(body as Partial<import('./config-store.js').AgentConfig>);
+        return Response.json({ ok: true, config: configStore.getAgentConfig() });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/usage') {

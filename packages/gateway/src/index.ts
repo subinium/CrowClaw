@@ -937,6 +937,95 @@ export function buildTelegramApiBase(botToken: string): string {
   return `https://api.telegram.org/bot${botToken}`;
 }
 
+/**
+ * Split a text into chunks that fit within Telegram's message size limit.
+ * Prefers splitting at paragraph boundaries (\n\n), then single newlines,
+ * then forces a hard split at maxLength.
+ */
+export function splitTelegramMessage(text: string, maxLength: number = 4096): string[] {
+  if (text.length <= maxLength) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to split at a paragraph boundary (\n\n)
+    let splitAt = remaining.lastIndexOf('\n\n', maxLength);
+    if (splitAt < maxLength * 0.3) {
+      // Try single newline
+      splitAt = remaining.lastIndexOf('\n', maxLength);
+    }
+    if (splitAt < maxLength * 0.3) {
+      // Force split at maxLength
+      splitAt = maxLength;
+    }
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, '');
+  }
+  return chunks;
+}
+
+// --- Telegram Typing Indicator ---
+
+/**
+ * Send a chat action (e.g. "typing") to a Telegram chat.
+ * Errors are caught and returned — never throws.
+ */
+export async function sendTelegramChatAction(
+  botToken: string,
+  chatId: string,
+  action: string = 'typing',
+): Promise<{ ok: boolean }> {
+  try {
+    const url = `${buildTelegramApiBase(botToken)}/sendChatAction`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action }),
+    });
+    const data = await res.json() as { ok?: boolean };
+    return { ok: data.ok === true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * Create a repeating typing indicator for a Telegram chat.
+ * Immediately sends a "typing" action, then repeats every `intervalMs`.
+ * Telegram's typing indicator expires after ~5s, so 4000ms is a safe default.
+ * Returns a `stop()` handle to cancel the interval.
+ */
+export function createTypingIndicator(
+  botToken: string,
+  chatId: string,
+  intervalMs: number = 4000,
+): { stop: () => void } {
+  let stopped = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+
+  // Fire immediately (non-blocking — ignore result)
+  void sendTelegramChatAction(botToken, chatId);
+
+  timer = setInterval(() => {
+    if (stopped) return;
+    void sendTelegramChatAction(botToken, chatId);
+  }, intervalMs);
+
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    },
+  };
+}
+
 export function buildTelegramSendUrl(botToken: string): string {
   return `${buildTelegramApiBase(botToken)}/sendMessage`;
 }
@@ -956,19 +1045,19 @@ export interface GatewaySendResult {
 }
 
 /**
- * Send a message via Telegram Bot API.
+ * Send a single (unsplit) Telegram message. Internal helper.
  */
-export async function sendTelegramMessage(
+async function sendTelegramMessageSingle(
   botToken: string,
   chatId: string,
   text: string,
-  options?: { parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML' }
+  parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'
 ): Promise<GatewaySendResult> {
   const url = buildTelegramSendUrl(botToken);
   const payload = buildTelegramSendPayload({
     chatId,
     text,
-    parseMode: options?.parseMode,
+    parseMode,
   });
 
   try {
@@ -992,6 +1081,37 @@ export async function sendTelegramMessage(
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+/**
+ * Send a message via Telegram Bot API.
+ *
+ * Automatically splits messages that exceed 4096 characters.
+ * When parseMode is set, retries without formatting if Telegram rejects
+ * the message (e.g. unbalanced Markdown characters).
+ */
+export async function sendTelegramMessage(
+  botToken: string,
+  chatId: string,
+  text: string,
+  options?: { parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'; splitLong?: boolean }
+): Promise<GatewaySendResult> {
+  const shouldSplit = options?.splitLong !== false;
+  const chunks = shouldSplit ? splitTelegramMessage(text) : [text];
+
+  let lastResult: GatewaySendResult = { ok: true, platform: 'telegram' };
+  for (const chunk of chunks) {
+    lastResult = await sendTelegramMessageSingle(botToken, chatId, chunk, options?.parseMode);
+    // If Markdown parsing failed (HTTP 400 from Telegram), retry without parseMode
+    if (!lastResult.ok && options?.parseMode) {
+      const errorDesc = typeof lastResult.error === 'string' ? lastResult.error : '';
+      if (errorDesc.includes("can't parse") || errorDesc.includes('Bad Request')) {
+        lastResult = await sendTelegramMessageSingle(botToken, chatId, chunk);
+      }
+    }
+    if (!lastResult.ok) return lastResult;
+  }
+  return lastResult;
 }
 
 /**
@@ -1328,6 +1448,97 @@ export async function probeMatrix(homeserverUrl: string, accessToken: string): P
   }
 }
 
+// --- Telegram Webhook Management ---
+
+export interface TelegramWebhookSetOptions {
+  secretToken?: string;
+  maxConnections?: number;
+  allowedUpdates?: string[];
+}
+
+export interface TelegramWebhookSetResult {
+  ok: boolean;
+  description?: string;
+}
+
+export interface TelegramWebhookInfo {
+  url: string;
+  has_custom_certificate: boolean;
+  pending_update_count: number;
+  last_error_date?: number;
+  last_error_message?: string;
+  max_connections?: number;
+  allowed_updates?: string[];
+}
+
+export interface TelegramWebhookInfoResult {
+  ok: boolean;
+  result?: TelegramWebhookInfo;
+}
+
+/**
+ * Register a webhook URL with the Telegram Bot API.
+ * The URL must use HTTPS (Telegram requirement).
+ */
+export async function setTelegramWebhook(
+  botToken: string,
+  url: string,
+  options?: TelegramWebhookSetOptions,
+): Promise<TelegramWebhookSetResult> {
+  if (!url.startsWith('https://')) {
+    return { ok: false, description: 'Webhook URL must use HTTPS' };
+  }
+  const apiUrl = `${buildTelegramApiBase(botToken)}/setWebhook`;
+  const body: Record<string, unknown> = { url };
+  if (options?.secretToken) body.secret_token = options.secretToken;
+  if (options?.maxConnections !== undefined) body.max_connections = options.maxConnections;
+  if (options?.allowedUpdates) body.allowed_updates = options.allowedUpdates;
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json() as { ok?: boolean; description?: string };
+    return { ok: data.ok === true, description: data.description };
+  } catch (error: unknown) {
+    return { ok: false, description: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Remove the current webhook integration for a Telegram bot.
+ */
+export async function deleteTelegramWebhook(
+  botToken: string,
+): Promise<{ ok: boolean; description?: string }> {
+  const apiUrl = `${buildTelegramApiBase(botToken)}/deleteWebhook`;
+  try {
+    const response = await fetch(apiUrl, { method: 'POST' });
+    const data = await response.json() as { ok?: boolean; description?: string };
+    return { ok: data.ok === true, description: data.description };
+  } catch (error: unknown) {
+    return { ok: false, description: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Get current webhook status for a Telegram bot.
+ */
+export async function getTelegramWebhookInfo(
+  botToken: string,
+): Promise<TelegramWebhookInfoResult> {
+  const apiUrl = `${buildTelegramApiBase(botToken)}/getWebhookInfo`;
+  try {
+    const response = await fetch(apiUrl);
+    const data = await response.json() as { ok?: boolean; result?: TelegramWebhookInfo };
+    return { ok: data.ok === true, result: data.result };
+  } catch (error: unknown) {
+    return { ok: false };
+  }
+}
+
 export const normalizeTelegramUpdate = normalizeTelegramWebhook;
 
 export { channels, type ChannelAdapter, type NormalizedChannelMessage, telegramChannel, discordChannel, slackChannel, genericChannel } from './channel-registry.js';
@@ -1362,3 +1573,5 @@ export async function normalizeGatewayRequest(platform: GatewayPlatform, request
 }
 
 export { GatewayRunner, type GatewayRunnerConfig, type GatewayRunnerPlatformConfig, type GatewayStatus } from './runner.js';
+export { executeWithRetry, type RetryResult } from './retry.js';
+export { PlatformRateLimiter } from './platform-rate-limiter.js';

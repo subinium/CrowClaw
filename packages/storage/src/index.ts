@@ -1,5 +1,7 @@
-import type { SessionState, SessionStore } from '@crowclaw/core';
+import type { SessionState, SessionStore, CheckpointStore, SessionCheckpoint } from '@crowclaw/core';
 import type { D1DatabaseLike } from '@crowclaw/shared';
+import { mkdir, readFile, writeFile, readdir, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 
 export interface SessionSearchHit {
   sessionId: string;
@@ -351,6 +353,87 @@ export class D1MemoryStore implements MemoryStore {
 
     const row = await statement.first<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
     return row ? [this.mapRow(row)] : [];
+  }
+}
+
+export class FileCheckpointStore implements CheckpointStore {
+  private readonly baseDir: string;
+
+  constructor(baseDir?: string) {
+    this.baseDir = baseDir ?? join(process.env.HOME ?? '/tmp', '.crowclaw', 'checkpoints');
+  }
+
+  private sessionDir(sessionId: string): string {
+    return join(this.baseDir, sessionId);
+  }
+
+  private filePath(sessionId: string, checkpointId: string): string {
+    return join(this.sessionDir(sessionId), checkpointId + '.json');
+  }
+
+  async save(checkpoint: SessionCheckpoint): Promise<void> {
+    const dir = this.sessionDir(checkpoint.sessionId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(this.filePath(checkpoint.sessionId, checkpoint.id), JSON.stringify(checkpoint), 'utf-8');
+  }
+
+  async get(id: string): Promise<SessionCheckpoint | null> {
+    try {
+      const sessions = await readdir(this.baseDir, { withFileTypes: true });
+      for (const entry of sessions) {
+        if (!entry.isDirectory()) continue;
+        try {
+          const data = await readFile(this.filePath(entry.name, id), 'utf-8');
+          return JSON.parse(data) as SessionCheckpoint;
+        } catch { continue; }
+      }
+    } catch { /* baseDir doesn't exist */ }
+    return null;
+  }
+
+  async listBySession(sessionId: string): Promise<SessionCheckpoint[]> {
+    const dir = this.sessionDir(sessionId);
+    try {
+      const files = await readdir(dir);
+      const checkpoints: SessionCheckpoint[] = [];
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        try {
+          const data = await readFile(join(dir, file), 'utf-8');
+          checkpoints.push(JSON.parse(data) as SessionCheckpoint);
+        } catch { continue; }
+      }
+      return checkpoints.sort((a, b) => a.iteration - b.iteration);
+    } catch { return []; }
+  }
+
+  async getLatest(sessionId: string): Promise<SessionCheckpoint | null> {
+    const checkpoints = await this.listBySession(sessionId);
+    return checkpoints.length > 0 ? checkpoints[checkpoints.length - 1] : null;
+  }
+
+  async delete(id: string): Promise<boolean> {
+    try {
+      const sessions = await readdir(this.baseDir, { withFileTypes: true });
+      for (const entry of sessions) {
+        if (!entry.isDirectory()) continue;
+        try {
+          await rm(this.filePath(entry.name, id));
+          return true;
+        } catch { continue; }
+      }
+    } catch { /* baseDir doesn't exist */ }
+    return false;
+  }
+
+  async deleteBySession(sessionId: string): Promise<number> {
+    const dir = this.sessionDir(sessionId);
+    try {
+      const files = await readdir(dir);
+      const count = files.filter((f: string) => f.endsWith('.json')).length;
+      await rm(dir, { recursive: true });
+      return count;
+    } catch { return 0; }
   }
 }
 

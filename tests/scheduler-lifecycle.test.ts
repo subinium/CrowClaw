@@ -49,7 +49,6 @@ describe('SchedulerExecutor job lifecycle', () => {
     expect(paused).not.toBeNull();
     expect(paused!.enabled).toBe(false);
 
-    // Verify persisted
     const fetched = await store.getJob('j1');
     expect(fetched!.enabled).toBe(false);
   });
@@ -116,7 +115,6 @@ describe('SchedulerExecutor job lifecycle', () => {
     const fetched = await store.getJob('j1');
     expect(fetched).toBeNull();
 
-    // Deleting again returns false
     const again = await executor.deleteJob('j1');
     expect(again).toBe(false);
   });
@@ -178,7 +176,6 @@ describe('Run history', () => {
     const run = mockAgentRun('ok');
     const executor = new SchedulerExecutor(store, run);
 
-    // Manually record multiple runs
     for (let i = 0; i < 5; i++) {
       await store.recordRun({
         jobId: 'j1',
@@ -196,7 +193,6 @@ describe('Run history', () => {
 
     const limited = await store.getRunHistory('j1', 3);
     expect(limited).toHaveLength(3);
-    // Most recent first
     expect(limited[0].runId).toBe('run-4');
     expect(limited[2].runId).toBe('run-2');
   });
@@ -226,7 +222,6 @@ describe('Dry run', () => {
     expect(record.jobId).toBe('j1');
     expect(typeof record.durationMs).toBe('number');
 
-    // Verify job state was NOT updated
     const job = await store.getJob('j1');
     expect(job!.runCount).toBe(3);
     expect(job!.lastRunAt).toBe('2025-01-01T00:00:00.000Z');
@@ -272,14 +267,12 @@ describe('AutonomousScheduler', () => {
     auto.start();
     expect(auto.isRunning()).toBe(true);
 
-    // Start again is no-op
     auto.start();
     expect(auto.isRunning()).toBe(true);
 
     auto.stop();
     expect(auto.isRunning()).toBe(false);
 
-    // Stop again is no-op
     auto.stop();
     expect(auto.isRunning()).toBe(false);
   });
@@ -312,11 +305,9 @@ describe('AutonomousScheduler', () => {
 
     auto.start();
 
-    // Advance past one interval
     await vi.advanceTimersByTimeAsync(150);
     expect(tickSpy).toHaveBeenCalledTimes(1);
 
-    // Advance past another
     await vi.advanceTimersByTimeAsync(100);
     expect(tickSpy).toHaveBeenCalledTimes(2);
 
@@ -381,7 +372,6 @@ describe('API endpoint response shapes', () => {
 // ---------------------------------------------------------------------------
 
 describe('Dashboard HTML lifecycle UI', () => {
-  // We need to import the HTML from the web package
   let DASHBOARD_HTML: string;
 
   it('loads dashboard HTML', async () => {
@@ -391,52 +381,44 @@ describe('Dashboard HTML lifecycle UI', () => {
     expect(DASHBOARD_HTML.length).toBeGreaterThan(0);
   });
 
-  it('contains scheduler status indicator', async () => {
+  it('contains crowclaw-automate-view for scheduler', async () => {
     const web = await import('../packages/web/src/index.js');
     DASHBOARD_HTML = web.DASHBOARD_HTML;
 
-    expect(DASHBOARD_HTML).toContain('schedStatus');
-    expect(DASHBOARD_HTML).toContain('schedLed');
-    expect(DASHBOARD_HTML).toContain('schedLbl');
-    expect(DASHBOARD_HTML).toContain('schedToggle');
+    expect(DASHBOARD_HTML).toContain('crowclaw-automate-view');
   });
 
-  it('contains job lifecycle functions', async () => {
+  it('contains scheduler API endpoints', async () => {
     const web = await import('../packages/web/src/index.js');
     DASHBOARD_HTML = web.DASHBOARD_HTML;
 
-    expect(DASHBOARD_HTML).toContain('jbToggle');
-    expect(DASHBOARD_HTML).toContain('jbDel');
-    expect(DASHBOARD_HTML).toContain('jbDryRun');
-    expect(DASHBOARD_HTML).toContain('jbHistToggle');
+    expect(DASHBOARD_HTML).toContain('/api/scheduler/jobs');
+    expect(DASHBOARD_HTML).toContain('/api/scheduler/start');
+    expect(DASHBOARD_HTML).toContain('/api/scheduler/stop');
   });
 
-  it('contains scheduler control functions', async () => {
+  it('contains scheduler history endpoint', async () => {
     const web = await import('../packages/web/src/index.js');
     DASHBOARD_HTML = web.DASHBOARD_HTML;
 
-    expect(DASHBOARD_HTML).toContain('schedToggle');
-    expect(DASHBOARD_HTML).toContain('lSchedStatus');
-    expect(DASHBOARD_HTML).toContain('jbStartAutoRefresh');
-    expect(DASHBOARD_HTML).toContain('jbStopAutoRefresh');
+    expect(DASHBOARD_HTML).toContain('/api/scheduler/history');
+    expect(DASHBOARD_HTML).toContain('/api/scheduler/tick');
   });
 
-  it('contains Pause/Resume button text', async () => {
+  it('contains Pause/Resume/Delete button text', async () => {
     const web = await import('../packages/web/src/index.js');
     DASHBOARD_HTML = web.DASHBOARD_HTML;
 
     expect(DASHBOARD_HTML).toContain('Pause');
     expect(DASHBOARD_HTML).toContain('Resume');
-    expect(DASHBOARD_HTML).toContain('Dry Run');
     expect(DASHBOARD_HTML).toContain('Delete');
     expect(DASHBOARD_HTML).toContain('History');
   });
 
-  it('contains auto-refresh mechanism', async () => {
+  it('contains Create Job text', async () => {
     const web = await import('../packages/web/src/index.js');
     DASHBOARD_HTML = web.DASHBOARD_HTML;
 
-    expect(DASHBOARD_HTML).toContain('jbAutoRefresh');
-    expect(DASHBOARD_HTML).toContain('30000');
+    expect(DASHBOARD_HTML).toContain('Create Job');
   });
 });

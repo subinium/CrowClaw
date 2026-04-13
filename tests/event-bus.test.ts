@@ -1,0 +1,80 @@
+import { describe, expect, it, vi } from 'vitest';
+import { EventBus } from '@crowclaw/runtime-node/event-bus';
+
+describe('EventBus', () => {
+  it('emits events to subscribers', () => {
+    const bus = new EventBus();
+    const received: unknown[] = [];
+    bus.subscribe((event) => received.push(event));
+
+    bus.emit('chat:message', { sessionId: 's1' });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      type: 'chat:message',
+      data: { sessionId: 's1' },
+    });
+  });
+
+  it('supports multiple subscribers', () => {
+    const bus = new EventBus();
+    const a: unknown[] = [];
+    const b: unknown[] = [];
+    bus.subscribe((e) => a.push(e));
+    bus.subscribe((e) => b.push(e));
+
+    bus.emit('chat:complete', { sessionId: 's1' });
+
+    expect(a).toHaveLength(1);
+    expect(b).toHaveLength(1);
+  });
+
+  it('unsubscribes correctly', () => {
+    const bus = new EventBus();
+    const received: unknown[] = [];
+    const unsub = bus.subscribe((e) => received.push(e));
+
+    bus.emit('chat:message', { id: 1 });
+    unsub();
+    bus.emit('chat:message', { id: 2 });
+
+    expect(received).toHaveLength(1);
+    expect(bus.subscriberCount).toBe(0);
+  });
+
+  it('isolates listener errors from other subscribers', () => {
+    const bus = new EventBus();
+    const received: unknown[] = [];
+
+    bus.subscribe(() => { throw new Error('boom'); });
+    bus.subscribe((e) => received.push(e));
+
+    bus.emit('gateway:error', { platform: 'telegram' });
+
+    expect(received).toHaveLength(1);
+  });
+
+  it('tracks subscriber count', () => {
+    const bus = new EventBus();
+    expect(bus.subscriberCount).toBe(0);
+
+    const u1 = bus.subscribe(() => {});
+    const u2 = bus.subscribe(() => {});
+    expect(bus.subscriberCount).toBe(2);
+
+    u1();
+    expect(bus.subscriberCount).toBe(1);
+    u2();
+    expect(bus.subscriberCount).toBe(0);
+  });
+
+  it('includes timestamp in emitted events', () => {
+    const bus = new EventBus();
+    let timestamp = '';
+    bus.subscribe((e) => { timestamp = e.timestamp; });
+
+    bus.emit('session:created', {});
+
+    expect(timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+});

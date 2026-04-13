@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/storage",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -20,5 +20,8 @@
   "dependencies": {
     "@crowclaw/core": "0.1.0",
     "@crowclaw/shared": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
   }
 }

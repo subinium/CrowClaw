@@ -1111,6 +1111,51 @@ const BUILT_IN_SKILLS: Omit<StoredSkillDraft, 'id' | 'createdAt' | 'updatedAt'>[
     sourceMessages: 0,
     status: 'published',
     markdown: '# Email Template\n\nCreate responsive HTML email templates for major email clients.'
+  },
+  {
+    slug: 'framework-distillation',
+    title: 'Framework Pattern Distillation',
+    summary: 'Research external frameworks/repos, extract strongest primitives, and create an implementation plan mapped to the target codebase.',
+    triggerPhrases: [
+      'distill from framework',
+      'learn from repo',
+      'bring patterns from',
+      'adopt from framework',
+      'extract patterns',
+      'framework audit',
+      'what can we learn from'
+    ],
+    steps: [
+      'Identify target frameworks and the specific subsystems to research (max 4-5 sources)',
+      'For each source, fetch actual docs/code -- get concrete API signatures, data structures, and interfaces, not marketing descriptions',
+      'Verify each claim against source code: flag anything that is just "coming soon" or undocumented',
+      'Assess source credibility: who built it, funding, production usage, GitHub activity, known issues',
+      'Map each pattern to the target codebase: which file, what changes, estimated line count',
+      'Rate transferability: HIGH (same language, direct port), MEDIUM (different language, pattern only), LOW (conceptual inspiration only)',
+      'Self-critique: challenge each priority decision -- is the evidence strong enough? Are you overstating severity?',
+      'Check for existing partial implementations in the target that could be extended rather than replaced',
+      'Produce a priority-ordered implementation table: pattern, source, target file, estimated size, dependencies',
+      'Flag patterns where the source framework itself has known issues or the feature is experimental'
+    ],
+    pitfalls: [
+      'Researching marketing pages instead of actual implementation details',
+      'Trying to adopt patterns from 6+ frameworks at once (leads to all-shallow implementations)',
+      'Treating all framework recommendations equally -- assess credibility per source',
+      'Overstating severity of gaps to justify more work (check: does the current code actually fail?)',
+      'Ignoring existing ad-hoc implementations that already solve the problem partially',
+      'Adopting Python-specific patterns without considering TypeScript translation cost'
+    ],
+    verificationSteps: [
+      'Every recommended pattern has a concrete API signature or data structure from the source',
+      'Every source framework has been assessed for credibility (funding, production usage, known issues)',
+      'Every target file path exists in the codebase and the change scope is realistic',
+      'Self-critique section explicitly calls out at least one prior judgment that was wrong or overstated',
+      'Total estimated line count is under 3,000 for a single minor version increment'
+    ],
+    sourceMessages: 0,
+    status: 'published',
+    markdown: '# Framework Pattern Distillation\n\nResearch external frameworks, extract their strongest primitives, and create an implementation plan mapped to your codebase.\n\n## Key Principles\n\n1. **Concrete over conceptual** -- get actual API signatures, not feature lists\n2. **Verify credibility** -- who built it, is it production-tested, are there known issues?\n3. **Map precisely** -- every pattern must point to a specific target file with estimated size\n4. **Self-critique** -- challenge your own priority decisions with evidence\n5. **Depth over breadth** -- 3 patterns deeply adopted > 10 patterns as stubs\n\n## Anti-Patterns\n\n- Reading only the README/landing page (read the source or API reference)\n- Treating all sources equally (AutoGen persistence roadmap was closed as "not planned")\n- Overstating gaps (ad-hoc inline validation may be sufficient)\n- Adopting everything from every framework (contradicts "strongest primitive" principle)',
+    requiredTools: ['web.search', 'web.fetch', 'workspace.read', 'workspace.search']
   }
 ];
 

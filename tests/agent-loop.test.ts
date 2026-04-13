@@ -217,7 +217,9 @@ describe('AgentLoop', () => {
 
   it('stops early on tool failure by default', async () => {
     const tools = new ToolRegistry().register(createEchoTool());
-    const agent = new AgentLoop(new ToolFailureProvider(), tools, new InMemorySessionStore());
+    const agent = new AgentLoop(new ToolFailureProvider(), tools, new InMemorySessionStore(), {
+      errorReflection: false,
+    });
     const result = await agent.run({
       agentId: 'crowclaw',
       sessionId: 'session-4',

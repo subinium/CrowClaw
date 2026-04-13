@@ -431,6 +431,11 @@ export class LearningPipeline {
     let refined: StoredSkillDraft;
     if (this.extractionProvider) {
       refined = await this.extractionProvider.refineSkill(existing, newMessages);
+      // If LLM refinement returned unchanged draft, fall back to heuristic merge
+      if (refined.version === existing.version && refined.steps.length === existing.steps.length) {
+        const heuristic = extractSkillDraft(newMessages, existing.title);
+        refined = mergeSkillDrafts(existing, heuristic);
+      }
     } else {
       const heuristic = extractSkillDraft(newMessages, existing.title);
       refined = mergeSkillDrafts(existing, heuristic);
