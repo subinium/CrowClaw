@@ -6,18 +6,11 @@
     "types": ["@cloudflare/workers-types", "node"]
   },
   "references": [
-    {
-      "path": "../core"
-    },
-    {
-      "path": "../scheduler"
-    },
-    {
-      "path": "../storage"
-    },
-    {
-      "path": "../workspace"
-    }
+    { "path": "../core" },
+    { "path": "../gateway" },
+    { "path": "../scheduler" },
+    { "path": "../storage" },
+    { "path": "../workspace" }
   ],
   "include": [
     "src/**/*.ts"

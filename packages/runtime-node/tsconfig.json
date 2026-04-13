@@ -6,33 +6,19 @@
     "types": ["@cloudflare/workers-types", "node"]
   },
   "references": [
-    {
-      "path": "../core"
-    },
-    {
-      "path": "../providers"
-    },
-    {
-      "path": "../storage"
-    },
-    {
-      "path": "../tools"
-    },
-    {
-      "path": "../workspace"
-    },
-    {
-      "path": "../scheduler"
-    },
-    {
-      "path": "../learning"
-    },
-    {
-      "path": "../mcp"
-    },
-    {
-      "path": "../plugins"
-    }
+    { "path": "../acp" },
+    { "path": "../core" },
+    { "path": "../gateway" },
+    { "path": "../learning" },
+    { "path": "../mcp" },
+    { "path": "../mcp-server" },
+    { "path": "../memory" },
+    { "path": "../plugins" },
+    { "path": "../providers" },
+    { "path": "../scheduler" },
+    { "path": "../storage" },
+    { "path": "../tools" },
+    { "path": "../workspace" }
   ],
   "include": [
     "src/**/*.ts"
