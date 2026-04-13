@@ -1835,6 +1835,28 @@ export class CredentialPool {
   activeCount(): number {
     return this.keys.filter((k) => k.active).length;
   }
+
+  summary(): {
+    strategy: 'round-robin' | 'random';
+    total: number;
+    active: number;
+    coolingDown: number;
+    disabled: number;
+    status: Array<{ key: string; active: boolean; failures: number; cooldownUntil?: string }>;
+  } {
+    const now = new Date();
+    const status = this.getStatus();
+    const active = this.activeCount();
+    const coolingDown = this.keys.filter((key) => key.active && key.cooldownUntil && key.cooldownUntil > now).length;
+    return {
+      strategy: this.strategy,
+      total: this.keys.length,
+      active,
+      coolingDown,
+      disabled: this.keys.length - active,
+      status
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------

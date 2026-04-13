@@ -1360,3 +1360,5 @@ export async function normalizeGatewayRequest(platform: GatewayPlatform, request
   }
   return normalizeGenericWebhook(payload as GenericWebhookPayload);
 }
+
+export { GatewayRunner, type GatewayRunnerConfig, type GatewayRunnerPlatformConfig, type GatewayStatus } from './runner.js';

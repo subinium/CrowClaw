@@ -3,7 +3,7 @@ import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
 describe('runtime scheduler integration', () => {
   it('creates, lists, and ticks scheduler jobs in the node runtime', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ schedulerStorePath: null });
 
     const create = await runtime.fetch(new Request('http://localhost/api/scheduler/jobs', {
       method: 'POST',

@@ -59,7 +59,7 @@ import {
   createScheduledAgentJob,
   createEveryNMinutesJob,
   collectDueJobs,
-  markIntervalJobRun,
+  markJobRun,
 } from '@crowclaw/scheduler';
 
 // Providers (EchoProvider for deterministic tests)

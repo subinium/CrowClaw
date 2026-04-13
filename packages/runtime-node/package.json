@@ -30,6 +30,7 @@
     "@crowclaw/scheduler": "0.1.0",
     "@crowclaw/learning": "0.1.0",
     "@crowclaw/mcp": "0.1.0",
+    "@crowclaw/mcp-server": "0.1.0",
     "@crowclaw/plugins": "0.1.0"
   }
 }

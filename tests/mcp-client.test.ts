@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { McpClient, McpHttpTransport, McpStdioTransport, MultiServerMcpManager, SandboxMcpRunner } from '../packages/mcp/src/index.js';
+import { McpClient, McpHttpTransport, MultiServerMcpManager } from '../packages/mcp/src/index.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -33,41 +33,6 @@ describe('MCP client', () => {
 
     expect(result.ok).toBe(true);
     expect(result.content).toEqual({ name: 'search', arguments: { query: 'crowclaw' } });
-  });
-
-  it('lists tools through stdio transport', async () => {
-    const transport = new McpStdioTransport({
-      run: vi.fn(async () => ({
-        stdout: JSON.stringify({ tools: [{ name: 'echo' }] }),
-        stderr: '',
-        exitCode: 0,
-      }))
-    });
-    const client = new McpClient(transport);
-    await expect(client.listTools()).resolves.toEqual([{
-      name: 'echo',
-      originalName: 'echo',
-      registeredName: 'echo'
-    }]);
-  });
-
-  it('calls tools through stdio transport', async () => {
-    const transport = new McpStdioTransport({
-      run: vi.fn(async () => ({
-        stdout: JSON.stringify({ ok: true, content: { echoed: true } }),
-        stderr: '',
-        exitCode: 0,
-      }))
-    });
-    const client = new McpClient(transport);
-    await expect(client.callTool('echo', { value: 1 })).resolves.toEqual({ ok: true, content: { echoed: true } });
-  });
-
-  it('adapts sandbox executor into an MCP command runner', async () => {
-    const runner = new SandboxMcpRunner({
-      executeCommand: vi.fn(async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }))
-    });
-    await expect(runner.run('mcp tools list --json')).resolves.toEqual({ stdout: 'ok', stderr: '', exitCode: 0 });
   });
 
   it('supports cached refreshable tool discovery with prefixing and filtering', async () => {

@@ -650,6 +650,62 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  // --- Provider Config API (fallback chain) ---
+  // In-memory provider config for dev mode
+  if (!('devProviderConfig' in runtimeState)) {
+    (runtimeState as Record<string, unknown>).devProviderConfig = null;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/providers/config') {
+    const cfg = (runtimeState as Record<string, unknown>).devProviderConfig as Record<string, unknown> | null;
+    return json({
+      ok: true,
+      config: cfg ?? null,
+      slots: {
+        primary: cfg ? (cfg as Record<string, unknown>).primary ?? null : null,
+        fallback: cfg ? (cfg as Record<string, unknown>).fallback ?? null : null,
+        vision: cfg ? (cfg as Record<string, unknown>).vision ?? null : null,
+        compression: cfg ? (cfg as Record<string, unknown>).compression ?? null : null,
+        embedding: cfg ? (cfg as Record<string, unknown>).embedding ?? null : null,
+      },
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/providers/config') {
+    const body = safeJson(await readBody(req));
+    if (!body.primary || typeof (body.primary as Record<string, unknown>).provider !== 'string') {
+      return json({ ok: false, error: 'primary slot with provider and model is required' }, 400);
+    }
+    (runtimeState as Record<string, unknown>).devProviderConfig = body;
+    return json({ ok: true, config: body });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/providers/test') {
+    const body = safeJson(await readBody(req));
+    const providerType = body.provider as string;
+    const model = body.model as string;
+    const apiKey = body.apiKey as string;
+    const baseUrl = (body.baseUrl as string) || '';
+    const slot = (body.slot as string) || 'test';
+    if (!providerType || !model) {
+      return json({ ok: false, error: 'provider and model are required' }, 400);
+    }
+    try {
+      const { OpenAICompatibleProvider: OAI, AnthropicProvider: AP } = await import('../packages/providers/src/index.js');
+      const testProvider = providerType === 'anthropic'
+        ? new AP({ apiKey, baseUrl: baseUrl || 'https://api.anthropic.com', model })
+        : new OAI({ apiKey, baseUrl: baseUrl || 'https://api.openai.com/v1', model });
+      const testResponse = await testProvider.generate({
+        messages: [{ role: 'user', content: 'Say "ok" in one word.', createdAt: new Date().toISOString() }],
+        availableTools: [],
+      });
+      return json({ ok: true, slot, response: (testResponse.assistantMessage ?? '').slice(0, 100) });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return json({ ok: false, slot, error: msg });
+    }
+  }
+
   // Config snapshot
   if (req.method === 'GET' && url.pathname === '/api/config/snapshot') {
     return json({

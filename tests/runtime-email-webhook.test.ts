@@ -23,10 +23,15 @@ describe('email webhook runtime integration', () => {
   });
 
   it('routes Email webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime();
-    const response = await runtime.fetch(new Request('http://localhost/webhooks/email', {
+    const runtime = createNodeRuntime({ webhookSecrets: { email: 'email-secret' } });
+    await runtime.fetch(new Request('http://localhost/api/gateway/email/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+    const response = await runtime.fetch(new Request('http://localhost/webhooks/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer email-secret' },
       body: JSON.stringify(emailPayload)
     }));
 
@@ -36,16 +41,21 @@ describe('email webhook runtime integration', () => {
   });
 
   it('deduplicates Email webhook payloads in the node runtime', async () => {
-    const runtime = createNodeRuntime();
-    await runtime.fetch(new Request('http://localhost/webhooks/email', {
+    const runtime = createNodeRuntime({ webhookSecrets: { email: 'email-secret' } });
+    await runtime.fetch(new Request('http://localhost/api/gateway/email/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+    await runtime.fetch(new Request('http://localhost/webhooks/email', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer email-secret' },
       body: JSON.stringify(emailPayload)
     }));
 
     const duplicate = await runtime.fetch(new Request('http://localhost/webhooks/email', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer email-secret' },
       body: JSON.stringify(emailPayload)
     }));
 
@@ -75,7 +85,7 @@ describe('email webhook runtime integration', () => {
 
     const first = await runtimeCloudflare.fetch(new Request('https://example.com/webhooks/email', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer email-secret' },
       body: JSON.stringify(emailPayload)
     }), env as never);
     const firstPayload = await first.json() as { forwardedTo: string; body: { userMessage: string; userId: string; workspaceId: string } };
@@ -88,7 +98,7 @@ describe('email webhook runtime integration', () => {
 
     const duplicate = await runtimeCloudflare.fetch(new Request('https://example.com/webhooks/email', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer email-secret' },
       body: JSON.stringify(emailPayload)
     }), env as never);
     expect(await duplicate.json()).toEqual({ ok: true, duplicate: true, sessionId: 'email:support-inbox' });

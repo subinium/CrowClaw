@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CliInteractiveController, parseCliArgs, renderCliHelp, runCli, runCliInputLine, suggestCliCommands } from '../packages/cli/src/index.js';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
@@ -26,7 +29,7 @@ describe('cli package', () => {
   });
 
   it('suggests slash commands by prefix', () => {
-    expect(suggestCliCommands('/mcp-')).toEqual(['/mcp-tools', '/mcp-status', '/mcp-inspect', '/mcp-resources', '/mcp-prompts']);
+    expect(suggestCliCommands('/mcp-')).toEqual(['/mcp-tools', '/mcp-status', '/mcp-inspect', '/mcp-resources', '/mcp-prompts', '/mcp-server-tools', '/mcp-server-call', '/mcp-auth', '/mcp-add', '/mcp-list', '/mcp-remove']);
     expect(suggestCliCommands('/bridge-')).toEqual(['/bridge-status', '/bridge-spawn', '/bridge-ping', '/bridge-terminate', '/bridge-capabilities', '/bridge-process', '/bridge-transcript']);
     expect(suggestCliCommands('/terminal-')).toEqual(['/terminal-backends', '/terminal-exec', '/terminal-background', '/terminal-processes', '/terminal-kill']);
     expect(suggestCliCommands('/pre')).toEqual(['/preflight']);
@@ -44,6 +47,15 @@ describe('cli package', () => {
   });
 
   it('supports slash-command style cli input lines', async () => {
+    const cliToken = 'cli-test-token';
+    (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process = {
+      ...(globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process,
+      env: {
+        ...(globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env,
+        CROWCLAW_DASHBOARD_TOKEN: cliToken,
+      },
+    };
+
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes('mcp.example.com/tools')) {
@@ -157,8 +169,41 @@ describe('cli package', () => {
     const mcpPrompts = await runCliInputLine('/mcp-prompts', initial, { runtime });
     expect(mcpPrompts.output).toContain('[]');
 
+    const mcpServerTools = await runCliInputLine('/mcp-server-tools', initial, { runtime });
+    expect(mcpServerTools.output).toContain('crowclaw.chat');
+
+    const mcpServerCall = await runCliInputLine('/mcp-server-call crowclaw.chat hello-from-cli-mcp', initial, { runtime });
+    expect(mcpServerCall.output).toContain('CrowClaw received');
+
+    const acpInfo = await runCliInputLine('/acp-info', initial, { runtime });
+    expect(acpInfo.output).toContain('"display_name"');
+
+    const acpCreate = await runCliInputLine('/acp-create CLI ACP Session', initial, { runtime });
+    expect(acpCreate.output).toContain('"title": "CLI ACP Session"');
+
+    const acpSessions = await runCliInputLine('/acp-sessions', initial, { runtime });
+    expect(acpSessions.output).toContain('"sessions"');
+
+    const acpPrompt = await runCliInputLine('/acp-prompt hello-from-cli-acp', initial, { runtime });
+    expect(acpPrompt.output).toContain('CrowClaw received');
+
+    const acpRequest = await runCliInputLine('/acp-request {"jsonrpc":"2.0","id":"acp-cli","method":"agent/info"}', initial, { runtime });
+    expect(acpRequest.output).toContain('"display_name"');
+
+    const acpDelete = await runCliInputLine('/acp-delete missing-session', initial, { runtime });
+    expect(acpDelete.output).toContain('"deleted": false');
+
     const providerModels = await runCliInputLine('/provider-models', initial, { runtime });
     expect(providerModels.output).toContain('gpt-4o');
+
+    const prevOpenRouter = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = 'sk-or-primary-7890';
+    const providerPool = await runCliInputLine('/provider-pool openrouter', initial, { runtime });
+    expect(providerPool.output).toContain('"provider": "openrouter"');
+    expect(providerPool.output).toContain('"configured": true');
+    expect(providerPool.output).toContain('7890');
+    if (prevOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = prevOpenRouter;
 
     const providerRoute = await runCliInputLine('/provider-route debug this tool', initial, { runtime });
     expect(providerRoute.output).toContain('"selectedTier"');
@@ -171,7 +216,7 @@ describe('cli package', () => {
     const draftCreateRuntime = createNodeRuntime();
     await draftCreateRuntime.fetch(new Request('http://localhost/api/learning/drafts', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${cliToken}` },
       body: JSON.stringify({
         title: 'Deploy CrowClaw',
         messages: [
@@ -185,7 +230,7 @@ describe('cli package', () => {
 
     const createdDraft = await draftCreateRuntime.fetch(new Request('http://localhost/api/learning/drafts', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${cliToken}` },
       body: JSON.stringify({
         title: 'Auth Setup',
         messages: [
@@ -207,11 +252,42 @@ describe('cli package', () => {
 
     await draftCreateRuntime.fetch(new Request('http://localhost/api/sessions/cli-line-demo', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${cliToken}` },
       body: JSON.stringify({ userMessage: 'deploy crowclaw' })
     }));
     const autoCapture = await runCliInputLine('/auto-capture', { sessionId: 'cli-line-demo' }, { runtime: draftCreateRuntime });
     expect(autoCapture.output).toContain('auto-cli-line-demo');
+
+    const refineDraft = await runCliInputLine(`/refine-draft ${createdDraftPayload.id} add preview deployment verification`, initial, { runtime: draftCreateRuntime });
+    expect(refineDraft.output).toContain('"version": 2');
+
+    const skillShow = await runCliInputLine('/skill-show auth-setup', initial, { runtime: draftCreateRuntime });
+    expect(skillShow.output).toContain('"slug": "auth-setup"');
+
+    const skillRate = await runCliInputLine('/skill-rate auth-setup helpful', initial, { runtime: draftCreateRuntime });
+    expect(skillRate.output).toContain('"rating": "helpful"');
+
+    const skillVersions = await runCliInputLine('/skill-versions auth-setup', initial, { runtime: draftCreateRuntime });
+    expect(skillVersions.output).toContain('"versions"');
+
+    const tempDir = await mkdtemp(join(tmpdir(), 'crowclaw-skill-'));
+    const skillPath = join(tempDir, 'SKILL.md');
+    await writeFile(skillPath, [
+      '# Imported Skill',
+      '',
+      '## Summary',
+      'Imported from disk.',
+      '',
+      '## Trigger phrases',
+      '- imported skill',
+      '',
+      '## Steps',
+      '1. Open file',
+      '2. Import skill'
+    ].join('\n'), 'utf-8');
+    const importSkill = await runCliInputLine(`/skill-import-file ${skillPath}`, initial, { runtime: draftCreateRuntime });
+    expect(importSkill.output).toContain('"ok": true');
+    expect(importSkill.output).toContain('"slug": "imported-skill"');
 
     const skillToggle = await runCliInputLine('/skill-toggle git-commit-workflow off', initial, { runtime });
     expect(skillToggle.output).toContain('"enabled": false');
@@ -276,6 +352,15 @@ describe('cli package', () => {
   });
 
   it('tracks an interactive transcript with stream chunks', async () => {
+    const interactiveToken = 'interactive-token';
+    (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process = {
+      ...(globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process,
+      env: {
+        ...(globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env,
+        CROWCLAW_DASHBOARD_TOKEN: interactiveToken,
+      },
+    };
+
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes('mcp.example.com/tools')) {

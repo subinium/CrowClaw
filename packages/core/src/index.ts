@@ -5,7 +5,7 @@ import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
 import type { DetailedUsageTracker } from './usage-tracker.js';
-import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand } from './security.js';
+import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand, SecurityAuditLog } from './security.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -186,6 +186,8 @@ export interface AgentLoopOptions {
   contextWindowSize?: number;
   /** Security policy for runtime enforcement of credential redaction, injection scanning, and command scanning */
   securityPolicy?: SecurityPolicy;
+  /** Security audit log for recording security events */
+  securityAuditLog?: SecurityAuditLog;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -390,6 +392,7 @@ export class AgentLoop {
   private readonly enablePromptCaching: boolean;
   private readonly contextWindowSize?: number;
   private readonly securityPolicy: Required<SecurityPolicy>;
+  private readonly securityAuditLog?: SecurityAuditLog;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -428,6 +431,7 @@ export class AgentLoop {
       scanCommands: options.securityPolicy?.scanCommands ?? true,
       blockDangerousCommands: options.securityPolicy?.blockDangerousCommands ?? false,
     };
+    this.securityAuditLog = options.securityAuditLog;
   }
 
   /** Track 1.2: Record usage from a provider response and return total tokens consumed so far */
@@ -634,6 +638,13 @@ export class AgentLoop {
     }
 
     const blocked = hasCritical && this.securityPolicy.blockDangerousCommands;
+    if (warnings.length > 0) {
+      this.securityAuditLog?.record({
+        type: blocked ? 'command_blocked' : 'command_warned',
+        severity: blocked ? 'critical' : 'warning',
+        detail: warnings.join('; '),
+      });
+    }
     return { blocked, warnings };
   }
 
@@ -642,6 +653,11 @@ export class AgentLoop {
     if (!this.securityPolicy.redactToolOutput) return result;
     const redacted = redactToolOutputFn(result.output);
     if (redacted === result.output) return result;
+    this.securityAuditLog?.record({
+      type: 'credential_redacted',
+      severity: 'info',
+      detail: `Credentials/PII redacted in output from tool "${result.toolName}"`,
+    });
     return { ...result, output: redacted, metadata: { ...result.metadata, securityRedacted: true } };
   }
 
@@ -689,11 +705,23 @@ export class AgentLoop {
     const needsApproval = this.requireApprovalForDangerousTools
       && (definition.manifest.dangerLevel === 'high' || dangerousSignals.length > 0);
     if (needsApproval) {
+      this.securityAuditLog?.record({
+        type: 'approval_required',
+        severity: 'warning',
+        detail: `Approval required for tool "${definition.manifest.name}" (danger: ${definition.manifest.dangerLevel})`,
+        sessionId: input.sessionId,
+      });
       const approved = this.approvalDecider
         ? await this.approvalDecider(definition, toolCall.input, context)
         : false;
 
       if (!approved) {
+        this.securityAuditLog?.record({
+          type: 'approval_denied',
+          severity: 'critical',
+          detail: `Approval denied for tool "${definition.manifest.name}"`,
+          sessionId: input.sessionId,
+        });
         return {
           toolName: definition.manifest.name,
           runtime: definition.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
@@ -754,6 +782,12 @@ export class AgentLoop {
           .map(t => `${t.severity}: ${t.description}`)
           .join('; ');
         injectionWarning = `[SECURITY WARNING] Potential prompt injection detected in user input: ${threatSummary}`;
+        this.securityAuditLog?.record({
+          type: 'injection_detected',
+          severity: injectionScan.threats.some(t => t.severity === 'high') ? 'critical' : 'warning',
+          detail: threatSummary,
+          sessionId: input.sessionId,
+        });
       }
     }
 
@@ -1059,6 +1093,11 @@ export class AgentLoop {
           .map(t => `${t.severity}: ${t.description}`)
           .join('; ');
         streamInjectionWarning = `[SECURITY WARNING] Potential prompt injection detected in user input: ${threatSummary}`;
+        this.securityAuditLog?.record({
+          type: 'injection_detected',
+          severity: injectionScan.threats.some(t => t.severity === 'high') ? 'critical' : 'warning',
+          detail: threatSummary,
+        });
       }
     }
 
@@ -1294,6 +1333,10 @@ export {
   type EnhancedInjectionScanResult,
   type CommandRisk,
   type CommandScanResult,
+  SecurityAuditLog,
+  type SecurityEvent,
+  type SecurityEventType,
+  type SecurityEventSeverity,
 } from './security.js';
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';

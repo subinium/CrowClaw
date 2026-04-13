@@ -13,7 +13,7 @@ describe('discord webhook runtime integration', () => {
     vi.clearAllMocks();
   });
 
-  it('routes discord webhook payloads through the node runtime', async () => {
+  it('rejects discord webhook payloads without public key configured', async () => {
     const runtime = createNodeRuntime();
     const response = await runtime.fetch(new Request('http://localhost/webhooks/discord', {
       method: 'POST',
@@ -25,9 +25,9 @@ describe('discord webhook runtime integration', () => {
       })
     }));
 
-    const payload = await response.json() as { finalResponse: string; session: { sessionId: string } };
-    expect(payload.session.sessionId).toBe('discord:chan-1');
-    expect(payload.finalResponse).toContain('CrowClaw received');
+    expect(response.status).toBe(403);
+    const payload = await response.json() as { error: string };
+    expect(payload.error).toContain('not configured');
   });
 
   it('routes discord webhook payloads through the Cloudflare runtime ingress', async () => {

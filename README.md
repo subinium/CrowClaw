@@ -5,17 +5,17 @@
     <strong>A self-improving TypeScript agent framework that learns from every conversation.</strong>
   </p>
   <p align="center">
-    <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/badge/npm-v0.1.2-cb3837.svg" alt="npm v0.1.2" /></a>
+    <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/badge/npm-v0.1.3-cb3837.svg" alt="npm v0.1.3" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-1302%20passed-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-1599%20passed-brightgreen.svg" alt="Tests" />
   </p>
 </p>
 
 ---
 
-> **Beta.** Core systems are functional and tested (1302 tests), but APIs may change before 1.0. Not recommended for production without review.
+> **Beta.** Core systems are functional and tested (1599 tests), but APIs may change before 1.0. Not recommended for production without review.
 
 CrowClaw started as an effort to bring [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Python) to Cloudflare Workers. Porting it to TypeScript opened up a chance to rethink the architecture — so we [studied dozens of agent frameworks](https://github.com/subinium/awesome-agent-frameworks), distilled the best patterns from each, and built a framework that actually closes the loop: your agent gets better every time it completes a task.
 

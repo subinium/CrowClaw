@@ -1,3 +1,5 @@
+// Standalone ACP server — not auto-started by runtime
+
 import { createInterface } from 'node:readline';
 
 // ---------------------------------------------------------------------------

@@ -13,10 +13,16 @@ describe('telegram webhook runtime paths', () => {
   });
 
   it('routes Telegram webhooks into the node runtime session flow', async () => {
-    const runtime = createNodeRuntime();
-    const response = await runtime.fetch(new Request('http://localhost/webhooks/telegram', {
+    const runtime = createNodeRuntime({ telegramWebhookSecret: 'tg-secret' });
+    // Configure gateway policy so deny-by-default doesn't block
+    await runtime.fetch(new Request('http://localhost/api/gateway/telegram/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
+    }));
+    const response = await runtime.fetch(new Request('http://localhost/webhooks/telegram', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'tg-secret' },
       body: JSON.stringify({
         update_id: 1,
         message: {

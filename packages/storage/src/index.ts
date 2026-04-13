@@ -1,5 +1,5 @@
 import type { SessionState, SessionStore } from '@crowclaw/core';
-import type { D1DatabaseLike, R2BucketLike } from '@crowclaw/shared';
+import type { D1DatabaseLike } from '@crowclaw/shared';
 
 export interface SessionSearchHit {
   sessionId: string;
@@ -351,16 +351,6 @@ export class D1MemoryStore implements MemoryStore {
 
     const row = await statement.first<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
     return row ? [this.mapRow(row)] : [];
-  }
-}
-
-export class R2ArtifactStore {
-  constructor(private readonly bucket: R2BucketLike) {}
-
-  async putJson(key: string, value: unknown): Promise<void> {
-    await this.bucket.put(key, JSON.stringify(value, null, 2), {
-      httpMetadata: { contentType: 'application/json; charset=utf-8' }
-    });
   }
 }
 

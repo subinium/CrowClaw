@@ -35,15 +35,29 @@ export const routePaths = {
     status: '/api/mcp/status',
     inspect: '/api/mcp/inspect',
     resources: '/api/mcp/resources',
-    prompts: '/api/mcp/prompts'
+    prompts: '/api/mcp/prompts',
+    serverTools: '/api/mcp/server/tools',
+    serverRequest: '/api/mcp/server/request'
+  },
+  acp: {
+    info: '/api/acp/info',
+    sessions: '/api/acp/sessions',
+    prompt: '/api/acp/prompt',
+    request: '/api/acp/request'
   },
   providers: {
     models: '/api/providers/models',
-    route: '/api/providers/route'
+    route: '/api/providers/route',
+    pool: '/api/providers/pool'
   },
   config: {
     provider: '/api/config/provider',
     providerTest: '/api/config/provider/test'
+  },
+  providerConfig: {
+    get: '/api/providers/config',
+    save: '/api/providers/config',
+    test: '/api/providers/test',
   },
   skills: '/api/skills',
   presets: '/api/presets',
@@ -75,6 +89,12 @@ export const routePaths = {
     list: '/api/personas',
     active: '/api/persona/active',
     switch: '/api/persona/switch'
+  },
+  configPresets: {
+    list: '/api/config-presets',
+    active: '/api/config-presets/active',
+    switch: '/api/config-presets/switch',
+    save: '/api/config-presets',
   },
   scheduler: {
     jobs: '/api/scheduler/jobs',

@@ -3,7 +3,7 @@ import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
 describe('runtime-node', () => {
   it('serves health, message, history/state, remember, and search routes', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ schedulerStorePath: null });
 
     const health = await runtime.fetch(new Request('http://localhost/health'));
     expect(await health.json()).toMatchObject({ ok: true, runtime: 'node' });
@@ -43,7 +43,7 @@ describe('runtime-node', () => {
   });
 
   it('creates and lists sessions from the top-level sessions API', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ schedulerStorePath: null });
 
     const created = await runtime.fetch(new Request('http://localhost/api/sessions', {
       method: 'POST',
@@ -75,7 +75,7 @@ describe('runtime-node', () => {
   });
 
   it('serves a system status/doctor route for operational inspection', async () => {
-    const runtime = createNodeRuntime({ deploymentName: 'crowclaw-local' });
+    const runtime = createNodeRuntime({ deploymentName: 'crowclaw-local', schedulerStorePath: null });
     const response = await runtime.fetch(new Request('http://localhost/api/system/status'));
     const payload = await response.json() as {
       ok: boolean;

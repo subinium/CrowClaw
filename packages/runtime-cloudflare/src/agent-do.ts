@@ -7,7 +7,7 @@ import { MemoryService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { OpenAICompatibleProvider, isModelOverridable } from '@crowclaw/providers';
 import { buildToolBridgeArtifacts, CloudflareSandboxExecutor, registerSandboxTools } from '@crowclaw/sandbox-executor';
-import { InMemorySchedulerStore, SchedulerExecutor, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markIntervalJobRun } from '@crowclaw/scheduler';
+import { InMemorySchedulerStore, SchedulerExecutor, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun } from '@crowclaw/scheduler';
 import { D1MemoryStore, D1SessionStore, type SessionListStore } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore } from '@crowclaw/workspace';

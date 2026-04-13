@@ -5,7 +5,7 @@ import {
   computeNextIntervalRun,
   createEveryNMinutesJob,
   isJobDue,
-  markIntervalJobRun,
+  markJobRun,
 } from '../packages/scheduler/src/index.js';
 
 describe('scheduler foundation', () => {
@@ -31,7 +31,7 @@ describe('scheduler foundation', () => {
     expect(due[0]?.due).toBe(true);
     expect(isJobDue(due[0].job, now)).toBe(true);
 
-    const updated = await markIntervalJobRun(store, due[0].job, now);
+    const updated = await markJobRun(store, due[0].job, now);
     expect(updated.nextRunAt).toBe('2026-01-01T00:15:00.000Z');
   });
 

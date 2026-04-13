@@ -5,8 +5,8 @@ import { DetailedUsageTracker } from '../packages/core/src/usage-tracker.js';
 import { builtInCliSlashCommands, runCliInputLine, renderCliHelp } from '../packages/cli/src/index.js';
 
 describe('Dashboard Usage panel', () => {
-  it('contains the Usage nav item in the sidebar', () => {
-    expect(DASHBOARD_HTML).toContain('data-v="usage"');
+  it('contains the Usage section in the Settings tab', () => {
+    expect(DASHBOARD_HTML).toContain('id="v-usage"');
     expect(DASHBOARD_HTML).toContain('>Usage<');
   });
 

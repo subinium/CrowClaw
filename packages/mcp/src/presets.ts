@@ -35,6 +35,14 @@ export interface GoogleMapsPresetConfig {
   apiKey: string;
 }
 
+export interface PlaywrightPresetConfig {
+  headless?: boolean;
+}
+
+export interface ExaPresetConfig {
+  apiKey: string;
+}
+
 export interface SequentialThinkingPresetConfig {
   // no config needed
 }
@@ -108,6 +116,18 @@ export const mcpPresets = {
     args: ['-y', '@modelcontextprotocol/server-everart'],
   }),
 
+  playwright: (config?: PlaywrightPresetConfig): McpStdioServerConfig => ({
+    command: 'npx',
+    args: ['@playwright/mcp@latest'],
+    ...(config?.headless === false ? { env: { HEADLESS: 'false' } } : {}),
+  }),
+
+  exa: (config: ExaPresetConfig): McpStdioServerConfig => ({
+    command: 'npx',
+    args: ['-y', 'exa-mcp-server'],
+    env: { EXA_API_KEY: config.apiKey },
+  }),
+
   sequentialThinking: (): McpStdioServerConfig => ({
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-sequential-thinking'],
@@ -139,6 +159,8 @@ type PresetConfigMap = {
   googleDrive: GoogleDrivePresetConfig;
   googleMaps: GoogleMapsPresetConfig;
   everart: void;
+  playwright: PlaywrightPresetConfig | void;
+  exa: ExaPresetConfig;
   sequentialThinking: void;
   everything: void;
   time: void;
@@ -165,6 +187,7 @@ const presetRequiredEnvVars: Partial<Record<McpPresetName, string[]>> = {
   braveSearch: ['BRAVE_API_KEY'],
   slack: ['SLACK_BOT_TOKEN'],
   googleMaps: ['GOOGLE_MAPS_API_KEY'],
+  exa: ['EXA_API_KEY'],
 };
 
 /** Check if the command/binary for a preset is available */
@@ -221,6 +244,8 @@ export function getMcpPresetDescription(name: McpPresetName): string {
     googleDrive: 'Google Drive file management',
     googleMaps: 'Google Maps geocoding and place search',
     everart: 'AI image generation via EverArt',
+    playwright: 'Browser automation — navigate, click, type, screenshot',
+    exa: 'AI-powered web search via Exa (requires EXA_API_KEY)',
     sequentialThinking: 'Dynamic problem-solving through sequential thinking',
     everything: 'Test server with all MCP features (for development)',
     time: 'Current time and timezone conversions',

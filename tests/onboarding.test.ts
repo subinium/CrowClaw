@@ -86,7 +86,7 @@ describe('Web onboarding wizard', () => {
     expect(html).toContain('CrowClaw is ready!');
     expect(html).toContain('Start chatting below');
     expect(html).toContain('Press Cmd+K for quick commands');
-    expect(html).toContain('Explore Skills and Tools in the sidebar');
+    expect(html).toContain('Explore Agent and Connect tabs in the sidebar');
     expect(html).toContain('Start Chatting');
   });
 
@@ -142,10 +142,18 @@ describe('Web onboarding wizard', () => {
 // --- Provider Test Endpoint ---
 
 describe('Provider test endpoint', () => {
+  const testToken = 'onboarding-test-token';
+  (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process = {
+    ...(globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process,
+    env: {
+      ...(globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env,
+      CROWCLAW_DASHBOARD_TOKEN: testToken,
+    },
+  };
   const runtime = createNodeRuntime();
 
   function req(method: string, path: string, body?: unknown) {
-    const init: RequestInit = { method, headers: { 'content-type': 'application/json' } };
+    const init: RequestInit = { method, headers: { 'content-type': 'application/json', 'authorization': `Bearer ${testToken}` } };
     if (body) init.body = JSON.stringify(body);
     return runtime.fetch(new Request(`http://localhost${path}`, init));
   }

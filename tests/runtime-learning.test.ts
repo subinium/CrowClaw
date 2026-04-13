@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
 describe('runtime learning integration', () => {
-  it('captures, auto-captures, lists, matches, and publishes learning drafts in the node runtime', async () => {
+  it('captures, auto-captures, refines, lists, matches, and publishes learning drafts in the node runtime', async () => {
     const runtime = createNodeRuntime();
 
     const create = await runtime.fetch(new Request('http://localhost/api/learning/drafts', {
@@ -35,6 +35,19 @@ describe('runtime learning integration', () => {
     expect(autoPayload).not.toBeNull();
     expect((autoPayload as { title: string }).title).toBe('Auto CrowClaw Draft');
 
+    const refine = await runtime.fetch(new Request(`http://localhost/api/learning/drafts/${created.id}/refine`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: 'also verify preview deployments before ship' }
+        ]
+      })
+    }));
+    const refined = await refine.json() as { version: number; steps: string[] };
+    expect(refined.version).toBe(2);
+    expect(refined.steps.some((step) => step.includes('preview deployments'))).toBe(true);
+
     const list = await runtime.fetch(new Request('http://localhost/api/learning/drafts'));
     const drafts = await list.json() as Array<{ id: string }>;
     expect(drafts.length).toBeGreaterThanOrEqual(2);
@@ -44,6 +57,12 @@ describe('runtime learning integration', () => {
     }));
     const published = await publish.json() as { status: string };
     expect(published.status).toBe('published');
+
+    const detail = await runtime.fetch(new Request('http://localhost/api/skills/deploy-crowclaw'));
+    const detailPayload = await detail.json() as { ok: boolean; skill: { slug: string; status: string } };
+    expect(detailPayload.ok).toBe(true);
+    expect(detailPayload.skill.slug).toBe('deploy-crowclaw');
+    expect(detailPayload.skill.status).toBe('published');
 
     const match = await runtime.fetch(new Request('http://localhost/api/learning/match', {
       method: 'POST',

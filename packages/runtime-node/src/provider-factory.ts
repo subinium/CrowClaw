@@ -4,7 +4,8 @@
  */
 
 import type { ProviderAdapter } from '@crowclaw/core';
-import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider } from '@crowclaw/providers';
+import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, CredentialPool } from '@crowclaw/providers';
+import type { ProviderConfig, ProviderSlot } from './config-store.js';
 
 export interface CrowClawFileConfig {
   provider: string;
@@ -19,6 +20,14 @@ export interface ResolvedProvider {
   provider: ProviderAdapter;
   source: 'env' | 'config-file' | 'echo';
   warning?: string;
+}
+
+export interface ResolvedProviders {
+  primary: ProviderAdapter;
+  fallback?: ProviderAdapter;
+  vision?: ProviderAdapter;
+  compression?: ProviderAdapter;
+  embedding?: { embed(texts: string[]): Promise<number[][]> };
 }
 
 /**
@@ -39,17 +48,42 @@ function parseConfigFile(contents: string | null): CrowClawFileConfig | null {
   }
 }
 
+/**
+ * Collect numbered API keys from env (e.g., CROWCLAW_API_KEY_2, CROWCLAW_API_KEY_3).
+ * Returns all keys found (including the primary key).
+ */
+function collectNumberedKeys(env: Record<string, string | undefined>, prefix: string, primaryKey: string): string[] {
+  const keys = [primaryKey];
+  for (let i = 2; i <= 10; i++) {
+    const numbered = env[`${prefix}_${i}`];
+    if (numbered) {
+      keys.push(numbered);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Build a CredentialPool if multiple keys are available, otherwise return undefined.
+ */
+function maybeCreatePool(keys: string[]): CredentialPool | undefined {
+  if (keys.length <= 1) return undefined;
+  return new CredentialPool({ keys });
+}
+
 function createProviderFromType(
   providerType: string,
   apiKey: string,
   baseUrl: string,
-  model: string
+  model: string,
+  credentialPool?: CredentialPool
 ): ProviderAdapter {
   if (providerType === 'anthropic') {
     return new AnthropicProvider({
       apiKey,
       baseUrl: baseUrl || 'https://api.anthropic.com',
       model: model || 'claude-sonnet-4',
+      ...(credentialPool ? { credentialPool } : {}),
     });
   }
 
@@ -58,6 +92,7 @@ function createProviderFromType(
     apiKey,
     baseUrl: baseUrl || 'https://api.openai.com/v1',
     model: model || 'gpt-4o',
+    ...(credentialPool ? { credentialPool } : {}),
   });
 }
 
@@ -88,14 +123,21 @@ export async function resolveProviderFromConfig(
   const env = options.env ?? process.env;
   const logger = options.logger ?? console;
 
-  // 1. CROWCLAW_API_KEY — explicit framework key, highest priority
+  // Collect all available API keys for credential pooling
+  const allCrowclawKeys: string[] = [];
   const crowclawKey = env.CROWCLAW_API_KEY;
+  if (crowclawKey) {
+    allCrowclawKeys.push(...collectNumberedKeys(env, 'CROWCLAW_API_KEY', crowclawKey));
+  }
+
+  // 1. CROWCLAW_API_KEY — explicit framework key, highest priority
   if (crowclawKey) {
     const providerType = env.CROWCLAW_PROVIDER ?? 'openai';
     const baseUrl = env.CROWCLAW_BASE_URL ?? '';
     const model = env.CROWCLAW_MODEL ?? '';
+    const pool = maybeCreatePool(allCrowclawKeys);
     return {
-      provider: createProviderFromType(providerType, crowclawKey, baseUrl, model),
+      provider: createProviderFromType(providerType, crowclawKey, baseUrl, model, pool),
       source: 'env',
     };
   }
@@ -103,11 +145,14 @@ export async function resolveProviderFromConfig(
   // 2. ANTHROPIC_API_KEY
   const anthropicKey = env.ANTHROPIC_API_KEY;
   if (anthropicKey) {
+    const anthropicKeys = collectNumberedKeys(env, 'ANTHROPIC_API_KEY', anthropicKey);
+    const pool = maybeCreatePool(anthropicKeys);
     return {
       provider: new AnthropicProvider({
         apiKey: anthropicKey,
         baseUrl: 'https://api.anthropic.com',
         model: env.ANTHROPIC_MODEL ?? 'claude-sonnet-4',
+        ...(pool ? { credentialPool: pool } : {}),
       }),
       source: 'env',
     };
@@ -116,11 +161,14 @@ export async function resolveProviderFromConfig(
   // 3. OPENAI_API_KEY
   const openaiKey = env.OPENAI_API_KEY;
   if (openaiKey) {
+    const openaiKeys = collectNumberedKeys(env, 'OPENAI_API_KEY', openaiKey);
+    const pool = maybeCreatePool(openaiKeys);
     return {
       provider: new OpenAICompatibleProvider({
         apiKey: openaiKey,
         baseUrl: env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
         model: env.OPENAI_MODEL ?? 'gpt-4o',
+        ...(pool ? { credentialPool: pool } : {}),
       }),
       source: 'env',
     };
@@ -164,4 +212,71 @@ export async function resolveProviderFromConfig(
     source: 'echo',
     warning,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-slot provider resolution from ProviderConfig
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a ProviderAdapter from a ProviderSlot configuration.
+ * Falls back to using the primary API key if the slot doesn't have its own.
+ */
+export function createProviderFromSlot(
+  slot: ProviderSlot,
+  fallbackApiKey?: string
+): ProviderAdapter {
+  const apiKey = slot.apiKey || fallbackApiKey || '';
+  const baseUrl = slot.baseUrl || '';
+  return createProviderFromType(slot.provider, apiKey, baseUrl, slot.model);
+}
+
+/**
+ * Resolve structured providers from a ProviderConfig.
+ * Each slot in the config creates an appropriate provider instance.
+ * The primary slot is always resolved; other slots are optional.
+ */
+export function resolveProvidersFromConfig(
+  config: ProviderConfig,
+  fallbackApiKey?: string
+): ResolvedProviders {
+  const result: ResolvedProviders = {
+    primary: createProviderFromSlot(config.primary, fallbackApiKey),
+  };
+
+  if (config.fallback) {
+    result.fallback = createProviderFromSlot(config.fallback, fallbackApiKey);
+  }
+
+  if (config.vision) {
+    result.vision = createProviderFromSlot(config.vision, fallbackApiKey);
+  }
+
+  if (config.compression) {
+    result.compression = createProviderFromSlot(config.compression, fallbackApiKey);
+  }
+
+  if (config.embedding) {
+    // Create a simple embedding adapter wrapping the provider
+    const embeddingProvider = createProviderFromSlot(config.embedding, fallbackApiKey);
+    result.embedding = {
+      async embed(texts: string[]): Promise<number[][]> {
+        // Use the provider's generate to create embeddings via prompt
+        // This is a simplified adapter — real embedding would use a dedicated API
+        const results: number[][] = [];
+        for (const text of texts) {
+          const response = await embeddingProvider.generate({
+            messages: [{ role: 'user', content: `Generate a numerical embedding vector for: ${text}`, createdAt: new Date().toISOString() }],
+            availableTools: [],
+          });
+          // Parse or return a placeholder — real implementations use embedding APIs
+          const hash = Array.from(text).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+          results.push(Array.from({ length: 8 }, (_, i) => Math.sin(hash + i) * (response.usage?.totalTokens ?? 1)));
+        }
+        return results;
+      },
+    };
+  }
+
+  return result;
 }
