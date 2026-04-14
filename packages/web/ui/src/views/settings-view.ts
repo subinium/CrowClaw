@@ -11,6 +11,7 @@ import {
   kvStyles,
 } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
+import { showToast } from '../components/toast.js';
 
 /* ------------------------------------------------------------------ */
 /*  Interfaces                                                        */
@@ -22,6 +23,11 @@ interface AgentConfig {
   systemPrompt: string;
   temperature: number;
   maxTokens: number;
+  maxToolIterations: number;
+  concurrentToolCalls: boolean;
+  synthesizeOnExhaustion: boolean;
+  maxToolResultLength: number;
+  requireApprovalForDangerousTools: boolean;
   [key: string]: unknown;
 }
 
@@ -604,6 +610,9 @@ export class SettingsView extends LitElement {
   // Diagnostics
   @state() private diagnostics: DiagnosticsInfo | null = null;
 
+  // Debounce timer for memory search
+  private _memorySearchTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Memory (session-scoped: backend has /api/sessions/{id}/memories, no global endpoint)
   @state() private memorySessions: SessionSummary[] = [];
   @state() private memorySessionId: string | null = null;
@@ -659,6 +668,11 @@ export class SettingsView extends LitElement {
         systemPrompt: '',
         temperature: 0.7,
         maxTokens: 4096,
+        maxToolIterations: 10,
+        concurrentToolCalls: true,
+        synthesizeOnExhaustion: true,
+        maxToolResultLength: 4000,
+        requireApprovalForDangerousTools: true,
       };
     }
   }
@@ -832,18 +846,22 @@ export class SettingsView extends LitElement {
   }
 
   private async _clearSecurityEvents() {
+    if (!window.confirm('Are you sure you want to clear all security events?')) return;
     try {
       await api('/api/security/events/clear', { method: 'POST' });
       this.securityEvents = [];
+      showToast('Security events cleared.', 'success');
     } catch {
       /* ignore */
     }
   }
 
   private async _resetUsage() {
+    if (!window.confirm('Are you sure you want to reset all usage data?')) return;
     try {
       await api('/api/usage/reset', { method: 'POST' });
       this._loadUsage();
+      showToast('Usage data reset.', 'success');
     } catch {
       /* ignore */
     }
@@ -861,7 +879,7 @@ export class SettingsView extends LitElement {
       });
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to save remote access config:', error.message);
+        showToast('Failed to save remote access config', 'error');
       }
     } finally {
       this.remoteAccessSaving = false;
@@ -869,12 +887,14 @@ export class SettingsView extends LitElement {
   }
 
   private async _deleteMemory(id: string) {
+    if (!window.confirm('Are you sure you want to delete this memory?')) return;
     try {
       await api(`/api/memories/${id}`, { method: 'DELETE' });
       this.memories = this.memories.filter((m) => m.id !== id);
       if (this.selectedMemoryId === id) {
         this.selectedMemoryId = null;
       }
+      showToast('Memory deleted.', 'success');
     } catch {
       /* ignore */
     }
@@ -1014,6 +1034,106 @@ export class SettingsView extends LitElement {
               };
             }}
           />
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Max Tool Iterations</label>
+          <input
+            class="form-input"
+            type="number"
+            min="1"
+            max="50"
+            step="1"
+            .value=${String(cfg.maxToolIterations ?? 10)}
+            @input=${(e: InputEvent) => {
+              this.agentConfig = {
+                ...cfg,
+                maxToolIterations: parseInt((e.target as HTMLInputElement).value, 10) || 10,
+              };
+            }}
+          />
+          <div class="form-hint">Maximum number of tool call iterations per turn (1-50)</div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Max Tool Result Length</label>
+          <input
+            class="form-input"
+            type="number"
+            min="100"
+            max="20000"
+            step="100"
+            .value=${String(cfg.maxToolResultLength ?? 4000)}
+            @input=${(e: InputEvent) => {
+              this.agentConfig = {
+                ...cfg,
+                maxToolResultLength: parseInt((e.target as HTMLInputElement).value, 10) || 4000,
+              };
+            }}
+          />
+          <div class="form-hint">Maximum character length for tool results (100-20000)</div>
+        </div>
+
+        <div class="sub-card" style="margin-top:var(--sp-3)">
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <div class="toggle-name">Concurrent Tool Calls</div>
+              <div class="toggle-desc">Allow the agent to execute multiple tool calls in parallel.</div>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                .checked=${cfg.concurrentToolCalls ?? true}
+                @change=${(e: Event) => {
+                  this.agentConfig = {
+                    ...cfg,
+                    concurrentToolCalls: (e.target as HTMLInputElement).checked,
+                  };
+                }}
+              />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <div class="toggle-name">Synthesize on Exhaustion</div>
+              <div class="toggle-desc">Generate a summary response when tool iterations are exhausted.</div>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                .checked=${cfg.synthesizeOnExhaustion ?? true}
+                @change=${(e: Event) => {
+                  this.agentConfig = {
+                    ...cfg,
+                    synthesizeOnExhaustion: (e.target as HTMLInputElement).checked,
+                  };
+                }}
+              />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <div class="toggle-name">Require Approval for Dangerous Tools</div>
+              <div class="toggle-desc">Prompt for user confirmation before executing tools marked as dangerous.</div>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                .checked=${cfg.requireApprovalForDangerousTools ?? true}
+                @change=${(e: Event) => {
+                  this.agentConfig = {
+                    ...cfg,
+                    requireApprovalForDangerousTools: (e.target as HTMLInputElement).checked,
+                  };
+                }}
+              />
+              <span class="slider"></span>
+            </label>
+          </div>
         </div>
 
         ${this.agentStatus
@@ -1487,7 +1607,8 @@ export class SettingsView extends LitElement {
                 .value=${this.memorySearch}
                 @input=${(e: InputEvent) => {
                   this.memorySearch = (e.target as HTMLInputElement).value;
-                  this._loadMemories();
+                  if (this._memorySearchTimer) clearTimeout(this._memorySearchTimer);
+                  this._memorySearchTimer = setTimeout(() => this._loadMemories(), 300);
                 }}
               />
 

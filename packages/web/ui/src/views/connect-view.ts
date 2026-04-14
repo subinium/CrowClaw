@@ -11,6 +11,7 @@ import {
   kvStyles,
 } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
+import { showToast } from '../components/toast.js';
 import '../components/toggle-switch.js';
 
 /* ------------------------------------------------------------------ */
@@ -876,9 +877,15 @@ export class ConnectView extends LitElement {
   @state() private loading = true;
   @state() private toolSearch = '';
 
+  /* Provider test */
+  @state() private testingProvider: string | null = null;
+
   /* Provider config form */
   @state() private configuringProvider: string | null = null;
   @state() private providerForm = { slot: '', name: '', provider: '', baseUrl: '', apiKey: '', model: '' };
+
+  /* MCP reconnect */
+  @state() private reconnectingMcp: string | null = null;
 
   /* MCP add form */
   @state() private showMcpForm = false;
@@ -1124,7 +1131,7 @@ export class ConnectView extends LitElement {
       await this._fetchPlatforms();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to save platform config:', error.message);
+        showToast('Failed to save platform config', 'error');
       }
     }
   }
@@ -1138,7 +1145,7 @@ export class ConnectView extends LitElement {
       await this._fetchPlatforms();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to save policy:', error.message);
+        showToast('Failed to save policy', 'error');
       }
     }
   }
@@ -1169,7 +1176,7 @@ export class ConnectView extends LitElement {
       await this._fetchPairings();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to approve pairing:', error.message);
+        showToast('Failed to approve pairing', 'error');
       }
     } finally {
       this.approvingPairing = null;
@@ -1191,7 +1198,7 @@ export class ConnectView extends LitElement {
       await this._fetchTelegramWebhook();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to set webhook:', error.message);
+        showToast('Failed to set webhook', 'error');
       }
     } finally {
       this.settingWebhook = false;
@@ -1206,7 +1213,7 @@ export class ConnectView extends LitElement {
       await this._fetchTelegramWebhook();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to delete webhook:', error.message);
+        showToast('Failed to delete webhook', 'error');
       }
     } finally {
       this.deletingWebhook = false;
@@ -1301,12 +1308,33 @@ export class ConnectView extends LitElement {
           body: JSON.stringify(payload),
         });
       }
+      // Clear sensitive form data immediately after successful save
+      this.providerForm = { ...this.providerForm, apiKey: '' };
       this.configuringProvider = null;
       await this._fetchProviders();
+      showToast('Provider config saved', 'success');
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to save provider config:', error.message);
+        showToast('Failed to save provider config', 'error');
       }
+    }
+  }
+
+  /* ---- provider test ---- */
+
+  private async _testProvider(provider: ProviderDisplay) {
+    this.testingProvider = provider.slot;
+    try {
+      await api('/api/providers/test', {
+        method: 'POST',
+        body: JSON.stringify({ provider: provider.provider, model: provider.model }),
+      });
+      showToast('Provider test passed', 'success');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      showToast('Provider test failed: ' + msg, 'error');
+    } finally {
+      this.testingProvider = null;
     }
   }
 
@@ -1378,6 +1406,7 @@ export class ConnectView extends LitElement {
   }
 
   private async _removeMcpServer(name: string) {
+    if (!window.confirm(`Remove MCP server "${name}"?`)) return;
     try {
       await api(`/api/mcp/servers/${encodeURIComponent(name)}`, {
         method: 'DELETE',
@@ -1385,8 +1414,23 @@ export class ConnectView extends LitElement {
       await this._fetchMcp();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to remove MCP server:', error.message);
+        showToast('Failed to remove MCP server', 'error');
       }
+    }
+  }
+
+  private async _reconnectMcpServer(name: string) {
+    this.reconnectingMcp = name;
+    try {
+      await api(`/api/mcp/servers/${encodeURIComponent(name)}/reconnect`, {
+        method: 'POST',
+      });
+      showToast(`Reconnected to ${name}`, 'success');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      showToast(`Failed to reconnect ${name}: ${msg}`, 'error');
+    } finally {
+      this.reconnectingMcp = null;
     }
   }
 
@@ -1394,6 +1438,8 @@ export class ConnectView extends LitElement {
 
   private async _togglePlatform(platform: GatewayPlatform) {
     const newEnabled = !platform.enabled;
+    // Confirm before disabling a platform
+    if (!newEnabled && !window.confirm(`Disable platform "${platform.name}"?`)) return;
     // Optimistic update
     this.platforms = this.platforms.map((p) =>
       p.name === platform.name ? { ...p, enabled: newEnabled } : p,
@@ -1539,6 +1585,14 @@ export class ConnectView extends LitElement {
         <div class="provider-url">${provider.baseUrl || provider.provider} / ${provider.model}</div>
         <div class="provider-actions">
           <button
+            class="btn"
+            aria-label="Test ${provider.name} provider"
+            ?disabled=${this.testingProvider === provider.slot}
+            @click=${() => this._testProvider(provider)}
+          >
+            ${this.testingProvider === provider.slot ? 'Testing...' : 'Test'}
+          </button>
+          <button
             class="btn ${isConfiguring ? 'btn-p' : ''}"
             @click=${() => this._openProviderConfig(provider)}
           >
@@ -1674,6 +1728,14 @@ export class ConnectView extends LitElement {
             ? html`<div class="mcp-desc">${server.description}</div>`
             : nothing}
         </div>
+        <button
+          class="btn"
+          aria-label="Reconnect ${server.name}"
+          ?disabled=${this.reconnectingMcp === server.name}
+          @click=${() => this._reconnectMcpServer(server.name)}
+        >
+          ${this.reconnectingMcp === server.name ? 'Reconnecting...' : 'Reconnect'}
+        </button>
         ${server.custom !== false
           ? html`
               <button

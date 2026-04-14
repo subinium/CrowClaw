@@ -11,6 +11,7 @@ import {
   gridStyles,
 } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
+import { showToast } from '../components/toast.js';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -340,7 +341,7 @@ export class AgentView extends LitElement {
       this.configPresets = all.filter((p) => p.type === 'config');
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to fetch presets:', error.message);
+        showToast('Failed to fetch presets', 'error');
       }
     } finally {
       this.presetsLoading = false;
@@ -362,7 +363,7 @@ export class AgentView extends LitElement {
       }));
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to fetch skills:', error.message);
+        showToast('Failed to fetch skills', 'error');
       }
     } finally {
       this.skillsLoading = false;
@@ -389,7 +390,7 @@ export class AgentView extends LitElement {
       await this._fetchSkills();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to create skill:', error.message);
+        showToast('Failed to create skill', 'error');
       }
     }
   }
@@ -412,7 +413,7 @@ export class AgentView extends LitElement {
       await this._fetchSkills();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to update skill:', error.message);
+        showToast('Failed to update skill', 'error');
       }
     }
   }
@@ -423,7 +424,7 @@ export class AgentView extends LitElement {
       this.skills = this.skills.filter((s) => s.slug !== slug);
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to delete skill:', error.message);
+        showToast('Failed to delete skill', 'error');
       }
     }
   }
@@ -463,7 +464,7 @@ export class AgentView extends LitElement {
       await this._fetchSkills();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to import skill:', error.message);
+        showToast('Failed to import skill', 'error');
       }
     }
   }
@@ -485,7 +486,7 @@ export class AgentView extends LitElement {
       await this._fetchPresets();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to activate preset:', error.message);
+        showToast('Failed to activate preset', 'error');
       }
     }
   }

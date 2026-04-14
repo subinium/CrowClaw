@@ -1643,6 +1643,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'POST' && renameMatch) {
         const sessionId = renameMatch[1];
         const body = (await request.json()) as { name: string };
+        const session = await store.get(sessionId);
+        if (session) {
+          // Store the display name in the first system message or as a metadata convention
+          // We prepend a metadata marker that the dashboard can read back
+          const existingMeta = session.messages.find(m => m.role === 'system' && m.content.startsWith('[session-meta]'));
+          const metaMsg = { role: 'system' as const, content: `[session-meta] name=${body.name}`, createdAt: new Date().toISOString() };
+          if (existingMeta) {
+            existingMeta.content = metaMsg.content;
+          } else {
+            session.messages.unshift(metaMsg);
+          }
+          session.updatedAt = new Date().toISOString();
+          await store.put(session);
+        }
         return Response.json({ ok: true, sessionId, name: body.name });
       }
 
@@ -4263,7 +4277,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                   });
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', response: result.finalResponse })}\n\n`));
                 }
-              } catch (err: unknown) {
+              // Post-stream: capture memory and skills (same as sync path)
+              try {
+                const updatedSession = await store.get(sessionId);
+                if (updatedSession) {
+                  await memoryService.captureSessionSummary(sessionId, updatedSession.messages);
+                  const toolMsgs = updatedSession.messages.filter(m => m.role === 'tool' || (m.role === 'assistant' && m.content?.includes('tool')));
+                  if (toolMsgs.length > 0) {
+                    learning.autoCapture(updatedSession.messages, sessionId).catch(() => { /* best-effort */ });
+                  }
+                  eventBus.emit('chat:complete', { sessionId, toolCount: toolMsgs.length });
+                  eventBus.emit('session:updated', { sessionId, messageCount: updatedSession.messages.length });
+                }
+              } catch { /* best-effort post-stream capture */ }
+              } catch (err: unknown) { // eslint-disable-line -- outer try-catch for stream errors
                 const msg = err instanceof Error ? err.message : String(err);
                 eventBus.emit('chat:error', { sessionId, error: msg });
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`));

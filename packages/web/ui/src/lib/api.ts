@@ -3,17 +3,40 @@
  * Ported from vanilla JS `ap()` function.
  */
 
-let authToken: string | null = null;
+const TOKEN_KEY = 'cc_auth_token';
+
+let authToken: string | null = sessionStorage.getItem(TOKEN_KEY);
 
 export const setAuthToken = (token: string | null) => {
   authToken = token;
+  if (token) {
+    sessionStorage.setItem(TOKEN_KEY, token);
+  } else {
+    sessionStorage.removeItem(TOKEN_KEY);
+  }
 };
 
 export const getAuthToken = () => authToken;
 
+export const clearAuthToken = () => {
+  authToken = null;
+  sessionStorage.removeItem(TOKEN_KEY);
+};
+
 export interface ApiOptions extends RequestInit {
   /** Skip JSON parsing and return raw Response */
   raw?: boolean;
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly statusText: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
 }
 
 export const api = async <T = unknown>(path: string, options?: ApiOptions): Promise<T> => {
@@ -35,7 +58,20 @@ export const api = async <T = unknown>(path: string, options?: ApiOptions): Prom
 
   if (response.status === 401) {
     document.dispatchEvent(new CustomEvent('crowclaw:auth-required'));
-    throw new Error('Unauthorized');
+    throw new ApiError('Unauthorized', 401, response.statusText);
+  }
+
+  if (!response.ok) {
+    let errorMessage = `HTTP ${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body?.error) {
+        errorMessage = typeof body.error === 'string' ? body.error : body.error.message ?? errorMessage;
+      }
+    } catch {
+      // Response is not JSON — use status text
+    }
+    throw new ApiError(errorMessage, response.status, response.statusText);
   }
 
   if (raw) {

@@ -4,6 +4,7 @@
  */
 
 import { connectEventStream } from './sse.js';
+import { getAuthToken } from './api.js';
 
 export interface WsCallbacks {
   onEvent: (event: { type: string; data: Record<string, unknown> }) => void;
@@ -24,7 +25,9 @@ const MAX_FAILURES_BEFORE_FALLBACK = 3;
 
 const buildWsUrl = (): string => {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${location.host}/api/ws`;
+  const base = `${protocol}//${location.host}/api/ws`;
+  const token = getAuthToken();
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 };
 
 export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {

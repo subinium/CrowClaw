@@ -5,6 +5,7 @@ import { api } from '../lib/api.js';
 import { streamMessage, type StreamCallbacks } from '../lib/sse.js';
 import { renderMarkdown, highlightCodeBlocks, attachCopyHandlers } from '../lib/markdown.js';
 import { buttonStyles } from '../lib/shared-styles.js';
+import { showToast } from '../components/toast.js';
 
 interface SessionInfo {
   id: string;
@@ -39,6 +40,7 @@ interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool' | 'iteration';
   content: string;
   name?: string;
+  createdAt?: string;
 }
 
 interface ToolStep {
@@ -726,11 +728,11 @@ export class ChatView extends LitElement {
         padding: var(--sp-3) var(--sp-4);
         border-top: 1px solid var(--glass-border);
         display: flex;
-        align-items: center;
+        align-items: flex-end;
         gap: var(--sp-2);
       }
 
-      .chat-input input {
+      .chat-input textarea {
         flex: 1;
         padding: var(--sp-3);
         border: 1px solid var(--glass-border);
@@ -741,10 +743,15 @@ export class ChatView extends LitElement {
         outline: none;
         border-radius: var(--radius-md);
         transition: border-color var(--duration-fast);
+        resize: none;
+        min-height: 40px;
+        max-height: 160px;
+        overflow-y: auto;
+        line-height: 1.5;
       }
 
-      .chat-input input:focus { border-color: var(--accent); }
-      .chat-input input::placeholder { color: var(--text-muted); }
+      .chat-input textarea:focus { border-color: var(--accent); }
+      .chat-input textarea::placeholder { color: var(--text-muted); }
 
       .send-btn {
         width: 36px;
@@ -936,9 +943,54 @@ export class ChatView extends LitElement {
         flex: 1;
       }
 
+      /* Thinking indicator */
+      .thinking-indicator {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-3) var(--sp-4);
+        max-width: 85%;
+        margin-bottom: var(--sp-3);
+        background: var(--glass-bg);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-md);
+        font-size: var(--text-sm);
+        color: var(--text-secondary);
+      }
+
+      .thinking-dots {
+        display: flex;
+        gap: 4px;
+      }
+
+      .thinking-dots span {
+        width: 6px;
+        height: 6px;
+        background: var(--text-muted);
+        border-radius: 50%;
+        animation: thinking-bounce 1.4s ease-in-out infinite;
+      }
+
+      .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+      .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+      @keyframes thinking-bounce {
+        0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+        40% { opacity: 1; transform: scale(1); }
+      }
+
+      /* Message timestamp */
+      .msg-time {
+        font-size: 9px;
+        color: var(--text-muted);
+        margin-top: var(--sp-1);
+        text-align: right;
+      }
+
       /* Responsive */
       @media (max-width: 768px) {
-        .sess-sb { display: none; }
+        .sess-sb { position: fixed; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: var(--shadow-md); }
+        .sess-sb.hidden { display: none; }
       }
     `,
   ];
@@ -968,8 +1020,9 @@ export class ChatView extends LitElement {
   @state() private showRenameInput = false;
   @state() private renameSessionId: string | null = null;
   @state() private showCheckpointLabel = false;
+  @state() private thinking = false;
 
-  @query('#msgInput') private msgInput!: HTMLInputElement;
+  @query('#msgInput') private msgInput!: HTMLTextAreaElement;
   @query('.messages') private messagesEl!: HTMLElement;
 
   private _streamController?: AbortController;
@@ -1066,7 +1119,7 @@ export class ChatView extends LitElement {
   private async _loadHistory() {
     if (!this.currentSessionId) return;
     try {
-      const data = await api<{ sessionId: string; messages: ChatMessage[]; updatedAt?: string }>(`/api/sessions/${this.currentSessionId}/history`);
+      const data = await api<{ sessionId: string; messages: ChatMessage[]; updatedAt?: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/history`);
       this.messages = data.messages || [];
       this._scrollToBottom();
     } catch {
@@ -1082,13 +1135,16 @@ export class ChatView extends LitElement {
     this._loadHistory();
   }
 
-  private _createSession() {
+  private async _createSession() {
     const id = `s-${Date.now().toString(36)}`;
     this.sessions = [
       { id, title: '', preview: '', messageCount: 0, updatedAt: new Date().toISOString() },
       ...this.sessions,
     ];
     this._selectSession(id);
+    try {
+      await api('/api/sessions', { method: 'POST', body: JSON.stringify({ sessionId: id }) });
+    } catch { /* session will be created on first message if this fails */ }
   }
 
   private async _deleteSession(e: Event, id: string) {
@@ -1101,7 +1157,7 @@ export class ChatView extends LitElement {
       this.messages = [];
     }
     try {
-      await api(`/api/sessions/${id}`, { method: 'DELETE' });
+      await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
     } catch { /* ignore */ }
   }
 
@@ -1119,7 +1175,7 @@ export class ChatView extends LitElement {
     if (!this.currentSessionId) return;
     this.aborting = true;
     try {
-      await api<{ ok: boolean; aborted: boolean }>(`/api/sessions/${this.currentSessionId}/abort`, { method: 'POST', body: JSON.stringify({}) });
+      await api<{ ok: boolean; aborted: boolean }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/abort`, { method: 'POST', body: JSON.stringify({}) });
       this._streamController?.abort();
       this.streaming = false;
       this.streamText = '';
@@ -1135,7 +1191,7 @@ export class ChatView extends LitElement {
     if (!this.currentSessionId) return;
     this.showConfirmCompact = false;
     try {
-      const data = await api<{ ok: boolean; originalMessageCount: number; compactedMessageCount: number; summary: string }>(`/api/sessions/${this.currentSessionId}/compact`, { method: 'POST', body: JSON.stringify({}) });
+      const data = await api<{ ok: boolean; originalMessageCount: number; compactedMessageCount: number; summary: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/compact`, { method: 'POST', body: JSON.stringify({}) });
       this.messages = [...this.messages, { role: 'system', content: `Compacted: ${data.originalMessageCount} -> ${data.compactedMessageCount} messages. ${data.summary}` }];
       // Refresh session info
       const session = this.sessions.find((s) => s.id === this.currentSessionId);
@@ -1154,7 +1210,7 @@ export class ChatView extends LitElement {
     if (!this.currentSessionId || !directive.trim()) return;
     this.showSteerInput = false;
     try {
-      const data = await api<{ ok: boolean; injectedPrompt: string }>(`/api/sessions/${this.currentSessionId}/steer`, { method: 'POST', body: JSON.stringify({ directive: directive.trim() }) });
+      const data = await api<{ ok: boolean; injectedPrompt: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/steer`, { method: 'POST', body: JSON.stringify({ directive: directive.trim() }) });
       this.messages = [...this.messages, { role: 'system', content: `Steered: ${data.injectedPrompt}` }];
       this._scrollToBottom();
     } catch (error: unknown) {
@@ -1167,7 +1223,7 @@ export class ChatView extends LitElement {
     if (!this.currentSessionId) return;
     this.showCheckpointLabel = false;
     try {
-      await api<{ ok: boolean; checkpoint: unknown }>(`/api/sessions/${this.currentSessionId}/checkpoint`, { method: 'POST', body: JSON.stringify({ label: label || undefined }) });
+      await api<{ ok: boolean; checkpoint: unknown }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/checkpoint`, { method: 'POST', body: JSON.stringify({ label: label || undefined }) });
       this.messages = [...this.messages, { role: 'system', content: `Checkpoint created${label ? `: ${label}` : ''}` }];
       this._scrollToBottom();
     } catch (error: unknown) {
@@ -1181,7 +1237,7 @@ export class ChatView extends LitElement {
     this.showCheckpointList = !this.showCheckpointList;
     if (!this.showCheckpointList) return;
     try {
-      const data = await api<{ checkpoints: CheckpointInfo[] }>(`/api/sessions/${this.currentSessionId}/checkpoints`);
+      const data = await api<{ checkpoints: CheckpointInfo[] }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/checkpoints`);
       this.checkpoints = data.checkpoints || [];
     } catch {
       this.checkpoints = [];
@@ -1191,7 +1247,7 @@ export class ChatView extends LitElement {
   private async _restoreCheckpoint(checkpointId: string) {
     if (!this.currentSessionId) return;
     try {
-      await api<{ ok: boolean; restoredTo: string }>(`/api/sessions/${this.currentSessionId}/restore`, { method: 'POST', body: JSON.stringify({ checkpointId }) });
+      await api<{ ok: boolean; restoredTo: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/restore`, { method: 'POST', body: JSON.stringify({ checkpointId }) });
       this.showCheckpointList = false;
       this._loadHistory();
     } catch (error: unknown) {
@@ -1203,7 +1259,7 @@ export class ChatView extends LitElement {
   private async _searchSession(query: string) {
     if (!this.currentSessionId || !query.trim()) return;
     try {
-      const data = await api<{ ok: boolean; results: SearchResult[] }>(`/api/sessions/${this.currentSessionId}/search`, { method: 'POST', body: JSON.stringify({ query: query.trim() }) });
+      const data = await api<{ ok: boolean; results: SearchResult[] }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/search`, { method: 'POST', body: JSON.stringify({ query: query.trim() }) });
       this.searchResults = data.results || [];
     } catch {
       this.searchResults = [];
@@ -1221,7 +1277,7 @@ export class ChatView extends LitElement {
       this.sessions = [...this.sessions];
     }
     try {
-      await api(`/api/sessions/${sessionId}/rename`, { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
+      await api(`/api/sessions/${encodeURIComponent(sessionId)}/rename`, { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
     } catch { /* ignore */ }
   }
 
@@ -1241,19 +1297,27 @@ export class ChatView extends LitElement {
     const text = this.msgInput?.value.trim();
     if (!text || !this.currentSessionId || this.streaming) return;
     this.msgInput.value = '';
+    this._autoResizeTextarea();
+    this._sendMessageWithText(text);
+  }
 
-    this.messages = [...this.messages, { role: 'user', content: text }];
+  private _sendMessageWithText(text: string) {
+    if (!text || !this.currentSessionId || this.streaming) return;
+
+    const now = new Date().toISOString();
+    this.messages = [...this.messages, { role: 'user', content: text, createdAt: now }];
 
     const session = this.sessions.find((s) => s.id === this.currentSessionId);
     if (session) {
       session.messageCount++;
-      session.updatedAt = new Date().toISOString();
+      session.updatedAt = now;
       if (!session.title) session.title = text.slice(0, 30);
       session.preview = text.slice(0, 60);
       this.sessions = [...this.sessions];
     }
 
     this.streaming = true;
+    this.thinking = true;
     this.streamText = '';
     this.toolSteps = [];
     this.traceToolHistory = [];
@@ -1265,18 +1329,20 @@ export class ChatView extends LitElement {
 
     const callbacks: StreamCallbacks = {
       onTextDelta: (content) => {
+        this.thinking = false;
         this.streamText += content;
         this.traceData = { ...this.traceData, tokens: this.traceData.tokens + 1 };
         this._scrollToBottom();
       },
       onToolStart: (toolName, toolCallId, input) => {
+        this.thinking = false;
         this.toolSteps = [...this.toolSteps, {
           toolCallId, toolName, status: 'running', input,
         }];
         this.traceData = { ...this.traceData, tool: toolName };
         this.traceToolHistory = [...this.traceToolHistory, { toolName, status: 'running' }];
         if (this.streamText.trim()) {
-          this.messages = [...this.messages, { role: 'assistant', content: this.streamText }];
+          this.messages = [...this.messages, { role: 'assistant', content: this.streamText, createdAt: new Date().toISOString() }];
           this.streamText = '';
         }
       },
@@ -1310,8 +1376,9 @@ export class ChatView extends LitElement {
         }
       },
       onDone: () => {
+        this.thinking = false;
         if (this.streamText.trim()) {
-          this.messages = [...this.messages, { role: 'assistant', content: this.streamText }];
+          this.messages = [...this.messages, { role: 'assistant', content: this.streamText, createdAt: new Date().toISOString() }];
         }
         this.streaming = false;
         this.streamText = '';
@@ -1321,9 +1388,10 @@ export class ChatView extends LitElement {
         this._applyHighlighting();
       },
       onError: (error) => {
+        this.thinking = false;
         this.streaming = false;
         this.aborting = false;
-        this.messages = [...this.messages, { role: 'system', content: `Error: ${error}` }];
+        this.messages = [...this.messages, { role: 'system', content: `Error: ${error}`, createdAt: new Date().toISOString() }];
         this._scrollToBottom();
       },
     };
@@ -1336,6 +1404,12 @@ export class ChatView extends LitElement {
       e.preventDefault();
       this._sendMessage();
     }
+  }
+
+  private _autoResizeTextarea() {
+    if (!this.msgInput) return;
+    this.msgInput.style.height = 'auto';
+    this.msgInput.style.height = Math.min(this.msgInput.scrollHeight, 160) + 'px';
   }
 
   private _scrollToBottom() {
@@ -1380,7 +1454,7 @@ export class ChatView extends LitElement {
       <div class="chat-area">
         <!-- Session Sidebar -->
         ${this.sessSidebarOpen ? html`
-          <div class="sess-sb">
+          <div class="sess-sb" @click=${(e: Event) => e.stopPropagation()}>
             <div class="sess-hdr">
               <input placeholder="Search sessions..."
                      .value=${this.searchQuery}
@@ -1412,6 +1486,12 @@ export class ChatView extends LitElement {
                 ? html`<div class="empty"><div class="empty-title">New Session</div><div class="empty-subtitle">Type a message to begin.</div></div>`
                 : html`
                     ${this.messages.map((m, i) => this._renderMessage(m, i))}
+                    ${this.streaming && this.thinking ? html`
+                      <div class="thinking-indicator">
+                        <div class="thinking-dots"><span></span><span></span><span></span></div>
+                        Thinking...
+                      </div>
+                    ` : nothing}
                     ${this.streaming && this.streamText ? html`
                       <div class="msg assistant streaming">
                         <span class="role-tag">assistant</span>
@@ -1424,9 +1504,11 @@ export class ChatView extends LitElement {
 
           <!-- Chat Input -->
           <div class="chat-input">
-            <input id="msgInput" placeholder="Send a message..."
-                   ?disabled=${!this.currentSessionId}
-                   @keydown=${this._inputKeydown}>
+            <textarea id="msgInput" placeholder="Send a message... (Shift+Enter for newline)"
+                      rows="1"
+                      ?disabled=${!this.currentSessionId}
+                      @keydown=${this._inputKeydown}
+                      @input=${this._autoResizeTextarea}></textarea>
             <button class="send-btn" @click=${this._sendMessage}
                     ?disabled=${!this.currentSessionId || this.streaming}
                     aria-label="Send message">
@@ -1734,6 +1816,7 @@ export class ChatView extends LitElement {
         ${msg.role === 'assistant' && index > 0
           ? html`<button class="btn retry-btn" @click=${() => this._retryMessage(index)}>Retry</button>`
           : nothing}
+        ${msg.createdAt ? html`<div class="msg-time">${timeAgo(msg.createdAt)}</div>` : nothing}
       </div>
     `;
   }
@@ -1741,8 +1824,9 @@ export class ChatView extends LitElement {
   private _retryMessage(index: number) {
     for (let i = index - 1; i >= 0; i--) {
       if (this.messages[i].role === 'user') {
+        const retryText = this.messages[i].content;
         this.messages = this.messages.slice(0, i);
-        this._sendMessage();
+        this._sendMessageWithText(retryText);
         break;
       }
     }

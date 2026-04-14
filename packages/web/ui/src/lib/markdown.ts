@@ -3,12 +3,62 @@
  * Ported from vanilla JS md() function.
  * Handles: code blocks, inline code, bold, italic, headers,
  * blockquotes, lists, links, horizontal rules.
+ *
+ * Security: All user text is HTML-escaped. Link URLs are attribute-encoded.
+ * Output is post-sanitized to strip any remaining dangerous elements.
  */
 
 const escapeHtml = (text: string): string => {
   const div = document.createElement('div');
   div.textContent = text;
   return div.innerHTML;
+};
+
+/** Encode a value for safe use inside an HTML attribute (double-quoted). */
+const escapeAttr = (value: string): string =>
+  value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** Blocked URL schemes that can execute scripts or exfiltrate data. */
+const BLOCKED_SCHEMES = /^(javascript|vbscript|data|blob):/i;
+
+/**
+ * Post-sanitize HTML output to remove any dangerous elements/attributes
+ * that might have slipped through the regex pipeline.
+ * Uses the browser's own parser for robust sanitization.
+ */
+const sanitizeHtml = (html: string): string => {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const body = doc.body;
+
+  // Remove dangerous elements
+  const dangerousTags = ['script', 'iframe', 'object', 'embed', 'form', 'base', 'meta', 'link', 'style'];
+  for (const tag of dangerousTags) {
+    const elements = body.getElementsByTagName(tag);
+    while (elements.length > 0) {
+      elements[0].remove();
+    }
+  }
+
+  // Remove event handler attributes from all elements
+  const allElements = body.querySelectorAll('*');
+  for (const el of allElements) {
+    const attrs = [...el.attributes];
+    for (const attr of attrs) {
+      const name = attr.name.toLowerCase();
+      // Remove on* event handlers, javascript: hrefs, and dangerous attributes
+      if (
+        name.startsWith('on') ||
+        (name === 'href' && BLOCKED_SCHEMES.test(attr.value.trim())) ||
+        (name === 'src' && BLOCKED_SCHEMES.test(attr.value.trim())) ||
+        name === 'srcdoc' ||
+        name === 'formaction'
+      ) {
+        el.removeAttribute(attr.name);
+      }
+    }
+  }
+
+  return body.innerHTML;
 };
 
 export const renderMarkdown = (raw: string): string => {
@@ -19,7 +69,7 @@ export const renderMarkdown = (raw: string): string => {
   const codeBlocks: string[] = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang: string, code: string) => {
     const idx = codeBlocks.length;
-    const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+    const langAttr = lang ? ` class="language-${escapeAttr(lang)}"` : '';
     codeBlocks.push(
       `<div class="code-block"><pre class="md-pre"><code${langAttr}>${escapeHtml(code.trim())}</code></pre>` +
       `<button class="code-copy" data-copy>Copy</button></div>`,
@@ -53,15 +103,15 @@ export const renderMarkdown = (raw: string): string => {
   // Horizontal rules
   text = text.replace(/^---$/gm, '<hr class="md-hr">');
 
-  // Links — block dangerous URL schemes (javascript:, vbscript:, data:)
+  // Links — block dangerous URL schemes (javascript:, vbscript:, data:, blob:)
   text = text.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
     (_match: string, label: string, url: string) => {
       const trimmed = url.trim().toLowerCase();
-      if (/^(javascript|vbscript|data):/i.test(trimmed)) {
-        return `<span title="Blocked: unsafe URL scheme">${label}</span>`;
+      if (BLOCKED_SCHEMES.test(trimmed)) {
+        return `<span title="Blocked: unsafe URL scheme">${escapeHtml(label)}</span>`;
       }
-      return `<a href="${url}" target="_blank" rel="noopener">${label}</a>`;
+      return `<a href="${escapeAttr(url.trim())}" target="_blank" rel="noopener noreferrer">${label}</a>`;
     },
   );
 
@@ -118,7 +168,8 @@ export const renderMarkdown = (raw: string): string => {
     text = text.replace(`%%INLINE${i}%%`, inlineCode[i]);
   }
 
-  return text;
+  // Final DOM-based sanitization pass — removes any script/iframe/event handlers
+  return sanitizeHtml(text);
 };
 
 /**
