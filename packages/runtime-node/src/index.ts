@@ -66,7 +66,7 @@ import { UserModelService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, ProviderChain, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
-import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools } from '@crowclaw/tools';
+import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools, createFrozenMemorySetTool, createFrozenMemoryRemoveTool } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
 import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun, type DeliveryFn, type DeliveryTarget } from '@crowclaw/scheduler';
 import { AcpServer } from '@crowclaw/acp';
@@ -1467,6 +1467,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   if (tools instanceof ToolRegistry) {
     registerSchedulerTools(tools, schedulerStore, autonomousScheduler);
   }
+
+  // Register frozen memory tools (memory.set, memory.remove)
+  tools.register(createFrozenMemorySetTool(frozenMemory));
+  tools.register(createFrozenMemoryRemoveTool(frozenMemory));
 
   // Auto-start scheduler if there are existing jobs
   schedulerStore.listJobs().then((jobs) => {
