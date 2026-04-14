@@ -1129,7 +1129,7 @@ export class ConnectView extends LitElement {
     try {
       await api(`/api/gateway/${encodeURIComponent(platform.name)}/policy`, {
         method: 'POST',
-        body: JSON.stringify({ policy: this.platformPolicyForm }),
+        body: JSON.stringify(this.platformPolicyForm),
       });
       await this._fetchPlatforms();
     } catch (error: unknown) {

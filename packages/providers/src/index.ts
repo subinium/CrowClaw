@@ -8,6 +8,8 @@ export interface OpenAICompatibleConfig {
   baseUrl: string;
   model: string;
   credentialPool?: CredentialPool;
+  /** Override the API endpoint path (default: /chat/completions). Use /responses for o-series/codex models. */
+  endpointPath?: string;
 }
 
 export interface AnthropicConfig {
@@ -517,6 +519,19 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     return this.config.model;
   }
 
+  /** Resolve the API endpoint: use explicit override, or auto-detect from model name */
+  private getEndpointUrl(): string {
+    const base = this.config.baseUrl.replace(/\/$/, '');
+    if (this.config.endpointPath) {
+      return `${base}${this.config.endpointPath}`;
+    }
+    // Auto-detect: o-series and codex models use /responses, others use /chat/completions
+    if (/^(o1|o3|o4|codex)/i.test(this.config.model)) {
+      return `${base}/responses`;
+    }
+    return `${base}/chat/completions`;
+  }
+
   /** Estimate token count for messages (~4 chars per token for OpenAI models) */
   countTokens(messages: ConversationMessage[]): number {
     const chars = countMessageChars(messages);
@@ -556,7 +571,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       body.tool_choice = 'auto';
     }
 
-    const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    const response = await fetch(this.getEndpointUrl(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -634,8 +649,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       body.tool_choice = 'auto';
     }
 
-    const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
-    const response = await fetch(url, {
+    const response = await fetch(this.getEndpointUrl(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,

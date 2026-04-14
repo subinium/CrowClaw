@@ -807,18 +807,28 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const frozenMemory = new FrozenMemory(frozenMemoryStore, 'MEMORY');
   const frozenUserProfile = new FrozenMemory(frozenMemoryStore, 'USER');
 
-  // Load frozen snapshots at startup (fire-and-forget)
-  void frozenMemory.load().catch(() => {});
-  void frozenUserProfile.load().catch(() => {});
+  // Load frozen snapshots at startup — await before first use
+  const frozenMemoryReady = Promise.all([
+    frozenMemory.load().catch(() => {}),
+    frozenUserProfile.load().catch(() => {}),
+  ]);
 
   // Context engine: discover .crowclaw.md, AGENTS.md, CLAUDE.md from working dir
   let contextEngineResult: ContextEngineResult | null = null;
+  let contextEngineReady: Promise<void> = Promise.resolve();
   const workingDir = (options as Record<string, unknown>).workingDirectory as string | undefined;
   if (workingDir) {
     const engine = new ContextEngine({ workingDirectory: workingDir });
-    void engine.discover().then((result) => {
+    // Initial discovery — await this before first agent run
+    contextEngineReady = engine.discover().then((result) => {
       contextEngineResult = result;
     }).catch(() => {});
+    // Periodic refresh every 60 seconds (picks up .crowclaw.md changes)
+    setInterval(() => {
+      engine.discover().then((result) => {
+        contextEngineResult = result;
+      }).catch(() => {});
+    }, 60_000);
   }
 
   // Security audit log, rate limiters, logger, and session mutex
@@ -1132,6 +1142,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }, overrides?: ExecutionOverrides) {
     // Auto-recall relevant memories (non-blocking — proceed without memories on failure)
     let memories: string[] = [];
+    // Ensure startup tasks have completed before first agent run
+    await contextEngineReady;
+    await frozenMemoryReady;
+
     try {
       const [recalled, profile] = await Promise.all([
         memoryService.recall(input.sessionId, input.userMessage, 5),
@@ -1172,24 +1186,60 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       memories,
     });
 
-    // Record messages to MessageStore (fire-and-forget)
-    const storedMsgs = result.session.messages.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
-      id: crypto.randomUUID(),
-      sessionId: input.sessionId,
-      role: m.role as 'system' | 'user' | 'assistant' | 'tool',
-      content: m.content,
-      name: m.name,
-      createdAt: m.createdAt ?? new Date().toISOString(),
-      metadata: m.metadata,
-    }));
-    void messageStore.appendBatch(storedMsgs).catch(() => {});
-
-    // Save frozen memory updates (extract facts from assistant responses)
-    const lastAssistant = result.session.messages.filter((m: { role: string }) => m.role === 'assistant').at(-1);
-    if (lastAssistant) {
-      void userModelService.updateFromConversation(result.session.messages, input.sessionId).catch(() => {});
-      void frozenMemory.save(input.sessionId).catch(() => {});
+    // Record only NEW messages this turn (not the full session, which includes prior messages)
+    // Use the message count before the run vs after to determine new messages
+    const existingStats = await messageStore.stats(input.sessionId).catch(() => ({ totalMessages: 0 }));
+    const allMsgs = result.session.messages;
+    const newMsgs = allMsgs.slice(existingStats.totalMessages);
+    if (newMsgs.length > 0) {
+      const storedMsgs = newMsgs.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
+        id: crypto.randomUUID(),
+        sessionId: input.sessionId,
+        role: m.role as 'system' | 'user' | 'assistant' | 'tool',
+        content: m.content,
+        name: m.name,
+        createdAt: m.createdAt ?? new Date().toISOString(),
+        metadata: m.metadata,
+      }));
+      void messageStore.appendBatch(storedMsgs).catch(() => {});
     }
+
+    // Extract facts from conversation and update frozen memory (Hermes pattern)
+    void (async () => {
+      try {
+        // Update user model
+        await userModelService.updateFromConversation(result.session.messages, input.sessionId);
+
+        // Extract user profile updates into frozen USER snapshot
+        const profile = await userModelService.getProfile(input.sessionId, input.userId ?? 'default-user');
+        if (profile.expertise.length > 0) {
+          frozenUserProfile.set('expertise', profile.expertise.join(', '), 'profile', input.sessionId);
+        }
+        if (profile.preferences.length > 0) {
+          frozenUserProfile.set('preferences', profile.preferences.join('; '), 'profile', input.sessionId);
+        }
+        await frozenUserProfile.save(input.sessionId);
+
+        // Extract key facts from tool results into frozen MEMORY snapshot
+        const toolMsgs = result.session.messages.filter((m: { role: string }) => m.role === 'tool');
+        for (const tm of toolMsgs.slice(-3)) { // last 3 tool results
+          const name = (tm as { name?: string }).name ?? 'tool';
+          const content = (tm as { content: string }).content;
+          if (content && content.length > 10 && content.length < 500) {
+            frozenMemory.set(`tool:${name}:${input.sessionId.slice(-6)}`, content.slice(0, 300), 'tool-result', input.sessionId);
+          }
+        }
+        // Extract decisions from assistant messages
+        const assistantMsgs = result.session.messages.filter((m: { role: string }) => m.role === 'assistant');
+        const lastAssistant = assistantMsgs.at(-1) as { content: string } | undefined;
+        if (lastAssistant?.content && /\b(decided|confirmed|set|created|updated|fixed|completed)\b/i.test(lastAssistant.content)) {
+          const fact = lastAssistant.content.slice(0, 200);
+          frozenMemory.set(`decision:${input.sessionId.slice(-6)}`, fact, 'decision', input.sessionId);
+        }
+        frozenMemory.prune(100); // Keep bounded
+        await frozenMemory.save(input.sessionId);
+      } catch { /* best-effort */ }
+    })();
     return result;
   }
 
@@ -1684,6 +1734,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           deployment: deploymentName,
           version
         });
+      }
+
+      // Tool inventory shortcut (used by app shell sidebar)
+      if (request.method === 'GET' && url.pathname === '/api/tools') {
+        const registry = buildConfiguredToolRegistry();
+        const allTools = registry.list();
+        return Response.json({ tools: allTools, count: allTools.length });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/status') {
@@ -4297,8 +4354,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname.match(/^\/api\/gateway\/([^/]+)\/config$/)) {
         const platform = url.pathname.split('/')[3]!;
-        const body = await request.json() as { token?: string; enabled?: boolean };
+        const body = await request.json() as { token?: string; enabled?: boolean; channelId?: string; muted?: boolean };
         const existing = configStore.getGatewayConfig(platform);
+        // Channel-level mute: store in extra map
+        if (body.channelId && body.muted !== undefined) {
+          const extra = existing?.extra ?? {};
+          extra[`mute:${body.channelId}`] = body.muted ? 'true' : 'false';
+          configStore.setGatewayConfig(platform, { ...existing ?? { enabled: false }, extra });
+          return Response.json({ ok: true, platform, channelId: body.channelId, muted: body.muted });
+        }
         configStore.setGatewayConfig(platform, {
           enabled: body.enabled ?? existing?.enabled ?? true,
           token: body.token ?? existing?.token,
@@ -4738,14 +4802,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/api/memory/snapshot') {
+        await frozenMemoryReady; // ensure load() finished before mutation
         const body = (await request.json()) as { namespace: 'memory' | 'user'; action: 'set' | 'remove'; key: string; value?: string; category?: string };
         const target = body.namespace === 'user' ? frozenUserProfile : frozenMemory;
         if (body.action === 'set') {
           target.set(body.key, body.value ?? '', body.category);
-          await target.save();
+          await target.save().catch(() => {}); // best-effort persist
         } else if (body.action === 'remove') {
           target.remove(body.key);
-          await target.save();
+          await target.save().catch(() => {}); // best-effort persist
         }
         return Response.json({ ok: true, size: target.size, version: target.snapshotVersion });
       }
