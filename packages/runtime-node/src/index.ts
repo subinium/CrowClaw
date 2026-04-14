@@ -882,14 +882,23 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     recallFn: (sessionId: string, query: string, limit: number) => memoryService.recall(sessionId, query, limit)
   });
 
-  // Provider: resolve from env/config if not explicitly provided
+  // Provider: resolve from env/config if not explicitly provided.
+  // Start with EchoProvider and upgrade async when real credentials are found.
+  // Callers that want hermetic behavior should pass options.provider explicitly.
   let provider = options.provider ?? new EchoProvider();
   let providerReady = !!options.provider;
   if (!options.provider) {
-    void resolveProviderFromConfig().then((resolved) => {
-      provider = resolved.provider;
+    // Skip config file when configStorePath is null (test/hermetic mode)
+    const resolveOpts = options.configStorePath === null
+      ? { configFileContents: null as string | null }
+      : {};
+    void resolveProviderFromConfig(resolveOpts).then((resolved) => {
+      // Only upgrade from EchoProvider if real credentials were found
+      if (resolved.source !== 'fallback') {
+        provider = resolved.provider;
+      }
       providerReady = true;
-    });
+    }).catch(() => { providerReady = true; });
   }
 
   const toolsetPresets = new Map<string, (ReturnType<typeof listToolsetPresets>)[number]>(
@@ -1212,11 +1221,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Normal: slice from where we left off
       newMsgs = allMsgs.slice(preRunMessageCount);
     } else {
-      // Compression happened: find the user input we just sent and take from there
-      const userInputIdx = allMsgs.findIndex(
-        (m: { role: string; content: string }) => m.role === 'user' && m.content === input.userMessage
-      );
-      newMsgs = userInputIdx >= 0 ? allMsgs.slice(userInputIdx) : allMsgs.slice(-2); // fallback: last 2
+      // Compression happened: find the LAST user message matching our input
+      // (search from end to avoid matching earlier turns with same text)
+      let userInputIdx = -1;
+      for (let i = allMsgs.length - 1; i >= 0; i--) {
+        const m = allMsgs[i] as { role: string; content: string };
+        if (m.role === 'user' && m.content === input.userMessage) {
+          userInputIdx = i;
+          break;
+        }
+      }
+      newMsgs = userInputIdx >= 0 ? allMsgs.slice(userInputIdx) : allMsgs.slice(-2);
     }
     if (newMsgs.length > 0) {
       const storedMsgs = newMsgs.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
@@ -2441,6 +2456,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const gwConfigs = configStore.getGatewayConfigs();
         const activeSessions = sessionController.getActiveSessions();
         // Build channel list from gateway config extra fields (mute:channelId entries)
+        // Only returns channels that have been explicitly tracked via gateway interactions
         const channelList: Array<{ platform: string; channelId: string; muted: boolean; lastMessageAt?: string; messageCount?: number }> = [];
         for (const [platform, cfg] of Object.entries(gwConfigs)) {
           if (!cfg?.extra) continue;
@@ -2451,7 +2467,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           }
         }
         return Response.json({
-          activeSessions: channelList.length > 0 ? channelList : activeSessions.map((s) => ({ platform: 'unknown', channelId: s.sessionId, muted: false })),
+          activeSessions: channelList,
           platforms: [
             {
               name: 'telegram',

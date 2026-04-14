@@ -22,7 +22,7 @@ describe('signal webhook runtime integration', () => {
   });
 
   it('routes Signal webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { signal: 'sig-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { signal: 'sig-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/signal/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -40,7 +40,7 @@ describe('signal webhook runtime integration', () => {
   });
 
   it('deduplicates Signal webhook payloads in the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { signal: 'sig-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { signal: 'sig-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/signal/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

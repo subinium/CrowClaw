@@ -13,7 +13,7 @@ describe('matrix/sms webhook runtime integration', () => {
   });
 
   it('routes Matrix webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { matrix: 'matrix-secret', sms: 'sms-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { matrix: 'matrix-secret', sms: 'sms-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/matrix/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -39,7 +39,7 @@ describe('matrix/sms webhook runtime integration', () => {
   });
 
   it('routes and deduplicates SMS webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { matrix: 'matrix-secret', sms: 'sms-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { matrix: 'matrix-secret', sms: 'sms-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/sms/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

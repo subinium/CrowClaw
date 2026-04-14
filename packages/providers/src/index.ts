@@ -776,25 +776,29 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
             if (eventType === 'response.output_text.delta' && typeof parsed.delta === 'string') {
               yield { type: 'text', text: parsed.delta };
             } else if (eventType === 'response.function_call_arguments.delta' && typeof parsed.delta === 'string') {
-              const acc = toolAccumulators.values().next().value;
+              // Route delta to the correct tool accumulator by output_index
+              const outputIdx = typeof parsed.output_index === 'number' ? parsed.output_index : toolAccumulators.size - 1;
+              const acc = toolAccumulators.get(outputIdx) ?? [...toolAccumulators.values()].at(-1);
               if (acc) {
                 acc.args += parsed.delta;
                 yield { type: 'tool_use_delta', toolInput: parsed.delta };
               }
             } else if (eventType === 'response.output_item.added') {
               const item = parsed.item as { type?: string; name?: string; call_id?: string } | undefined;
+              const outputIdx = typeof parsed.output_index === 'number' ? parsed.output_index : toolAccumulators.size;
               if (item?.type === 'function_call' && item.name) {
                 const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === item.name)?.name ?? item.name;
-                toolAccumulators.set(toolAccumulators.size, { name: originalName, args: '', id: item.call_id });
+                toolAccumulators.set(outputIdx, { name: originalName, args: '', id: item.call_id });
                 yield { type: 'tool_use_start', toolName: originalName, toolCallId: item.call_id };
               }
             } else if (eventType === 'response.output_item.done') {
               const item = parsed.item as { type?: string } | undefined;
+              const doneIdx = typeof parsed.output_index === 'number' ? parsed.output_index : undefined;
               if (item?.type === 'function_call') {
-                for (const [key, acc] of toolAccumulators) {
+                const acc = doneIdx !== undefined ? toolAccumulators.get(doneIdx) : [...toolAccumulators.values()].at(-1);
+                if (acc) {
                   yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
-                  toolAccumulators.delete(key);
-                  break;
+                  if (doneIdx !== undefined) toolAccumulators.delete(doneIdx);
                 }
               }
             } else if (eventType === 'response.completed' || eventType === 'response.done') {

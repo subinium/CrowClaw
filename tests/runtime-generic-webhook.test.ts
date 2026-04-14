@@ -14,7 +14,7 @@ describe('generic webhook runtime integration', () => {
   });
 
   it('routes generic webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ configStorePath: null });
     // Configure a gateway policy for the 'webhook' platform so deny-by-default doesn't block
     await runtime.fetch(new Request('http://localhost/api/gateway/webhook/policy', {
       method: 'POST',
@@ -65,7 +65,7 @@ describe('generic webhook runtime integration', () => {
   });
 
   it('inspects gateway delivery plans through the node runtime', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ configStorePath: null });
     const response = await runtime.fetch(new Request('http://localhost/api/gateway/inspect', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -95,7 +95,7 @@ describe('generic webhook runtime integration', () => {
   });
 
   it('inspects Matrix and SMS gateway delivery plans through the node runtime', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ configStorePath: null });
 
     const matrix = await runtime.fetch(new Request('http://localhost/api/gateway/inspect', {
       method: 'POST',

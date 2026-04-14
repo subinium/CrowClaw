@@ -14,7 +14,7 @@ describe('discord webhook runtime integration', () => {
   });
 
   it('rejects discord webhook payloads without public key configured', async () => {
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ configStorePath: null });
     const response = await runtime.fetch(new Request('http://localhost/webhooks/discord', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
