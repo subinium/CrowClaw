@@ -52,8 +52,11 @@ export interface ToolExecutionContext {
 /** Env var patterns that should never be exposed to tools. */
 const SENSITIVE_ENV_PATTERNS = [
   /api[_-]?key/i, /secret/i, /token/i, /password/i, /credential/i,
+  /private[_-]?key/i, /signing[_-]?key/i, /encryption[_-]?key/i,
   /^OPENAI_/, /^ANTHROPIC_/, /^OPENROUTER_/, /^CROWCLAW_DASHBOARD_TOKEN$/,
-  /^AWS_SECRET/, /^GH_TOKEN$/, /^GITHUB_TOKEN$/, /^npm_config_/,
+  /^AWS_/, /^GH_TOKEN$/, /^GITHUB_TOKEN$/, /^npm_config_/,
+  /^DATABASE_URL$/i, /^REDIS_URL$/i, /^MONGO_URI$/i,
+  /^SUPABASE_/, /^FIREBASE_/, /^STRIPE_/,
 ];
 
 /** Strip sensitive environment variables before passing to tools. */
@@ -662,8 +665,9 @@ export class AgentLoop {
       msg.includes('token limit') ||
       msg.includes('too many tokens') ||
       msg.includes('context window') ||
-      msg.includes('max_tokens') ||
-      (msg.includes('400') && msg.includes('token'))
+      msg.includes('prompt is too long') || // Anthropic
+      msg.includes('request too large') || // Generic
+      msg.includes('input is too long') // Google
     );
   }
 
@@ -681,7 +685,8 @@ export class AgentLoop {
       const result = await this.compressWithLLM(messages);
       compactedMessages = result.messages;
     } else {
-      const result = compressMessages(messages, messages.length, this.protectLastMessages);
+      // Force compression by passing threshold=0 (not messages.length which is a no-op)
+      const result = compressMessages(messages, 0, this.protectLastMessages);
       compactedMessages = result.messages;
     }
 
@@ -1215,7 +1220,7 @@ export class AgentLoop {
       if (this.shouldCompressTokenAware(nextMessages)) {
         const compression = this.compressionProvider
           ? await this.compressWithLLM(nextMessages)
-          : compressMessages(nextMessages, nextMessages.length, this.protectLastMessages);
+          : compressMessages(nextMessages, 0, this.protectLastMessages);
         if (compression.compressedCount > 0) {
           nextMessages.length = 0;
           nextMessages.push(...compression.messages);
@@ -1295,10 +1300,16 @@ export class AgentLoop {
       metadata: toolResults.length > 0 ? { toolCount: toolResults.length } : undefined
     });
 
+    // Strip transient memory prefix messages before persisting session
+    // (they are re-injected fresh each turn from the memory service)
+    const persistMessages = nextMessages.filter(m =>
+      !(m.role === 'system' && m.content.includes('<recalled-context'))
+    );
+
     // Track 2.2: Use LLM compression if provider is available, else heuristic
     const compression = this.compressionProvider
-      ? await this.compressWithLLM(nextMessages)
-      : compressMessages(nextMessages, this.compressAfterMessageCount, this.protectLastMessages);
+      ? await this.compressWithLLM(persistMessages)
+      : compressMessages(persistMessages, this.compressAfterMessageCount, this.protectLastMessages);
     const baseLineage = session.lineage ?? {
       rootSessionId: session.sessionId,
       compressionCount: 0
