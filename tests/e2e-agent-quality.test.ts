@@ -193,10 +193,12 @@ describe('Multi-turn context', () => {
 // ---------------------------------------------------------------------------
 
 describe('Memory utilization', () => {
-  it('injects recalled memories into system prompt', async () => {
+  it('injects recalled memories as untrusted context in messages (not system prompt)', async () => {
+    let capturedMessages: ConversationMessage[] = [];
     let capturedSystemPrompt = '';
     const provider: ProviderAdapter = {
       generate(request: ProviderRequest) {
+        capturedMessages = request.messages;
         capturedSystemPrompt = request.systemPrompt ?? '';
         return Promise.resolve({ assistantMessage: 'Got it.' });
       },
@@ -213,8 +215,14 @@ describe('Memory utilization', () => {
       memories: ['User prefers Korean', 'Project: CrowClaw v0.3.1'],
     });
 
-    expect(capturedSystemPrompt).toContain('User prefers Korean');
-    expect(capturedSystemPrompt).toContain('CrowClaw v0.3.1');
+    // Memories should NOT be in the system prompt (security: untrusted prefix pattern)
+    expect(capturedSystemPrompt).not.toContain('User prefers Korean');
+
+    // Memories should be in the messages array as a recalled-context block
+    const memoryMsg = capturedMessages.find(m => m.content.includes('recalled-context'));
+    expect(memoryMsg).toBeDefined();
+    expect(memoryMsg!.content).toContain('User prefers Korean');
+    expect(memoryMsg!.content).toContain('CrowClaw v0.3.1');
   });
 });
 

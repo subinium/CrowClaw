@@ -97,6 +97,156 @@ function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
     : 'manual';
 }
 
+// --- Feature: Gateway message debouncing (P0-3) ---
+
+interface DebouncePending {
+  timer: ReturnType<typeof setTimeout>;
+  messages: string[];
+  resolve: (merged: string) => void;
+}
+
+export class GatewayDebouncer {
+  private pending = new Map<string, DebouncePending>();
+  private readonly windowMs: number;
+
+  constructor(windowMs = 500) {
+    this.windowMs = windowMs;
+  }
+
+  /**
+   * Debounce a gateway message. Returns a promise that resolves with the
+   * (possibly merged) text once the debounce window expires.
+   * Key format: `${platform}:${senderId}:${channelId}`
+   */
+  debounce(platform: string, senderId: string, channelId: string, text: string): Promise<string> {
+    const key = `${platform}:${senderId}:${channelId}`;
+    const existing = this.pending.get(key);
+
+    if (existing) {
+      // Merge: append new message text
+      existing.messages.push(text);
+      // Reset the timer
+      clearTimeout(existing.timer);
+      return new Promise<string>((resolve) => {
+        existing.resolve = resolve;
+        existing.timer = setTimeout(() => {
+          this.pending.delete(key);
+          resolve(existing.messages.join('\n'));
+        }, this.windowMs);
+      });
+    }
+
+    return new Promise<string>((resolve) => {
+      const entry: DebouncePending = {
+        messages: [text],
+        resolve,
+        timer: setTimeout(() => {
+          this.pending.delete(key);
+          resolve(entry.messages.join('\n'));
+        }, this.windowMs),
+      };
+      this.pending.set(key, entry);
+    });
+  }
+
+  /** Number of keys currently pending debounce */
+  get pendingCount(): number {
+    return this.pending.size;
+  }
+}
+
+// --- Feature: Feedback Ledger (P0-5) ---
+
+export interface FeedbackEntry {
+  timestamp: string;
+  toolName: string;
+  ok: boolean;
+  durationMs?: number;
+  error?: string;
+  sessionId: string;
+}
+
+export class FeedbackLedger {
+  private entries: FeedbackEntry[] = [];
+  private maxEntries = 200;
+
+  record(entry: FeedbackEntry): void {
+    this.entries.push(entry);
+    if (this.entries.length > this.maxEntries) {
+      this.entries = this.entries.slice(-this.maxEntries);
+    }
+  }
+
+  getDigest(limit = 50): string {
+    const recent = this.entries.slice(-limit);
+    if (recent.length === 0) return '';
+    const stats = this.getStats();
+    const lines = [
+      `## Tool Feedback (last ${recent.length} calls)`,
+      `Total: ${stats.total} | Success: ${stats.success} | Failure: ${stats.failure}`,
+      '',
+    ];
+    const toolNames = Object.keys(stats.byTool).slice(0, 10);
+    for (const name of toolNames) {
+      const t = stats.byTool[name];
+      lines.push(`- **${name}**: ${t.ok} ok, ${t.fail} fail`);
+    }
+    return lines.join('\n');
+  }
+
+  getStats(): { total: number; success: number; failure: number; byTool: Record<string, { ok: number; fail: number }> } {
+    const byTool: Record<string, { ok: number; fail: number }> = {};
+    let success = 0;
+    let failure = 0;
+    for (const entry of this.entries) {
+      if (entry.ok) success++;
+      else failure++;
+      if (!byTool[entry.toolName]) {
+        byTool[entry.toolName] = { ok: 0, fail: 0 };
+      }
+      if (entry.ok) byTool[entry.toolName].ok++;
+      else byTool[entry.toolName].fail++;
+    }
+    return { total: this.entries.length, success, failure, byTool };
+  }
+
+  getEntries(limit?: number): FeedbackEntry[] {
+    return limit ? this.entries.slice(-limit) : [...this.entries];
+  }
+}
+
+// --- Feature: Config mutation safety gate (P1-9) ---
+
+const BLOCKED_CONFIG_MUTATIONS = new Set([
+  'apiKey',
+  'dashboardToken',
+  'securityPolicy.blockDangerousCommands',
+  'securityPolicy.redactCredentials',
+]);
+
+/**
+ * Check if a config mutation body contains any blocked fields.
+ * Returns the first blocked field name, or null if safe.
+ */
+export function sanitizeConfigMutation(body: Record<string, unknown>): string | null {
+  for (const key of Object.keys(body)) {
+    if (BLOCKED_CONFIG_MUTATIONS.has(key)) {
+      return key;
+    }
+    // Check nested: securityPolicy.blockDangerousCommands etc.
+    if (typeof body[key] === 'object' && body[key] !== null && !Array.isArray(body[key])) {
+      const nested = body[key] as Record<string, unknown>;
+      for (const nestedKey of Object.keys(nested)) {
+        const fullKey = `${key}.${nestedKey}`;
+        if (BLOCKED_CONFIG_MUTATIONS.has(fullKey)) {
+          return fullKey;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function isLocalOperatorBypassRoute(pathname: string): boolean {
   // Read-only config routes
   if (pathname === '/api/config/snapshot' || pathname === '/api/config/schema') return true;
@@ -106,6 +256,7 @@ function isLocalOperatorBypassRoute(pathname: string): boolean {
   // Read-only gateway routes only (status, probe results)
   if (pathname === '/api/gateway/status' || pathname === '/api/gateway/pairings') return true;
   // Safe read-only routes
+  if (pathname === '/api/feedback') return true;
   return pathname.startsWith('/api/skills')
     || pathname.startsWith('/api/providers/')
     || pathname.startsWith('/api/web/')
@@ -767,6 +918,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   })();
   const skillStore = options.skillStore ?? new InMemorySkillStore();
   const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
+  const feedbackLedger = new FeedbackLedger();
+  const gatewayDebouncer = new GatewayDebouncer();
 
   // Config store: FileConfigStore for persistence, or in-memory if null
   const defaultConfigPath = (() => {
@@ -1196,6 +1349,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       memories.push(formatContextForPrompt(contextEngineResult));
     }
 
+    // Inject feedback ledger digest into system prompt context
+    const feedbackDigest = feedbackLedger.getDigest(30);
+    if (feedbackDigest) {
+      memories.push(feedbackDigest);
+    }
+
     // Timestamp the start of this turn for accurate new-message detection
     const turnStartedAt = new Date().toISOString();
 
@@ -1265,6 +1424,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         await frozenMemory.save(input.sessionId);
       } catch { /* best-effort */ }
     })();
+
+    // Record tool execution feedback
+    for (const tr of result.toolResults) {
+      feedbackLedger.record({
+        timestamp: new Date().toISOString(),
+        toolName: tr.toolName,
+        ok: tr.ok,
+        error: tr.ok ? undefined : tr.output.slice(0, 200),
+        sessionId: input.sessionId,
+      });
+    }
+
     return result;
   }
 
@@ -1543,6 +1714,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     log,
     sessionMutex,
     eventBus,
+    feedbackLedger,
     async fetch(request: Request): Promise<Response> {
       const url = new URL(request.url);
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
@@ -1786,6 +1958,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true, service: 'crowclaw', runtime: 'node' });
+      }
+
+      // Public discovery endpoint (no auth required)
+      if (request.method === 'GET' && url.pathname === '/.well-known/agent-skills') {
+        const resolved = skillRegistry.resolve();
+        return Response.json({
+          skills: resolved.map((s) => ({
+            name: s.manifest.name,
+            description: s.manifest.description,
+            triggers: s.manifest.triggers ?? [],
+            tools: s.manifest.tools ?? [],
+          })),
+          version,
+        });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/version') {
@@ -2753,9 +2939,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message) });
         }
         const sessionId = buildGatewaySessionKey(message);
+        // Debounce: merge rapid-fire messages from the same sender
+        const debouncedText = await gatewayDebouncer.debounce(
+          message.platform, message.userId ?? 'unknown', message.channelId ?? 'unknown', message.text
+        );
         const result = await runConfiguredAgent({
           sessionId,
-          userMessage: message.text,
+          userMessage: debouncedText,
           userId: message.userId,
           workspaceId: message.channelId,
           systemPrompt: 'You are CrowClaw handling a generic webhook runtime event.'
@@ -2811,9 +3001,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return accessResponse;
         }
         const dispatch = buildDiscordDispatch(payload as never)!;
+        const debouncedDiscordText = await gatewayDebouncer.debounce(
+          'discord', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedDiscordText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling a Discord runtime event.'
@@ -2851,9 +3044,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const chatId = String(message.channelId);
         const typing = telegramToken ? createTypingIndicator(telegramToken, chatId) : null;
         try {
+          const debouncedTelegramText = await gatewayDebouncer.debounce(
+            'telegram', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? chatId, dispatch.payload.userMessage
+          );
           const result = await runConfiguredAgent({
             sessionId: dispatch.sessionId,
-            userMessage: dispatch.payload.userMessage,
+            userMessage: debouncedTelegramText,
             userId: dispatch.payload.userId,
             workspaceId: dispatch.payload.workspaceId,
             systemPrompt: 'You are CrowClaw handling a Telegram runtime event.'
@@ -2912,9 +3108,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildSlackDispatch(payload as never)!;
+        const debouncedSlackText = await gatewayDebouncer.debounce(
+          'slack', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedSlackText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling a Slack runtime event.'
@@ -2951,9 +3150,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildWhatsAppDispatch(payload as never)!;
+        const debouncedWhatsAppText = await gatewayDebouncer.debounce(
+          'whatsapp', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedWhatsAppText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling a WhatsApp runtime event.'
@@ -2990,9 +3192,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildSignalDispatch(payload as never)!;
+        const debouncedSignalText = await gatewayDebouncer.debounce(
+          'signal', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedSignalText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling a Signal runtime event.'
@@ -3029,9 +3234,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildEmailDispatch(payload as never)!;
+        const debouncedEmailText = await gatewayDebouncer.debounce(
+          'email', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedEmailText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling an Email runtime event.'
@@ -3068,9 +3276,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildMatrixDispatch(payload as never)!;
+        const debouncedMatrixText = await gatewayDebouncer.debounce(
+          'matrix', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedMatrixText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling a Matrix runtime event.'
@@ -3107,9 +3318,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
         }
         const dispatch = buildSmsDispatch(payload as never)!;
+        const debouncedSmsText = await gatewayDebouncer.debounce(
+          'sms', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+        );
         const result = await runConfiguredAgent({
           sessionId: dispatch.sessionId,
-          userMessage: dispatch.payload.userMessage,
+          userMessage: debouncedSmsText,
           userId: dispatch.payload.userId,
           workspaceId: dispatch.payload.workspaceId,
           systemPrompt: 'You are CrowClaw handling an SMS runtime event.'
@@ -4341,7 +4555,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // --- Mutation API endpoints (dashboard config management) ---
 
       if (request.method === 'POST' && url.pathname === '/api/config') {
-        await request.json();
+        const configBody = await request.json() as Record<string, unknown>;
+        const blockedField = sanitizeConfigMutation(configBody);
+        if (blockedField) {
+          return Response.json(
+            { error: 'Blocked: cannot modify protected config field', field: blockedField },
+            { status: 403 }
+          );
+        }
         return Response.json({ ok: true, config: configStore.snapshot() });
       }
 
@@ -4596,6 +4817,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === routePaths.config.agent) {
         const body = await request.json() as Partial<Record<string, unknown>>;
+        const blockedAgentField = sanitizeConfigMutation(body as Record<string, unknown>);
+        if (blockedAgentField) {
+          return Response.json(
+            { error: 'Blocked: cannot modify protected config field', field: blockedAgentField },
+            { status: 403 }
+          );
+        }
         configStore.setAgentConfig(body as Partial<import('./config-store.js').AgentConfig>);
         return Response.json({ ok: true, config: configStore.getAgentConfig() });
       }
@@ -4607,6 +4835,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'POST' && url.pathname === '/api/usage/reset') {
         usageTracker.reset();
         return Response.json({ ok: true });
+      }
+
+      // --- Feedback Ledger API ---
+      if (request.method === 'GET' && url.pathname === '/api/feedback') {
+        return Response.json({
+          ok: true,
+          stats: feedbackLedger.getStats(),
+          recent: feedbackLedger.getEntries(50),
+        });
       }
 
       // --- MCP Server CRUD ---
