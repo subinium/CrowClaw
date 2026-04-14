@@ -844,6 +844,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
+  let lastHeartbeatAt: string | null = null;
+  eventBus.subscribe((event) => {
+    if (event.type === 'chat:complete' || event.type === 'session:updated') {
+      lastHeartbeatAt = new Date().toISOString();
+    }
+  });
   const sessionController = new SessionController(eventBus);
   const wsManager = new WebSocketManager();
   wsManager.start(eventBus);
@@ -1186,17 +1192,22 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       memories.push(formatContextForPrompt(contextEngineResult));
     }
 
+    // Snapshot message count BEFORE the run to detect new messages after
+    const preRunMessageCount = (await store.get(input.sessionId))?.messages.length ?? 0;
+
     const result = await createConfiguredAgent(overrides).run({
       agentId: options.agentId ?? 'crowclaw',
       ...input,
       memories,
     });
 
-    // Record only NEW messages this turn (not the full session, which includes prior messages)
-    // Use the message count before the run vs after to determine new messages
-    const existingStats = await messageStore.stats(input.sessionId).catch(() => ({ totalMessages: 0 }));
+    // Record only messages added THIS turn (handles compression correctly:
+    // we compare pre-run count against the user's input message position, not stored count)
     const allMsgs = result.session.messages;
-    const newMsgs = allMsgs.slice(existingStats.totalMessages);
+    // After compression, session may have fewer messages than preRunMessageCount.
+    // In that case, the compressed summary + recent messages are all "new" post-compression.
+    const newStartIdx = Math.min(preRunMessageCount, allMsgs.length);
+    const newMsgs = allMsgs.slice(newStartIdx);
     if (newMsgs.length > 0) {
       const storedMsgs = newMsgs.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
         id: crypto.randomUUID(),
@@ -1240,17 +1251,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
         await frozenUserProfile.save(input.sessionId);
 
-        // Extract key facts from tool results into frozen MEMORY snapshot
-        const toolMsgs = result.session.messages.filter((m: { role: string }) => m.role === 'tool');
-        for (const tm of toolMsgs.slice(-3)) { // last 3 tool results
+        // Extract key facts from THIS TURN's new messages (not post-compression session)
+        const turnToolMsgs = newMsgs.filter((m: { role: string }) => m.role === 'tool');
+        for (const tm of turnToolMsgs.slice(-3)) {
           const name = (tm as { name?: string }).name ?? 'tool';
           const content = (tm as { content: string }).content;
           if (content && content.length > 10 && content.length < 500) {
             frozenMemory.set(`tool:${name}:${input.sessionId.slice(-6)}`, content.slice(0, 300), 'tool-result', input.sessionId);
           }
         }
-        // Extract decisions from assistant messages
-        const assistantMsgs = result.session.messages.filter((m: { role: string }) => m.role === 'assistant');
+        // Extract decisions from this turn's assistant messages
+        const assistantMsgs = newMsgs.filter((m: { role: string }) => m.role === 'assistant');
         const lastAssistant = assistantMsgs.at(-1) as { content: string } | undefined;
         if (lastAssistant?.content && /\b(decided|confirmed|set|created|updated|fixed|completed)\b/i.test(lastAssistant.content)) {
           const fact = lastAssistant.content.slice(0, 200);
@@ -4805,6 +4816,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (typeof body.publicUrl === 'string') {
           publicUrl = body.publicUrl.replace(/\/$/, '') || null;
         }
+        if (typeof body.trustProxy === 'boolean') {
+          (options as Record<string, unknown>).trustProxy = body.trustProxy;
+        }
         return Response.json({
           ok: true,
           serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
@@ -4869,6 +4883,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           activeSessions: sessionController.getActiveSessions().length,
           eventBusSubscribers: eventBus.subscriberCount,
           uptime: typeof process !== 'undefined' ? Math.floor(process.uptime()) : 0,
+          lastHeartbeat: lastHeartbeatAt,
         });
       }
 

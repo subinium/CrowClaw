@@ -605,7 +605,41 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       checkRateLimitHeaders(response.headers, pool, apiKey);
     }
 
-    const payload = (await response.json()) as ChatCompletionsResponse;
+    const rawPayload = (await response.json()) as Record<string, unknown>;
+
+    // Handle Responses API format: { output: [...], usage: {...} }
+    if (isResponsesApi && Array.isArray(rawPayload.output)) {
+      const outputItems = rawPayload.output as Array<{ type: string; content?: Array<{ type: string; text?: string }>; name?: string; arguments?: string; call_id?: string }>;
+      let text = '';
+      const toolCalls: Array<{ name: string; input: Record<string, unknown>; id?: string }> = [];
+      for (const item of outputItems) {
+        if (item.type === 'message' && Array.isArray(item.content)) {
+          for (const part of item.content) {
+            if (part.type === 'output_text' && part.text) text += part.text;
+          }
+        }
+        if (item.type === 'function_call' && item.name) {
+          let args: Record<string, unknown> = {};
+          try { args = JSON.parse(item.arguments ?? '{}') as Record<string, unknown>; } catch { /* ignore */ }
+          const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === item.name)?.name ?? item.name;
+          toolCalls.push({ name: originalName, input: args, id: item.call_id });
+        }
+      }
+      const rawUsage = rawPayload.usage as Record<string, number> | undefined;
+      const usage = rawUsage ? {
+        inputTokens: rawUsage.input_tokens ?? 0,
+        outputTokens: rawUsage.output_tokens ?? 0,
+        totalTokens: (rawUsage.input_tokens ?? 0) + (rawUsage.output_tokens ?? 0),
+      } : undefined;
+      return {
+        assistantMessage: text || undefined,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        ...(usage ? { usage } : {}),
+      };
+    }
+
+    // Standard Chat Completions format
+    const payload = rawPayload as ChatCompletionsResponse;
     const message = payload.choices?.[0]?.message;
     const assistantMessage = normalizeOpenAIMessageContent(message?.content, message?.refusal);
     const parsedToolCalls = parseOpenAIToolCalls(message?.tool_calls, request.availableTools) ?? parseOpenAIFunctionCall(message?.function_call);
@@ -736,6 +770,45 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
             continue;
           }
 
+          // Responses API streaming: events have { type: 'response.output_text.delta', delta: '...' }
+          const eventType = parsed.type as string | undefined;
+          if (isResponsesApi && eventType) {
+            if (eventType === 'response.output_text.delta' && typeof parsed.delta === 'string') {
+              yield { type: 'text', text: parsed.delta };
+            } else if (eventType === 'response.function_call_arguments.delta' && typeof parsed.delta === 'string') {
+              const acc = toolAccumulators.values().next().value;
+              if (acc) {
+                acc.args += parsed.delta;
+                yield { type: 'tool_use_delta', toolInput: parsed.delta };
+              }
+            } else if (eventType === 'response.output_item.added') {
+              const item = parsed.item as { type?: string; name?: string; call_id?: string } | undefined;
+              if (item?.type === 'function_call' && item.name) {
+                const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === item.name)?.name ?? item.name;
+                toolAccumulators.set(toolAccumulators.size, { name: originalName, args: '', id: item.call_id });
+                yield { type: 'tool_use_start', toolName: originalName, toolCallId: item.call_id };
+              }
+            } else if (eventType === 'response.output_item.done') {
+              const item = parsed.item as { type?: string } | undefined;
+              if (item?.type === 'function_call') {
+                for (const [key, acc] of toolAccumulators) {
+                  yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+                  toolAccumulators.delete(key);
+                  break;
+                }
+              }
+            } else if (eventType === 'response.completed' || eventType === 'response.done') {
+              for (const [, acc] of toolAccumulators) {
+                yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+              }
+              toolAccumulators.clear();
+              yield { type: 'done' };
+              return;
+            }
+            continue;
+          }
+
+          // Standard Chat Completions streaming
           const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
           const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
           const finishReason = choices?.[0]?.finish_reason as string | undefined;
@@ -749,7 +822,6 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
               const idx = (tc.index as number) ?? 0;
               const fn = tc.function as { name?: string; arguments?: string } | undefined;
               if (fn?.name) {
-                // Reverse-map sanitized name (web_search → web.search) for streaming tool calls
                 const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === fn.name)?.name ?? fn.name;
                 toolAccumulators.set(idx, { name: originalName, args: '', id: tc.id as string | undefined });
                 yield { type: 'tool_use_start', toolName: originalName, toolCallId: tc.id as string | undefined };
