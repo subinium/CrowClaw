@@ -1,8 +1,9 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
-import { checkAuth, verifyToken, api } from './lib/api.js';
+import { checkAuth, verifyToken, api, clearAuthToken } from './lib/api.js';
 import { connectWebSocket, type WsClient } from './lib/ws.js';
 import { buttonStyles } from './lib/shared-styles.js';
+import { showToast } from './components/toast.js';
 
 export type ViewName = 'chat' | 'agent' | 'connect' | 'automate' | 'settings';
 
@@ -523,8 +524,36 @@ export class CrowClawApp extends LitElement {
 
   private _wsClient: WsClient | null = null;
 
+  private _authRequiredHandler = () => {
+    this.authenticated = false;
+    showToast('Session expired. Please sign in again.', 'error');
+  };
+
+  private _hashChangeHandler = () => {
+    const hash = location.hash.slice(1) as ViewName;
+    if (['chat', 'agent', 'connect', 'automate', 'settings'].includes(hash)) {
+      this.currentView = hash;
+    }
+  };
+
+  private _globalKeyHandler = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      // Close auth overlay or mobile sidebar
+      if (this.mobileOpen) this.mobileOpen = false;
+      if (this.presenceOpen) this.presenceOpen = false;
+    }
+  };
+
   connectedCallback() {
     super.connectedCallback();
+    // Restore view from hash
+    const hash = location.hash.slice(1) as ViewName;
+    if (['chat', 'agent', 'connect', 'automate', 'settings'].includes(hash)) {
+      this.currentView = hash;
+    }
+    document.addEventListener('crowclaw:auth-required', this._authRequiredHandler);
+    window.addEventListener('hashchange', this._hashChangeHandler);
+    window.addEventListener('keydown', this._globalKeyHandler);
     this._checkAuth();
   }
 
@@ -532,6 +561,9 @@ export class CrowClawApp extends LitElement {
     super.disconnectedCallback();
     this._wsClient?.close();
     this._wsClient = null;
+    document.removeEventListener('crowclaw:auth-required', this._authRequiredHandler);
+    window.removeEventListener('hashchange', this._hashChangeHandler);
+    window.removeEventListener('keydown', this._globalKeyHandler);
   }
 
   private async _checkAuth() {
@@ -716,7 +748,7 @@ export class CrowClawApp extends LitElement {
                 </div>`
               : nothing}
 
-            <!-- Pair Device button -->
+            <!-- Pair Device + Logout buttons -->
             ${this.authenticated
               ? html`
                 <button class="ft-btn" aria-label="Pair a new device" @click=${this._openPairingModal}>
@@ -725,6 +757,14 @@ export class CrowClawApp extends LitElement {
                     <line x1="12" y1="18" x2="12.01" y2="18"/>
                   </svg>
                   Pair Device
+                </button>
+                <button class="ft-btn" aria-label="Sign out" @click=${this._logout} style="opacity:0.6">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                    <polyline points="16 17 21 12 16 7"/>
+                    <line x1="21" y1="12" x2="9" y2="12"/>
+                  </svg>
+                  Sign Out
                 </button>`
               : nothing}
           </div>
@@ -752,14 +792,26 @@ export class CrowClawApp extends LitElement {
     `;
   }
 
+  private _logout() {
+    clearAuthToken();
+    this.authenticated = false;
+    showToast('Signed out.', 'info');
+  }
+
+  private _navigateTo(view: ViewName) {
+    this.currentView = view;
+    this.mobileOpen = false;
+    location.hash = view;
+  }
+
   private _nav(view: ViewName, label: string, icon: ReturnType<typeof html>, count?: number) {
     return html`
       <div class="ni ${this.currentView === view ? 'a' : ''}"
            role="button"
            tabindex="0"
            aria-label="Navigate to ${label}"
-           @click=${() => { this.currentView = view; this.mobileOpen = false; }}
-           @keydown=${(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { this.currentView = view; this.mobileOpen = false; } }}>
+           @click=${() => { this._navigateTo(view); }}
+           @keydown=${(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { this._navigateTo(view); } }}>
         ${icon}${label}
         ${count ? html`<span class="ct">${count}</span>` : nothing}
       </div>

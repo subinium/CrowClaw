@@ -149,7 +149,9 @@ export const connectEventStream = (callbacks: {
   onOpen?: () => void;
   onError?: () => void;
 }): (() => void) => {
-  const source = new EventSource(`${location.origin}/api/events`);
+  const token = getAuthToken();
+  const eventsUrl = token ? `${location.origin}/api/events?token=${encodeURIComponent(token)}` : `${location.origin}/api/events`;
+  const source = new EventSource(eventsUrl);
 
   source.onopen = () => {
     callbacks.onOpen?.();

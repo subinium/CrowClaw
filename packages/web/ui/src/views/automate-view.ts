@@ -2,6 +2,7 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { buttonStyles, cardStyles, tagStyles, formStyles, sectionStyles } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
+import { showToast } from '../components/toast.js';
 
 /** Maps to CronJobDefinition from @crowclaw/scheduler */
 interface SchedulerJob {
@@ -44,7 +45,15 @@ interface SkillInfo {
 const timeAgo = (d: string) => {
   if (!d) return '--';
   const s = Math.floor((Date.now() - new Date(d).getTime()) / 1000);
+  if (s < 0) return timeUntil(d); // future date
   return s < 60 ? s + 's ago' : s < 3600 ? Math.floor(s / 60) + 'm ago' : s < 86400 ? Math.floor(s / 3600) + 'h ago' : Math.floor(s / 86400) + 'd ago';
+};
+
+const timeUntil = (d: string) => {
+  if (!d) return '--';
+  const s = Math.floor((new Date(d).getTime() - Date.now()) / 1000);
+  if (s <= 0) return 'now';
+  return s < 60 ? `in ${s}s` : s < 3600 ? `in ${Math.floor(s / 60)}m` : s < 86400 ? `in ${Math.floor(s / 3600)}h` : `in ${Math.floor(s / 86400)}d`;
 };
 
 const formatDuration = (ms: number): string => {
@@ -461,9 +470,24 @@ export class AutomateView extends LitElement {
   @state() private formDeliveryChannel = '';
   @state() private formSubmitting = false;
 
+  private _refreshInterval?: ReturnType<typeof setInterval>;
+
   connectedCallback() {
     super.connectedCallback();
     this._fetchAll();
+    // Auto-refresh every 30 seconds
+    this._refreshInterval = setInterval(() => {
+      this._fetchJobs();
+      this._fetchSchedulerStatus();
+    }, 30_000);
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    if (this._refreshInterval) {
+      clearInterval(this._refreshInterval);
+      this._refreshInterval = undefined;
+    }
   }
 
   private async _fetchAll() {
@@ -533,7 +557,7 @@ export class AutomateView extends LitElement {
       this.schedulerRunning = !this.schedulerRunning;
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to toggle scheduler:', error.message);
+        showToast('Failed to toggle scheduler', 'error');
       }
     }
   }
@@ -545,7 +569,7 @@ export class AutomateView extends LitElement {
       setTimeout(() => this._fetchJobs(), 1000);
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to tick scheduler:', error.message);
+        showToast('Failed to tick scheduler', 'error');
       }
     }
   }
@@ -560,18 +584,39 @@ export class AutomateView extends LitElement {
       this.jobs = this.jobs.map((j) => (j.id === job.id ? updated : j));
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to toggle job:', error.message);
+        showToast('Failed to toggle job', 'error');
       }
     }
   }
 
   private async _deleteJob(job: SchedulerJob) {
+    if (!confirm(`Delete job "${job.id}"? This cannot be undone.`)) return;
     try {
       await api(`/api/scheduler/jobs/${encodeURIComponent(job.id)}`, { method: 'DELETE' });
       this.jobs = this.jobs.filter((j) => j.id !== job.id);
+      showToast(`Job "${job.id}" deleted`, 'success');
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to delete job:', error.message);
+        showToast('Failed to delete job', 'error');
+      }
+    }
+  }
+
+  private async _dryRunJob(job: SchedulerJob) {
+    showToast(`Running dry-run for "${job.id}"...`, 'info');
+    try {
+      const result = await api<{ ok: boolean; output?: string; error?: string }>(
+        `/api/scheduler/jobs/${encodeURIComponent(job.id)}/dry-run`,
+        { method: 'POST' },
+      );
+      if (result.ok) {
+        showToast(`Dry-run completed: ${(result.output ?? '').slice(0, 100)}`, 'success');
+      } else {
+        showToast(`Dry-run failed: ${result.error ?? 'unknown'}`, 'error');
+      }
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        showToast('Dry-run failed', 'error');
       }
     }
   }
@@ -633,7 +678,7 @@ export class AutomateView extends LitElement {
       await this._fetchJobs();
     } catch (error: unknown) {
       if (error instanceof Error) {
-        console.error('Failed to create job:', error.message);
+        showToast('Failed to create job', 'error');
       }
     } finally {
       this.formSubmitting = false;
@@ -722,6 +767,12 @@ export class AutomateView extends LitElement {
             ${job.enabled ? 'active' : 'paused'}
           </span>
           <div class="job-card-actions">
+            <button
+              class="icon-btn"
+              @click=${() => this._dryRunJob(job)}
+              title="Dry Run"
+              aria-label="Test run job without side effects"
+            >&#x25B7;</button>
             <button
               class="icon-btn"
               @click=${() => this._toggleJobExpand(job.id)}
