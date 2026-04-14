@@ -127,11 +127,16 @@ export class GatewayDebouncer {
       existing.messages.push(text);
       // Reset the timer
       clearTimeout(existing.timer);
+      // Resolve the previous caller's promise with the same merged result
+      // (all callers for the same debounce window share the merged text)
+      const previousResolve = existing.resolve;
       return new Promise<string>((resolve) => {
         existing.resolve = resolve;
         existing.timer = setTimeout(() => {
           this.pending.delete(key);
-          resolve(existing.messages.join('\n'));
+          const merged = existing.messages.join('\n');
+          resolve(merged);
+          previousResolve(merged); // Resolve the previous caller too
         }, this.windowMs);
       });
     }
