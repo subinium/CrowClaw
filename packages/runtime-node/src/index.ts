@@ -1225,19 +1225,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       void messageStore.appendBatch(storedMsgs).catch(() => {});
     }
 
-    // Record compression events for lineage tracking
-    const compressionMsg = result.session.messages.find((m: { metadata?: Record<string, unknown> }) => m.metadata?.compressionMethod);
-    if (compressionMsg) {
-      void messageStore.append({
-        id: crypto.randomUUID(),
-        sessionId: input.sessionId,
-        role: 'system',
-        content: (compressionMsg as { content: string }).content,
-        createdAt: new Date().toISOString(),
-        parentId: `compression:${input.sessionId}`,
-        metadata: { compressionLineage: true, method: (compressionMsg as { metadata: Record<string, unknown> }).metadata.compressionMethod },
-      }).catch(() => {});
-    }
+    // Compression lineage: newMsgs already includes compression summary (if any)
+    // via timestamp filter, so no separate append needed. The summary message
+    // carries compressionMethod in its metadata for downstream lineage queries.
 
     // Extract facts from conversation and update frozen memory (Hermes pattern)
     void (async () => {
@@ -2450,7 +2440,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           }
         }
         return Response.json({
-          activeSessions: channelList,
+          knownChannels: channelList,
           platforms: [
             {
               name: 'telegram',
@@ -4825,25 +4815,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'GET' && url.pathname === '/api/config/remote-access') {
         return Response.json({
           ok: true,
-          serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
-          trustProxy: !!(options as Record<string, unknown>).trustProxy,
+          serverUrl: configStore.getPublicUrl() ?? publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          trustProxy: configStore.getTrustProxy(),
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/config/remote-access') {
         const body = (await request.json()) as { publicUrl?: string; trustProxy?: boolean };
-        if (typeof body.publicUrl === 'string') {
-          publicUrl = body.publicUrl.replace(/\/$/, '') || null;
-        }
-        if (typeof body.trustProxy === 'boolean') {
-          (options as Record<string, unknown>).trustProxy = body.trustProxy;
-        }
-        // Note: trustProxy is stored in options (in-process only).
-        // For full persistence, add trustProxy to RuntimeConfig and configStore.
+        const newPublicUrl = typeof body.publicUrl === 'string'
+          ? (body.publicUrl.replace(/\/$/, '') || null)
+          : configStore.getPublicUrl();
+        const newTrustProxy = typeof body.trustProxy === 'boolean'
+          ? body.trustProxy
+          : configStore.getTrustProxy();
+        publicUrl = newPublicUrl;
+        (options as Record<string, unknown>).trustProxy = newTrustProxy;
+        // Persist to configStore (FileConfigStore writes to disk)
+        configStore.setRemoteAccess(newPublicUrl, newTrustProxy);
         return Response.json({
           ok: true,
-          serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
-          trustProxy: !!(options as Record<string, unknown>).trustProxy,
+          serverUrl: newPublicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          trustProxy: newTrustProxy,
         });
       }
 

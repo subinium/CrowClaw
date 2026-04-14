@@ -1006,7 +1006,7 @@ export class ConnectView extends LitElement {
           policy?: PlatformPolicy;
           configured?: boolean;
         }>;
-        activeSessions?: Array<{
+        knownChannels?: Array<{
           platform: string;
           channelId: string;
           lastMessageAt?: string;
@@ -1026,8 +1026,8 @@ export class ConnectView extends LitElement {
         policy: p.policy ?? null,
       }));
 
-      // Extract channel data from activeSessions
-      this.channels = (data.activeSessions ?? []).map((s) => ({
+      // Extract tracked channel data
+      this.channels = (data.knownChannels ?? []).map((s) => ({
         platform: s.platform,
         channelId: s.channelId,
         lastMessageAt: s.lastMessageAt,
