@@ -1201,13 +1201,23 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       memories,
     });
 
-    // Record only messages added THIS turn (handles compression correctly:
-    // we compare pre-run count against the user's input message position, not stored count)
+    // Determine which messages are new this turn.
+    // Normal case: session grew, new messages are at the end.
+    // Compression case: session shrank (preRunCount > postRunLength),
+    //   so we can't slice by index. Instead, find the user's input message
+    //   and everything after it is "new this turn".
     const allMsgs = result.session.messages;
-    // After compression, session may have fewer messages than preRunMessageCount.
-    // In that case, the compressed summary + recent messages are all "new" post-compression.
-    const newStartIdx = Math.min(preRunMessageCount, allMsgs.length);
-    const newMsgs = allMsgs.slice(newStartIdx);
+    let newMsgs: typeof allMsgs;
+    if (preRunMessageCount <= allMsgs.length) {
+      // Normal: slice from where we left off
+      newMsgs = allMsgs.slice(preRunMessageCount);
+    } else {
+      // Compression happened: find the user input we just sent and take from there
+      const userInputIdx = allMsgs.findIndex(
+        (m: { role: string; content: string }) => m.role === 'user' && m.content === input.userMessage
+      );
+      newMsgs = userInputIdx >= 0 ? allMsgs.slice(userInputIdx) : allMsgs.slice(-2); // fallback: last 2
+    }
     if (newMsgs.length > 0) {
       const storedMsgs = newMsgs.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
         id: crypto.randomUUID(),
@@ -2430,8 +2440,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // Enhance platform list with config/policy state
         const gwConfigs = configStore.getGatewayConfigs();
         const activeSessions = sessionController.getActiveSessions();
+        // Build channel list from gateway config extra fields (mute:channelId entries)
+        const channelList: Array<{ platform: string; channelId: string; muted: boolean; lastMessageAt?: string; messageCount?: number }> = [];
+        for (const [platform, cfg] of Object.entries(gwConfigs)) {
+          if (!cfg?.extra) continue;
+          for (const [key, value] of Object.entries(cfg.extra)) {
+            if (key.startsWith('mute:')) {
+              channelList.push({ platform, channelId: key.slice(5), muted: value === 'true' });
+            }
+          }
+        }
         return Response.json({
-          activeSessions: activeSessions.length,
+          activeSessions: channelList.length > 0 ? channelList : activeSessions.map((s) => ({ platform: 'unknown', channelId: s.sessionId, muted: false })),
           platforms: [
             {
               name: 'telegram',
@@ -4819,6 +4839,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (typeof body.trustProxy === 'boolean') {
           (options as Record<string, unknown>).trustProxy = body.trustProxy;
         }
+        // Note: trustProxy is stored in options (in-process only).
+        // For full persistence, add trustProxy to RuntimeConfig and configStore.
         return Response.json({
           ok: true,
           serverUrl: publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
