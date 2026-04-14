@@ -176,6 +176,10 @@ export interface RuntimeConfig {
 
   // Agent loop configuration
   agentConfig: AgentConfig;
+
+  // Remote access
+  publicUrl: string | null;
+  trustProxy: boolean;
 }
 
 type ConfigChangeListener = (key: string, value: unknown) => void;
@@ -206,6 +210,8 @@ export class RuntimeConfigStore {
       activeConfigPreset: null,
       securityPolicy: { ...DEFAULT_SECURITY_POLICY },
       agentConfig: { ...DEFAULT_AGENT_CONFIG },
+      publicUrl: null,
+      trustProxy: false,
     };
   }
 
@@ -224,6 +230,13 @@ export class RuntimeConfigStore {
   }
   getSecurityPolicy(): SecurityPolicyConfig { return { ...this.config.securityPolicy }; }
   getAgentConfig(): AgentConfig { return { ...this.config.agentConfig }; }
+  getPublicUrl(): string | null { return this.config.publicUrl; }
+  getTrustProxy(): boolean { return this.config.trustProxy; }
+  setRemoteAccess(publicUrl: string | null, trustProxy: boolean): void {
+    this.config.publicUrl = publicUrl;
+    this.config.trustProxy = trustProxy;
+    this.emit('remoteAccess', { publicUrl, trustProxy });
+  }
   // --- Provider Config ---
   getProviderConfig(): ProviderConfig | null { return this.config.providerConfig; }
 
@@ -455,6 +468,8 @@ interface SerializedConfig {
   activeConfigPreset?: string | null;
   securityPolicy?: SecurityPolicyConfig;
   agentConfig?: AgentConfig;
+  publicUrl?: string | null;
+  trustProxy?: boolean;
 }
 
 /**
@@ -547,6 +562,9 @@ export class FileConfigStore extends RuntimeConfigStore {
     if (data.agentConfig) {
       super.setAgentConfig(data.agentConfig);
     }
+    if (data.publicUrl !== undefined || data.trustProxy !== undefined) {
+      super.setRemoteAccess(data.publicUrl ?? null, data.trustProxy ?? false);
+    }
   }
 
   /** Persist current state to disk. Silently falls back to in-memory on failure. */
@@ -582,6 +600,8 @@ export class FileConfigStore extends RuntimeConfigStore {
         activeConfigPreset: cfg.activeConfigPreset,
         securityPolicy: cfg.securityPolicy,
         agentConfig: cfg.agentConfig,
+        publicUrl: cfg.publicUrl,
+        trustProxy: cfg.trustProxy,
       };
       await mkdir(dirname(this.filePath), { recursive: true });
       await writeFile(this.filePath, JSON.stringify(serialized, null, 2), { mode: 0o600 });
@@ -697,6 +717,11 @@ export class FileConfigStore extends RuntimeConfigStore {
 
   override setAgentConfig(config: Partial<AgentConfig>): void {
     super.setAgentConfig(config);
+    void this.persistToDisk();
+  }
+
+  override setRemoteAccess(publicUrl: string | null, trustProxy: boolean): void {
+    super.setRemoteAccess(publicUrl, trustProxy);
     void this.persistToDisk();
   }
 

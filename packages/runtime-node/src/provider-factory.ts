@@ -4,7 +4,7 @@
  */
 
 import type { ProviderAdapter } from '@crowclaw/core';
-import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, CredentialPool } from '@crowclaw/providers';
+import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, CredentialPool, resolveApiMode } from '@crowclaw/providers';
 import type { ProviderConfig, ProviderSlot } from './config-store.js';
 
 export interface CrowClawFileConfig {
@@ -78,7 +78,10 @@ function createProviderFromType(
   model: string,
   credentialPool?: CredentialPool
 ): ProviderAdapter {
-  if (providerType === 'anthropic') {
+  // Use API mode resolver when provider type is not explicit
+  const resolvedMode = resolveApiMode(model, providerType !== 'openai' && providerType !== 'custom' ? providerType : undefined);
+
+  if (providerType === 'anthropic' || resolvedMode.family === 'anthropic') {
     return new AnthropicProvider({
       apiKey,
       baseUrl: baseUrl || 'https://api.anthropic.com',
@@ -87,10 +90,14 @@ function createProviderFromType(
     });
   }
 
-  // openai, openrouter, custom — all OpenAI-compatible
+  // openai, openrouter, google, custom — all OpenAI-compatible
+  // Use resolved endpoint hint for base URL default
+  const defaultBaseUrl = resolvedMode.family === 'google'
+    ? 'https://generativelanguage.googleapis.com/v1beta/openai'
+    : 'https://api.openai.com/v1';
   return new OpenAICompatibleProvider({
     apiKey,
-    baseUrl: baseUrl || 'https://api.openai.com/v1',
+    baseUrl: baseUrl || defaultBaseUrl,
     model: model || 'gpt-4o',
     ...(credentialPool ? { credentialPool } : {}),
   });

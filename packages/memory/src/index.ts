@@ -223,3 +223,11 @@ export {
   EmbeddingMemoryProvider,
 } from './memory-provider.js';
 export { MemoryManager } from './memory-manager.js';
+export {
+  FrozenMemory,
+  InMemoryFrozenStore,
+  FileFrozenStore,
+  type FrozenMemoryEntry,
+  type FrozenSnapshot,
+  type FrozenMemoryStore,
+} from './frozen-memory.js';

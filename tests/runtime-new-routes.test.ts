@@ -185,7 +185,72 @@ describe('WebSocket route', () => {
     const res = await runtime.fetch(
       new Request('http://localhost/ws', { headers: authHeaders }),
     );
-    // Without proper WebSocket upgrade headers, should still respond
     expect(res).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hermes runtime wiring
+// ---------------------------------------------------------------------------
+
+describe('Hermes runtime wiring', () => {
+  it('GET /api/memory/snapshot returns frozen memory state', async () => {
+    const runtime = createTestRuntime();
+    const res = await runtime.fetch(
+      new Request('http://localhost/api/memory/snapshot', { headers: authHeaders }),
+    );
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.memory).toBeDefined();
+    expect(data.user).toBeDefined();
+    expect(typeof data.memory.size).toBe('number');
+    expect(typeof data.user.size).toBe('number');
+  });
+
+  it('POST /api/memory/snapshot sets a frozen memory entry', async () => {
+    const runtime = createTestRuntime();
+    const res = await runtime.fetch(
+      new Request('http://localhost/api/memory/snapshot', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...authHeaders },
+        body: JSON.stringify({ namespace: 'memory', action: 'set', key: 'test-key', value: 'test-value', category: 'fact' }),
+      }),
+    );
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.size).toBeGreaterThanOrEqual(1);
+  });
+
+  it('GET /api/context returns context engine status', async () => {
+    const runtime = createTestRuntime();
+    const res = await runtime.fetch(
+      new Request('http://localhost/api/context', { headers: authHeaders }),
+    );
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.files)).toBe(true);
+    expect(typeof data.totalBytes).toBe('number');
+  });
+
+  it('GET /api/diagnostics returns runtime info', async () => {
+    const runtime = createTestRuntime();
+    const res = await runtime.fetch(
+      new Request('http://localhost/api/diagnostics', { headers: authHeaders }),
+    );
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.runtime).toBe('node');
+    expect(typeof data.wsConnections).toBe('number');
+    expect(typeof data.activeSessions).toBe('number');
+  });
+
+  it('GET /api/config/remote-access returns server config', async () => {
+    const runtime = createTestRuntime();
+    const res = await runtime.fetch(
+      new Request('http://localhost/api/config/remote-access', { headers: authHeaders }),
+    );
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(typeof data.serverUrl).toBe('string');
   });
 });

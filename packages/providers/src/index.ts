@@ -8,6 +8,8 @@ export interface OpenAICompatibleConfig {
   baseUrl: string;
   model: string;
   credentialPool?: CredentialPool;
+  /** Override the API endpoint path (default: /chat/completions). Use /responses for o-series/codex models. */
+  endpointPath?: string;
 }
 
 export interface AnthropicConfig {
@@ -517,6 +519,19 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     return this.config.model;
   }
 
+  /** Resolve the API endpoint: use explicit override, or auto-detect from model name */
+  private getEndpointUrl(): string {
+    const base = this.config.baseUrl.replace(/\/$/, '');
+    if (this.config.endpointPath) {
+      return `${base}${this.config.endpointPath}`;
+    }
+    // Auto-detect: o-series and codex models use /responses, others use /chat/completions
+    if (/^(o1|o3|o4|codex)/i.test(this.config.model)) {
+      return `${base}/responses`;
+    }
+    return `${base}/chat/completions`;
+  }
+
   /** Estimate token count for messages (~4 chars per token for OpenAI models) */
   countTokens(messages: ConversationMessage[]): number {
     const chars = countMessageChars(messages);
@@ -531,32 +546,44 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       return new EchoProvider().generate(request);
     }
 
+    const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
+    const mappedMessages = request.messages.map((message) => {
+      // Convert tool results to user messages for provider compatibility
+      if (message.role === 'tool') {
+        return {
+          role: 'user',
+          content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
+        };
+      }
+      return {
+        role: message.role,
+        content: message.content,
+      };
+    });
+
     const body: Record<string, unknown> = {
       model: this.config.model,
-      messages: [
-        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
-        ...request.messages.map((message) => {
-          // Convert tool results to user messages for provider compatibility
-          if (message.role === 'tool') {
-            return {
-              role: 'user',
-              content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
-            };
-          }
-          return {
-            role: message.role,
-            content: message.content,
-          };
-        })
-      ]
     };
+
+    if (isResponsesApi) {
+      // Responses API: use `input` instead of `messages`, `developer` instead of `system`
+      body.input = [
+        ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    } else {
+      body.messages = [
+        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    }
 
     if (request.availableTools.length > 0) {
       body.tools = buildOpenAITools(request.availableTools);
       body.tool_choice = 'auto';
     }
 
-    const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    const response = await fetch(this.getEndpointUrl(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -578,7 +605,41 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       checkRateLimitHeaders(response.headers, pool, apiKey);
     }
 
-    const payload = (await response.json()) as ChatCompletionsResponse;
+    const rawPayload = (await response.json()) as Record<string, unknown>;
+
+    // Handle Responses API format: { output: [...], usage: {...} }
+    if (isResponsesApi && Array.isArray(rawPayload.output)) {
+      const outputItems = rawPayload.output as Array<{ type: string; content?: Array<{ type: string; text?: string }>; name?: string; arguments?: string; call_id?: string }>;
+      let text = '';
+      const toolCalls: Array<{ name: string; input: Record<string, unknown>; id?: string }> = [];
+      for (const item of outputItems) {
+        if (item.type === 'message' && Array.isArray(item.content)) {
+          for (const part of item.content) {
+            if (part.type === 'output_text' && part.text) text += part.text;
+          }
+        }
+        if (item.type === 'function_call' && item.name) {
+          let args: Record<string, unknown> = {};
+          try { args = JSON.parse(item.arguments ?? '{}') as Record<string, unknown>; } catch { /* ignore */ }
+          const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === item.name)?.name ?? item.name;
+          toolCalls.push({ name: originalName, input: args, id: item.call_id });
+        }
+      }
+      const rawUsage = rawPayload.usage as Record<string, number> | undefined;
+      const usage = rawUsage ? {
+        inputTokens: rawUsage.input_tokens ?? 0,
+        outputTokens: rawUsage.output_tokens ?? 0,
+        totalTokens: (rawUsage.input_tokens ?? 0) + (rawUsage.output_tokens ?? 0),
+      } : undefined;
+      return {
+        assistantMessage: text || undefined,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        ...(usage ? { usage } : {}),
+      };
+    }
+
+    // Standard Chat Completions format
+    const payload = rawPayload as ChatCompletionsResponse;
     const message = payload.choices?.[0]?.message;
     const assistantMessage = normalizeOpenAIMessageContent(message?.content, message?.refusal);
     const parsedToolCalls = parseOpenAIToolCalls(message?.tool_calls, request.availableTools) ?? parseOpenAIFunctionCall(message?.function_call);
@@ -609,33 +670,44 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       return;
     }
 
+    const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
+    const mappedMessages = request.messages.map((message) => {
+      if (message.role === 'tool') {
+        return {
+          role: 'user',
+          content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
+        };
+      }
+      return {
+        role: message.role,
+        content: message.content,
+      };
+    });
+
     const body: Record<string, unknown> = {
       model: this.config.model,
       stream: true,
-      messages: [
-        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
-        ...request.messages.map((message) => {
-          if (message.role === 'tool') {
-            return {
-              role: 'user',
-              content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
-            };
-          }
-          return {
-            role: message.role,
-            content: message.content,
-          };
-        })
-      ]
     };
+
+    if (isResponsesApi) {
+      // Responses API: use `input` instead of `messages`, `developer` instead of `system`
+      body.input = [
+        ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    } else {
+      body.messages = [
+        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    }
 
     if (request.availableTools.length > 0) {
       body.tools = buildOpenAITools(request.availableTools);
       body.tool_choice = 'auto';
     }
 
-    const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
-    const response = await fetch(url, {
+    const response = await fetch(this.getEndpointUrl(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -698,6 +770,49 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
             continue;
           }
 
+          // Responses API streaming: events have { type: 'response.output_text.delta', delta: '...' }
+          const eventType = parsed.type as string | undefined;
+          if (isResponsesApi && eventType) {
+            if (eventType === 'response.output_text.delta' && typeof parsed.delta === 'string') {
+              yield { type: 'text', text: parsed.delta };
+            } else if (eventType === 'response.function_call_arguments.delta' && typeof parsed.delta === 'string') {
+              // Route delta to the correct tool accumulator by output_index
+              const outputIdx = typeof parsed.output_index === 'number' ? parsed.output_index : toolAccumulators.size - 1;
+              const acc = toolAccumulators.get(outputIdx) ?? [...toolAccumulators.values()].at(-1);
+              if (acc) {
+                acc.args += parsed.delta;
+                yield { type: 'tool_use_delta', toolInput: parsed.delta };
+              }
+            } else if (eventType === 'response.output_item.added') {
+              const item = parsed.item as { type?: string; name?: string; call_id?: string } | undefined;
+              const outputIdx = typeof parsed.output_index === 'number' ? parsed.output_index : toolAccumulators.size;
+              if (item?.type === 'function_call' && item.name) {
+                const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === item.name)?.name ?? item.name;
+                toolAccumulators.set(outputIdx, { name: originalName, args: '', id: item.call_id });
+                yield { type: 'tool_use_start', toolName: originalName, toolCallId: item.call_id };
+              }
+            } else if (eventType === 'response.output_item.done') {
+              const item = parsed.item as { type?: string } | undefined;
+              const doneIdx = typeof parsed.output_index === 'number' ? parsed.output_index : undefined;
+              if (item?.type === 'function_call') {
+                const acc = doneIdx !== undefined ? toolAccumulators.get(doneIdx) : [...toolAccumulators.values()].at(-1);
+                if (acc) {
+                  yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+                  if (doneIdx !== undefined) toolAccumulators.delete(doneIdx);
+                }
+              }
+            } else if (eventType === 'response.completed' || eventType === 'response.done') {
+              for (const [, acc] of toolAccumulators) {
+                yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+              }
+              toolAccumulators.clear();
+              yield { type: 'done' };
+              return;
+            }
+            continue;
+          }
+
+          // Standard Chat Completions streaming
           const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
           const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
           const finishReason = choices?.[0]?.finish_reason as string | undefined;
@@ -711,7 +826,6 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
               const idx = (tc.index as number) ?? 0;
               const fn = tc.function as { name?: string; arguments?: string } | undefined;
               if (fn?.name) {
-                // Reverse-map sanitized name (web_search → web.search) for streaming tool calls
                 const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === fn.name)?.name ?? fn.name;
                 toolAccumulators.set(idx, { name: originalName, args: '', id: tc.id as string | undefined });
                 yield { type: 'tool_use_start', toolName: originalName, toolCallId: tc.id as string | undefined };
@@ -1891,3 +2005,10 @@ export interface ModelOverridable {
 export function isModelOverridable(provider: ProviderAdapter): provider is ProviderAdapter & ModelOverridable {
   return 'withModel' in provider && typeof (provider as unknown as ModelOverridable).withModel === 'function';
 }
+
+// ---------------------------------------------------------------------------
+// API mode resolver
+// ---------------------------------------------------------------------------
+
+export { resolveApiMode, modelSupports, getEndpointForModel, listApiModes, getRequestShape } from './api-mode.js';
+export type { ApiMode, ApiModeCapabilities, ResolvedMode, ModeRequestShape } from './api-mode.js';

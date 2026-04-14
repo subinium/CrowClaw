@@ -15,6 +15,26 @@ interface SessionInfo {
   contextPct?: number;
 }
 
+interface ActiveSessionInfo {
+  sessionId: string;
+  status: string;
+  startedAt: string;
+}
+
+interface CheckpointInfo {
+  id: string;
+  label?: string;
+  createdAt: string;
+  messageCount?: number;
+}
+
+interface SearchResult {
+  messageIndex: number;
+  role: string;
+  content: string;
+  score?: number;
+}
+
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool' | 'iteration';
   content: string;
@@ -27,6 +47,12 @@ interface ToolStep {
   status: 'running' | 'done' | 'error';
   input?: Record<string, unknown>;
   output?: string;
+  elapsed?: number;
+}
+
+interface TraceToolEntry {
+  toolName: string;
+  status: 'running' | 'done' | 'error';
   elapsed?: number;
 }
 
@@ -45,6 +71,11 @@ const timeAgo = (date: string): string => {
   return `${Math.floor(seconds / 86400)}d ago`;
 };
 
+const truncateId = (id: string, len = 12): string => {
+  if (id.length <= len) return id;
+  return id.slice(0, len) + '...';
+};
+
 @customElement('crowclaw-chat-view')
 export class ChatView extends LitElement {
   static styles = [
@@ -57,7 +88,7 @@ export class ChatView extends LitElement {
 
       /* Session Sidebar */
       .sess-sb {
-        width: 260px;
+        width: 280px;
         border-right: 1px solid var(--glass-border);
         display: flex;
         flex-direction: column;
@@ -101,6 +132,29 @@ export class ChatView extends LitElement {
       .sess-item:hover { background: var(--bg-card); }
       .sess-item.active { background: var(--accent-soft); border-left: 2px solid var(--accent); }
 
+      .sess-item-top {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        margin-bottom: 2px;
+      }
+
+      .sess-active-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--success);
+        flex-shrink: 0;
+        animation: pulse 1.5s infinite;
+      }
+
+      .sess-id {
+        font-size: 10px;
+        font-family: var(--font-mono);
+        color: var(--text-muted);
+        letter-spacing: 0.3px;
+      }
+
       .sess-title {
         font-size: var(--text-sm);
         font-weight: 500;
@@ -111,11 +165,37 @@ export class ChatView extends LitElement {
         text-overflow: ellipsis;
       }
 
+      .sess-preview {
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        margin-bottom: 4px;
+      }
+
       .sess-meta {
         display: flex;
+        align-items: center;
         gap: var(--sp-3);
         font-size: var(--text-xs);
         color: var(--text-muted);
+      }
+
+      .sess-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 18px;
+        height: 16px;
+        padding: 0 4px;
+        background: var(--glass-bg);
+        border: 1px solid var(--glass-border);
+        border-radius: 8px;
+        font-size: 9px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-family: var(--font-mono);
       }
 
       .sess-ctx {
@@ -150,6 +230,37 @@ export class ChatView extends LitElement {
 
       .sess-actions button:hover { color: var(--text-primary); background: var(--bg-card-hover); }
 
+      /* Context menu for session actions */
+      .sess-ctx-menu {
+        position: absolute;
+        top: 28px;
+        right: var(--sp-2);
+        z-index: 20;
+        background: var(--bg-secondary);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-sm);
+        box-shadow: var(--shadow-md);
+        min-width: 140px;
+        overflow: hidden;
+      }
+
+      .sess-ctx-menu button {
+        display: block;
+        width: 100%;
+        padding: var(--sp-2) var(--sp-3);
+        border: none;
+        background: none;
+        color: var(--text-primary);
+        font-size: var(--text-xs);
+        text-align: left;
+        cursor: pointer;
+        font-family: inherit;
+      }
+
+      .sess-ctx-menu button:hover { background: var(--bg-card-hover); }
+      .sess-ctx-menu button.danger { color: var(--error); }
+      .sess-ctx-menu button.danger:hover { background: rgba(255, 69, 58, 0.1); }
+
       /* Chat Content */
       .chat-content {
         display: flex;
@@ -168,6 +279,233 @@ export class ChatView extends LitElement {
         font-size: 14px;
         border-radius: var(--radius-sm);
         width: fit-content;
+      }
+
+      /* Operations Toolbar */
+      .ops-toolbar {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: var(--bg-secondary);
+        flex-wrap: wrap;
+      }
+
+      .ops-toolbar .ops-label {
+        font-size: var(--text-xs);
+        font-weight: 600;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        margin-right: var(--sp-1);
+      }
+
+      .ops-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--sp-1);
+        padding: 4px 10px;
+        border: 1px solid var(--glass-border);
+        background: var(--glass-bg);
+        color: var(--text-secondary);
+        font-size: var(--text-xs);
+        font-weight: 500;
+        font-family: inherit;
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+        transition: background var(--duration-fast), border-color var(--duration-fast);
+      }
+
+      .ops-btn:hover {
+        background: var(--bg-card-hover);
+        border-color: rgba(255, 255, 255, 0.15);
+        color: var(--text-primary);
+      }
+
+      .ops-btn:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
+      .ops-btn.danger {
+        border-color: rgba(255, 69, 58, 0.3);
+        color: var(--error);
+      }
+
+      .ops-btn.danger:hover {
+        background: rgba(255, 69, 58, 0.1);
+      }
+
+      .ops-btn.aborting {
+        border-color: rgba(255, 214, 10, 0.3);
+        color: var(--warning);
+        animation: pulse 1s infinite;
+      }
+
+      .ops-sep {
+        width: 1px;
+        height: 20px;
+        background: var(--glass-border);
+        margin: 0 var(--sp-1);
+      }
+
+      /* Steer input overlay */
+      .steer-overlay {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: rgba(100, 210, 255, 0.04);
+      }
+
+      .steer-overlay input {
+        flex: 1;
+        padding: var(--sp-2) var(--sp-3);
+        border: 1px solid rgba(100, 210, 255, 0.3);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        font-size: var(--text-xs);
+        font-family: inherit;
+        outline: none;
+        border-radius: var(--radius-sm);
+      }
+
+      .steer-overlay input:focus { border-color: var(--info); }
+
+      /* Search overlay */
+      .search-overlay {
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: rgba(100, 210, 255, 0.04);
+      }
+
+      .search-overlay .search-row {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+      }
+
+      .search-overlay input {
+        flex: 1;
+        padding: var(--sp-2) var(--sp-3);
+        border: 1px solid rgba(100, 210, 255, 0.3);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        font-size: var(--text-xs);
+        font-family: inherit;
+        outline: none;
+        border-radius: var(--radius-sm);
+      }
+
+      .search-results {
+        max-height: 160px;
+        overflow-y: auto;
+      }
+
+      .search-result-item {
+        padding: var(--sp-1) var(--sp-2);
+        font-size: var(--text-xs);
+        border-bottom: 1px solid var(--glass-border);
+        cursor: pointer;
+      }
+
+      .search-result-item:hover { background: var(--bg-card-hover); }
+
+      .search-result-item .sr-role {
+        font-weight: 600;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        font-size: 9px;
+        margin-right: var(--sp-2);
+      }
+
+      .search-result-item .sr-content {
+        color: var(--text-secondary);
+      }
+
+      /* Checkpoint list overlay */
+      .checkpoint-overlay {
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: rgba(100, 210, 255, 0.04);
+        max-height: 200px;
+        overflow-y: auto;
+      }
+
+      .checkpoint-overlay .cp-hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: var(--sp-2);
+      }
+
+      .checkpoint-overlay .cp-hdr span {
+        font-size: var(--text-xs);
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+
+      .cp-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: var(--sp-1) var(--sp-2);
+        border-bottom: 1px solid var(--glass-border);
+        font-size: var(--text-xs);
+      }
+
+      .cp-item:last-child { border-bottom: none; }
+
+      .cp-item .cp-label {
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+      }
+
+      .cp-item .cp-time {
+        color: var(--text-muted);
+      }
+
+      .cp-item .cp-restore {
+        padding: 2px 6px;
+        border: 1px solid var(--glass-border);
+        background: none;
+        color: var(--text-secondary);
+        font-size: 10px;
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+        font-family: inherit;
+      }
+
+      .cp-item .cp-restore:hover {
+        background: var(--bg-card-hover);
+        color: var(--text-primary);
+      }
+
+      /* Rename dialog */
+      .rename-overlay {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: rgba(255, 255, 255, 0.02);
+      }
+
+      .rename-overlay input {
+        flex: 1;
+        padding: var(--sp-2) var(--sp-3);
+        border: 1px solid var(--glass-border);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        font-size: var(--text-xs);
+        font-family: inherit;
+        outline: none;
+        border-radius: var(--radius-sm);
       }
 
       /* Messages */
@@ -473,23 +811,45 @@ export class ChatView extends LitElement {
         position: absolute;
         bottom: 60px;
         right: 48px;
-        width: 220px;
+        width: 260px;
         background: var(--bg-secondary);
         border: 1px solid var(--glass-border);
         border-radius: var(--radius-md);
         z-index: 5;
         display: none;
+        max-height: 400px;
+        overflow-y: auto;
       }
 
       .trace-panel.open { display: block; }
 
       .tp-hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
         padding: var(--sp-2) var(--sp-3);
         font-size: var(--text-xs);
         font-weight: 600;
         color: var(--text-secondary);
         border-bottom: 1px solid var(--glass-border);
+        position: sticky;
+        top: 0;
+        background: var(--bg-secondary);
       }
+
+      .tp-hdr .tp-stop-btn {
+        padding: 2px 8px;
+        border: 1px solid rgba(255, 69, 58, 0.3);
+        background: rgba(255, 69, 58, 0.08);
+        color: var(--error);
+        font-size: 10px;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+        font-family: inherit;
+      }
+
+      .tp-hdr .tp-stop-btn:hover { background: rgba(255, 69, 58, 0.15); }
 
       .tp-body { padding: var(--sp-2) var(--sp-3); }
 
@@ -502,6 +862,79 @@ export class ChatView extends LitElement {
 
       .tp-row span:first-child { color: var(--text-muted); }
       .tp-row span:last-child { color: var(--text-primary); font-family: var(--font-mono); }
+
+      .tp-section-label {
+        font-size: 9px;
+        font-weight: 600;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        padding: var(--sp-2) var(--sp-3) var(--sp-1);
+        border-top: 1px solid var(--glass-border);
+        margin-top: var(--sp-1);
+      }
+
+      .tp-tool-list {
+        padding: 0 var(--sp-3) var(--sp-2);
+      }
+
+      .tp-tool-entry {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: 2px 0;
+        font-size: var(--text-xs);
+      }
+
+      .tp-tool-entry .tp-tool-dot {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+
+      .tp-tool-dot.running { background: var(--accent); animation: pulse 1.5s infinite; }
+      .tp-tool-dot.done { background: var(--success); }
+      .tp-tool-dot.error { background: var(--error); }
+
+      .tp-tool-entry .tp-tool-name {
+        font-family: var(--font-mono);
+        color: var(--text-secondary);
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .tp-tool-entry .tp-tool-time {
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+        flex-shrink: 0;
+      }
+
+      .tp-aborting {
+        color: var(--warning);
+        font-weight: 600;
+        font-size: var(--text-xs);
+        padding: var(--sp-2) var(--sp-3);
+        animation: pulse 1s infinite;
+      }
+
+      /* Confirmation dialog */
+      .confirm-overlay {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: rgba(255, 69, 58, 0.04);
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+      }
+
+      .confirm-overlay .confirm-msg {
+        flex: 1;
+      }
 
       /* Responsive */
       @media (max-width: 768px) {
@@ -518,14 +951,30 @@ export class ChatView extends LitElement {
   @state() private streamText = '';
   @state() private toolSteps: ToolStep[] = [];
   @state() private traceOpen = false;
-  @state() private traceData = { iteration: 0, tool: '--', tokens: 0, elapsed: 0 };
+  @state() private traceData = { iteration: 0, tool: '--', tokens: 0, elapsed: 0, maxIterations: 0 };
   @state() private sessSidebarOpen = true;
+
+  // New state for enhanced features
+  @state() private activeSessions: Set<string> = new Set();
+  @state() private contextMenuSessionId: string | null = null;
+  @state() private aborting = false;
+  @state() private traceToolHistory: TraceToolEntry[] = [];
+  @state() private showSteerInput = false;
+  @state() private showSearchOverlay = false;
+  @state() private searchResults: SearchResult[] = [];
+  @state() private showCheckpointList = false;
+  @state() private checkpoints: CheckpointInfo[] = [];
+  @state() private showConfirmCompact = false;
+  @state() private showRenameInput = false;
+  @state() private renameSessionId: string | null = null;
+  @state() private showCheckpointLabel = false;
 
   @query('#msgInput') private msgInput!: HTMLInputElement;
   @query('.messages') private messagesEl!: HTMLElement;
 
   private _streamController?: AbortController;
   private _streamStart = 0;
+  private _activePollingInterval?: ReturnType<typeof setInterval>;
 
   connectedCallback() {
     super.connectedCallback();
@@ -533,16 +982,59 @@ export class ChatView extends LitElement {
     if (this.currentSessionId) {
       this._loadHistory();
     }
+    this._startActivePolling();
+    // Close context menu on outside click
+    this._onDocClick = this._onDocClick.bind(this);
+    document.addEventListener('click', this._onDocClick);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     this._streamController?.abort();
+    this._stopActivePolling();
+    document.removeEventListener('click', this._onDocClick);
   }
+
+  private _onDocClick() {
+    if (this.contextMenuSessionId) {
+      this.contextMenuSessionId = null;
+    }
+  }
+
+  // --- Active session polling ---
+
+  private _startActivePolling() {
+    this._pollActiveSessions();
+    this._activePollingInterval = setInterval(() => {
+      this._pollActiveSessions();
+    }, 10_000);
+  }
+
+  private _stopActivePolling() {
+    if (this._activePollingInterval) {
+      clearInterval(this._activePollingInterval);
+      this._activePollingInterval = undefined;
+    }
+  }
+
+  private async _pollActiveSessions() {
+    try {
+      const data = await api<{ sessions: ActiveSessionInfo[] }>('/api/sessions/active');
+      const ids = new Set((data.sessions || []).map((s) => s.sessionId));
+      this.activeSessions = ids;
+    } catch {
+      // ignore polling failures
+    }
+  }
+
+  private _isSessionActive(sessionId: string): boolean {
+    return this.activeSessions.has(sessionId);
+  }
+
+  // --- Session loading ---
 
   private async _loadSessions() {
     try {
-      // Backend returns { ok, supported, count, sessions } from summarizeSessionRecord()
       const data = await api<{
         ok: boolean;
         supported: boolean;
@@ -574,7 +1066,6 @@ export class ChatView extends LitElement {
   private async _loadHistory() {
     if (!this.currentSessionId) return;
     try {
-      // Backend returns the full session object { sessionId, messages, updatedAt, ... }
       const data = await api<{ sessionId: string; messages: ChatMessage[]; updatedAt?: string }>(`/api/sessions/${this.currentSessionId}/history`);
       this.messages = data.messages || [];
       this._scrollToBottom();
@@ -586,13 +1077,12 @@ export class ChatView extends LitElement {
   private _selectSession(id: string) {
     this.currentSessionId = id;
     localStorage.setItem('cc_sid', id);
-    this.sessions = [...this.sessions]; // trigger re-render
+    this.sessions = [...this.sessions];
+    this._closeAllOverlays();
     this._loadHistory();
   }
 
   private _createSession() {
-    // TODO: Session ID should ideally be generated server-side via POST /api/sessions
-    // to avoid potential collisions and ensure the backend is the source of truth.
     const id = `s-${Date.now().toString(36)}`;
     this.sessions = [
       { id, title: '', preview: '', messageCount: 0, updatedAt: new Date().toISOString() },
@@ -603,6 +1093,7 @@ export class ChatView extends LitElement {
 
   private async _deleteSession(e: Event, id: string) {
     e.stopPropagation();
+    this.contextMenuSessionId = null;
     this.sessions = this.sessions.filter((s) => s.id !== id);
     if (this.currentSessionId === id) {
       this.currentSessionId = null;
@@ -614,15 +1105,145 @@ export class ChatView extends LitElement {
     } catch { /* ignore */ }
   }
 
+  // --- Context menu ---
+
+  private _openContextMenu(e: Event, sessionId: string) {
+    e.stopPropagation();
+    e.preventDefault();
+    this.contextMenuSessionId = this.contextMenuSessionId === sessionId ? null : sessionId;
+  }
+
+  // --- Session operations ---
+
+  private async _abortSession() {
+    if (!this.currentSessionId) return;
+    this.aborting = true;
+    try {
+      await api<{ ok: boolean; aborted: boolean }>(`/api/sessions/${this.currentSessionId}/abort`, { method: 'POST', body: JSON.stringify({}) });
+      this._streamController?.abort();
+      this.streaming = false;
+      this.streamText = '';
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Abort failed';
+      this.messages = [...this.messages, { role: 'system', content: `Abort error: ${msg}` }];
+    } finally {
+      this.aborting = false;
+    }
+  }
+
+  private async _compactSession() {
+    if (!this.currentSessionId) return;
+    this.showConfirmCompact = false;
+    try {
+      const data = await api<{ ok: boolean; originalMessageCount: number; compactedMessageCount: number; summary: string }>(`/api/sessions/${this.currentSessionId}/compact`, { method: 'POST', body: JSON.stringify({}) });
+      this.messages = [...this.messages, { role: 'system', content: `Compacted: ${data.originalMessageCount} -> ${data.compactedMessageCount} messages. ${data.summary}` }];
+      // Refresh session info
+      const session = this.sessions.find((s) => s.id === this.currentSessionId);
+      if (session) {
+        session.messageCount = data.compactedMessageCount;
+        this.sessions = [...this.sessions];
+      }
+      this._loadHistory();
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Compact failed';
+      this.messages = [...this.messages, { role: 'system', content: `Compact error: ${msg}` }];
+    }
+  }
+
+  private async _steerSession(directive: string) {
+    if (!this.currentSessionId || !directive.trim()) return;
+    this.showSteerInput = false;
+    try {
+      const data = await api<{ ok: boolean; injectedPrompt: string }>(`/api/sessions/${this.currentSessionId}/steer`, { method: 'POST', body: JSON.stringify({ directive: directive.trim() }) });
+      this.messages = [...this.messages, { role: 'system', content: `Steered: ${data.injectedPrompt}` }];
+      this._scrollToBottom();
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Steer failed';
+      this.messages = [...this.messages, { role: 'system', content: `Steer error: ${msg}` }];
+    }
+  }
+
+  private async _checkpointSession(label?: string) {
+    if (!this.currentSessionId) return;
+    this.showCheckpointLabel = false;
+    try {
+      await api<{ ok: boolean; checkpoint: unknown }>(`/api/sessions/${this.currentSessionId}/checkpoint`, { method: 'POST', body: JSON.stringify({ label: label || undefined }) });
+      this.messages = [...this.messages, { role: 'system', content: `Checkpoint created${label ? `: ${label}` : ''}` }];
+      this._scrollToBottom();
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Checkpoint failed';
+      this.messages = [...this.messages, { role: 'system', content: `Checkpoint error: ${msg}` }];
+    }
+  }
+
+  private async _loadCheckpoints() {
+    if (!this.currentSessionId) return;
+    this.showCheckpointList = !this.showCheckpointList;
+    if (!this.showCheckpointList) return;
+    try {
+      const data = await api<{ checkpoints: CheckpointInfo[] }>(`/api/sessions/${this.currentSessionId}/checkpoints`);
+      this.checkpoints = data.checkpoints || [];
+    } catch {
+      this.checkpoints = [];
+    }
+  }
+
+  private async _restoreCheckpoint(checkpointId: string) {
+    if (!this.currentSessionId) return;
+    try {
+      await api<{ ok: boolean; restoredTo: string }>(`/api/sessions/${this.currentSessionId}/restore`, { method: 'POST', body: JSON.stringify({ checkpointId }) });
+      this.showCheckpointList = false;
+      this._loadHistory();
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Restore failed';
+      this.messages = [...this.messages, { role: 'system', content: `Restore error: ${msg}` }];
+    }
+  }
+
+  private async _searchSession(query: string) {
+    if (!this.currentSessionId || !query.trim()) return;
+    try {
+      const data = await api<{ ok: boolean; results: SearchResult[] }>(`/api/sessions/${this.currentSessionId}/search`, { method: 'POST', body: JSON.stringify({ query: query.trim() }) });
+      this.searchResults = data.results || [];
+    } catch {
+      this.searchResults = [];
+    }
+  }
+
+  private async _renameSession(sessionId: string, name: string) {
+    if (!name.trim()) return;
+    this.showRenameInput = false;
+    this.renameSessionId = null;
+    this.contextMenuSessionId = null;
+    const session = this.sessions.find((s) => s.id === sessionId);
+    if (session) {
+      session.title = name.trim();
+      this.sessions = [...this.sessions];
+    }
+    try {
+      await api(`/api/sessions/${sessionId}/rename`, { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
+    } catch { /* ignore */ }
+  }
+
+  private _closeAllOverlays() {
+    this.showSteerInput = false;
+    this.showSearchOverlay = false;
+    this.showCheckpointList = false;
+    this.showConfirmCompact = false;
+    this.showRenameInput = false;
+    this.showCheckpointLabel = false;
+    this.searchResults = [];
+  }
+
+  // --- Messaging ---
+
   private _sendMessage() {
     const text = this.msgInput?.value.trim();
     if (!text || !this.currentSessionId || this.streaming) return;
     this.msgInput.value = '';
 
-    // Add user message
     this.messages = [...this.messages, { role: 'user', content: text }];
 
-    // Update session
     const session = this.sessions.find((s) => s.id === this.currentSessionId);
     if (session) {
       session.messageCount++;
@@ -632,12 +1253,13 @@ export class ChatView extends LitElement {
       this.sessions = [...this.sessions];
     }
 
-    // Start streaming
     this.streaming = true;
     this.streamText = '';
     this.toolSteps = [];
+    this.traceToolHistory = [];
     this._streamStart = Date.now();
-    this.traceData = { iteration: 0, tool: '--', tokens: 0, elapsed: 0 };
+    this.traceData = { iteration: 0, tool: '--', tokens: 0, elapsed: 0, maxIterations: 0 };
+    this.aborting = false;
 
     this._scrollToBottom();
 
@@ -652,27 +1274,33 @@ export class ChatView extends LitElement {
           toolCallId, toolName, status: 'running', input,
         }];
         this.traceData = { ...this.traceData, tool: toolName };
-        // Flush any pending text as a message
+        this.traceToolHistory = [...this.traceToolHistory, { toolName, status: 'running' }];
         if (this.streamText.trim()) {
           this.messages = [...this.messages, { role: 'assistant', content: this.streamText }];
           this.streamText = '';
         }
       },
       onToolEnd: (toolCallId, output, success) => {
+        const endTime = Date.now();
         this.toolSteps = this.toolSteps.map((s) =>
           s.toolCallId === toolCallId
             ? { ...s, status: success ? 'done' : 'error', output }
             : s,
         );
-        // Add tool result as message
+        // Update trace history
+        const histIdx = this.traceToolHistory.findIndex((t) => t.toolName === this.traceData.tool && t.status === 'running');
+        if (histIdx >= 0) {
+          const updated = [...this.traceToolHistory];
+          updated[histIdx] = { ...updated[histIdx], status: success ? 'done' : 'error', elapsed: endTime - this._streamStart };
+          this.traceToolHistory = updated;
+        }
         const step = this.toolSteps.find((s) => s.toolCallId === toolCallId);
         if (step) {
           this.messages = [...this.messages, { role: 'tool', content: output, name: step.toolName }];
         }
       },
       onIterationStart: (iteration) => {
-        this.traceData = { ...this.traceData, iteration };
-        // Flush pending stream text before iteration separator
+        this.traceData = { ...this.traceData, iteration, maxIterations: Math.max(this.traceData.maxIterations, iteration + 1) };
         if (this.streamText.trim()) {
           this.messages = [...this.messages, { role: 'assistant', content: this.streamText }];
           this.streamText = '';
@@ -687,12 +1315,14 @@ export class ChatView extends LitElement {
         }
         this.streaming = false;
         this.streamText = '';
+        this.aborting = false;
         this.traceData = { ...this.traceData, elapsed: Date.now() - this._streamStart };
         this._scrollToBottom();
         this._applyHighlighting();
       },
       onError: (error) => {
         this.streaming = false;
+        this.aborting = false;
         this.messages = [...this.messages, { role: 'system', content: `Error: ${error}` }];
         this._scrollToBottom();
       },
@@ -743,6 +1373,8 @@ export class ChatView extends LitElement {
       new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }
 
+  // --- Render ---
+
   render() {
     return html`
       <div class="chat-area">
@@ -753,34 +1385,25 @@ export class ChatView extends LitElement {
               <input placeholder="Search sessions..."
                      .value=${this.searchQuery}
                      @input=${(e: InputEvent) => { this.searchQuery = (e.target as HTMLInputElement).value; }}>
-              <button class="btn btn-p" style="padding:6px 10px" @click=${this._createSession} title="New Session">+</button>
+              <button class="btn btn-p" style="padding:6px 10px" @click=${this._createSession} aria-label="New Session" title="New Session">+</button>
             </div>
             <div class="sess-list">
               ${this._filteredSessions.length === 0
                 ? html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">${this.sessions.length ? 'No matching sessions' : 'No sessions yet'}</div></div>`
-                : this._filteredSessions.map((s) => html`
-                    <div class="sess-item ${s.id === this.currentSessionId ? 'active' : ''}"
-                         @click=${() => this._selectSession(s.id)}>
-                      <div class="sess-actions">
-                        <button @click=${(e: Event) => this._deleteSession(e, s.id)} title="Delete">&#128465;</button>
-                      </div>
-                      <div class="sess-title">${s.title || s.preview?.slice(0, 30) || s.id.slice(0, 20)}</div>
-                      <div class="sess-meta">
-                        <span>${timeAgo(s.updatedAt)}</span>
-                        <span>${s.messageCount} msgs</span>
-                      </div>
-                      ${s.contextPct !== undefined ? html`
-                        <div class="sess-ctx"><div class="sess-ctx-bar" style="width:${Math.min(100, s.contextPct)}%"></div></div>
-                      ` : nothing}
-                    </div>
-                  `)}
+                : this._filteredSessions.map((s) => this._renderSessionCard(s))}
             </div>
           </div>
         ` : nothing}
 
         <!-- Chat Content -->
         <div class="chat-content" style="position:relative">
-          <button class="sess-toggle-btn" @click=${() => { this.sessSidebarOpen = !this.sessSidebarOpen; }}>&#9776;</button>
+          <button class="sess-toggle-btn" @click=${() => { this.sessSidebarOpen = !this.sessSidebarOpen; }} aria-label="Toggle sidebar">&#9776;</button>
+
+          <!-- Operations Toolbar -->
+          ${this.currentSessionId ? this._renderOpsToolbar() : nothing}
+
+          <!-- Overlays -->
+          ${this._renderOverlays()}
 
           <div class="messages">
             ${!this.currentSessionId
@@ -805,7 +1428,8 @@ export class ChatView extends LitElement {
                    ?disabled=${!this.currentSessionId}
                    @keydown=${this._inputKeydown}>
             <button class="send-btn" @click=${this._sendMessage}
-                    ?disabled=${!this.currentSessionId || this.streaming}>
+                    ?disabled=${!this.currentSessionId || this.streaming}
+                    aria-label="Send message">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <line x1="22" y1="2" x2="11" y2="13"/>
                 <polygon points="22 2 15 22 11 13 2 9 22 2"/>
@@ -814,20 +1438,268 @@ export class ChatView extends LitElement {
           </div>
 
           <!-- Trace Panel -->
-          <button class="trace-toggle" @click=${() => { this.traceOpen = !this.traceOpen; }}>T</button>
-          <div class="trace-panel ${this.traceOpen ? 'open' : ''}">
-            <div class="tp-hdr">Trace</div>
-            <div class="tp-body">
-              <div class="tp-row"><span>Iteration</span><span>${this.traceData.iteration}</span></div>
-              <div class="tp-row"><span>Tool</span><span>${this.traceData.tool}</span></div>
-              <div class="tp-row"><span>Tokens</span><span>${this.traceData.tokens}</span></div>
-              <div class="tp-row"><span>Elapsed</span><span>${this.traceData.elapsed}ms</span></div>
-            </div>
-          </div>
+          <button class="trace-toggle" @click=${() => { this.traceOpen = !this.traceOpen; }} aria-label="Toggle trace panel">T</button>
+          ${this._renderTracePanel()}
         </div>
       </div>
     `;
   }
+
+  // --- Rich session card ---
+
+  private _renderSessionCard(s: SessionInfo) {
+    const isActive = this._isSessionActive(s.id);
+    const isCurrent = s.id === this.currentSessionId;
+    const showMenu = this.contextMenuSessionId === s.id;
+
+    return html`
+      <div class="sess-item ${isCurrent ? 'active' : ''}"
+           @click=${() => this._selectSession(s.id)}>
+        <div class="sess-actions">
+          <button @click=${(e: Event) => this._openContextMenu(e, s.id)} aria-label="Session actions" title="Actions">...</button>
+        </div>
+        ${showMenu ? html`
+          <div class="sess-ctx-menu" @click=${(e: Event) => e.stopPropagation()}>
+            <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this.renameSessionId = s.id; this.showRenameInput = true; this._selectSession(s.id); }}>Rename</button>
+            <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this._selectSession(s.id); this._checkpointSession(); }}>Checkpoint</button>
+            <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this._selectSession(s.id); this.showConfirmCompact = true; }}>Compact</button>
+            <button class="danger" @click=${(e: Event) => this._deleteSession(e, s.id)}>Delete</button>
+          </div>
+        ` : nothing}
+        <div class="sess-item-top">
+          ${isActive ? html`<span class="sess-active-dot" title="Active"></span>` : nothing}
+          <span class="sess-id" title="${s.id}">${truncateId(s.id)}</span>
+        </div>
+        <div class="sess-title">${s.title || s.preview?.slice(0, 30) || 'Untitled'}</div>
+        ${s.preview ? html`<div class="sess-preview">${s.preview.slice(0, 80)}</div>` : nothing}
+        <div class="sess-meta">
+          <span>${timeAgo(s.updatedAt)}</span>
+          <span class="sess-badge">${s.messageCount}</span>
+        </div>
+        ${s.contextPct !== undefined ? html`
+          <div class="sess-ctx"><div class="sess-ctx-bar" style="width:${Math.min(100, s.contextPct)}%"></div></div>
+        ` : nothing}
+      </div>
+    `;
+  }
+
+  // --- Operations toolbar ---
+
+  private _renderOpsToolbar() {
+    const isActive = this.currentSessionId ? this._isSessionActive(this.currentSessionId) : false;
+    const canAbort = this.streaming || isActive;
+
+    return html`
+      <div class="ops-toolbar">
+        <span class="ops-label">Ops</span>
+        ${canAbort ? html`
+          <button class="ops-btn ${this.aborting ? 'aborting' : 'danger'}"
+                  @click=${this._abortSession}
+                  ?disabled=${this.aborting}
+                  aria-label="Abort session">
+            ${this.aborting ? 'Aborting...' : 'Abort'}
+          </button>
+        ` : nothing}
+        <button class="ops-btn"
+                @click=${() => { this._closeAllOverlays(); this.showConfirmCompact = true; }}
+                aria-label="Compact session">
+          Compact
+        </button>
+        <button class="ops-btn"
+                @click=${() => { this._closeAllOverlays(); this.showSteerInput = !this.showSteerInput; }}
+                aria-label="Steer session">
+          Steer
+        </button>
+        <div class="ops-sep"></div>
+        <button class="ops-btn"
+                @click=${() => { this._closeAllOverlays(); this.showCheckpointLabel = true; }}
+                aria-label="Create checkpoint">
+          Checkpoint
+        </button>
+        <button class="ops-btn"
+                @click=${() => { this._closeAllOverlays(); this._loadCheckpoints(); }}
+                aria-label="View checkpoint history">
+          History
+        </button>
+        <div class="ops-sep"></div>
+        <button class="ops-btn"
+                @click=${() => { this._closeAllOverlays(); this.showSearchOverlay = !this.showSearchOverlay; this.searchResults = []; }}
+                aria-label="Search messages">
+          Search
+        </button>
+      </div>
+    `;
+  }
+
+  // --- Overlays (steer, search, checkpoints, confirm, rename) ---
+
+  private _renderOverlays() {
+    return html`
+      ${this.showConfirmCompact ? html`
+        <div class="confirm-overlay">
+          <span class="confirm-msg">Compact this session? This will summarize and reduce message count.</span>
+          <button class="ops-btn danger" @click=${this._compactSession} aria-label="Confirm compact">Confirm</button>
+          <button class="ops-btn" @click=${() => { this.showConfirmCompact = false; }} aria-label="Cancel compact">Cancel</button>
+        </div>
+      ` : nothing}
+
+      ${this.showSteerInput ? html`
+        <div class="steer-overlay">
+          <input placeholder="Enter directive to steer the session..."
+                 @keydown=${(e: KeyboardEvent) => {
+                   if (e.key === 'Enter') {
+                     this._steerSession((e.target as HTMLInputElement).value);
+                   } else if (e.key === 'Escape') {
+                     this.showSteerInput = false;
+                   }
+                 }}>
+          <button class="ops-btn" @click=${(e: Event) => {
+            const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
+            if (input) this._steerSession(input.value);
+          }} aria-label="Send steer directive">Send</button>
+          <button class="ops-btn" @click=${() => { this.showSteerInput = false; }} aria-label="Close steer">X</button>
+        </div>
+      ` : nothing}
+
+      ${this.showCheckpointLabel ? html`
+        <div class="steer-overlay">
+          <input placeholder="Checkpoint label (optional, press Enter)..."
+                 @keydown=${(e: KeyboardEvent) => {
+                   if (e.key === 'Enter') {
+                     this._checkpointSession((e.target as HTMLInputElement).value || undefined);
+                   } else if (e.key === 'Escape') {
+                     this.showCheckpointLabel = false;
+                   }
+                 }}>
+          <button class="ops-btn" @click=${(e: Event) => {
+            const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
+            this._checkpointSession(input?.value || undefined);
+          }} aria-label="Create checkpoint">Create</button>
+          <button class="ops-btn" @click=${() => { this.showCheckpointLabel = false; }} aria-label="Cancel checkpoint">X</button>
+        </div>
+      ` : nothing}
+
+      ${this.showRenameInput && this.renameSessionId ? html`
+        <div class="rename-overlay">
+          <input placeholder="New session name..."
+                 @keydown=${(e: KeyboardEvent) => {
+                   if (e.key === 'Enter' && this.renameSessionId) {
+                     this._renameSession(this.renameSessionId, (e.target as HTMLInputElement).value);
+                   } else if (e.key === 'Escape') {
+                     this.showRenameInput = false;
+                     this.renameSessionId = null;
+                   }
+                 }}>
+          <button class="ops-btn" @click=${(e: Event) => {
+            const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
+            if (input && this.renameSessionId) this._renameSession(this.renameSessionId, input.value);
+          }} aria-label="Confirm rename">Rename</button>
+          <button class="ops-btn" @click=${() => { this.showRenameInput = false; this.renameSessionId = null; }} aria-label="Cancel rename">X</button>
+        </div>
+      ` : nothing}
+
+      ${this.showSearchOverlay ? html`
+        <div class="search-overlay">
+          <div class="search-row">
+            <input placeholder="Search messages in this session..."
+                   @keydown=${(e: KeyboardEvent) => {
+                     if (e.key === 'Enter') {
+                       this._searchSession((e.target as HTMLInputElement).value);
+                     } else if (e.key === 'Escape') {
+                       this.showSearchOverlay = false;
+                       this.searchResults = [];
+                     }
+                   }}>
+            <button class="ops-btn" @click=${(e: Event) => {
+              const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
+              if (input) this._searchSession(input.value);
+            }} aria-label="Search">Go</button>
+            <button class="ops-btn" @click=${() => { this.showSearchOverlay = false; this.searchResults = []; }} aria-label="Close search">X</button>
+          </div>
+          ${this.searchResults.length > 0 ? html`
+            <div class="search-results">
+              ${this.searchResults.map((r) => html`
+                <div class="search-result-item" @click=${() => this._scrollToMessage(r.messageIndex)}>
+                  <span class="sr-role">${r.role}</span>
+                  <span class="sr-content">${r.content.slice(0, 120)}</span>
+                </div>
+              `)}
+            </div>
+          ` : nothing}
+        </div>
+      ` : nothing}
+
+      ${this.showCheckpointList ? html`
+        <div class="checkpoint-overlay">
+          <div class="cp-hdr">
+            <span>Checkpoints</span>
+            <button class="ops-btn" @click=${() => { this.showCheckpointList = false; }} aria-label="Close checkpoints">X</button>
+          </div>
+          ${this.checkpoints.length === 0
+            ? html`<div style="font-size:var(--text-xs);color:var(--text-muted);padding:var(--sp-2) 0">No checkpoints</div>`
+            : this.checkpoints.map((cp) => html`
+                <div class="cp-item">
+                  <span class="cp-label">${cp.label || cp.id.slice(0, 12)}</span>
+                  <span class="cp-time">${timeAgo(cp.createdAt)}</span>
+                  <button class="cp-restore" @click=${() => this._restoreCheckpoint(cp.id)} aria-label="Restore checkpoint">Restore</button>
+                </div>
+              `)}
+        </div>
+      ` : nothing}
+    `;
+  }
+
+  private _scrollToMessage(index: number) {
+    requestAnimationFrame(() => {
+      if (!this.messagesEl) return;
+      const msgs = this.messagesEl.querySelectorAll('.msg, .tool-step, .iter-sep');
+      if (msgs[index]) {
+        msgs[index].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  }
+
+  // --- Enhanced Trace Panel ---
+
+  private _renderTracePanel() {
+    return html`
+      <div class="trace-panel ${this.traceOpen ? 'open' : ''}">
+        <div class="tp-hdr">
+          <span>Trace</span>
+          ${this.streaming ? html`
+            <button class="tp-stop-btn" @click=${this._abortSession} aria-label="Stop streaming">Stop</button>
+          ` : nothing}
+        </div>
+        <div class="tp-body">
+          <div class="tp-row">
+            <span>Iteration</span>
+            <span>${this.traceData.iteration + 1}${this.traceData.maxIterations > 1 ? ` / ${this.traceData.maxIterations}` : ''}</span>
+          </div>
+          <div class="tp-row"><span>Current Tool</span><span>${this.traceData.tool}</span></div>
+          <div class="tp-row"><span>Tokens</span><span>${this.traceData.tokens}</span></div>
+          <div class="tp-row">
+            <span>Elapsed</span>
+            <span>${this.streaming ? `${Math.floor((Date.now() - this._streamStart) / 1000)}s` : `${this.traceData.elapsed}ms`}</span>
+          </div>
+          ${this.aborting ? html`<div class="tp-aborting">Aborting...</div>` : nothing}
+        </div>
+        ${this.traceToolHistory.length > 0 ? html`
+          <div class="tp-section-label">Tool History</div>
+          <div class="tp-tool-list">
+            ${this.traceToolHistory.map((t) => html`
+              <div class="tp-tool-entry">
+                <span class="tp-tool-dot ${t.status}"></span>
+                <span class="tp-tool-name">${t.toolName}</span>
+                ${t.elapsed !== undefined ? html`<span class="tp-tool-time">${t.elapsed}ms</span>` : nothing}
+              </div>
+            `)}
+          </div>
+        ` : nothing}
+      </div>
+    `;
+  }
+
+  // --- Message rendering ---
 
   private _renderMessage(msg: ChatMessage, index: number) {
     if (msg.role === 'iteration') {
@@ -867,7 +1739,6 @@ export class ChatView extends LitElement {
   }
 
   private _retryMessage(index: number) {
-    // Find the user message before this assistant message
     for (let i = index - 1; i >= 0; i--) {
       if (this.messages[i].role === 'user') {
         this.messages = this.messages.slice(0, i);

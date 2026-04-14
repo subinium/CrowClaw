@@ -6,6 +6,7 @@ import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
 import type { DetailedUsageTracker } from './usage-tracker.js';
 import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand, SecurityAuditLog } from './security.js';
+import { splitWithPairPreservation, extractPreflightFacts } from './compression-utils.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -525,27 +526,50 @@ export class AgentLoop {
     return messages.length > this.compressAfterMessageCount;
   }
 
-  /** Track 2.2: Compress using LLM provider if available, else fall back to heuristic */
+  /** Track 2.2: Compress using LLM provider if available, else fall back to heuristic.
+   *  Uses pair-preserving split to never break tool-call/tool-result pairs. */
   private async compressWithLLM(
     messages: ConversationMessage[],
-  ): Promise<{ messages: ConversationMessage[]; compressedCount: number }> {
-    // Determine how many messages to protect
-    const protectedCount = Math.min(this.protectLastMessages, messages.length);
-    const preserved = messages.slice(-protectedCount);
-    const middle = messages.slice(0, messages.length - protectedCount);
+  ): Promise<{ messages: ConversationMessage[]; compressedCount: number; preflightFacts?: string[] }> {
+    // Use pair-preserving split to ensure tool-call/result pairs stay together
+    const { toCompress, toKeep } = splitWithPairPreservation(messages, this.protectLastMessages);
 
-    if (middle.length === 0) {
+    if (toCompress.length === 0) {
       return { messages, compressedCount: 0 };
     }
 
+    // Extract key facts before compression (preflight flush)
+    const preflightFacts = extractPreflightFacts(toCompress);
+
     if (!this.compressionProvider) {
-      // Fall back to heuristic compression
-      return compressMessages(messages, this.compressAfterMessageCount, this.protectLastMessages);
+      // Fall back to heuristic compression (still using pair-preserving split)
+      const systemMsg = messages.find(m => m.role === 'system');
+      const heuristicSummary = toCompress
+        .map(m => `[${m.role}] ${(m.content ?? '').slice(0, 100)}`)
+        .join('\n');
+      const summaryContent = `Compressed conversation summary (${toCompress.length} messages):\n${heuristicSummary}`;
+      return {
+        messages: [
+          ...(systemMsg && !toKeep.includes(systemMsg) ? [systemMsg] : []),
+          {
+            role: 'system' as Role,
+            content: summaryContent.slice(0, 2000),
+            createdAt: nowIso(),
+            metadata: { compressedCount: toCompress.length, compressionMethod: 'heuristic-pair-safe' }
+          },
+          ...toKeep
+        ],
+        compressedCount: toCompress.length,
+        preflightFacts,
+      };
     }
 
-    // Build compression prompt
-    const middleText = middle.map(m => `[${m.role}] ${m.content}`).join('\n\n');
-    const compressionPrompt = 'Summarize this conversation, preserving key facts, decisions, and tool results. Be concise.';
+    // Build compression prompt with preflight facts context
+    const middleText = toCompress.map(m => `[${m.role}] ${m.content}`).join('\n\n');
+    const factsContext = preflightFacts.length > 0
+      ? `\n\nKey facts to preserve:\n${preflightFacts.map(f => `- ${f}`).join('\n')}`
+      : '';
+    const compressionPrompt = `Summarize this conversation, preserving key facts, decisions, and tool results. Be concise.${factsContext}`;
 
     try {
       const response = await this.compressionProvider.generate({
@@ -560,24 +584,25 @@ export class AgentLoop {
 
       const summary = response.assistantMessage ?? '';
       if (!summary) {
-        // Empty response fallback
         return compressMessages(messages, this.compressAfterMessageCount, this.protectLastMessages);
       }
 
+      const systemMsg = messages.find(m => m.role === 'system');
       return {
         messages: [
+          ...(systemMsg && !toKeep.includes(systemMsg) ? [systemMsg] : []),
           {
             role: 'system' as Role,
-            content: `Compressed conversation summary (${middle.length} messages, LLM-summarized):\n\n${summary}`,
+            content: `Compressed conversation summary (${toCompress.length} messages, LLM-summarized):\n\n${summary}`,
             createdAt: nowIso(),
-            metadata: { compressedCount: middle.length, compressionMethod: 'llm-summary' }
+            metadata: { compressedCount: toCompress.length, compressionMethod: 'llm-summary', preflightFacts }
           },
-          ...preserved
+          ...toKeep
         ],
-        compressedCount: middle.length
+        compressedCount: toCompress.length,
+        preflightFacts,
       };
     } catch {
-      // LLM compression failed, fall back to heuristic
       return compressMessages(messages, this.compressAfterMessageCount, this.protectLastMessages);
     }
   }
@@ -1693,3 +1718,7 @@ export {
 export { collectStream, textStream, type StreamChunk, type StreamingProviderAdapter } from './streaming.js';
 
 export { compressWithStructure, mergeStructuredSummaries, formatStructuredSummary, type StructuredSummary, type StructuredCompressionResult, type StructuredCompressionOptions } from './structured-compression.js';
+
+export { ContextEngine, loadContextFiles, formatContextForPrompt, type ContextFile, type ContextEngineOptions, type ContextEngineResult } from './context-engine.js';
+
+export { identifyToolPairs, splitWithPairPreservation, extractPreflightFacts, createCompressionChild, type ToolCallPair, type ChildSessionResult } from './compression-utils.js';

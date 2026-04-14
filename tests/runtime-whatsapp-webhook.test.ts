@@ -30,7 +30,7 @@ describe('whatsapp webhook runtime integration', () => {
   });
 
   it('routes WhatsApp webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { whatsapp: 'wa-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { whatsapp: 'wa-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/whatsapp/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -48,7 +48,7 @@ describe('whatsapp webhook runtime integration', () => {
   });
 
   it('deduplicates WhatsApp webhook payloads in the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { whatsapp: 'wa-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { whatsapp: 'wa-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/whatsapp/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

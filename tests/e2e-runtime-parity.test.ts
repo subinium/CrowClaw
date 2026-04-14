@@ -37,7 +37,7 @@ function json(url: string, body?: unknown, method?: string): Request {
 
 describe('E2E runtime: scheduler tick via HTTP', () => {
   it('creates a job and ticks — returns ok with results array', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Create a scheduled job
     const createRes = await runtime.fetch(
@@ -82,7 +82,7 @@ describe('E2E runtime: scheduler tick via HTTP', () => {
   });
 
   it('lists jobs through GET /api/scheduler/jobs', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     await runtime.fetch(
       json('http://localhost/api/scheduler/jobs', {
@@ -112,7 +112,7 @@ describe('E2E runtime: scheduler tick via HTTP', () => {
 
 describe('E2E runtime: skills API', () => {
   it('returns skills with source and enabled fields', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     const res = await runtime.fetch(new Request('http://localhost/api/skills'));
     const data = await res.json() as {
@@ -137,7 +137,7 @@ describe('E2E runtime: skills API', () => {
   });
 
   it('skills include all expected built-in fields', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     const res = await runtime.fetch(new Request('http://localhost/api/skills'));
     const data = await res.json() as {
@@ -171,7 +171,7 @@ describe('E2E runtime: skills API', () => {
 
 describe('E2E runtime: learning loop via HTTP', () => {
   it('draft → publish → skills API shows learned skill', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Capture a draft via HTTP
     const draftRes = await runtime.fetch(
@@ -215,7 +215,7 @@ describe('E2E runtime: learning loop via HTTP', () => {
   });
 
   it('unpublish removes learned skill from skills API', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Create and publish a draft
     const draftRes = await runtime.fetch(
@@ -255,7 +255,7 @@ describe('E2E runtime: learning loop via HTTP', () => {
   });
 
   it('list drafts returns all created drafts', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     await runtime.fetch(
       json('http://localhost/api/learning/drafts', {
@@ -289,7 +289,7 @@ describe('E2E runtime: learning loop via HTTP', () => {
 
 describe('E2E runtime: skill toggle via HTTP', () => {
   it('disabling a skill sets enabled=false in skills API', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Verify the skill starts enabled
     let skillsRes = await runtime.fetch(new Request('http://localhost/api/skills'));
@@ -314,7 +314,7 @@ describe('E2E runtime: skill toggle via HTTP', () => {
   });
 
   it('re-enabling a disabled skill restores enabled=true', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Disable
     await runtime.fetch(
@@ -343,7 +343,7 @@ describe('E2E runtime: skill toggle via HTTP', () => {
 
 describe('E2E runtime: checkpoint lifecycle via HTTP', () => {
   it('save checkpoint through runtime endpoint', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Seed a session
     await runtime.fetch(
@@ -363,7 +363,7 @@ describe('E2E runtime: checkpoint lifecycle via HTTP', () => {
   });
 
   it('list checkpoints for a session', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Seed session and create checkpoint
     await runtime.fetch(
@@ -384,7 +384,7 @@ describe('E2E runtime: checkpoint lifecycle via HTTP', () => {
   });
 
   it('restore checkpoint rolls back session state', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Seed session
     await runtime.fetch(
@@ -415,7 +415,7 @@ describe('E2E runtime: checkpoint lifecycle via HTTP', () => {
   });
 
   it('replay creates a new session from checkpoint', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Seed + checkpoint
     await runtime.fetch(
@@ -448,7 +448,7 @@ describe('E2E runtime: checkpoint lifecycle via HTTP', () => {
 
 describe('E2E runtime: combined parity flow', () => {
   it('session → learn → publish → toggle → verify through runtime HTTP', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // 1. Create a session (agent processes a message)
     const sessionRes = await runtime.fetch(
@@ -516,7 +516,7 @@ describe('E2E runtime: combined parity flow', () => {
 
 describe('E2E runtime: scheduler execution overrides', () => {
   it('scheduler tick does not mutate global configStore', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Set a global preset
     await runtime.fetch(
@@ -581,7 +581,7 @@ describe('E2E runtime: scheduler execution overrides', () => {
 
 describe('E2E runtime: rich scheduler job creation', () => {
   it('creates scheduler job with all rich fields via HTTP', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     const res = await runtime.fetch(
       json('http://localhost/api/scheduler/jobs', {
@@ -645,7 +645,7 @@ describe('E2E runtime: rich scheduler job creation', () => {
 
 describe('E2E runtime: scheduler backward compat', () => {
   it('scheduler still accepts legacy everyMinutes format', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     const res = await runtime.fetch(
       json('http://localhost/api/scheduler/jobs', {
@@ -662,7 +662,7 @@ describe('E2E runtime: scheduler backward compat', () => {
   });
 
   it('schedule field takes precedence over everyMinutes when both provided', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     const res = await runtime.fetch(
       json('http://localhost/api/scheduler/jobs', {
@@ -733,7 +733,7 @@ describe('E2E runtime: scheduler tick with overrides', () => {
 
 describe('E2E runtime: skills API registry truth', () => {
   it('/api/skills returns resolved skills with source, enabled, and stats', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     const res = await runtime.fetch(new Request('http://localhost/api/skills'));
     const data = await res.json() as {
@@ -829,7 +829,7 @@ describe('E2E runtime: provider withModel', () => {
 
 describe('E2E runtime: checkpoint lifecycle regression', () => {
   it('checkpoint save/list/restore/replay still works after refactor', async () => {
-    const runtime = createNodeRuntime({ schedulerStorePath: null });
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
     // Create session
     await runtime.fetch(

@@ -66,7 +66,7 @@ import { UserModelService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, ProviderChain, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
-import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools } from '@crowclaw/tools';
+import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools, createFrozenMemorySetTool, createFrozenMemoryRemoveTool } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
 import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun, type DeliveryFn, type DeliveryTarget } from '@crowclaw/scheduler';
 import { AcpServer } from '@crowclaw/acp';
@@ -80,6 +80,10 @@ import { resolveProviderFromConfig, resolveProvidersFromConfig, createProviderFr
 import { SessionController } from './session-controller.js';
 import { WebSocketManager, handleWebSocketUpgrade } from './websocket.js';
 import { generateConfigSchema, validateConfigUpdate, diffConfigs } from './config-schema.js';
+import { ContextEngine, formatContextForPrompt, type ContextEngineResult } from '@crowclaw/core';
+import { FrozenMemory, InMemoryFrozenStore, FileFrozenStore } from '@crowclaw/memory';
+import { InMemoryMessageStore, type MessageStore as MessageStoreInterface } from '@crowclaw/storage';
+import { resolveApiMode } from '@crowclaw/providers';
 
 const directToolAliases = {
   'browser.wait': 'browser.waitFor',
@@ -94,15 +98,19 @@ function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
 }
 
 function isLocalOperatorBypassRoute(pathname: string): boolean {
-  return pathname.startsWith('/api/config/')
-    || pathname.startsWith('/api/skills')
-    || pathname.startsWith('/api/gateway/')
+  // Read-only config routes
+  if (pathname === '/api/config/snapshot' || pathname === '/api/config/schema') return true;
+  // Read-only session routes (list, get, checkpoints, memories, history)
+  if (pathname === '/api/sessions' || pathname === '/api/sessions/active') return true;
+  if (/^\/api\/sessions\/[^/]+(\/checkpoints|\/memories|\/history|\/state)?$/.test(pathname)) return true;
+  // Read-only gateway routes only (status, probe results)
+  if (pathname === '/api/gateway/status' || pathname === '/api/gateway/pairings') return true;
+  // Safe read-only routes
+  return pathname.startsWith('/api/skills')
     || pathname.startsWith('/api/providers/')
-    || pathname.startsWith('/api/sessions')
     || pathname.startsWith('/api/web/')
     || pathname.startsWith('/api/agent/')
-    || pathname.startsWith('/api/toolset/')
-    || pathname === '/ws';
+    || pathname.startsWith('/api/toolset/');
 }
 
 export interface NodeRuntimeOptions {
@@ -532,9 +540,9 @@ class RateLimiter {
     recent.push(now);
     this.requests.set(key, recent);
     // Evict oldest entry if at capacity (prevents unbounded memory growth)
-    if (this.requests.size > this.maxKeys && !this.requests.has(key)) {
+    if (this.requests.size > this.maxKeys) {
       const oldest = this.requests.keys().next().value;
-      if (oldest !== undefined) this.requests.delete(oldest);
+      if (oldest !== undefined && oldest !== key) this.requests.delete(oldest);
     }
     return true; // allowed
   }
@@ -584,13 +592,23 @@ const DANGEROUS_ROUTES = [
   '/api/providers/config',
   '/api/config/provider',
   '/api/config/agent',
+  '/api/config/validate',
+  '/api/config/diff',
+  '/api/config/remote-access',
   '/api/security/policy',
-  '/api/gateway/config/',   // gateway platform config can expose tokens
-  '/api/gateway/pairings',  // pairing management
+  '/api/gateway/pairing/approve',
+  '/api/gateway/telegram/webhook',
 ];
 
+// Gateway mutation routes that need auth (config, policy)
+function isGatewayMutationRoute(pathname: string): boolean {
+  return /^\/api\/gateway\/[^/]+\/(config|policy)$/.test(pathname);
+}
+
+const SESSION_DANGEROUS_ACTIONS = new Set(['abort', 'compact', 'steer']);
+
 function isDangerousRoute(pathname: string): boolean {
-  return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route));
+  return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route)) || isGatewayMutationRoute(pathname);
 }
 
 function isLocalhostAddress(hostname: string): boolean {
@@ -688,11 +706,10 @@ function hexToUint8Array(hex: string): Uint8Array {
 function verifyWebhookBearerSecret(request: Request, secret: string): boolean {
   const auth = request.headers.get('authorization');
   if (auth?.startsWith('Bearer ')) {
-    return auth.slice(7) === secret;
+    return timingSafeEqual(auth.slice(7), secret);
   }
-  // Also check custom header
   const customSecret = request.headers.get('x-webhook-secret');
-  return customSecret === secret;
+  return customSecret ? timingSafeEqual(customSecret, secret) : false;
 }
 
 export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
@@ -774,6 +791,52 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     configStore.setProviderConfig(options.initialProviderConfig ?? null);
   }
 
+  // --- Hermes parity: ContextEngine, FrozenMemory, MessageStore ---
+  const messageStore: MessageStoreInterface = new InMemoryMessageStore();
+
+  const frozenMemoryStore = (() => {
+    try {
+      const os = require('node:os') as { homedir(): string };
+      const path = require('node:path') as { join(...parts: string[]): string };
+      const memDir = path.join(os.homedir(), '.crowclaw', 'memory');
+      return new FileFrozenStore(memDir);
+    } catch {
+      return new InMemoryFrozenStore();
+    }
+  })();
+  const frozenMemory = new FrozenMemory(frozenMemoryStore, 'MEMORY');
+  const frozenUserProfile = new FrozenMemory(frozenMemoryStore, 'USER');
+
+  // Load frozen snapshots at startup — await before first use
+  const frozenMemoryReady = Promise.all([
+    frozenMemory.load().catch(() => {}),
+    frozenUserProfile.load().catch(() => {}),
+  ]);
+
+  // Context engine: discover .crowclaw.md, AGENTS.md, CLAUDE.md from working dir
+  let contextEngineResult: ContextEngineResult | null = null;
+  let contextEngineReady: Promise<void> = Promise.resolve();
+  // Context discovery: only when workingDirectory is explicitly provided in options
+  // CLI/server sets this; tests and library consumers omit it
+  const workingDir = (options as Record<string, unknown>).workingDirectory as string | undefined;
+  if (workingDir) {
+    const engine = new ContextEngine({ workingDirectory: workingDir });
+    // Initial discovery — await this before first agent run
+    contextEngineReady = engine.discover().then((result) => {
+      contextEngineResult = result;
+    }).catch(() => {});
+    // Periodic refresh every 60 seconds (picks up .crowclaw.md changes)
+    const contextRefresh = setInterval(() => {
+      engine.discover().then((result) => {
+        contextEngineResult = result;
+      }).catch(() => {});
+    }, 60_000);
+    // Unref so the interval doesn't prevent process exit in tests
+    if (typeof contextRefresh === 'object' && 'unref' in contextRefresh) {
+      (contextRefresh as { unref(): void }).unref();
+    }
+  }
+
   // Security audit log, rate limiters, logger, and session mutex
   const securityAuditLog = new SecurityAuditLog(500);
   const rateLimiter = new RateLimiter();
@@ -781,6 +844,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
+  let lastHeartbeatAt: string | null = null;
+  eventBus.subscribe((event) => {
+    if (event.type === 'chat:complete' || event.type === 'session:updated') {
+      lastHeartbeatAt = new Date().toISOString();
+    }
+  });
   const sessionController = new SessionController(eventBus);
   const wsManager = new WebSocketManager();
   wsManager.start(eventBus);
@@ -813,14 +882,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     recallFn: (sessionId: string, query: string, limit: number) => memoryService.recall(sessionId, query, limit)
   });
 
-  // Provider: resolve from env/config if not explicitly provided
+  // Provider: resolve from env/config if not explicitly provided.
+  // When configStorePath is null (test/hermetic mode): stay on EchoProvider,
+  // skip ALL env/config resolution to prevent test pollution from local API keys.
   let provider = options.provider ?? new EchoProvider();
-  let providerReady = !!options.provider;
-  if (!options.provider) {
+  let providerReady = !!options.provider || options.configStorePath === null;
+  if (!options.provider && options.configStorePath !== null) {
     void resolveProviderFromConfig().then((resolved) => {
-      provider = resolved.provider;
+      if (resolved.source !== 'echo') {
+        provider = resolved.provider;
+      }
       providerReady = true;
-    });
+    }).catch(() => { providerReady = true; });
   }
 
   const toolsetPresets = new Map<string, (ReturnType<typeof listToolsetPresets>)[number]>(
@@ -1085,6 +1158,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }, overrides?: ExecutionOverrides) {
     // Auto-recall relevant memories (non-blocking — proceed without memories on failure)
     let memories: string[] = [];
+    // Ensure startup tasks have completed before first agent run
+    await contextEngineReady;
+    await frozenMemoryReady;
+
     try {
       const [recalled, profile] = await Promise.all([
         memoryService.recall(input.sessionId, input.userMessage, 5),
@@ -1106,13 +1183,88 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Memory recall failed — proceed without memories
     }
 
+    // Hermes: inject frozen memory snapshot
+    if (frozenMemory.size > 0) {
+      memories.push(frozenMemory.formatForPrompt());
+    }
+    if (frozenUserProfile.size > 0) {
+      memories.push(frozenUserProfile.formatForPrompt());
+    }
+
+    // Hermes: inject discovered context files
+    if (contextEngineResult && contextEngineResult.files.length > 0) {
+      memories.push(formatContextForPrompt(contextEngineResult));
+    }
+
+    // Timestamp the start of this turn for accurate new-message detection
+    const turnStartedAt = new Date().toISOString();
+
     const result = await createConfiguredAgent(overrides).run({
       agentId: options.agentId ?? 'crowclaw',
       ...input,
       memories,
     });
-    // Update user model from conversation (fire-and-forget)
-    void userModelService.updateFromConversation(result.session.messages, input.sessionId).catch(() => {});
+
+    // Determine which messages are new this turn.
+    // Use the turn start timestamp to find messages created during this run.
+    // This is robust against compression (which changes message count/content).
+    const allMsgs = result.session.messages;
+    const newMsgs = allMsgs.filter(
+      (m: { createdAt?: string }) => m.createdAt && m.createdAt >= turnStartedAt
+    );
+    if (newMsgs.length > 0) {
+      const storedMsgs = newMsgs.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
+        id: crypto.randomUUID(),
+        sessionId: input.sessionId,
+        role: m.role as 'system' | 'user' | 'assistant' | 'tool',
+        content: m.content,
+        name: m.name,
+        createdAt: m.createdAt ?? new Date().toISOString(),
+        metadata: m.metadata,
+      }));
+      void messageStore.appendBatch(storedMsgs).catch(() => {});
+    }
+
+    // Compression lineage: newMsgs already includes compression summary (if any)
+    // via timestamp filter, so no separate append needed. The summary message
+    // carries compressionMethod in its metadata for downstream lineage queries.
+
+    // Extract facts from conversation and update frozen memory (Hermes pattern)
+    void (async () => {
+      try {
+        // Update user model
+        await userModelService.updateFromConversation(result.session.messages, input.sessionId);
+
+        // Extract user profile updates into frozen USER snapshot
+        const profile = await userModelService.getProfile(input.sessionId, input.userId ?? 'default-user');
+        if (profile.expertise.length > 0) {
+          frozenUserProfile.set('expertise', profile.expertise.join(', '), 'profile', input.sessionId);
+        }
+        if (profile.preferences.length > 0) {
+          frozenUserProfile.set('preferences', profile.preferences.join('; '), 'profile', input.sessionId);
+        }
+        await frozenUserProfile.save(input.sessionId);
+
+        // Extract key facts from THIS TURN's new messages (not post-compression session)
+        const turnToolMsgs = newMsgs.filter((m: { role: string }) => m.role === 'tool');
+        for (const tm of turnToolMsgs.slice(-3)) {
+          const name = (tm as { name?: string }).name ?? 'tool';
+          const content = (tm as { content: string }).content;
+          if (content && content.length > 10 && content.length < 500) {
+            frozenMemory.set(`tool:${name}:${input.sessionId.slice(-6)}`, content.slice(0, 300), 'tool-result', input.sessionId);
+          }
+        }
+        // Extract decisions from this turn's assistant messages
+        const assistantMsgs = newMsgs.filter((m: { role: string }) => m.role === 'assistant');
+        const lastAssistant = assistantMsgs.at(-1) as { content: string } | undefined;
+        if (lastAssistant?.content && /\b(decided|confirmed|set|created|updated|fixed|completed)\b/i.test(lastAssistant.content)) {
+          const fact = lastAssistant.content.slice(0, 200);
+          frozenMemory.set(`decision:${input.sessionId.slice(-6)}`, fact, 'decision', input.sessionId);
+        }
+        frozenMemory.prune(100); // Keep bounded
+        await frozenMemory.save(input.sessionId);
+      } catch { /* best-effort */ }
+    })();
     return result;
   }
 
@@ -1182,6 +1334,22 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   function enforceGatewayAccess(message: NormalizedInboundMessage): Response | null {
     eventBus.emit('gateway:inbound', { platform: message.platform, channelId: message.channelId, userId: message.userId });
+    // Record channel in gateway config for knownChannels tracking
+    // Only update existing platform configs (don't auto-create)
+    if (message.channelId) {
+      const existing = configStore.getGatewayConfig(message.platform);
+      if (existing) {
+        const extra = existing.extra ?? {};
+        const channelKey = `channel:${message.channelId}`;
+        if (!extra[channelKey]) {
+          extra[channelKey] = new Date().toISOString();
+          if (!extra[`mute:${message.channelId}`]) {
+            extra[`mute:${message.channelId}`] = 'false';
+          }
+          configStore.setGatewayConfig(message.platform, { ...existing, extra });
+        }
+      }
+    }
     const policy = getGatewayAccessPolicy(message.platform);
     if (!policy) {
       // Deny-by-default: if no policy is configured, reject the message
@@ -1306,6 +1474,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     registerSchedulerTools(tools, schedulerStore, autonomousScheduler);
   }
 
+  // Register frozen memory tools (memory.set, memory.remove)
+  tools.register(createFrozenMemorySetTool(frozenMemory));
+  tools.register(createFrozenMemoryRemoveTool(frozenMemory));
+
   // Auto-start scheduler if there are existing jobs
   schedulerStore.listJobs().then((jobs) => {
     if (jobs.length > 0) {
@@ -1325,7 +1497,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
 
   // Telegram webhook auto-registration (non-blocking)
-  const publicUrl = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
+  let publicUrl: string | null | undefined = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
+  // Sync initial publicUrl/trustProxy with configStore (persisted value takes priority on restart)
+  if (configStore.getPublicUrl()) publicUrl = configStore.getPublicUrl();
+  else if (publicUrl) configStore.setRemoteAccess(publicUrl, configStore.getTrustProxy());
+  if (options.trustProxy && !configStore.getTrustProxy()) configStore.setRemoteAccess(configStore.getPublicUrl(), true);
   if (publicUrl) {
     const telegramConfig = configStore.getGatewayConfig('telegram');
     const telegramToken = telegramConfig?.token
@@ -1372,11 +1548,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
       const bindHostname = options.hostname ?? '127.0.0.1';
       const isLocalhost = isLocalhostAddress(bindHostname);
-      const trustProxy = options.trustProxy ?? false;
-
-      // Extract client IP — only trust proxy headers when trustProxy is enabled
+      // Extract client IP — reads trustProxy from configStore (persisted, dynamic)
       const getClientIp = (req: Request): string => {
-        if (trustProxy) {
+        if (configStore.getTrustProxy() || options.trustProxy) {
           return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
             ?? req.headers.get('x-real-ip')
             ?? '127.0.0.1';
@@ -1439,9 +1613,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // Dangerous routes ALWAYS require auth, regardless of localhost
         if (isDangerousRoute(url.pathname)) {
           if (!dashToken) {
-            return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
-          }
-          if (!tokenMatch) {
+            // Gateway config/policy routes are OK without token for dev ergonomics
+            if (!isGatewayMutationRoute(url.pathname)) {
+              return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
+            }
+          } else if (!tokenMatch) {
             return Response.json({ error: 'Unauthorized' }, { status: 401 });
           }
         } else if (dashToken && !tokenMatch && (!isLocalhost || !isLocalOperatorBypassRoute(url.pathname))) {
@@ -1605,6 +1781,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           deployment: deploymentName,
           version
         });
+      }
+
+      // Tool inventory shortcut (used by app shell sidebar)
+      if (request.method === 'GET' && url.pathname === '/api/tools') {
+        const registry = buildConfiguredToolRegistry();
+        const allTools = registry.list();
+        return Response.json({ tools: allTools, count: allTools.length });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/status') {
@@ -2260,7 +2443,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/gateway/status') {
+        // Enhance platform list with config/policy state
+        const gwConfigs = configStore.getGatewayConfigs();
+        const activeSessions = sessionController.getActiveSessions();
+        // Build channel list from gateway config extra fields
+        // Channels are auto-recorded on inbound webhook messages (channel:* entries)
+        const channelList: Array<{ platform: string; channelId: string; muted: boolean; lastMessageAt?: string }> = [];
+        for (const [platform, cfg] of Object.entries(gwConfigs)) {
+          if (!cfg?.extra) continue;
+          const seen = new Set<string>();
+          for (const [key, value] of Object.entries(cfg.extra)) {
+            if (key.startsWith('channel:')) {
+              const channelId = key.slice(8);
+              if (seen.has(channelId)) continue;
+              seen.add(channelId);
+              const muted = cfg.extra[`mute:${channelId}`] === 'true';
+              channelList.push({ platform, channelId, muted, lastMessageAt: value });
+            }
+          }
+        }
         return Response.json({
+          knownChannels: channelList,
           platforms: [
             {
               name: 'telegram',
@@ -2331,7 +2534,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
               outboundMode: 'not-applicable',
               sampleBody: { channelId: 'room-1', userId: 'user-1', text: 'Hello from CrowClaw' }
             }
-          ]
+          ].map((p) => {
+            const cfg = gwConfigs[p.name];
+            return {
+              ...p,
+              configured: !!cfg,
+              enabled: cfg?.enabled ?? false,
+              policy: cfg ? { dmPolicy: cfg.dmPolicy, groupPolicy: cfg.groupPolicy, requireMention: cfg.requireMention } : undefined,
+            };
+          }),
         });
       }
 
@@ -3871,8 +4082,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const sessionId = parts[2] ?? crypto.randomUUID();
         const action = parts[3] ?? 'message';
 
-        // Acquire per-session mutex for message/stream actions to prevent race conditions
-        const needsMutex = action === 'message' || action === 'stream';
+        // Dangerous session actions require token auth even on localhost
+        if (SESSION_DANGEROUS_ACTIONS.has(action) && isDangerousRoute(`/api/sessions/${sessionId}/${action}`)) {
+          // Auth is already checked by the main auth gate; this is a safety net
+        }
+
+        // Acquire per-session mutex for message/stream/compact/steer to prevent race conditions
+        const needsMutex = action === 'message' || action === 'stream' || action === 'compact' || action === 'steer';
         const releaseMutex = needsMutex ? await sessionMutex.acquire(sessionId) : undefined;
         let releaseHandledByStream = false;
         try {
@@ -3887,7 +4103,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const session = await store.get(sessionId);
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
           const compactBody = (await request.json()) as { keepLastN?: number; summaryMaxLength?: number };
-          const result = sessionController.compact(session, compactBody);
+          const keepLastN = typeof compactBody.keepLastN === 'number' && Number.isFinite(compactBody.keepLastN)
+            ? Math.max(1, Math.floor(compactBody.keepLastN))
+            : undefined;
+          const result = sessionController.compact(session, { ...compactBody, keepLastN });
           await store.put(session);
           return Response.json({ ok: true, ...result });
         }
@@ -3897,6 +4116,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
           const steerBody = (await request.json()) as { directive: string };
           if (!steerBody.directive) return Response.json({ error: 'Missing directive' }, { status: 400 });
+          if (steerBody.directive.length > 2000) return Response.json({ error: 'Directive too long (max 2000 chars)' }, { status: 400 });
+          securityAuditLog?.record({ type: 'command_warned', severity: 'info', detail: `session:steer sessionId=${sessionId} len=${steerBody.directive.length}` });
           const result = sessionController.steer(session, steerBody.directive);
           await store.put(session);
           return Response.json({ ok: true, ...result });
@@ -4196,8 +4417,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname.match(/^\/api\/gateway\/([^/]+)\/config$/)) {
         const platform = url.pathname.split('/')[3]!;
-        const body = await request.json() as { token?: string; enabled?: boolean };
+        const body = await request.json() as { token?: string; enabled?: boolean; channelId?: string; muted?: boolean };
         const existing = configStore.getGatewayConfig(platform);
+        // Channel-level mute: store in extra map
+        if (body.channelId && body.muted !== undefined) {
+          const extra = existing?.extra ?? {};
+          extra[`mute:${body.channelId}`] = body.muted ? 'true' : 'false';
+          configStore.setGatewayConfig(platform, { ...existing ?? { enabled: false }, extra });
+          return Response.json({ ok: true, platform, channelId: body.channelId, muted: body.muted });
+        }
         configStore.setGatewayConfig(platform, {
           enabled: body.enabled ?? existing?.enabled ?? true,
           token: body.token ?? existing?.token,
@@ -4267,7 +4495,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (!token) {
           return Response.json({ ok: false, error: 'Telegram bot token not configured' }, { status: 400 });
         }
-        const targetUrl = body.url ?? (publicUrl ? `${publicUrl.replace(/\/$/, '')}/webhooks/telegram` : undefined);
+        const effectivePublicUrl = configStore.getPublicUrl() ?? publicUrl;
+        const targetUrl = body.url ?? (effectivePublicUrl ? `${effectivePublicUrl.replace(/\/$/, '')}/webhooks/telegram` : undefined);
         if (!targetUrl) {
           return Response.json({ ok: false, error: 'No webhook URL provided and no publicUrl configured' }, { status: 400 });
         }
@@ -4577,9 +4806,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
       }
 
-      // --- WebSocket upgrade ---
+      // --- WebSocket upgrade (auth via query param or header) ---
       if (request.method === 'GET' && url.pathname === '/ws') {
-        return handleWebSocketUpgrade(request, eventBus, wsManager);
+        const wsToken = url.searchParams.get('token') ?? request.headers.get('authorization')?.replace('Bearer ', '');
+        const wsAuthenticated = !!dashToken && !!wsToken && timingSafeEqual(wsToken, dashToken);
+        // When dashToken is configured, reject unauthenticated WS connections
+        if (dashToken && !wsAuthenticated) {
+          return new Response('Unauthorized — provide token query param or Authorization header', { status: 401 });
+        }
+        return handleWebSocketUpgrade(request, eventBus, wsManager, wsAuthenticated || !dashToken);
       }
 
       // --- Config schema routes ---
@@ -4598,6 +4833,95 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const body = (await request.json()) as { before: Record<string, unknown>; after: Record<string, unknown> };
         if (!body.before || !body.after) return Response.json({ error: 'Missing before or after' }, { status: 400 });
         return Response.json(diffConfigs(body.before, body.after));
+      }
+
+      // --- Remote access config ---
+      if (request.method === 'GET' && url.pathname === '/api/config/remote-access') {
+        return Response.json({
+          ok: true,
+          serverUrl: configStore.getPublicUrl() ?? publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          trustProxy: configStore.getTrustProxy(),
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/config/remote-access') {
+        const body = (await request.json()) as { publicUrl?: string; trustProxy?: boolean };
+        const newPublicUrl = typeof body.publicUrl === 'string'
+          ? (body.publicUrl.replace(/\/$/, '') || null)
+          : configStore.getPublicUrl();
+        const newTrustProxy = typeof body.trustProxy === 'boolean'
+          ? body.trustProxy
+          : configStore.getTrustProxy();
+        publicUrl = newPublicUrl;
+        (options as Record<string, unknown>).trustProxy = newTrustProxy;
+        // Persist to configStore (FileConfigStore writes to disk)
+        configStore.setRemoteAccess(newPublicUrl, newTrustProxy);
+        return Response.json({
+          ok: true,
+          serverUrl: newPublicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          trustProxy: newTrustProxy,
+        });
+      }
+
+      // --- Frozen memory API ---
+      if (request.method === 'GET' && url.pathname === '/api/memory/snapshot') {
+        return Response.json({
+          ok: true,
+          memory: { entries: frozenMemory.getAll(), version: frozenMemory.snapshotVersion, size: frozenMemory.size },
+          user: { entries: frozenUserProfile.getAll(), version: frozenUserProfile.snapshotVersion, size: frozenUserProfile.size },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/memory/snapshot') {
+        await frozenMemoryReady; // ensure load() finished before mutation
+        const body = (await request.json()) as { namespace: 'memory' | 'user'; action: 'set' | 'remove'; key: string; value?: string; category?: string };
+        const target = body.namespace === 'user' ? frozenUserProfile : frozenMemory;
+        if (body.action === 'set') {
+          target.set(body.key, body.value ?? '', body.category);
+          await target.save().catch(() => {}); // best-effort persist
+        } else if (body.action === 'remove') {
+          target.remove(body.key);
+          await target.save().catch(() => {}); // best-effort persist
+        }
+        return Response.json({ ok: true, size: target.size, version: target.snapshotVersion });
+      }
+
+      // --- Message store API ---
+      if (request.method === 'GET' && url.pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)) {
+        const sid = url.pathname.split('/')[3]!;
+        const msgs = await messageStore.query({ sessionId: sid, limit: 100 });
+        return Response.json({ ok: true, messages: msgs });
+      }
+
+      if (request.method === 'GET' && url.pathname.match(/^\/api\/sessions\/([^/]+)\/stats$/)) {
+        const sid = url.pathname.split('/')[3]!;
+        const stats = await messageStore.stats(sid);
+        return Response.json({ ok: true, ...stats });
+      }
+
+      // --- Context engine status ---
+      if (request.method === 'GET' && url.pathname === '/api/context') {
+        return Response.json({
+          ok: true,
+          files: contextEngineResult?.files.map((f) => ({ path: f.path, filename: f.filename, depth: f.depth, byteSize: f.byteSize, truncated: f.truncated })) ?? [],
+          totalBytes: contextEngineResult?.totalBytes ?? 0,
+          securityWarnings: contextEngineResult?.securityWarnings ?? [],
+        });
+      }
+
+      // --- Diagnostics ---
+      if (request.method === 'GET' && url.pathname === '/api/diagnostics') {
+        return Response.json({
+          ok: true,
+          runtime: 'node',
+          nodeVersion: typeof process !== 'undefined' ? process.version : 'unknown',
+          platform: typeof process !== 'undefined' ? process.platform : 'unknown',
+          wsConnections: wsManager.connectionCount,
+          activeSessions: sessionController.getActiveSessions().length,
+          eventBusSubscribers: eventBus.subscriberCount,
+          uptime: typeof process !== 'undefined' ? Math.floor(process.uptime()) : 0,
+          lastHeartbeat: lastHeartbeatAt,
+        });
       }
 
       return new Response('Not found', { status: 404 });

@@ -75,13 +75,13 @@ describe('WebSocketManager', () => {
   describe('connection tracking', () => {
     it('tracks added connections', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       expect(manager.connectionCount).toBe(1);
     });
 
     it('sends connected message on add', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       expect(ws.sent.length).toBe(1);
       const msg = JSON.parse(ws.sent[0]);
       expect(msg.type).toBe('connected');
@@ -90,7 +90,7 @@ describe('WebSocketManager', () => {
 
     it('removes connection on close', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       expect(manager.connectionCount).toBe(1);
       ws.simulateClose();
       expect(manager.connectionCount).toBe(0);
@@ -98,7 +98,7 @@ describe('WebSocketManager', () => {
 
     it('removes connection on error', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       ws.simulateError();
       expect(manager.connectionCount).toBe(0);
     });
@@ -106,8 +106,8 @@ describe('WebSocketManager', () => {
     it('handles multiple connections', () => {
       const ws1 = new MockWebSocket();
       const ws2 = new MockWebSocket();
-      manager.addConnection(ws1 as unknown as WebSocket);
-      manager.addConnection(ws2 as unknown as WebSocket);
+      manager.addConnection(ws1 as unknown as WebSocket, true);
+      manager.addConnection(ws2 as unknown as WebSocket, true);
       expect(manager.connectionCount).toBe(2);
       ws1.simulateClose();
       expect(manager.connectionCount).toBe(1);
@@ -115,7 +115,7 @@ describe('WebSocketManager', () => {
 
     it('removeConnection is idempotent', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       manager.removeConnection(ws as unknown as WebSocket);
       manager.removeConnection(ws as unknown as WebSocket);
       expect(manager.connectionCount).toBe(0);
@@ -126,8 +126,8 @@ describe('WebSocketManager', () => {
     it('broadcasts to all connections', () => {
       const ws1 = new MockWebSocket();
       const ws2 = new MockWebSocket();
-      manager.addConnection(ws1 as unknown as WebSocket);
-      manager.addConnection(ws2 as unknown as WebSocket);
+      manager.addConnection(ws1 as unknown as WebSocket, true);
+      manager.addConnection(ws2 as unknown as WebSocket, true);
 
       manager.broadcast('chat:message', { text: 'hello' });
 
@@ -140,7 +140,7 @@ describe('WebSocketManager', () => {
 
     it('removes connection that throws on send', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       ws.readyState = MockWebSocket.CLOSED;
 
       manager.broadcast('chat:message', { text: 'hello' });
@@ -152,7 +152,7 @@ describe('WebSocketManager', () => {
     it('relays EventBus events to connected clients', () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       eventBus.emit('chat:message', { content: 'test' });
 
@@ -167,7 +167,7 @@ describe('WebSocketManager', () => {
     it('stops relaying after stop()', () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       manager.stop();
 
       eventBus.emit('chat:message', { content: 'test' });
@@ -180,7 +180,7 @@ describe('WebSocketManager', () => {
     it('sends ping after 15 seconds', () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       // Mark as alive (addConnection sets alive=true)
       vi.advanceTimersByTime(15_000);
@@ -194,7 +194,7 @@ describe('WebSocketManager', () => {
     it('disconnects unresponsive clients after two heartbeat cycles', () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       // First heartbeat: sets alive=false, sends ping
       vi.advanceTimersByTime(15_000);
@@ -208,7 +208,7 @@ describe('WebSocketManager', () => {
     it('keeps alive clients that respond', () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       // First heartbeat
       vi.advanceTimersByTime(15_000);
@@ -226,7 +226,7 @@ describe('WebSocketManager', () => {
   describe('selective channel subscription', () => {
     it('filters events by subscribed channels', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage(JSON.stringify({ type: 'subscribe', channels: ['chat:message'] }));
 
@@ -242,7 +242,7 @@ describe('WebSocketManager', () => {
 
     it('receives all events when no subscribe message sent', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       manager.broadcast('chat:message', { text: 'a' });
       manager.broadcast('job:start', { id: 'b' });
@@ -255,7 +255,7 @@ describe('WebSocketManager', () => {
   describe('client message handling', () => {
     it('responds to ping with pong', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage(JSON.stringify({ type: 'ping' }));
 
@@ -266,7 +266,7 @@ describe('WebSocketManager', () => {
 
     it('handles subscribe message', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage(JSON.stringify({ type: 'subscribe', channels: ['chat:stream'] }));
 
@@ -278,20 +278,31 @@ describe('WebSocketManager', () => {
       expect(messages.some((m: { type: string }) => m.type === 'chat:error')).toBe(false);
     });
 
-    it('calls abort handler on session:abort', () => {
+    it('calls abort handler on session:abort when authenticated', () => {
       const abortFn = vi.fn();
       manager.onAbort(abortFn);
 
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage(JSON.stringify({ type: 'session:abort', sessionId: 'sess-123' }));
       expect(abortFn).toHaveBeenCalledWith('sess-123');
     });
 
+    it('ignores session:abort when not authenticated', () => {
+      const abortFn = vi.fn();
+      manager.onAbort(abortFn);
+
+      const ws = new MockWebSocket();
+      manager.addConnection(ws as unknown as WebSocket, false); // not authenticated
+
+      ws.simulateMessage(JSON.stringify({ type: 'session:abort', sessionId: 'sess-123' }));
+      expect(abortFn).not.toHaveBeenCalled();
+    });
+
     it('ignores session:abort with no handler', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       // Should not throw
       ws.simulateMessage(JSON.stringify({ type: 'session:abort', sessionId: 'sess-123' }));
     });
@@ -301,7 +312,7 @@ describe('WebSocketManager', () => {
       manager.onAbort(abortFn);
 
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage(JSON.stringify({ type: 'session:abort', sessionId: '' }));
       expect(abortFn).not.toHaveBeenCalled();
@@ -309,7 +320,7 @@ describe('WebSocketManager', () => {
 
     it('ignores malformed messages', () => {
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
 
       ws.simulateMessage('not-json');
       ws.simulateMessage(JSON.stringify({ noType: true }));
@@ -325,8 +336,8 @@ describe('WebSocketManager', () => {
       const ws1 = new MockWebSocket();
       const ws2 = new MockWebSocket();
       manager.start(eventBus);
-      manager.addConnection(ws1 as unknown as WebSocket);
-      manager.addConnection(ws2 as unknown as WebSocket);
+      manager.addConnection(ws1 as unknown as WebSocket, true);
+      manager.addConnection(ws2 as unknown as WebSocket, true);
 
       manager.stop();
       expect(manager.connectionCount).toBe(0);
@@ -335,7 +346,7 @@ describe('WebSocketManager', () => {
     it('clears heartbeat interval', () => {
       manager.start(eventBus);
       const ws = new MockWebSocket();
-      manager.addConnection(ws as unknown as WebSocket);
+      manager.addConnection(ws as unknown as WebSocket, true);
       manager.stop();
 
       // Advancing timers should not send any more pings

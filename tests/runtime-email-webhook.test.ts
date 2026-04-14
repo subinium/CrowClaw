@@ -23,7 +23,7 @@ describe('email webhook runtime integration', () => {
   });
 
   it('routes Email webhook payloads through the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { email: 'email-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { email: 'email-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/email/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -41,7 +41,7 @@ describe('email webhook runtime integration', () => {
   });
 
   it('deduplicates Email webhook payloads in the node runtime', async () => {
-    const runtime = createNodeRuntime({ webhookSecrets: { email: 'email-secret' } });
+    const runtime = createNodeRuntime({ configStorePath: null, webhookSecrets: { email: 'email-secret' } });
     await runtime.fetch(new Request('http://localhost/api/gateway/email/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

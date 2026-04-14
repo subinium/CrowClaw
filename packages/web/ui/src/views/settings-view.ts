@@ -71,9 +71,16 @@ interface UsageData {
 
 interface MemoryRecord {
   id: string;
+  sessionId: string;
+  scope: string;
+  scopeKey?: string;
+  summary: string;
+  tags: string[];
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+  // Computed aliases for UI compatibility
   key: string;
   value: string;
-  scope: string;
   timestamp: string;
 }
 
@@ -81,6 +88,20 @@ interface SessionSummary {
   sessionId: string;
   title: string;
   updatedAt: string;
+}
+
+interface RemoteAccessConfig {
+  serverUrl: string;
+  publicUrl: string;
+  trustProxy: boolean;
+}
+
+interface DiagnosticsInfo {
+  nodeVersion: string;
+  platform: string;
+  wsConnections: number;
+  activeSessions: number;
+  lastHeartbeat: string;
 }
 
 type SettingsTab =
@@ -189,7 +210,7 @@ export class SettingsView extends LitElement {
         color: var(--text-muted);
         cursor: pointer;
         border-bottom: 2px solid transparent;
-        transition: all var(--duration-fast);
+        transition: color var(--duration-fast), border-bottom-color var(--duration-fast);
         user-select: none;
       }
 
@@ -386,7 +407,7 @@ export class SettingsView extends LitElement {
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         cursor: pointer;
-        transition: all var(--duration-fast);
+        transition: border-color var(--duration-fast), background-color var(--duration-fast);
       }
 
       .mem-item:hover {
@@ -523,7 +544,7 @@ export class SettingsView extends LitElement {
         border: 1px solid var(--glass-border);
         cursor: pointer;
         border-radius: var(--radius-sm);
-        transition: all var(--duration-fast);
+        transition: color var(--duration-fast), border-color var(--duration-fast), background-color var(--duration-fast);
       }
 
       .scope-btn:hover {
@@ -576,6 +597,13 @@ export class SettingsView extends LitElement {
   // System
   @state() private systemConfig: Record<string, string> = {};
 
+  // Remote Access
+  @state() private remoteAccess: RemoteAccessConfig = { serverUrl: '', publicUrl: '', trustProxy: false };
+  @state() private remoteAccessSaving = false;
+
+  // Diagnostics
+  @state() private diagnostics: DiagnosticsInfo | null = null;
+
   // Memory (session-scoped: backend has /api/sessions/{id}/memories, no global endpoint)
   @state() private memorySessions: SessionSummary[] = [];
   @state() private memorySessionId: string | null = null;
@@ -611,6 +639,8 @@ export class SettingsView extends LitElement {
         break;
       case 'system':
         this._loadSystem();
+        this._loadRemoteAccess();
+        this._loadDiagnostics();
         break;
       case 'memory':
         this._loadMemorySessions();
@@ -679,6 +709,32 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _loadRemoteAccess() {
+    try {
+      const data = await api<RemoteAccessConfig>('/api/config/remote-access');
+      this.remoteAccess = {
+        serverUrl: data.serverUrl ?? window.location.origin,
+        publicUrl: data.publicUrl ?? '',
+        trustProxy: data.trustProxy ?? false,
+      };
+    } catch {
+      this.remoteAccess = {
+        serverUrl: window.location.origin,
+        publicUrl: '',
+        trustProxy: false,
+      };
+    }
+  }
+
+  private async _loadDiagnostics() {
+    try {
+      const data = await api<DiagnosticsInfo>('/api/diagnostics');
+      this.diagnostics = data;
+    } catch {
+      this.diagnostics = null;
+    }
+  }
+
   private async _loadMemorySessions() {
     try {
       const data = await api<{ sessions: SessionSummary[] }>('/api/sessions');
@@ -704,10 +760,15 @@ export class SettingsView extends LitElement {
       const params = new URLSearchParams();
       if (this.memoryScope !== 'All') params.set('scope', this.memoryScope);
       const q = params.toString();
-      const data = await api<{ records: MemoryRecord[] }>(
+      const data = await api<{ records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }> }>(
         `/api/sessions/${this.memorySessionId}/memories${q ? `?${q}` : ''}`,
       );
-      let records = data.records || [];
+      let records: MemoryRecord[] = (data.records || []).map((r) => ({
+        ...r,
+        key: r.tags?.[0] ?? r.id?.slice(0, 8) ?? 'memory',
+        value: r.summary ?? '',
+        timestamp: r.createdAt ?? '',
+      }));
       // Client-side search filter
       if (this.memorySearch) {
         const term = this.memorySearch.toLowerCase();
@@ -785,6 +846,25 @@ export class SettingsView extends LitElement {
       this._loadUsage();
     } catch {
       /* ignore */
+    }
+  }
+
+  private async _saveRemoteAccess() {
+    this.remoteAccessSaving = true;
+    try {
+      await api('/api/config/remote-access', {
+        method: 'POST',
+        body: JSON.stringify({
+          publicUrl: this.remoteAccess.publicUrl,
+          trustProxy: this.remoteAccess.trustProxy,
+        }),
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        console.error('Failed to save remote access config:', error.message);
+      }
+    } finally {
+      this.remoteAccessSaving = false;
     }
   }
 
@@ -1031,13 +1111,14 @@ export class SettingsView extends LitElement {
         <!-- Event log -->
         <div class="actions-row">
           <div class="sec-h" style="margin-bottom:0">Event Log</div>
-          <button class="btn btn-danger" @click=${this._clearSecurityEvents}>
+          <button class="btn btn-danger" aria-label="Clear security event log" @click=${this._clearSecurityEvents}>
             Clear Log
           </button>
         </div>
 
         <div class="filter-row">
           <select
+            aria-label="Filter events by type"
             @change=${(e: Event) => {
               this.secEventTypeFilter = (e.target as HTMLSelectElement).value;
               this._loadSecurityEvents();
@@ -1050,6 +1131,7 @@ export class SettingsView extends LitElement {
             <option value="policy">Policy</option>
           </select>
           <select
+            aria-label="Filter events by severity"
             @change=${(e: Event) => {
               this.secEventSeverityFilter = (e.target as HTMLSelectElement).value;
               this._loadSecurityEvents();
@@ -1111,7 +1193,7 @@ export class SettingsView extends LitElement {
       <div class="section-block">
         <div class="actions-row">
           <div class="section-header" style="border:none;padding:0;margin:0">Usage</div>
-          <button class="btn btn-danger" @click=${this._resetUsage}>Reset Usage</button>
+          <button class="btn btn-danger" aria-label="Reset usage data" @click=${this._resetUsage}>Reset Usage</button>
         </div>
 
         ${usage
@@ -1249,6 +1331,116 @@ export class SettingsView extends LitElement {
               No system configuration available.
             </div>`}
       </div>
+
+      ${this._renderRemoteAccess()}
+      ${this._renderDiagnostics()}
+    `;
+  }
+
+  /* ---- Remote Access ---- */
+
+  private _renderRemoteAccess() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Remote Access</div>
+
+        <div class="form-group">
+          <label class="form-label">Server URL</label>
+          <div class="kv" style="margin-bottom:var(--sp-3)">
+            <span class="kv-k">Current</span>
+            <span class="kv-v">${this.remoteAccess.serverUrl || window.location.origin}</span>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Public URL</label>
+          <input
+            class="form-input"
+            type="text"
+            placeholder="https://your-public-url.example.com"
+            aria-label="Public URL"
+            .value=${this.remoteAccess.publicUrl}
+            @input=${(e: InputEvent) => {
+              this.remoteAccess = { ...this.remoteAccess, publicUrl: (e.target as HTMLInputElement).value };
+            }}
+          />
+          <div class="form-hint">External URL used by remote clients to connect to this server.</div>
+        </div>
+
+        <div class="toggle-row" style="border:1px solid var(--glass-border);border-radius:var(--radius-md);margin-top:var(--sp-3)">
+          <div class="toggle-info">
+            <div class="toggle-name">Trust Proxy</div>
+            <div class="toggle-desc">Enable when running behind a reverse proxy (e.g. nginx, Cloudflare).</div>
+          </div>
+          <label class="switch" aria-label="Toggle trust proxy">
+            <input
+              type="checkbox"
+              .checked=${this.remoteAccess.trustProxy}
+              @change=${(e: Event) => {
+                this.remoteAccess = { ...this.remoteAccess, trustProxy: (e.target as HTMLInputElement).checked };
+              }}
+            />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="form-actions">
+          <button
+            class="btn btn-p"
+            aria-label="Save remote access configuration"
+            ?disabled=${this.remoteAccessSaving}
+            @click=${this._saveRemoteAccess}
+          >
+            ${this.remoteAccessSaving ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  /* ---- Diagnostics ---- */
+
+  private _renderDiagnostics() {
+    const diag = this.diagnostics;
+
+    return html`
+      <div class="section-block">
+        <div class="actions-row">
+          <div class="section-header" style="border:none;padding:0;margin:0">Diagnostics</div>
+          <button class="btn" aria-label="Refresh diagnostics" @click=${this._loadDiagnostics}>Refresh</button>
+        </div>
+
+        ${diag
+          ? html`
+              <div class="summary-row">
+                <div class="summary-card">
+                  <div class="label">Node Version</div>
+                  <div class="value" style="font-size:var(--text-sm)">${diag.nodeVersion}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Platform</div>
+                  <div class="value" style="font-size:var(--text-sm)">${diag.platform}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">WebSocket Connections</div>
+                  <div class="value">${diag.wsConnections}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Active Sessions</div>
+                  <div class="value">${diag.activeSessions}</div>
+                </div>
+              </div>
+              <div class="sub-card">
+                <div class="kv">
+                  <span class="kv-k">Last Heartbeat</span>
+                  <span class="kv-v">${diag.lastHeartbeat ? formatTime(diag.lastHeartbeat) : '--'}</span>
+                </div>
+              </div>
+            `
+          : html`<div class="status-msg" style="color:var(--text-muted)">
+              Loading diagnostics...
+            </div>`}
+      </div>
     `;
   }
 
@@ -1264,6 +1456,7 @@ export class SettingsView extends LitElement {
         <!-- Session selector -->
         <div class="filter-row" style="margin-bottom:var(--sp-3)">
           <select
+            aria-label="Select memory session"
             @change=${(e: Event) => {
               this.memorySessionId = (e.target as HTMLSelectElement).value || null;
               this.selectedMemoryId = null;
@@ -1290,6 +1483,7 @@ export class SettingsView extends LitElement {
                 class="srch"
                 type="text"
                 placeholder="Search memories..."
+                aria-label="Search memories"
                 .value=${this.memorySearch}
                 @input=${(e: InputEvent) => {
                   this.memorySearch = (e.target as HTMLInputElement).value;
@@ -1351,6 +1545,7 @@ export class SettingsView extends LitElement {
                               <span class="mem-detail-key">${selected.key}</span>
                               <button
                                 class="btn btn-danger"
+                                aria-label="Delete memory record"
                                 @click=${() => this._deleteMemory(selected.id)}
                               >
                                 Delete

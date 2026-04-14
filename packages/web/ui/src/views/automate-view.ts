@@ -149,7 +149,7 @@ export class AutomateView extends LitElement {
         background: var(--glass-bg);
         border: 1px solid var(--glass-border);
         padding: var(--sp-4) var(--sp-5);
-        transition: all var(--duration-normal) var(--ease-spring);
+        transition: background-color var(--duration-normal) var(--ease-spring), border-color var(--duration-normal) var(--ease-spring);
         border-radius: var(--radius-md);
       }
 
@@ -189,7 +189,7 @@ export class AutomateView extends LitElement {
         font-size: 13px;
         padding: 3px 6px;
         border-radius: var(--radius-sm);
-        transition: all var(--duration-fast);
+        transition: color var(--duration-fast), background-color var(--duration-fast), border-color var(--duration-fast);
       }
 
       .icon-btn:hover {
@@ -312,7 +312,7 @@ export class AutomateView extends LitElement {
         cursor: pointer;
         font-size: var(--text-xs);
         color: var(--text-secondary);
-        transition: all var(--duration-fast);
+        transition: border-color var(--duration-fast), color var(--duration-fast);
       }
 
       .checkbox-option:hover {
@@ -682,13 +682,13 @@ export class AutomateView extends LitElement {
             <span>${this.schedulerRunning ? 'Running' : 'Stopped'}</span>
           </div>
           <div class="sched-bar-actions">
-            <button class="btn" @click=${this._toggleScheduler}>
+            <button class="btn" aria-label="${this.schedulerRunning ? 'Stop scheduler' : 'Start scheduler'}" @click=${this._toggleScheduler}>
               ${this.schedulerRunning ? 'Stop' : 'Start'}
             </button>
-            <button class="btn" @click=${this._tickNow} ?disabled=${!this.schedulerRunning}>
+            <button class="btn" aria-label="Run scheduler tick now" @click=${this._tickNow} ?disabled=${!this.schedulerRunning}>
               Tick Now
             </button>
-            <button class="btn btn-p" @click=${this._openForm}>
+            <button class="btn btn-p" aria-label="Create new job" @click=${this._openForm}>
               New Job
             </button>
           </div>
@@ -717,7 +717,7 @@ export class AutomateView extends LitElement {
     return html`
       <div class="job-card">
         <div class="job-card-header">
-          <span class="job-name">${job.id}</span>
+          <span class="job-name" title=${job.id}>${job.id}</span>
           <span class="tag ${job.enabled ? 'ok' : 'wn'}">
             ${job.enabled ? 'active' : 'paused'}
           </span>
@@ -726,16 +726,19 @@ export class AutomateView extends LitElement {
               class="icon-btn"
               @click=${() => this._toggleJobExpand(job.id)}
               title="History"
+              aria-label="Show run history"
             >&#x1F4CB;</button>
             <button
               class="icon-btn"
               @click=${() => this._toggleJob(job)}
               title="${job.enabled ? 'Pause' : 'Resume'}"
+              aria-label="${job.enabled ? 'Pause job' : 'Resume job'}"
             >${job.enabled ? '&#x23F8;' : '&#x25B6;'}</button>
             <button
               class="icon-btn danger"
               @click=${() => this._deleteJob(job)}
               title="Delete"
+              aria-label="Delete job"
             >&#x2715;</button>
           </div>
         </div>
@@ -784,7 +787,7 @@ export class AutomateView extends LitElement {
                               <span class="tag ${entry.ok ? 'ok' : 'er'}">${entry.ok ? 'success' : 'error'}</span>
                             </td>
                             <td>
-                              <div class="output-preview">${(entry.response || entry.error || '--').slice(0, 80)}</div>
+                              <div class="output-preview" title=${entry.response || entry.error || '--'}>${(entry.response || entry.error || '--').slice(0, 80)}</div>
                             </td>
                           </tr>
                         `)}
@@ -929,9 +932,10 @@ export class AutomateView extends LitElement {
           </div>
 
           <div class="form-actions">
-            <button class="btn" @click=${this._closeForm}>Cancel</button>
+            <button class="btn" aria-label="Cancel job creation" @click=${this._closeForm}>Cancel</button>
             <button
               class="btn btn-p"
+              aria-label="Create scheduled job"
               @click=${this._submitJob}
               ?disabled=${this.formSubmitting || !this.formName.trim() || !this.formPrompt.trim() || !this.formScheduleValue.trim()}
             >${this.formSubmitting ? 'Creating...' : 'Create Job'}</button>

@@ -16,6 +16,7 @@ import {
   buildTelegramSendUrl
 } from '@crowclaw/gateway';
 import type { McpClient } from '@crowclaw/mcp';
+import type { FrozenMemory } from '@crowclaw/memory';
 import type { SchedulerStore } from '@crowclaw/scheduler';
 import { createScheduledAgentJob } from '@crowclaw/scheduler';
 import type { MemoryRecord, MemoryStore, SessionSearchStore } from '@crowclaw/storage';
@@ -1907,6 +1908,84 @@ export function createMemoryListTool(memoryStore: MemoryStore): ToolDefinition {
         ok: true,
         output: JSON.stringify(results.slice(0, limit), null, 2),
         metadata: { count: Math.min(results.length, limit), ...(scope ? { scope, scopeKey } : {}) }
+      };
+    }
+  };
+}
+
+export function createFrozenMemorySetTool(frozenMemory: FrozenMemory): ToolDefinition {
+  return {
+    manifest: {
+      name: 'memory.set',
+      description: 'Set or update a key-value entry in the frozen memory snapshot. Use for facts, decisions, or preferences that should persist across sessions.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Unique key for the memory entry' },
+          value: { type: 'string', description: 'Value to store' },
+          category: { type: 'string', description: 'Category (fact, preference, decision, context)', enum: ['fact', 'preference', 'decision', 'context'] }
+        },
+        required: ['key', 'value']
+      }
+    },
+    async execute(input, context) {
+      const key = typeof input.key === 'string' ? input.key : '';
+      const value = typeof input.value === 'string' ? input.value : '';
+      const category = typeof input.category === 'string' ? input.category : undefined;
+      if (!key || !value) {
+        return { toolName: 'memory.set', runtime: 'worker', ok: false, output: 'Missing key or value' };
+      }
+      frozenMemory.set(key, value, category, context.sessionId);
+      await frozenMemory.save(context.sessionId);
+      return {
+        toolName: 'memory.set',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify({ key, value, category, size: frozenMemory.size }),
+        metadata: { key, size: frozenMemory.size }
+      };
+    }
+  };
+}
+
+export function createFrozenMemoryRemoveTool(frozenMemory: FrozenMemory): ToolDefinition {
+  return {
+    manifest: {
+      name: 'memory.remove',
+      description: 'Remove an entry from the frozen memory snapshot by key.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: true,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Key of the entry to remove' }
+        },
+        required: ['key']
+      }
+    },
+    async execute(input, context) {
+      const key = typeof input.key === 'string' ? input.key : '';
+      if (!key) {
+        return { toolName: 'memory.remove', runtime: 'worker', ok: false, output: 'Missing key' };
+      }
+      frozenMemory.remove(key);
+      await frozenMemory.save(context.sessionId);
+      return {
+        toolName: 'memory.remove',
+        runtime: 'worker',
+        ok: true,
+        output: JSON.stringify({ removed: key, size: frozenMemory.size }),
+        metadata: { key, size: frozenMemory.size }
       };
     }
   };

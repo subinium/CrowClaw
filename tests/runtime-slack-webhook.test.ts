@@ -16,7 +16,7 @@ describe('slack webhook runtime integration', () => {
 
   it('routes slack webhook payloads through the node runtime', async () => {
     const signingSecret = 'slack-test-secret';
-    const runtime = createNodeRuntime({ slackSigningSecret: signingSecret });
+    const runtime = createNodeRuntime({ configStorePath: null, slackSigningSecret: signingSecret });
     await runtime.fetch(new Request('http://localhost/api/gateway/slack/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -76,7 +76,7 @@ describe('slack webhook runtime integration', () => {
 
   it('responds to slack url verification without dispatching', async () => {
     const signingSecret = 'slack-test-secret';
-    const runtime = createNodeRuntime({ slackSigningSecret: signingSecret });
+    const runtime = createNodeRuntime({ configStorePath: null, slackSigningSecret: signingSecret });
     const body = JSON.stringify({ type: 'url_verification', challenge: 'challenge-123' });
     const timestamp = '1700000000';
     const signature = await buildSlackSignature(signingSecret, timestamp, body);
@@ -91,7 +91,7 @@ describe('slack webhook runtime integration', () => {
   });
 
   it('rejects invalid slack signatures when verification is configured', async () => {
-    const runtime = createNodeRuntime({ slackSigningSecret: 'correct-secret' });
+    const runtime = createNodeRuntime({ configStorePath: null, slackSigningSecret: 'correct-secret' });
     const body = JSON.stringify({
       type: 'event_callback',
       event: { channel: 'C-3', user: 'U-3', text: 'deploy signed slack' }
@@ -112,7 +112,7 @@ describe('slack webhook runtime integration', () => {
   });
 
   it('accepts valid slack signatures when verification is configured', async () => {
-    const runtime = createNodeRuntime({ slackSigningSecret: 'correct-secret' });
+    const runtime = createNodeRuntime({ configStorePath: null, slackSigningSecret: 'correct-secret' });
     await runtime.fetch(new Request('http://localhost/api/gateway/slack/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

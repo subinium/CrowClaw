@@ -535,6 +535,8 @@ function validateField(
  * Handles flat and nested (dot-notation) keys. For objects, performs a
  * recursive comparison and reports each changed leaf as a separate entry.
  */
+const SENSITIVE_KEY_PATTERNS = /apikey|api_key|token|secret|password/i;
+
 export function diffConfigs(
   before: Record<string, unknown>,
   after: Record<string, unknown>,
@@ -542,6 +544,14 @@ export function diffConfigs(
   const changes: ConfigDiff['changes'] = [];
 
   collectChanges('', before, after, changes);
+
+  // Redact sensitive values
+  for (const change of changes) {
+    if (SENSITIVE_KEY_PATTERNS.test(change.field)) {
+      change.oldValue = change.oldValue != null ? '***' : change.oldValue;
+      change.newValue = change.newValue != null ? '***' : change.newValue;
+    }
+  }
 
   return {
     changes,

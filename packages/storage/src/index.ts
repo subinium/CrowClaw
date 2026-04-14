@@ -489,3 +489,5 @@ CREATE TABLE IF NOT EXISTS memories (
   metadata_json TEXT
 );
 `;
+
+export { InMemoryMessageStore, MESSAGE_STORE_SCHEMA, type StoredMessage, type MessageQuery, type MessageStats, type MessageStore } from './message-store.js';
