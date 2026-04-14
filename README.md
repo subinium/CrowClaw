@@ -9,13 +9,13 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-1907%20passed-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-2064%20passed-brightgreen.svg" alt="Tests" />
   </p>
 </p>
 
 ---
 
-> **Beta.** Core systems are functional and tested (1907 tests). APIs may change before 1.0 -- pin to minor versions for stability.
+> **Beta.** Core systems are functional and tested (2064 tests). APIs may change before 1.0 -- pin to minor versions for stability.
 
 ## Why CrowClaw
 
