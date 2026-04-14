@@ -1,5 +1,5 @@
 import { PluginManager } from '@crowclaw/plugins';
-import { buildSystemPrompt } from './prompt-builder.js';
+import { buildSystemPrompt, buildMemoryPrefix } from './prompt-builder.js';
 import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
@@ -44,8 +44,29 @@ export interface ToolExecutionContext {
   agentId: string;
   sessionId: string;
   workspaceId?: string;
+  /** Env passed to tools. Use sanitizeEnv() to strip sensitive vars before passing. */
   env?: unknown;
   signal?: AbortSignal;
+}
+
+/** Env var patterns that should never be exposed to tools. */
+const SENSITIVE_ENV_PATTERNS = [
+  /api[_-]?key/i, /secret/i, /token/i, /password/i, /credential/i,
+  /^OPENAI_/, /^ANTHROPIC_/, /^OPENROUTER_/, /^CROWCLAW_DASHBOARD_TOKEN$/,
+  /^AWS_SECRET/, /^GH_TOKEN$/, /^GITHUB_TOKEN$/, /^npm_config_/,
+];
+
+/** Strip sensitive environment variables before passing to tools. */
+export function sanitizeEnv(env?: unknown): Record<string, string> | undefined {
+  if (!env || typeof env !== 'object') return undefined;
+  const raw = env as Record<string, string>;
+  const sanitized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== 'string') continue;
+    if (SENSITIVE_ENV_PATTERNS.some(p => p.test(key))) continue;
+    sanitized[key] = value;
+  }
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined;
 }
 
 export interface ToolExecutionResult {
@@ -631,6 +652,52 @@ export class AgentLoop {
     return prompt;
   }
 
+  /** Detect if an error is a context window overflow / token limit error. */
+  private isContextOverflowError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes('context_length_exceeded') ||
+      msg.includes('maximum context length') ||
+      msg.includes('token limit') ||
+      msg.includes('too many tokens') ||
+      msg.includes('context window') ||
+      msg.includes('max_tokens') ||
+      (msg.includes('400') && msg.includes('token'))
+    );
+  }
+
+  /** Auto-compact messages on context overflow and retry the request. */
+  private async recoverFromContextOverflow(
+    request: ProviderRequest,
+    pluginContext?: { sessionId: string; agentId: string },
+  ): Promise<{ response: ProviderResponse; compactedMessages: ConversationMessage[] } | null> {
+    // Try to compact messages
+    const messages = request.messages;
+    if (messages.length < 4) return null; // Too few to compact
+
+    let compactedMessages: ConversationMessage[];
+    if (this.compressionProvider) {
+      const result = await this.compressWithLLM(messages);
+      compactedMessages = result.messages;
+    } else {
+      const result = compressMessages(messages, messages.length, this.protectLastMessages);
+      compactedMessages = result.messages;
+    }
+
+    if (compactedMessages.length >= messages.length) return null; // Compression didn't help
+
+    try {
+      const response = await this.generateWithFallbacks(
+        { ...request, messages: compactedMessages },
+        pluginContext,
+      );
+      return { response, compactedMessages };
+    } catch {
+      return null; // Retry also failed
+    }
+  }
+
   /** Track 1.4: Create a checkpoint if auto-checkpointing is enabled */
   private async generateWithFallbacks(
     request: ProviderRequest,
@@ -773,7 +840,7 @@ export class AgentLoop {
       agentId: input.agentId,
       sessionId: input.sessionId,
       workspaceId: input.workspaceId,
-      env: input.env,
+      env: sanitizeEnv(input.env),
       signal: input.signal
     };
 
@@ -874,7 +941,13 @@ export class AgentLoop {
       }
     } satisfies SessionState;
 
-    const nextMessages = [...session.messages, {
+    // Inject recalled memories as untrusted context prefix (not in system prompt)
+    const memoryPrefix = buildMemoryPrefix(input.memories ?? []);
+    const memoryMessages: ConversationMessage[] = memoryPrefix
+      ? [{ role: 'system', content: memoryPrefix, createdAt: nowIso() }]
+      : [];
+
+    const nextMessages = [...session.messages, ...memoryMessages, {
       role: 'user',
       content: input.userMessage,
       createdAt: nowIso()
@@ -940,7 +1013,7 @@ export class AgentLoop {
     }
 
     // Track 2.3: Use prompt caching-aware system prompt builder
-    let currentResponse = await this.generateWithFallbacks({
+    const buildRequest = (msgs: ConversationMessage[]): ProviderRequest => ({
       systemPrompt: this.buildSystemPromptForRequest({
         personaPrompt: this.personaPrompt,
         basePrompt: baseSystemPrompt,
@@ -953,13 +1026,30 @@ export class AgentLoop {
         agentPreset: this.agentPreset,
         memories: input.memories,
       }),
-      messages: nextMessages,
+      messages: msgs,
       availableTools: this.tools.list(),
-      signal: input.signal
-    }, {
-      sessionId: input.sessionId,
-      agentId: input.agentId
+      signal: input.signal,
     });
+
+    const pluginCtx = { sessionId: input.sessionId, agentId: input.agentId };
+    let currentResponse: ProviderResponse;
+    try {
+      currentResponse = await this.generateWithFallbacks(buildRequest(nextMessages), pluginCtx);
+    } catch (error: unknown) {
+      // Context overflow recovery: compact and retry once
+      if (this.isContextOverflowError(error)) {
+        const recovery = await this.recoverFromContextOverflow(buildRequest(nextMessages), pluginCtx);
+        if (recovery) {
+          currentResponse = recovery.response;
+          nextMessages.length = 0;
+          nextMessages.push(...recovery.compactedMessages);
+        } else {
+          throw error;
+        }
+      } else {
+        throw error;
+      }
+    }
 
     // Track 1.2: Record usage from initial provider call
     let totalTokensConsumed = this.recordUsage(currentResponse);
@@ -1357,43 +1447,85 @@ export class AgentLoop {
           signal,
         };
 
-        // Collect stream chunks and yield text deltas
+        // Collect stream chunks and yield text deltas (with stream-drop fallback)
         let text = '';
         const streamToolCalls: Array<{ name: string; input: Record<string, unknown>; id?: string }> = [];
         let currentTool: { name: string; input: string; id?: string } | null = null;
 
-        for await (const chunk of streamingProvider.generateStream(request)) {
-          switch (chunk.type) {
-            case 'text':
-              if (chunk.text) {
-                text += chunk.text;
-                yield { type: 'text-delta', content: chunk.text };
+        // Build provider candidates: primary streaming provider + fallbacks that support streaming
+        const streamProviderCandidates: Array<Partial<StreamingProviderAdapter>> = [
+          streamingProvider,
+          ...this.fallbackProviders
+            .filter((p): p is ProviderAdapter & Partial<StreamingProviderAdapter> =>
+              typeof (p as Partial<StreamingProviderAdapter>).generateStream === 'function')
+        ];
+
+        let streamConsumed = false;
+        for (let providerIdx = 0; providerIdx < streamProviderCandidates.length; providerIdx++) {
+          const candidateProvider = streamProviderCandidates[providerIdx];
+          if (!candidateProvider.generateStream) continue;
+
+          try {
+            const rawStream = candidateProvider.generateStream(request);
+
+            for await (const chunk of rawStream) {
+              switch (chunk.type) {
+                case 'text':
+                  if (chunk.text) {
+                    text += chunk.text;
+                    yield { type: 'text-delta', content: chunk.text };
+                  }
+                  break;
+                case 'tool_use_start':
+                  currentTool = { name: chunk.toolName ?? '', input: '', id: chunk.toolCallId };
+                  break;
+                case 'tool_use_delta':
+                  if (currentTool) currentTool.input += chunk.toolInput ?? '';
+                  break;
+                case 'tool_use_end':
+                  if (currentTool) {
+                    let parsedInput: Record<string, unknown>;
+                    try {
+                      parsedInput = JSON.parse(currentTool.input || '{}') as Record<string, unknown>;
+                    } catch {
+                      parsedInput = { raw: currentTool.input };
+                    }
+                    streamToolCalls.push({ name: currentTool.name, input: parsedInput, id: currentTool.id });
+                    currentTool = null;
+                  }
+                  break;
+                case 'error':
+                  // Stream-level error from provider — attempt fallback
+                  throw new Error(chunk.error ?? 'Stream error');
+                case 'done':
+                  break;
               }
-              break;
-            case 'tool_use_start':
-              currentTool = { name: chunk.toolName ?? '', input: '', id: chunk.toolCallId };
-              break;
-            case 'tool_use_delta':
-              if (currentTool) currentTool.input += chunk.toolInput ?? '';
-              break;
-            case 'tool_use_end':
-              if (currentTool) {
-                let parsedInput: Record<string, unknown>;
-                try {
-                  parsedInput = JSON.parse(currentTool.input || '{}') as Record<string, unknown>;
-                } catch {
-                  parsedInput = { raw: currentTool.input };
-                }
-                streamToolCalls.push({ name: currentTool.name, input: parsedInput, id: currentTool.id });
-                currentTool = null;
-              }
-              break;
-            case 'error':
-              yield { type: 'error', error: chunk.error ?? 'Stream error' };
+            }
+
+            // Stream completed successfully
+            streamConsumed = true;
+            break;
+          } catch (streamError: unknown) {
+            const errorMsg = streamError instanceof Error ? streamError.message : String(streamError);
+            const isLastProvider = providerIdx === streamProviderCandidates.length - 1;
+
+            if (isLastProvider) {
+              // No more fallbacks — yield error and abort
+              yield { type: 'error', error: errorMsg };
               return;
-            case 'done':
-              break;
+            }
+
+            // Notify caller about the fallback and reset state for the next provider
+            yield { type: 'error', error: `Provider stream dropped, falling back... (${errorMsg})` };
+            text = '';
+            streamToolCalls.length = 0;
+            currentTool = null;
           }
+        }
+
+        if (!streamConsumed) {
+          yield { type: 'error', error: 'No streaming provider available' };
+          return;
         }
 
         finalResponse = text || finalResponse;
@@ -1657,7 +1789,7 @@ export class AgentLoop {
   }
 }
 
-export { buildSystemPrompt, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
+export { buildSystemPrompt, buildMemoryPrefix, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
 
 export {
   isPrivateUrl,
@@ -1722,3 +1854,5 @@ export { compressWithStructure, mergeStructuredSummaries, formatStructuredSummar
 export { ContextEngine, loadContextFiles, formatContextForPrompt, type ContextFile, type ContextEngineOptions, type ContextEngineResult } from './context-engine.js';
 
 export { identifyToolPairs, splitWithPairPreservation, extractPreflightFacts, createCompressionChild, type ToolCallPair, type ChildSessionResult } from './compression-utils.js';
+
+export { scoreComplexity, selectModelForComplexity, type ComplexityLevel, type ComplexityScore } from './complexity-router.js';

@@ -231,3 +231,8 @@ export {
   type FrozenSnapshot,
   type FrozenMemoryStore,
 } from './frozen-memory.js';
+export {
+  InMemoryDreamStore,
+  type DreamEntry,
+  type DreamMemoryStore,
+} from './dream-memory.js';

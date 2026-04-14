@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSystemPrompt } from '@crowclaw/core';
+import { buildSystemPrompt, buildMemoryPrefix } from '@crowclaw/core';
 
 describe('prompt builder', () => {
   it('assembles a structured system prompt from runtime context and tools', () => {
@@ -33,7 +33,7 @@ describe('prompt builder', () => {
     expect(prompt).toContain('- echo (worker, danger:low)');
   });
 
-  it('injects recalled memories into the system prompt', () => {
+  it('does not inject memories into system prompt (moved to untrusted prefix)', () => {
     const prompt = buildSystemPrompt({
       basePrompt: 'You are CrowClaw.',
       runtimeName: 'node',
@@ -44,9 +44,24 @@ describe('prompt builder', () => {
       ],
     });
 
-    expect(prompt).toContain('## Relevant Memories');
-    expect(prompt).toContain('- User prefers TypeScript over JavaScript');
-    expect(prompt).toContain('- Previous session discussed Cloudflare Workers deployment');
+    // Memories are no longer in system prompt — they use buildMemoryPrefix() instead
+    expect(prompt).not.toContain('## Relevant Memories');
+  });
+
+  it('buildMemoryPrefix creates untrusted context block', () => {
+    const prefix = buildMemoryPrefix([
+      'User prefers TypeScript over JavaScript',
+      'Previous session discussed Cloudflare Workers deployment',
+    ]);
+
+    expect(prefix).toContain('<recalled-context');
+    expect(prefix).toContain('trust="low"');
+    expect(prefix).toContain('- User prefers TypeScript over JavaScript');
+    expect(prefix).toContain('- Previous session discussed Cloudflare Workers deployment');
+  });
+
+  it('buildMemoryPrefix returns undefined for empty memories', () => {
+    expect(buildMemoryPrefix([])).toBeUndefined();
   });
 
   it('omits memory section when memories array is empty', () => {
@@ -66,7 +81,7 @@ describe('prompt builder', () => {
     expect(prompt).not.toContain('Relevant Memories');
   });
 
-  it('places memories after runtime context and before tools', () => {
+  it('system prompt has no memory section even with memories passed', () => {
     const prompt = buildSystemPrompt({
       basePrompt: 'You are CrowClaw.',
       runtimeName: 'node',
@@ -87,11 +102,9 @@ describe('prompt builder', () => {
       reasoningGuidance: false,
     });
 
-    const runtimeIdx = prompt!.indexOf('Runtime context:');
-    const memoryIdx = prompt!.indexOf('## Relevant Memories');
-    const toolsIdx = prompt!.indexOf('Available tools:');
-
-    expect(runtimeIdx).toBeLessThan(memoryIdx);
-    expect(memoryIdx).toBeLessThan(toolsIdx);
+    expect(prompt).toContain('Runtime context:');
+    expect(prompt).toContain('Available tools:');
+    // Memories are now in a separate untrusted prefix, not in system prompt
+    expect(prompt).not.toContain('Relevant Memories');
   });
 });
