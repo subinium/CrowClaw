@@ -1334,6 +1334,22 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   function enforceGatewayAccess(message: NormalizedInboundMessage): Response | null {
     eventBus.emit('gateway:inbound', { platform: message.platform, channelId: message.channelId, userId: message.userId });
+    // Record channel in gateway config for knownChannels tracking
+    // Only update existing platform configs (don't auto-create)
+    if (message.channelId) {
+      const existing = configStore.getGatewayConfig(message.platform);
+      if (existing) {
+        const extra = existing.extra ?? {};
+        const channelKey = `channel:${message.channelId}`;
+        if (!extra[channelKey]) {
+          extra[channelKey] = new Date().toISOString();
+          if (!extra[`mute:${message.channelId}`]) {
+            extra[`mute:${message.channelId}`] = 'false';
+          }
+          configStore.setGatewayConfig(message.platform, { ...existing, extra });
+        }
+      }
+    }
     const policy = getGatewayAccessPolicy(message.platform);
     if (!policy) {
       // Deny-by-default: if no policy is configured, reject the message
@@ -1482,6 +1498,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   // Telegram webhook auto-registration (non-blocking)
   let publicUrl: string | null | undefined = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
+  // Sync initial publicUrl/trustProxy with configStore (persisted value takes priority on restart)
+  if (configStore.getPublicUrl()) publicUrl = configStore.getPublicUrl();
+  else if (publicUrl) configStore.setRemoteAccess(publicUrl, configStore.getTrustProxy());
+  if (options.trustProxy && !configStore.getTrustProxy()) configStore.setRemoteAccess(configStore.getPublicUrl(), true);
   if (publicUrl) {
     const telegramConfig = configStore.getGatewayConfig('telegram');
     const telegramToken = telegramConfig?.token
@@ -1528,11 +1548,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
       const bindHostname = options.hostname ?? '127.0.0.1';
       const isLocalhost = isLocalhostAddress(bindHostname);
-      const trustProxy = options.trustProxy ?? false;
-
-      // Extract client IP — only trust proxy headers when trustProxy is enabled
+      // Extract client IP — reads trustProxy from configStore (persisted, dynamic)
       const getClientIp = (req: Request): string => {
-        if (trustProxy) {
+        if (configStore.getTrustProxy() || options.trustProxy) {
           return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
             ?? req.headers.get('x-real-ip')
             ?? '127.0.0.1';
@@ -2428,14 +2446,19 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // Enhance platform list with config/policy state
         const gwConfigs = configStore.getGatewayConfigs();
         const activeSessions = sessionController.getActiveSessions();
-        // Build channel list from gateway config extra fields (mute:channelId entries)
-        // Only returns channels that have been explicitly tracked via gateway interactions
-        const channelList: Array<{ platform: string; channelId: string; muted: boolean; lastMessageAt?: string; messageCount?: number }> = [];
+        // Build channel list from gateway config extra fields
+        // Channels are auto-recorded on inbound webhook messages (channel:* entries)
+        const channelList: Array<{ platform: string; channelId: string; muted: boolean; lastMessageAt?: string }> = [];
         for (const [platform, cfg] of Object.entries(gwConfigs)) {
           if (!cfg?.extra) continue;
+          const seen = new Set<string>();
           for (const [key, value] of Object.entries(cfg.extra)) {
-            if (key.startsWith('mute:')) {
-              channelList.push({ platform, channelId: key.slice(5), muted: value === 'true' });
+            if (key.startsWith('channel:')) {
+              const channelId = key.slice(8);
+              if (seen.has(channelId)) continue;
+              seen.add(channelId);
+              const muted = cfg.extra[`mute:${channelId}`] === 'true';
+              channelList.push({ platform, channelId, muted, lastMessageAt: value });
             }
           }
         }
@@ -4472,7 +4495,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (!token) {
           return Response.json({ ok: false, error: 'Telegram bot token not configured' }, { status: 400 });
         }
-        const targetUrl = body.url ?? (publicUrl ? `${publicUrl.replace(/\/$/, '')}/webhooks/telegram` : undefined);
+        const effectivePublicUrl = configStore.getPublicUrl() ?? publicUrl;
+        const targetUrl = body.url ?? (effectivePublicUrl ? `${effectivePublicUrl.replace(/\/$/, '')}/webhooks/telegram` : undefined);
         if (!targetUrl) {
           return Response.json({ ok: false, error: 'No webhook URL provided and no publicUrl configured' }, { status: 400 });
         }
