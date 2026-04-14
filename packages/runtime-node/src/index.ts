@@ -883,18 +883,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   });
 
   // Provider: resolve from env/config if not explicitly provided.
-  // Start with EchoProvider and upgrade async when real credentials are found.
-  // Callers that want hermetic behavior should pass options.provider explicitly.
+  // When configStorePath is null (test/hermetic mode): stay on EchoProvider,
+  // skip ALL env/config resolution to prevent test pollution from local API keys.
   let provider = options.provider ?? new EchoProvider();
-  let providerReady = !!options.provider;
-  if (!options.provider) {
-    // Skip config file when configStorePath is null (test/hermetic mode)
-    const resolveOpts = options.configStorePath === null
-      ? { configFileContents: null as string | null }
-      : {};
-    void resolveProviderFromConfig(resolveOpts).then((resolved) => {
-      // Only upgrade from EchoProvider if real credentials were found
-      if (resolved.source !== 'fallback') {
+  let providerReady = !!options.provider || options.configStorePath === null;
+  if (!options.provider && options.configStorePath !== null) {
+    void resolveProviderFromConfig().then((resolved) => {
+      if (resolved.source !== 'echo') {
         provider = resolved.provider;
       }
       providerReady = true;
@@ -1201,8 +1196,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       memories.push(formatContextForPrompt(contextEngineResult));
     }
 
-    // Snapshot message count BEFORE the run to detect new messages after
-    const preRunMessageCount = (await store.get(input.sessionId))?.messages.length ?? 0;
+    // Timestamp the start of this turn for accurate new-message detection
+    const turnStartedAt = new Date().toISOString();
 
     const result = await createConfiguredAgent(overrides).run({
       agentId: options.agentId ?? 'crowclaw',
@@ -1211,28 +1206,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     });
 
     // Determine which messages are new this turn.
-    // Normal case: session grew, new messages are at the end.
-    // Compression case: session shrank (preRunCount > postRunLength),
-    //   so we can't slice by index. Instead, find the user's input message
-    //   and everything after it is "new this turn".
+    // Use the turn start timestamp to find messages created during this run.
+    // This is robust against compression (which changes message count/content).
     const allMsgs = result.session.messages;
-    let newMsgs: typeof allMsgs;
-    if (preRunMessageCount <= allMsgs.length) {
-      // Normal: slice from where we left off
-      newMsgs = allMsgs.slice(preRunMessageCount);
-    } else {
-      // Compression happened: find the LAST user message matching our input
-      // (search from end to avoid matching earlier turns with same text)
-      let userInputIdx = -1;
-      for (let i = allMsgs.length - 1; i >= 0; i--) {
-        const m = allMsgs[i] as { role: string; content: string };
-        if (m.role === 'user' && m.content === input.userMessage) {
-          userInputIdx = i;
-          break;
-        }
-      }
-      newMsgs = userInputIdx >= 0 ? allMsgs.slice(userInputIdx) : allMsgs.slice(-2);
-    }
+    const newMsgs = allMsgs.filter(
+      (m: { createdAt?: string }) => m.createdAt && m.createdAt >= turnStartedAt
+    );
     if (newMsgs.length > 0) {
       const storedMsgs = newMsgs.map((m: { role: string; content: string; name?: string; createdAt?: string; metadata?: Record<string, unknown> }) => ({
         id: crypto.randomUUID(),
