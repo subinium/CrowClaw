@@ -546,25 +546,37 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       return new EchoProvider().generate(request);
     }
 
+    const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
+    const mappedMessages = request.messages.map((message) => {
+      // Convert tool results to user messages for provider compatibility
+      if (message.role === 'tool') {
+        return {
+          role: 'user',
+          content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
+        };
+      }
+      return {
+        role: message.role,
+        content: message.content,
+      };
+    });
+
     const body: Record<string, unknown> = {
       model: this.config.model,
-      messages: [
-        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
-        ...request.messages.map((message) => {
-          // Convert tool results to user messages for provider compatibility
-          if (message.role === 'tool') {
-            return {
-              role: 'user',
-              content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
-            };
-          }
-          return {
-            role: message.role,
-            content: message.content,
-          };
-        })
-      ]
     };
+
+    if (isResponsesApi) {
+      // Responses API: use `input` instead of `messages`, `developer` instead of `system`
+      body.input = [
+        ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    } else {
+      body.messages = [
+        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    }
 
     if (request.availableTools.length > 0) {
       body.tools = buildOpenAITools(request.availableTools);
@@ -624,25 +636,37 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       return;
     }
 
+    const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
+    const mappedMessages = request.messages.map((message) => {
+      if (message.role === 'tool') {
+        return {
+          role: 'user',
+          content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
+        };
+      }
+      return {
+        role: message.role,
+        content: message.content,
+      };
+    });
+
     const body: Record<string, unknown> = {
       model: this.config.model,
       stream: true,
-      messages: [
-        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
-        ...request.messages.map((message) => {
-          if (message.role === 'tool') {
-            return {
-              role: 'user',
-              content: `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
-            };
-          }
-          return {
-            role: message.role,
-            content: message.content,
-          };
-        })
-      ]
     };
+
+    if (isResponsesApi) {
+      // Responses API: use `input` instead of `messages`, `developer` instead of `system`
+      body.input = [
+        ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    } else {
+      body.messages = [
+        ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
+        ...mappedMessages,
+      ];
+    }
 
     if (request.availableTools.length > 0) {
       body.tools = buildOpenAITools(request.availableTools);

@@ -59,6 +59,8 @@ interface GatewayPlatform {
   outboundMode: string;
   outboundRoute?: string;
   enabled: boolean;
+  /** Whether this platform has valid credentials configured */
+  configured?: boolean;
   /** Populated after probe */
   probeResult?: PlatformProbeResult | null;
   /** Policy settings */
@@ -1002,6 +1004,7 @@ export class ConnectView extends LitElement {
           outboundMode: string;
           outboundRoute?: string;
           policy?: PlatformPolicy;
+          configured?: boolean;
         }>;
         activeSessions?: Array<{
           platform: string;
@@ -1019,6 +1022,7 @@ export class ConnectView extends LitElement {
         outboundMode: p.outboundMode,
         outboundRoute: p.outboundRoute,
         enabled: p.outboundMode !== 'not-exposed',
+        configured: p.configured ?? false,
         policy: p.policy ?? null,
       }));
 

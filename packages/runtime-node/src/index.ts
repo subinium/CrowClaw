@@ -816,6 +816,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // Context engine: discover .crowclaw.md, AGENTS.md, CLAUDE.md from working dir
   let contextEngineResult: ContextEngineResult | null = null;
   let contextEngineReady: Promise<void> = Promise.resolve();
+  // Context discovery: only when workingDirectory is explicitly provided in options
+  // CLI/server sets this; tests and library consumers omit it
   const workingDir = (options as Record<string, unknown>).workingDirectory as string | undefined;
   if (workingDir) {
     const engine = new ContextEngine({ workingDirectory: workingDir });
@@ -824,11 +826,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       contextEngineResult = result;
     }).catch(() => {});
     // Periodic refresh every 60 seconds (picks up .crowclaw.md changes)
-    setInterval(() => {
+    const contextRefresh = setInterval(() => {
       engine.discover().then((result) => {
         contextEngineResult = result;
       }).catch(() => {});
     }, 60_000);
+    // Unref so the interval doesn't prevent process exit in tests
+    if (typeof contextRefresh === 'object' && 'unref' in contextRefresh) {
+      (contextRefresh as { unref(): void }).unref();
+    }
   }
 
   // Security audit log, rate limiters, logger, and session mutex
@@ -1202,6 +1208,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         metadata: m.metadata,
       }));
       void messageStore.appendBatch(storedMsgs).catch(() => {});
+    }
+
+    // Record compression events for lineage tracking
+    const compressionMsg = result.session.messages.find((m: { metadata?: Record<string, unknown> }) => m.metadata?.compressionMethod);
+    if (compressionMsg) {
+      void messageStore.append({
+        id: crypto.randomUUID(),
+        sessionId: input.sessionId,
+        role: 'system',
+        content: (compressionMsg as { content: string }).content,
+        createdAt: new Date().toISOString(),
+        parentId: `compression:${input.sessionId}`,
+        metadata: { compressionLineage: true, method: (compressionMsg as { metadata: Record<string, unknown> }).metadata.compressionMethod },
+      }).catch(() => {});
     }
 
     // Extract facts from conversation and update frozen memory (Hermes pattern)
