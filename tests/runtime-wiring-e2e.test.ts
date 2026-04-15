@@ -72,7 +72,7 @@ describe('runtime wiring e2e', () => {
 
   it('runtime-node enforces pairing policy before agent execution and approves via gateway approvePairing', async () => {
     const provider = new InspectingProvider();
-    const runtime = createNodeRuntime({ provider, telegramWebhookSecret: 'tg-wiring-secret' });
+    const runtime = createNodeRuntime({ provider, telegramWebhookSecret: 'tg-wiring-secret', configStorePath: null });
 
     const firstPolicyResponse = await runtime.fetch(new Request('http://localhost/api/gateway/telegram/policy', {
       method: 'POST',
@@ -130,7 +130,7 @@ describe('runtime wiring e2e', () => {
 
   it('RuntimeConfigStore state reconfigures agent preset, toolset, and enabled skills for each run', async () => {
     const provider = new InspectingProvider();
-    const runtime = createNodeRuntime({ provider });
+    const runtime = createNodeRuntime({ provider, configStorePath: null });
 
     await runtime.fetch(new Request('http://localhost/api/agent/preset', {
       method: 'POST',
@@ -183,7 +183,7 @@ describe('runtime wiring e2e', () => {
     const fetchMock = vi.fn(async () => new Response('unexpected'));
     vi.stubGlobal('fetch', fetchMock);
 
-    const runtime = createNodeRuntime();
+    const runtime = createNodeRuntime({ configStorePath: null });
     const response = await runtime.fetch(new Request('http://localhost/api/web/fetch', {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...authHeaders },

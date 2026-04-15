@@ -27,8 +27,8 @@ interface ActiveSession {
 /*  Pairing Modal                                                      */
 /* ------------------------------------------------------------------ */
 
-@customElement('crowclaw-modal')
-export class CrowClawModal extends LitElement {
+@customElement('crowclaw-pairing-modal')
+export class CrowClawPairingModal extends LitElement {
   static styles = [
     buttonStyles,
     css`
@@ -446,45 +446,128 @@ export class CrowClawApp extends LitElement {
         height: 100%; color: var(--text-muted); font-size: var(--text-sm);
       }
 
-      /* Auth Overlay */
+      /* Auth Overlay — login dialog, follows design tokens */
       .auth-overlay {
         display: none;
-        position: fixed; inset: 0;
+        position: fixed;
+        inset: 0;
         background: var(--bg-overlay);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
         z-index: 200;
-        align-items: center; justify-content: center;
+        padding: var(--sp-6);
+        box-sizing: border-box;
       }
 
-      .auth-overlay.on { display: flex; }
+      .auth-overlay.on {
+        display: grid;
+        place-items: center;
+      }
 
       .auth-box {
         background: var(--bg-secondary);
         border: 1px solid var(--glass-border);
-        padding: var(--sp-8);
-        width: 360px;
-        max-width: 90vw;
+        padding: var(--sp-6);
+        width: 100%;
+        max-width: 360px;
+        box-sizing: border-box;
         border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-lg);
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-4);
       }
 
-      .auth-box h2 { font-size: var(--text-2xl); font-weight: 700; margin-bottom: var(--sp-2); }
-      .auth-box p { font-size: var(--text-sm); color: var(--text-secondary); margin-bottom: var(--sp-5); }
+      .auth-brand {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-3);
+        margin-bottom: var(--sp-1);
+      }
+
+      .auth-brand-mark {
+        width: 28px;
+        height: 28px;
+        border-radius: var(--radius-sm);
+        background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+        display: grid;
+        place-items: center;
+        color: #fff;
+        font-weight: 700;
+        font-size: 14px;
+        letter-spacing: -0.02em;
+      }
+
+      .auth-box h2 {
+        font-size: var(--text-lg);
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        margin: 0;
+        color: var(--text-primary);
+      }
+
+      .auth-box p {
+        font-size: var(--text-sm);
+        color: var(--text-secondary);
+        margin: 0;
+        line-height: 1.5;
+      }
+
+      .auth-field {
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-2);
+      }
+
+      .auth-label {
+        font-size: var(--text-xs);
+        font-weight: 500;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
 
       .auth-box input {
         width: 100%;
-        padding: var(--sp-3);
+        padding: 10px var(--sp-3);
         border: 1px solid var(--glass-border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-sm);
-        font-family: var(--font-mono);
+        font-family: var(--font-sans);
         outline: none;
-        margin-bottom: var(--sp-3);
-        border-radius: var(--radius-sm);
+        box-sizing: border-box;
+        border-radius: var(--radius-md);
+        transition: border-color var(--duration-fast) var(--ease-spring),
+                    background var(--duration-fast) var(--ease-spring);
       }
 
-      .auth-box input:focus { border-color: var(--accent); }
+      .auth-box input::placeholder {
+        color: var(--text-muted);
+        font-family: var(--font-sans);
+      }
 
-      .auth-err { color: var(--error); font-size: var(--text-xs); margin-bottom: var(--sp-3); min-height: 16px; }
+      .auth-box input:hover:not(:focus) { background: var(--bg-card-hover); }
+      .auth-box input:focus {
+        border-color: var(--accent);
+        background: var(--bg-card-hover);
+      }
+      .auth-box input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      .auth-err {
+        color: var(--error);
+        font-size: var(--text-xs);
+        min-height: 14px;
+        line-height: 1.2;
+      }
+
+      .auth-box .btn {
+        width: 100%;
+        padding: 10px var(--sp-4);
+        font-size: var(--text-sm);
+        font-weight: 600;
+        margin-top: var(--sp-1);
+      }
 
       /* Mobile */
       .mobile-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 99; }
@@ -511,6 +594,7 @@ export class CrowClawApp extends LitElement {
   @state() private connectionStatus: 'connecting' | 'connected' | 'error' = 'connecting';
   @state() private authenticated = false;
   @state() private authError = '';
+  @state() private authSubmitting = false;
   @state() private sessionCount = 0;
   @state() private jobCount = 0;
   @state() private toolCount = 0;
@@ -569,7 +653,10 @@ export class CrowClawApp extends LitElement {
   private async _checkAuth() {
     try {
       this._checkHealth();
-      this._connectTransport();
+      // Don't connect transport before auth — when a dashToken is configured,
+      // the WS/SSE 401s, the client burns through its 3-failure budget, and
+      // never reconnects after login. Connect inside _initApp() instead, after
+      // we know auth is established.
       const authed = await checkAuth();
       if (authed) {
         this.authenticated = true;
@@ -617,6 +704,11 @@ export class CrowClawApp extends LitElement {
   }
 
   private async _initApp() {
+    // Establish (or re-establish) the realtime transport now that we're authed.
+    // Calling this after a fresh login fixes the empty-dashboard symptom where
+    // WS/SSE were started before auth, exhausted their retry budget, and never
+    // reconnected.
+    this._connectTransport();
     try {
       const tools = await api<{ tools: unknown[] }>('/api/tools');
       this.toolCount = tools.tools?.length ?? 0;
@@ -631,21 +723,32 @@ export class CrowClawApp extends LitElement {
       return;
     }
     this.authError = '';
-    const ok = await verifyToken(token);
-    if (ok) {
-      this.authenticated = true;
-      this._initApp();
-    } else {
-      this.authError = 'Invalid token';
+    this.authSubmitting = true;
+    try {
+      const ok = await verifyToken(token);
+      if (ok) {
+        this.authenticated = true;
+        this._initApp();
+      } else {
+        this.authError = 'Invalid token';
+      }
+    } finally {
+      this.authSubmitting = false;
     }
   }
 
   private _authKeydown(e: KeyboardEvent) {
+    // Clear any prior error as soon as the user starts typing again
+    if (this.authError) this.authError = '';
     if (e.key === 'Enter') this._authSubmit();
   }
 
+  private _authInput() {
+    if (this.authError) this.authError = '';
+  }
+
   private _openPairingModal() {
-    const modal = this.shadowRoot?.querySelector<CrowClawModal>('crowclaw-modal');
+    const modal = this.shadowRoot?.querySelector<CrowClawPairingModal>('crowclaw-pairing-modal');
     modal?.show();
   }
 
@@ -671,18 +774,30 @@ export class CrowClawApp extends LitElement {
       <!-- Auth Overlay -->
       <div class="auth-overlay ${this.authenticated ? '' : 'on'}">
         <div class="auth-box">
-          <h2>CrowClaw</h2>
-          <p>Enter your dashboard token to continue.</p>
-          <input id="authIn" type="password" placeholder="Dashboard token..."
-                 aria-label="Dashboard authentication token"
-                 @keydown=${this._authKeydown}>
-          <div class="auth-err">${this.authError}</div>
-          <button class="btn btn-p" style="width:100%" aria-label="Sign in" @click=${this._authSubmit}>Sign In</button>
+          <div class="auth-brand">
+            <div class="auth-brand-mark">C</div>
+            <h2>CrowClaw</h2>
+          </div>
+          <p>Enter your dashboard token to access the runtime control plane.</p>
+          <div class="auth-field">
+            <label class="auth-label" for="authIn">Dashboard token</label>
+            <input id="authIn" type="password" placeholder="••••••••"
+                   aria-label="Dashboard authentication token"
+                   ?disabled=${this.authSubmitting}
+                   @input=${this._authInput}
+                   @keydown=${this._authKeydown}>
+            <div class="auth-err">${this.authError}</div>
+          </div>
+          <button class="btn btn-p" aria-label="Sign in"
+                  ?disabled=${this.authSubmitting}
+                  @click=${this._authSubmit}>
+            ${this.authSubmitting ? 'Signing in…' : 'Sign In'}
+          </button>
         </div>
       </div>
 
       <!-- Pairing Modal -->
-      <crowclaw-modal></crowclaw-modal>
+      <crowclaw-pairing-modal></crowclaw-pairing-modal>
 
       <!-- Mobile -->
       <div class="mobile-backdrop ${this.mobileOpen ? 'on' : ''}"
@@ -771,22 +886,26 @@ export class CrowClawApp extends LitElement {
         </aside>
 
         <main class="mn">
-          <div class="vw ${this.currentView === 'chat' ? 'on' : ''}">
-            <crowclaw-chat-view></crowclaw-chat-view>
-          </div>
-          <div class="vw ${this.currentView === 'agent' ? 'on' : ''}">
-            <crowclaw-agent-view></crowclaw-agent-view>
-          </div>
-          <div class="vw ${this.currentView === 'connect' ? 'on' : ''}">
-            <div class="mh"><h2>Connect</h2><p>Providers, integrations, and service connections</p></div>
-            <div class="mb"><crowclaw-connect-view></crowclaw-connect-view></div>
-          </div>
-          <div class="vw ${this.currentView === 'automate' ? 'on' : ''}">
-            <crowclaw-automate-view></crowclaw-automate-view>
-          </div>
-          <div class="vw ${this.currentView === 'settings' ? 'on' : ''}">
-            <crowclaw-settings-view></crowclaw-settings-view>
-          </div>
+          ${this.authenticated
+            ? html`
+                <div class="vw ${this.currentView === 'chat' ? 'on' : ''}">
+                  <crowclaw-chat-view></crowclaw-chat-view>
+                </div>
+                <div class="vw ${this.currentView === 'agent' ? 'on' : ''}">
+                  <crowclaw-agent-view></crowclaw-agent-view>
+                </div>
+                <div class="vw ${this.currentView === 'connect' ? 'on' : ''}">
+                  <div class="mh"><h2>Connect</h2><p>Providers, integrations, and service connections</p></div>
+                  <div class="mb"><crowclaw-connect-view></crowclaw-connect-view></div>
+                </div>
+                <div class="vw ${this.currentView === 'automate' ? 'on' : ''}">
+                  <crowclaw-automate-view></crowclaw-automate-view>
+                </div>
+                <div class="vw ${this.currentView === 'settings' ? 'on' : ''}">
+                  <crowclaw-settings-view></crowclaw-settings-view>
+                </div>
+              `
+            : nothing}
         </main>
       </div>
     `;
@@ -839,6 +958,6 @@ export class CrowClawApp extends LitElement {
 declare global {
   interface HTMLElementTagNameMap {
     'crowclaw-app': CrowClawApp;
-    'crowclaw-modal': CrowClawModal;
+    'crowclaw-pairing-modal': CrowClawPairingModal;
   }
 }

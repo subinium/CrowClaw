@@ -181,6 +181,22 @@ export async function resolveProviderFromConfig(
     };
   }
 
+  // 4. OPENROUTER_API_KEY — same shape as OpenAI (chat completions API)
+  const openrouterKey = env.OPENROUTER_API_KEY;
+  if (openrouterKey) {
+    const openrouterKeys = collectNumberedKeys(env, 'OPENROUTER_API_KEY', openrouterKey);
+    const pool = maybeCreatePool(openrouterKeys);
+    return {
+      provider: new OpenAICompatibleProvider({
+        apiKey: openrouterKey,
+        baseUrl: env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1',
+        model: env.OPENROUTER_MODEL ?? 'openai/gpt-4o-mini',
+        ...(pool ? { credentialPool: pool } : {}),
+      }),
+      source: 'env',
+    };
+  }
+
   // 4. Config file from CLI onboarding
   // Distinguish: undefined = "not provided, read from disk", null = "explicitly skip file"
   const hasExplicitConfig = 'configFileContents' in options;

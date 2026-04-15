@@ -21,14 +21,24 @@ interface Preset {
   id: string;
   name: string;
   description: string;
-  type: string;
+  type: 'agent' | 'toolset' | 'mcp' | 'config';
   active?: boolean;
 }
 
+/** Raw shape returned by GET /api/presets — server fields differ per category. */
 interface PresetsResponse {
-  agents: Preset[];
-  toolsets: Preset[];
-  mcp: Preset[];
+  agents: Array<{ name: string; role?: string; goal?: string; backstory?: string }>;
+  toolsets: Array<{ name: string; description?: string; toolNames?: string[] }>;
+  mcp: Array<{ name: string; description?: string }>;
+  activeAgent?: string | null;
+  activeToolset?: string | null;
+  activeMcp?: string | null;
+}
+
+/** Raw shape returned by GET /api/config-presets/list */
+interface ConfigPresetsResponse {
+  presets: Array<{ name: string; description?: string }>;
+  active: string | null;
 }
 
 interface BackendSkill {
@@ -331,14 +341,44 @@ export class AgentView extends LitElement {
     this.presetsLoading = true;
     this.configPresetsLoading = true;
     try {
-      const data = await api<PresetsResponse>('/api/presets');
-      this.presetAgents = data.agents ?? [];
-      this.presetToolsets = data.toolsets ?? [];
-      this.presetMcp = data.mcp ?? [];
+      const [data, configData] = await Promise.all([
+        api<PresetsResponse>('/api/presets'),
+        api<ConfigPresetsResponse>('/api/config-presets').catch(() => ({ presets: [], active: null } as ConfigPresetsResponse)),
+      ]);
+      const activeAgent = data.activeAgent ?? null;
+      const activeToolset = data.activeToolset ?? null;
+      const activeMcp = data.activeMcp ?? null;
 
-      // Config presets are those with type "config" across all categories
-      const all = [...this.presetAgents, ...this.presetToolsets, ...this.presetMcp];
-      this.configPresets = all.filter((p) => p.type === 'config');
+      this.presetAgents = (data.agents ?? []).map((a) => ({
+        id: a.name,
+        name: a.name,
+        description: [a.role, a.goal].filter(Boolean).join(' — ') || 'No description',
+        type: 'agent',
+        active: a.name === activeAgent,
+      }));
+      this.presetToolsets = (data.toolsets ?? []).map((t) => ({
+        id: t.name,
+        name: t.name,
+        description: t.description ?? `${t.toolNames?.length ?? 0} tools`,
+        type: 'toolset',
+        active: t.name === activeToolset,
+      }));
+      this.presetMcp = (data.mcp ?? []).map((m) => ({
+        id: m.name,
+        name: m.name,
+        description: m.description ?? 'MCP server preset',
+        type: 'mcp',
+        active: m.name === activeMcp,
+      }));
+
+      // Config presets are bundled MCP+Skill+Tool configurations from the dedicated endpoint
+      this.configPresets = (configData.presets ?? []).map((p) => ({
+        id: p.name,
+        name: p.name,
+        description: p.description ?? 'Bundled configuration',
+        type: 'config',
+        active: p.name === configData.active,
+      }));
     } catch (error: unknown) {
       if (error instanceof Error) {
         showToast('Failed to fetch presets', 'error');
@@ -472,16 +512,21 @@ export class AgentView extends LitElement {
   /* ---- Config preset actions ---- */
 
   private async _activatePreset(preset: Preset) {
-    const endpointMap: Record<string, string> = {
+    const endpointMap: Partial<Record<Preset['type'], string>> = {
       agent: '/api/agent/preset',
       toolset: '/api/toolset/select',
+      config: '/api/config-presets/switch',
     };
-    const endpoint = endpointMap[preset.type] ?? '/api/config-presets/switch';
+    const endpoint = endpointMap[preset.type];
+    if (!endpoint) {
+      showToast(`Activation not supported for ${preset.type} presets`, 'error');
+      return;
+    }
 
     try {
       await api(endpoint, {
         method: 'POST',
-        body: JSON.stringify({ preset: preset.name }),
+        body: JSON.stringify({ name: preset.name }),
       });
       await this._fetchPresets();
     } catch (error: unknown) {
@@ -632,6 +677,8 @@ export class AgentView extends LitElement {
   }
 
   private _renderPresetCard(preset: Preset) {
+    // MCP presets have no activation endpoint yet — render as informational only.
+    const canActivate = preset.type === 'agent' || preset.type === 'toolset';
     return html`
       <div class="card">
         <div class="card-name">
@@ -639,6 +686,15 @@ export class AgentView extends LitElement {
           ${preset.active ? html`<span class="badge-active">Active</span>` : nothing}
         </div>
         <div class="card-desc">${preset.description || 'No description'}</div>
+        ${canActivate
+          ? html`
+              <div class="card-footer">
+                ${preset.active
+                  ? html`<span class="tag ok">Activated</span>`
+                  : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
+              </div>
+            `
+          : nothing}
       </div>
     `;
   }

@@ -952,7 +952,13 @@ export class AgentLoop {
       ? [{ role: 'system', content: memoryPrefix, createdAt: nowIso() }]
       : [];
 
-    const nextMessages = [...session.messages, ...memoryMessages, {
+    // Strip out [session-meta] dashboard markers so they never reach the LLM.
+    // These are added by /api/sessions/:id/rename and are display-only metadata.
+    const cleanedSessionMessages = session.messages.filter(
+      (m) => !(m.role === 'system' && m.content?.startsWith('[session-meta]')),
+    );
+
+    const nextMessages = [...cleanedSessionMessages, ...memoryMessages, {
       role: 'user',
       content: input.userMessage,
       createdAt: nowIso()
@@ -1377,7 +1383,14 @@ export class AgentLoop {
       return;
     }
 
-    const nextMessages: ConversationMessage[] = [...session.messages, {
+    // Strip out [session-meta] dashboard markers so they never reach the LLM.
+    // These are added by /api/sessions/:id/rename and are display-only metadata.
+    // (Mirrors the same filter in run().)
+    const cleanedStreamMessages = session.messages.filter(
+      (m) => !(m.role === 'system' && m.content?.startsWith('[session-meta]')),
+    );
+
+    const nextMessages: ConversationMessage[] = [...cleanedStreamMessages, {
       role: 'user' as Role,
       content: userMessage,
       createdAt: nowIso(),

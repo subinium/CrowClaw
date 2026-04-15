@@ -25,7 +25,7 @@ const MAX_FAILURES_BEFORE_FALLBACK = 3;
 
 const buildWsUrl = (): string => {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const base = `${protocol}//${location.host}/api/ws`;
+  const base = `${protocol}//${location.host}/ws`;
   const token = getAuthToken();
   return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 };

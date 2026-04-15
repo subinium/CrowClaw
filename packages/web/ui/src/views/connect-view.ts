@@ -1325,11 +1325,24 @@ export class ConnectView extends LitElement {
   private async _testProvider(provider: ProviderDisplay) {
     this.testingProvider = provider.slot;
     try {
-      await api('/api/providers/test', {
-        method: 'POST',
-        body: JSON.stringify({ provider: provider.provider, model: provider.model }),
-      });
-      showToast('Provider test passed', 'success');
+      // Sending `slot` lets the server resolve the stored apiKey/baseUrl, so the
+      // dashboard never has to round-trip secrets just to run a connection test.
+      const result = await api<{ ok: boolean; error?: string; response?: string }>(
+        '/api/providers/test',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            slot: provider.slot,
+            provider: provider.provider,
+            model: provider.model,
+          }),
+        },
+      );
+      if (result.ok) {
+        showToast('Provider test passed', 'success');
+      } else {
+        showToast(`Provider test failed: ${result.error ?? 'unknown'}`, 'error');
+      }
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       showToast('Provider test failed: ' + msg, 'error');
@@ -1422,10 +1435,15 @@ export class ConnectView extends LitElement {
   private async _reconnectMcpServer(name: string) {
     this.reconnectingMcp = name;
     try {
-      await api(`/api/mcp/servers/${encodeURIComponent(name)}/reconnect`, {
-        method: 'POST',
-      });
-      showToast(`Reconnected to ${name}`, 'success');
+      const result = await api<{ ok: boolean; error?: string }>(
+        `/api/mcp/servers/${encodeURIComponent(name)}/reconnect`,
+        { method: 'POST' },
+      );
+      if (result.ok) {
+        showToast(`Reconnected to ${name}`, 'success');
+      } else {
+        showToast(`Failed to reconnect ${name}: ${result.error ?? 'unknown'}`, 'error');
+      }
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       showToast(`Failed to reconnect ${name}: ${msg}`, 'error');

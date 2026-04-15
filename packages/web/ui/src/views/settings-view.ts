@@ -684,8 +684,8 @@ export class SettingsView extends LitElement {
 
   private async _loadAgentConfig() {
     try {
-      const data = await api<AgentConfig>('/api/config/agent');
-      this.agentConfig = data;
+      const data = await api<{ config: AgentConfig }>('/api/config/agent');
+      this.agentConfig = data.config;
     } catch {
       this.agentConfig = {
         name: '',
@@ -825,9 +825,9 @@ export class SettingsView extends LitElement {
 
   private async _loadFeedback() {
     try {
-      const data = await api<{ stats: FeedbackStats; entries: FeedbackEntry[] }>('/api/feedback');
+      const data = await api<{ stats: FeedbackStats; recent: FeedbackEntry[] }>('/api/feedback');
       this.feedbackStats = data.stats ?? null;
-      this.feedbackEntries = data.entries ?? [];
+      this.feedbackEntries = data.recent ?? [];
     } catch {
       this.feedbackStats = null;
       this.feedbackEntries = [];
