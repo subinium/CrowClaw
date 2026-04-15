@@ -5,14 +5,16 @@
 
 const TOKEN_KEY = 'cc_auth_token';
 
-let authToken: string | null = sessionStorage.getItem(TOKEN_KEY);
+const storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null;
+
+let authToken: string | null = storage?.getItem(TOKEN_KEY) ?? null;
 
 export const setAuthToken = (token: string | null) => {
   authToken = token;
   if (token) {
-    sessionStorage.setItem(TOKEN_KEY, token);
+    storage?.setItem(TOKEN_KEY, token);
   } else {
-    sessionStorage.removeItem(TOKEN_KEY);
+    storage?.removeItem(TOKEN_KEY);
   }
 };
 
