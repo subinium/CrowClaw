@@ -1094,6 +1094,7 @@ export class ChatView extends LitElement {
         count: number;
         sessions: Array<{
           sessionId: string;
+          title?: string;
           messageCount: number;
           updatedAt: string;
           preview?: string;
@@ -1107,7 +1108,7 @@ export class ChatView extends LitElement {
         .filter((s) => !existing.includes(s.sessionId))
         .map((s) => ({
           id: s.sessionId,
-          title: '',
+          title: s.title ?? '',
           preview: s.preview ?? '',
           messageCount: s.messageCount ?? 0,
           updatedAt: s.updatedAt ?? new Date().toISOString(),
@@ -1136,15 +1137,23 @@ export class ChatView extends LitElement {
   }
 
   private async _createSession() {
-    const id = `s-${Date.now().toString(36)}`;
-    this.sessions = [
-      { id, title: '', preview: '', messageCount: 0, updatedAt: new Date().toISOString() },
-      ...this.sessions,
-    ];
-    this._selectSession(id);
+    // Server is the authority on session IDs to prevent collision and ID
+    // enumeration. We POST with an empty body and use the returned sessionId.
     try {
-      await api('/api/sessions', { method: 'POST', body: JSON.stringify({ sessionId: id }) });
-    } catch { /* session will be created on first message if this fails */ }
+      const data = await api<{ ok: boolean; session: { sessionId: string; updatedAt: string } }>(
+        '/api/sessions',
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+      const id = data.session.sessionId;
+      this.sessions = [
+        { id, title: '', preview: '', messageCount: 0, updatedAt: data.session.updatedAt },
+        ...this.sessions,
+      ];
+      this._selectSession(id);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to create session';
+      showToast(msg, 'error');
+    }
   }
 
   private async _deleteSession(e: Event, id: string) {

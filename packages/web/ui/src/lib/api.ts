@@ -22,7 +22,7 @@ export const getAuthToken = () => authToken;
 
 export const clearAuthToken = () => {
   authToken = null;
-  sessionStorage.removeItem(TOKEN_KEY);
+  storage?.removeItem(TOKEN_KEY);
 };
 
 export interface ApiOptions extends RequestInit {

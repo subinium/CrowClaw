@@ -34,8 +34,19 @@ function createRegistry(sessionStore: D1SessionStore, memoryStore: D1MemoryStore
 
 function summarizeSessionRecord(session: SessionState) {
   const lastMessage = [...session.messages].reverse().find((message) => message.role !== 'system');
+  // Derive a human-readable title for the dashboard session picker:
+  // 1. Prefer an explicit rename (stored as a [session-meta] system message)
+  // 2. Fall back to the first user message
+  // 3. Fall back to the empty string — the UI then shows the sessionId
+  const renameMeta = session.messages.find(
+    (m) => m.role === 'system' && m.content?.startsWith('[session-meta] name='),
+  );
+  const renamedTitle = renameMeta?.content.replace('[session-meta] name=', '').trim();
+  const firstUser = session.messages.find((m) => m.role === 'user');
+  const title = renamedTitle || firstUser?.content?.slice(0, 60).trim() || '';
   return {
     sessionId: session.sessionId,
+    title,
     updatedAt: session.updatedAt,
     messageCount: session.messages.length,
     userId: session.userId,

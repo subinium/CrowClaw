@@ -252,7 +252,11 @@ export function sanitizeConfigMutation(body: Record<string, unknown>): string | 
   return null;
 }
 
-function isLocalOperatorBypassRoute(pathname: string): boolean {
+function isLocalOperatorBypassRoute(pathname: string, method: string): boolean {
+  // The bypass is intended for read-only navigation only. Any non-GET request
+  // (POST, DELETE, PUT, PATCH) MUST go through token auth even on localhost,
+  // otherwise any local process can mutate runtime state without the token.
+  if (method !== 'GET') return false;
   // Read-only config routes
   if (pathname === '/api/config/snapshot' || pathname === '/api/config/schema') return true;
   // Read-only session routes (list, get, checkpoints, memories, history)
@@ -263,8 +267,6 @@ function isLocalOperatorBypassRoute(pathname: string): boolean {
   // Safe read-only routes
   if (pathname === '/api/feedback') return true;
   return pathname.startsWith('/api/skills')
-    || pathname.startsWith('/api/providers/')
-    || pathname.startsWith('/api/web/')
     || pathname.startsWith('/api/agent/')
     || pathname.startsWith('/api/toolset/');
 }
@@ -347,8 +349,20 @@ function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>)
 
 function summarizeSessionRecord(session: SessionState) {
   const lastMessage = [...session.messages].reverse().find((message) => message.role !== 'system');
+  // Derive a human-readable title for the dashboard session picker:
+  // 1. Prefer an explicit rename via /api/sessions/:id/rename (stored as a
+  //    [session-meta] system message)
+  // 2. Fall back to the first user message
+  // 3. Fall back to the empty string — the UI then shows the sessionId
+  const renameMeta = session.messages.find(
+    (m) => m.role === 'system' && m.content?.startsWith('[session-meta] name='),
+  );
+  const renamedTitle = renameMeta?.content.replace('[session-meta] name=', '').trim();
+  const firstUser = session.messages.find((m) => m.role === 'user');
+  const title = renamedTitle || firstUser?.content?.slice(0, 60).trim() || '';
   return {
     sessionId: session.sessionId,
+    title,
     updatedAt: session.updatedAt,
     messageCount: session.messages.length,
     userId: session.userId,
@@ -730,7 +744,23 @@ function generateNonce(): string {
 
 /** CSP for dashboard pages (nonce-based script-src, unsafe-inline for styles). */
 function dashboardCSP(nonce: string): string {
-  return `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'`;
+  // connect-src must explicitly allow ws:/wss: for the dashboard WebSocket
+  // transport. CSP3 says 'self' implies same-origin ws/wss, but Safari and
+  // older Chromium still block it without an explicit scheme.
+  // The dashboard HTML loads:
+  //   - Google Fonts CSS (fonts.googleapis.com) + font files (fonts.gstatic.com)
+  //   - highlight.js CSS + JS from cdnjs.cloudflare.com (for chat code blocks)
+  // These must be allowlisted explicitly. The script source is still nonce-only
+  // for inline scripts; the cdnjs entry is for the external highlight.js script.
+  return [
+    `default-src 'self'`,
+    `script-src 'nonce-${nonce}' https://cdnjs.cloudflare.com`,
+    `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com`,
+    `style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com`,
+    `font-src 'self' data: https://fonts.gstatic.com`,
+    `img-src 'self' data:`,
+    `connect-src 'self' ws: wss:`,
+  ].join('; ');
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +957,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const gatewayDebouncer = new GatewayDebouncer();
 
   // Config store: FileConfigStore for persistence, or in-memory if null
+  // Under Vitest, force in-memory to avoid parallel-test races on the shared
+  // ~/.crowclaw/runtime-config.json file. Tests can still opt into the file
+  // store by passing an explicit configStorePath.
+  const isVitest = typeof process !== 'undefined'
+    && (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test');
   const defaultConfigPath = (() => {
     try {
       const os = require('node:os') as { homedir(): string };
@@ -937,7 +972,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     }
   })();
   const configStore: RuntimeConfigStore =
-    options.configStorePath === null
+    options.configStorePath === null || (isVitest && options.configStorePath === undefined)
       ? new RuntimeConfigStore()
       : new FileConfigStore(options.configStorePath ?? defaultConfigPath ?? '');
 
@@ -1041,11 +1076,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   });
 
   // Provider: resolve from env/config if not explicitly provided.
-  // When configStorePath is null (test/hermetic mode): stay on EchoProvider,
-  // skip ALL env/config resolution to prevent test pollution from local API keys.
+  // Hermetic mode (skip ALL env/config resolution → keep EchoProvider) when:
+  //   - configStorePath is explicitly null (test fixture opt-in), OR
+  //   - we're running under Vitest and the caller didn't pass either provider
+  //     or configStorePath (auto-detected to prevent local API keys from
+  //     leaking into the in-process test runtime).
+  const isHermeticMode = options.configStorePath === null
+    || (isVitest && options.configStorePath === undefined && !options.provider);
   let provider = options.provider ?? new EchoProvider();
-  let providerReady = !!options.provider || options.configStorePath === null;
-  if (!options.provider && options.configStorePath !== null) {
+  let providerReady = !!options.provider || isHermeticMode;
+  if (!options.provider && !isHermeticMode) {
     void resolveProviderFromConfig().then((resolved) => {
       if (resolved.source !== 'echo') {
         provider = resolved.provider;
@@ -1745,14 +1785,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return '127.0.0.1';
       };
 
-      // Stricter rate limit for auth endpoints: 5 requests per minute per IP
-      // Must run before auth handlers which return early
-      if (url.pathname.startsWith('/api/auth/')) {
+      // Stricter rate limit for credential-checking endpoints only.
+      // /api/auth/check is a passive cookie/bearer status read that the dashboard
+      // hits on every page load — counting it as an "auth attempt" exhausts the
+      // budget and locks the user out. Only /api/auth/verify (which actually
+      // accepts a token from the request body) is rate-limited.
+      // Must run before auth handlers which return early.
+      if (url.pathname === '/api/auth/verify' && request.method === 'POST') {
         const clientIp = getClientIp(request);
-        if (!authRateLimiter.check(clientIp, 5, 60_000)) {
+        if (!authRateLimiter.check(clientIp, 10, 60_000)) {
           log.warn('Auth rate limit exceeded', { component: 'security', clientIp, path: url.pathname });
           return Response.json(
-            { error: 'Too many authentication attempts. Limit: 5 per minute.' },
+            { error: 'Too many authentication attempts. Limit: 10 per minute.' },
             { status: 429, headers: { 'Retry-After': '60' } }
           );
         }
@@ -1807,7 +1851,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           } else if (!tokenMatch) {
             return Response.json({ error: 'Unauthorized' }, { status: 401 });
           }
-        } else if (dashToken && !tokenMatch && (!isLocalhost || !isLocalOperatorBypassRoute(url.pathname))) {
+        } else if (dashToken && !tokenMatch && (!isLocalhost || !isLocalOperatorBypassRoute(url.pathname, request.method))) {
           // Non-dangerous routes: require auth by default when a token is configured.
           // Localhost keeps a narrow operator/test bypass only for selected routes.
           return Response.json({ error: 'Unauthorized' }, { status: 401 });
@@ -1932,14 +1976,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'GET' && url.pathname === '/api/security/events') {
         const limitParam = url.searchParams.get('limit');
         const typeParam = url.searchParams.get('type');
+        const severityParam = url.searchParams.get('severity');
         const limit = limitParam ? parseInt(limitParam, 10) : undefined;
-        let events;
-        if (typeParam) {
-          events = securityAuditLog.getEventsByType(typeParam);
-          if (limit) events = events.slice(0, limit);
-        } else {
-          events = securityAuditLog.getEvents(limit);
+        let events = typeParam
+          ? securityAuditLog.getEventsByType(typeParam)
+          : securityAuditLog.getEvents();
+        if (severityParam) {
+          events = events.filter((e) => e.severity === severityParam);
         }
+        if (limit) events = events.slice(0, limit);
         return Response.json({ events });
       }
 
@@ -2468,11 +2513,35 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/api/providers/config') {
         const body = await request.json() as Record<string, unknown>;
-        const newConfig = body as unknown as import('./config-store.js').ProviderConfig;
-        if (!newConfig.primary || typeof newConfig.primary.provider !== 'string' || typeof newConfig.primary.model !== 'string') {
+        const incoming = body as unknown as import('./config-store.js').ProviderConfig;
+        const stored = configStore.getProviderConfig();
+
+        // Merge incoming config with stored secrets. The dashboard fetches
+        // GET /api/providers/config which redacts apiKeys to '***', so a
+        // round-trip would otherwise overwrite the real key with the redacted
+        // placeholder. Also: a `null` slot means "leave as-is" (the dashboard
+        // sends explicit `null` for slots it isn't editing).
+        type Slot = import('./config-store.js').ProviderSlot;
+        const SLOT_KEYS = ['primary', 'fallback', 'fast', 'vision', 'compression', 'embedding'] as const;
+        const merged: Partial<import('./config-store.js').ProviderConfig> = {};
+        for (const key of SLOT_KEYS) {
+          const incomingSlot = (incoming as unknown as Record<string, Slot | null | undefined>)[key];
+          const storedSlot = stored ? (stored as unknown as Record<string, Slot | undefined>)[key] : undefined;
+          if (incomingSlot === null) {
+            // Explicit null: preserve stored slot
+            if (storedSlot) (merged as Record<string, Slot>)[key] = storedSlot;
+          } else if (incomingSlot) {
+            // If apiKey is the redaction placeholder, keep the stored secret
+            const apiKey = incomingSlot.apiKey === '***' ? storedSlot?.apiKey : incomingSlot.apiKey;
+            (merged as Record<string, Slot>)[key] = { ...incomingSlot, apiKey };
+          }
+          // If incoming key is missing entirely, drop it (matches old behavior)
+        }
+
+        if (!merged.primary || typeof merged.primary.provider !== 'string' || typeof merged.primary.model !== 'string') {
           return Response.json({ ok: false, error: 'primary slot with provider and model is required' }, { status: 400 });
         }
-        configStore.setProviderConfig(newConfig);
+        configStore.setProviderConfig(merged as import('./config-store.js').ProviderConfig);
         return Response.json({ ok: true, config: configStore.getProviderConfig() });
       }
 
@@ -2481,8 +2550,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const slot = body.slot as string;
         const providerType = body.provider as string;
         const model = body.model as string;
-        const apiKey = body.apiKey as string;
-        const baseUrl = body.baseUrl as string | undefined;
+        // Fall back to the stored slot config so the dashboard doesn't have to
+        // round-trip the API key just to test the connection.
+        const stored = configStore.getProviderConfig();
+        const storedSlot = stored && slot
+          ? (stored as unknown as Record<string, { apiKey?: string; baseUrl?: string } | undefined>)[slot]
+          : undefined;
+        const apiKey = (body.apiKey as string | undefined) ?? storedSlot?.apiKey ?? '';
+        const baseUrl = (body.baseUrl as string | undefined) ?? storedSlot?.baseUrl;
         if (!providerType || !model) {
           return Response.json({ ok: false, error: 'provider and model are required' }, { status: 400 });
         }
@@ -2513,6 +2588,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             summary: s.skill.manifest.description,
             triggerPhrases: s.skill.manifest.triggers ?? [],
             steps: s.skill.instructions.split('\n').filter(Boolean),
+            requiredTools: s.skill.manifest.tools ?? [],
             status: skillRegistry.getStatus(s.skill.manifest.name) ?? 'published',
             source: s.skill.manifest.category ?? 'builtin',
             enabled: s.enabled,
@@ -2527,7 +2603,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({
           agents: listAgentPresets(),
           toolsets: listToolsetPresets(),
-          mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) }))
+          mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) })),
+          activeAgent: configStore.getActivePreset(),
+          activeToolset: configStore.getActiveToolset(),
+          activeMcp: null,
         });
       }
 
@@ -2804,7 +2883,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/sessions/active') {
-        return Response.json({ sessions: sessionController.getActiveSessions() });
+        // Strip non-serializable AbortController before responding
+        const sessions = sessionController.getActiveSessions().map((s) => ({
+          sessionId: s.sessionId,
+          startedAt: s.startedAt,
+          status: s.status,
+        }));
+        return Response.json({ sessions });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/sessions') {
@@ -2824,9 +2909,24 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/api/sessions') {
         const body = (await request.json().catch(() => ({}))) as { sessionId?: string; userId?: string; workspaceId?: string };
-        const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim()
-          ? body.sessionId.trim()
-          : crypto.randomUUID();
+        // Validate client-supplied sessionId format to prevent path injection,
+        // collisions with internal IDs, and predictable ID enumeration. The
+        // dashboard normally lets the server generate the ID — this branch
+        // exists for tests and platform integrations (e.g., `telegram:99`).
+        const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$/;
+        let sessionId: string;
+        if (typeof body.sessionId === 'string' && body.sessionId.trim()) {
+          const candidate = body.sessionId.trim();
+          if (!SESSION_ID_PATTERN.test(candidate)) {
+            return Response.json(
+              { ok: false, error: 'Invalid sessionId: must match [a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}' },
+              { status: 400 },
+            );
+          }
+          sessionId = candidate;
+        } else {
+          sessionId = crypto.randomUUID();
+        }
         const existing = await store.get(sessionId);
         const session = existing ?? {
           agentId: options.agentId ?? 'crowclaw',
@@ -4316,7 +4416,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
         if (parts[3] === 'history' || parts[3] === 'state' || parts.length === 3) {
           const session = sessionId ? await store.get(sessionId) : null;
-          return Response.json(session ?? { sessionId, messages: [] });
+          if (!session) return Response.json({ sessionId, messages: [] });
+          // Strip [session-meta] markers so the chat UI doesn't render them as
+          // visible system messages.
+          return Response.json({
+            ...session,
+            messages: session.messages.filter(
+              (m) => !(m.role === 'system' && m.content?.startsWith('[session-meta]')),
+            ),
+          });
         }
       }
 
@@ -4680,7 +4788,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname.match(/^\/api\/gateway\/([^/]+)\/config$/)) {
         const platform = url.pathname.split('/')[3]!;
-        const body = await request.json() as { token?: string; enabled?: boolean; channelId?: string; muted?: boolean };
+        const body = await request.json() as {
+          token?: string;
+          enabled?: boolean;
+          channelId?: string;
+          muted?: boolean;
+          // Platform-specific connection params — persisted in `extra` so probe
+          // and outbound delivery can read them without a redundant round-trip.
+          webhookUrl?: string;
+          phoneNumberId?: string;
+          homeserverUrl?: string;
+        };
         const existing = configStore.getGatewayConfig(platform);
         // Channel-level mute: store in extra map
         if (body.channelId && body.muted !== undefined) {
@@ -4689,9 +4807,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           configStore.setGatewayConfig(platform, { ...existing ?? { enabled: false }, extra });
           return Response.json({ ok: true, platform, channelId: body.channelId, muted: body.muted });
         }
+        const mergedExtra = { ...(existing?.extra ?? {}) };
+        if (body.webhookUrl !== undefined) mergedExtra.webhookUrl = body.webhookUrl;
+        if (body.phoneNumberId !== undefined) mergedExtra.phoneNumberId = body.phoneNumberId;
+        if (body.homeserverUrl !== undefined) mergedExtra.homeserverUrl = body.homeserverUrl;
         configStore.setGatewayConfig(platform, {
           enabled: body.enabled ?? existing?.enabled ?? true,
           token: body.token ?? existing?.token,
+          extra: Object.keys(mergedExtra).length > 0 ? mergedExtra : existing?.extra,
         });
         eventBus.emit('gateway:status', { platform, enabled: body.enabled ?? existing?.enabled ?? true });
         return Response.json({ ok: true, platform, configured: Boolean(configStore.getGatewayConfig(platform)) });
@@ -4700,24 +4823,31 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       const probeMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/probe$/);
       if (request.method === 'POST' && probeMatch) {
         const platform = probeMatch[1];
-        const body = await request.json() as { token?: string; webhookUrl?: string; phoneNumberId?: string; homeserverUrl?: string };
+        const body = await request.json().catch(() => ({})) as { token?: string; webhookUrl?: string; phoneNumberId?: string; homeserverUrl?: string };
+        // Fall back to the platform's stored config so the dashboard doesn't have to
+        // re-send credentials on every probe.
+        const stored = configStore.getGatewayConfig(platform);
+        const token = body.token ?? stored?.token;
+        const webhookUrl = body.webhookUrl ?? stored?.extra?.webhookUrl;
+        const phoneNumberId = body.phoneNumberId ?? stored?.extra?.phoneNumberId;
+        const homeserverUrl = body.homeserverUrl ?? stored?.extra?.homeserverUrl;
         let result: ProbeResult;
 
         switch (platform) {
           case 'telegram':
-            result = body.token ? await probeTelegram(body.token) : { ok: false, platform: 'telegram' as const, error: 'Missing token' };
+            result = token ? await probeTelegram(token) : { ok: false, platform: 'telegram' as const, error: 'Missing token' };
             break;
           case 'slack':
-            result = body.token ? await probeSlack(body.token) : { ok: false, platform: 'slack' as const, error: 'Missing token' };
+            result = token ? await probeSlack(token) : { ok: false, platform: 'slack' as const, error: 'Missing token' };
             break;
           case 'discord':
-            result = body.webhookUrl ? await probeDiscord(body.webhookUrl) : { ok: false, platform: 'discord' as const, error: 'Missing webhookUrl' };
+            result = webhookUrl ? await probeDiscord(webhookUrl) : { ok: false, platform: 'discord' as const, error: 'Missing webhookUrl' };
             break;
           case 'whatsapp':
-            result = body.token && body.phoneNumberId ? await probeWhatsApp(body.token, body.phoneNumberId) : { ok: false, platform: 'whatsapp' as const, error: 'Missing token or phoneNumberId' };
+            result = token && phoneNumberId ? await probeWhatsApp(token, phoneNumberId) : { ok: false, platform: 'whatsapp' as const, error: 'Missing token or phoneNumberId' };
             break;
           case 'matrix':
-            result = body.token && body.homeserverUrl ? await probeMatrix(body.homeserverUrl, body.token) : { ok: false, platform: 'matrix' as const, error: 'Missing token or homeserverUrl' };
+            result = token && homeserverUrl ? await probeMatrix(homeserverUrl, token) : { ok: false, platform: 'matrix' as const, error: 'Missing token or homeserverUrl' };
             break;
           default:
             result = { ok: false, platform: platform as GatewayPlatform, error: `Probe not supported for ${platform}` };
@@ -4787,8 +4917,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (!token) {
           return Response.json({ ok: false, error: 'Telegram bot token not configured' }, { status: 400 });
         }
-        const result = await getTelegramWebhookInfo(token);
-        return Response.json(result);
+        const info = await getTelegramWebhookInfo(token);
+        // Flatten the {ok, result} envelope so the dashboard can read fields directly
+        return Response.json({ ok: info.ok, ...(info.result ?? {}) });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/gateway/pairing/approve') {
@@ -5116,9 +5247,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       // --- Remote access config ---
       if (request.method === 'GET' && url.pathname === '/api/config/remote-access') {
+        const effectivePublicUrl = configStore.getPublicUrl() ?? publicUrl ?? null;
         return Response.json({
           ok: true,
-          serverUrl: configStore.getPublicUrl() ?? publicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          serverUrl: effectivePublicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
+          publicUrl: effectivePublicUrl,
           trustProxy: configStore.getTrustProxy(),
         });
       }

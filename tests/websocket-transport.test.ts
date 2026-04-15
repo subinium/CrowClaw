@@ -449,7 +449,7 @@ describe('ws client behavior', () => {
     const { connectWebSocket } = await import('../packages/web/ui/src/lib/ws.js');
     const client = connectWebSocket({ onEvent: vi.fn() });
     expect(mockInstances.length).toBe(1);
-    expect(mockInstances[0].url).toBe('ws://localhost:3000/api/ws');
+    expect(mockInstances[0].url).toBe('ws://localhost:3000/ws');
     client.close();
   });
 

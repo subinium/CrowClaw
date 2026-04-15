@@ -605,12 +605,12 @@ export class AutomateView extends LitElement {
   private async _dryRunJob(job: SchedulerJob) {
     showToast(`Running dry-run for "${job.id}"...`, 'info');
     try {
-      const result = await api<{ ok: boolean; output?: string; error?: string }>(
+      const result = await api<{ ok: boolean; response?: string; error?: string }>(
         `/api/scheduler/jobs/${encodeURIComponent(job.id)}/dry-run`,
         { method: 'POST' },
       );
       if (result.ok) {
-        showToast(`Dry-run completed: ${(result.output ?? '').slice(0, 100)}`, 'success');
+        showToast(`Dry-run completed: ${(result.response ?? '').slice(0, 100)}`, 'success');
       } else {
         showToast(`Dry-run failed: ${result.error ?? 'unknown'}`, 'error');
       }

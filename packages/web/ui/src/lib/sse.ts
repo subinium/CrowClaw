@@ -6,13 +6,15 @@
 import { getAuthToken } from './api.js';
 
 export interface StreamEvent {
-  type: 'text-delta' | 'tool-start' | 'tool-end' | 'iteration-start' | 'iteration-end' | 'error' | 'done';
+  type: 'text-delta' | 'tool-start' | 'tool-end' | 'iteration-start' | 'error' | 'done';
   content?: string;
   toolName?: string;
   toolCallId?: string;
   input?: Record<string, unknown>;
-  output?: string;
-  success?: boolean;
+  // tool-end fields — match the wire format emitted by core (AgentLoop)
+  result?: string;
+  ok?: boolean;
+  durationMs?: number;
   iteration?: number;
   error?: string;
 }
@@ -123,8 +125,8 @@ const dispatchEvent = (event: StreamEvent, callbacks: StreamCallbacks): void => 
     case 'tool-end':
       callbacks.onToolEnd(
         event.toolCallId ?? '',
-        event.output ?? '',
-        event.success ?? true,
+        event.result ?? '',
+        event.ok ?? true,
       );
       break;
     case 'iteration-start':
@@ -149,9 +151,9 @@ export const connectEventStream = (callbacks: {
   onOpen?: () => void;
   onError?: () => void;
 }): (() => void) => {
-  const token = getAuthToken();
-  const eventsUrl = token ? `${location.origin}/api/events?token=${encodeURIComponent(token)}` : `${location.origin}/api/events`;
-  const source = new EventSource(eventsUrl);
+  // EventSource sends cookies on same-origin by default — no need to put the
+  // token in the URL (which would leak it to access logs / referer headers).
+  const source = new EventSource(`${location.origin}/api/events`, { withCredentials: true });
 
   source.onopen = () => {
     callbacks.onOpen?.();
