@@ -1785,6 +1785,21 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return '127.0.0.1';
       };
 
+      // Fail-close: if we're bound to a non-localhost interface and no dashboard
+      // token is configured, reject every protected surface (API, events, WS).
+      // Webhooks still work because they carry their own per-platform secret.
+      // Without this gate, `/api/events`, `/api/sessions/*/message`, `/api/mcp/call`,
+      // and `/ws` would all be unauthenticated on a public IP.
+      if (!dashToken && !isLocalhost) {
+        const isProtectedSurface = url.pathname.startsWith('/api/') || url.pathname === '/ws';
+        if (isProtectedSurface) {
+          return Response.json(
+            { error: 'CROWCLAW_DASHBOARD_TOKEN is required when binding to non-localhost' },
+            { status: 500 }
+          );
+        }
+      }
+
       // Stricter rate limit for credential-checking endpoints only.
       // /api/auth/check is a passive cookie/bearer status read that the dashboard
       // hits on every page load — counting it as an "auth attempt" exhausts the
@@ -1821,6 +1836,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({ ok: false });
       }
 
+      // Auth logout endpoint — clears the HttpOnly cookie. We can't clear
+      // an HttpOnly cookie from JS, so the client calls this to sign out.
+      if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+        const secureSuffix = isLocalhost ? '' : '; Secure';
+        const headers = new Headers({ 'content-type': 'application/json' });
+        headers.set(
+          'Set-Cookie',
+          `crowclaw_auth=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureSuffix}`,
+        );
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+      }
+
       // Auth check endpoint (cookie-based, does not leak token)
       if (request.method === 'GET' && url.pathname === '/api/auth/check') {
         const cookieAuth = parseCookieToken(request.headers.get('cookie'));
@@ -1834,7 +1861,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       // Auth middleware for /api/* routes
-      if (url.pathname.startsWith('/api/') && url.pathname !== '/api/auth/verify' && url.pathname !== '/api/auth/check') {
+      if (
+        url.pathname.startsWith('/api/')
+        && url.pathname !== '/api/auth/verify'
+        && url.pathname !== '/api/auth/check'
+        && url.pathname !== '/api/auth/logout'
+      ) {
         const authHeader = request.headers.get('authorization');
         const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
         const cookieToken = parseCookieToken(request.headers.get('cookie'));
@@ -2542,7 +2574,24 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: false, error: 'primary slot with provider and model is required' }, { status: 400 });
         }
         configStore.setProviderConfig(merged as import('./config-store.js').ProviderConfig);
-        return Response.json({ ok: true, config: configStore.getProviderConfig() });
+        // Return the redacted config — the POST response used to echo back the
+        // full stored config, leaking every persisted apiKey to whoever called
+        // this endpoint (including secrets from untouched slots the caller did
+        // not submit).
+        const saved = configStore.getProviderConfig();
+        const redactSlot = (slot: import('./config-store.js').ProviderSlot | undefined) =>
+          slot ? { ...slot, apiKey: slot.apiKey ? '***' : undefined } : null;
+        return Response.json({
+          ok: true,
+          config: saved ? {
+            primary: redactSlot(saved.primary),
+            fallback: redactSlot(saved.fallback),
+            fast: redactSlot(saved.fast),
+            vision: redactSlot(saved.vision),
+            compression: redactSlot(saved.compression),
+            embedding: redactSlot(saved.embedding),
+          } : null,
+        });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/providers/test') {
@@ -5216,13 +5265,23 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
       }
 
-      // --- WebSocket upgrade (auth via query param or header) ---
+      // --- WebSocket upgrade (auth via HttpOnly cookie or Authorization header) ---
       if (request.method === 'GET' && url.pathname === '/ws') {
-        const wsToken = url.searchParams.get('token') ?? request.headers.get('authorization')?.replace('Bearer ', '');
-        const wsAuthenticated = !!dashToken && !!wsToken && timingSafeEqual(wsToken, dashToken);
-        // When dashToken is configured, reject unauthenticated WS connections
+        // Prefer the cookie the browser already holds from /api/auth/verify.
+        // Bearer header stays supported for non-browser clients. We intentionally
+        // do NOT accept `?token=...` query params: they leak into access logs,
+        // proxy logs, and the browser's Referer header.
+        const cookieAuth = parseCookieToken(request.headers.get('cookie'));
+        const bearerHeader = request.headers.get('authorization');
+        const wsBearer = bearerHeader?.startsWith('Bearer ') ? bearerHeader.slice(7) : null;
+
+        const derivedCookie = dashToken ? deriveCookieToken(dashToken) : '';
+        const cookieMatches = !!dashToken && cookieAuth !== null && timingSafeEqual(cookieAuth, derivedCookie);
+        const bearerMatches = !!dashToken && wsBearer !== null && timingSafeEqual(wsBearer, dashToken);
+        const wsAuthenticated = cookieMatches || bearerMatches;
+
         if (dashToken && !wsAuthenticated) {
-          return new Response('Unauthorized — provide token query param or Authorization header', { status: 401 });
+          return new Response('Unauthorized — authenticated cookie or Authorization header required', { status: 401 });
         }
         return handleWebSocketUpgrade(request, eventBus, wsManager, wsAuthenticated || !dashToken);
       }

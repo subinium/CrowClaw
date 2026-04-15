@@ -473,6 +473,25 @@ interface SerializedConfig {
   trustProxy?: boolean;
 }
 
+/** Build a clone of a ProviderConfig with every slot's apiKey stripped. */
+function stripProviderSecrets(providerConfig: ProviderConfig): ProviderConfig {
+  const stripSlot = (slot: ProviderSlot | undefined): ProviderSlot | undefined => {
+    if (!slot) return undefined;
+    const clone: ProviderSlot = { ...slot };
+    delete clone.apiKey;
+    return clone;
+  };
+  const stripped: ProviderConfig = {
+    primary: stripSlot(providerConfig.primary) as ProviderSlot,
+  };
+  if (providerConfig.fallback) stripped.fallback = stripSlot(providerConfig.fallback);
+  if (providerConfig.fast) stripped.fast = stripSlot(providerConfig.fast);
+  if (providerConfig.vision) stripped.vision = stripSlot(providerConfig.vision);
+  if (providerConfig.compression) stripped.compression = stripSlot(providerConfig.compression);
+  if (providerConfig.embedding) stripped.embedding = stripSlot(providerConfig.embedding);
+  return stripped;
+}
+
 /**
  * FileConfigStore — a RuntimeConfigStore that persists to a JSON file.
  *
@@ -485,6 +504,13 @@ export class FileConfigStore extends RuntimeConfigStore {
   private filePath: string;
   private initialized = false;
   private writeErrors = 0;
+  /**
+   * Serialized write chain. Every `persistToDisk()` call chains after the
+   * previous one so concurrent mutators don't race on the file. Writes are
+   * atomic: we write to a sibling temp path and then rename, which on POSIX
+   * is atomic and on Windows replaces the target in a single operation.
+   */
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(filePath: string) {
     super();
@@ -568,45 +594,75 @@ export class FileConfigStore extends RuntimeConfigStore {
     }
   }
 
-  /** Persist current state to disk. Silently falls back to in-memory on failure. */
-  private async persistToDisk(): Promise<void> {
+  /**
+   * Persist current state to disk. Silently falls back to in-memory on failure.
+   * Concurrent calls are serialized via `writeQueue` so writes never race.
+   */
+  private persistToDisk(): Promise<void> {
+    const previous = this.writeQueue;
+    const next = (async () => {
+      // Snapshot the config synchronously before the previous write completes,
+      // so the enqueued write captures "state as of now" and later mutations
+      // get their own queued write.
+      const serialized = this.serializeForDisk();
+      await previous.catch(() => { /* previous failure is already accounted for */ });
+      await this.doWrite(serialized);
+    })();
+    this.writeQueue = next;
+    return next;
+  }
+
+  /** Build the serialized config. Runs synchronously while holding the mutation point. */
+  private serializeForDisk(): SerializedConfig {
+    const cfg = this.config;
+    return {
+      activePreset: cfg.activePreset,
+      agentPreset: cfg.agentPreset,
+      activeToolset: cfg.activeToolset,
+      disabledSkills: [...cfg.disabledSkills],
+      mcpConnections: Object.fromEntries(cfg.mcpConnections),
+      customMcpServers: [...cfg.customMcpServers.values()],
+      // Never persist gateway bot tokens or webhook secrets to disk. Writing
+      // '***' back round-tripped as the real token on reload, corrupting
+      // gateway delivery. Users must re-supply the token via env var or the
+      // dashboard after a restart.
+      gatewayConfigs: Object.fromEntries(
+        [...cfg.gatewayConfigs].map(([platform, gatewayConfig]) => [
+          platform,
+          { ...gatewayConfig, token: undefined, webhookSecret: undefined },
+        ]),
+      ),
+      providerType: cfg.providerType,
+      model: cfg.model,
+      apiKey: '', // Never persist LLM API keys to disk — require env var or re-entry
+      providerConfig: cfg.providerConfig ? stripProviderSecrets(cfg.providerConfig) : null,
+      pendingPairings: Object.fromEntries(
+        [...cfg.pendingPairings].map(([k, v]) => [k, v])
+      ),
+      configPresets: [...cfg.configPresets.values()],
+      activeConfigPreset: cfg.activeConfigPreset,
+      securityPolicy: cfg.securityPolicy,
+      agentConfig: cfg.agentConfig,
+      publicUrl: cfg.publicUrl,
+      trustProxy: cfg.trustProxy,
+    };
+  }
+
+  private async doWrite(serialized: SerializedConfig): Promise<void> {
     try {
-      const { writeFile, mkdir } = await import('node:fs/promises');
+      const { writeFile, rename, mkdir, unlink } = await import('node:fs/promises');
       const { dirname } = await import('node:path');
-      // Persist raw config directly — NOT the redacted snapshot().
-      // snapshot() redacts API keys and MCP env values for API responses,
-      // but we need the real values on disk for restart recovery.
-      const cfg = this.config;
-      const serialized: SerializedConfig = {
-        activePreset: cfg.activePreset,
-        agentPreset: cfg.agentPreset,
-        activeToolset: cfg.activeToolset,
-        disabledSkills: [...cfg.disabledSkills],
-        mcpConnections: Object.fromEntries(cfg.mcpConnections),
-        customMcpServers: [...cfg.customMcpServers.values()],
-        gatewayConfigs: Object.fromEntries(
-          [...cfg.gatewayConfigs].map(([platform, gatewayConfig]) => [
-            platform,
-            { ...gatewayConfig, token: gatewayConfig.token ? '***' : undefined }
-          ])
-        ),
-        providerType: cfg.providerType,
-        model: cfg.model,
-        apiKey: '', // Never persist LLM API keys to disk — require env var or re-entry
-        providerConfig: cfg.providerConfig ? JSON.parse(JSON.stringify(cfg.providerConfig)) : null,
-        pendingPairings: Object.fromEntries(
-          [...cfg.pendingPairings].map(([k, v]) => [k, v])
-        ),
-        configPresets: [...cfg.configPresets.values()],
-        activeConfigPreset: cfg.activeConfigPreset,
-        securityPolicy: cfg.securityPolicy,
-        agentConfig: cfg.agentConfig,
-        publicUrl: cfg.publicUrl,
-        trustProxy: cfg.trustProxy,
-      };
       await mkdir(dirname(this.filePath), { recursive: true });
-      await writeFile(this.filePath, JSON.stringify(serialized, null, 2), { mode: 0o600 });
-      this.writeErrors = 0;
+      const tmpPath = `${this.filePath}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
+      try {
+        await writeFile(tmpPath, JSON.stringify(serialized, null, 2), { mode: 0o600 });
+        await rename(tmpPath, this.filePath);
+        this.writeErrors = 0;
+      } catch (err) {
+        // Clean up the temp file if the rename failed so we don't leak files.
+        try { await unlink(tmpPath); } catch { /* temp may not exist */ }
+        throw err;
+      }
     } catch {
       this.writeErrors++;
       // Fall back to in-memory silently

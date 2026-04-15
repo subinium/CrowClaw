@@ -306,19 +306,48 @@ describe('FileConfigStore', () => {
     expect(data.activeToolset).toBe('minimal');
   });
 
-  it('persists gateway config', async () => {
+  it('persists gateway config without leaking or round-tripping tokens', async () => {
     const store = new FileConfigStore(configPath);
     await store.load();
 
-    store.setGatewayConfig('discord', { enabled: true, token: 'test-token' });
+    store.setGatewayConfig('discord', { enabled: true, token: 'test-token', webhookSecret: 'shh' });
 
     await new Promise((r) => setTimeout(r, 50));
 
     const raw = await readFile(configPath, 'utf-8');
     const data = JSON.parse(raw);
-    // Token should be masked in snapshot
     expect(data.gatewayConfigs.discord.enabled).toBe(true);
-    expect(data.gatewayConfigs.discord.token).toBe('***');
+    // Tokens and webhook secrets must never land on disk, because the previous
+    // implementation persisted a '***' placeholder and then reloaded it as the
+    // literal token — breaking every outbound message after a restart.
+    expect(data.gatewayConfigs.discord.token).toBeUndefined();
+    expect(data.gatewayConfigs.discord.webhookSecret).toBeUndefined();
+
+    // Reloaded instance must not treat the redacted placeholder as a real token
+    const store2 = new FileConfigStore(configPath);
+    await store2.load();
+    const reloaded = store2.getGatewayConfig('discord');
+    expect(reloaded?.enabled).toBe(true);
+    expect(reloaded?.token).toBeUndefined();
+    expect(reloaded?.webhookSecret).toBeUndefined();
+  });
+
+  it('strips provider apiKeys before persisting', async () => {
+    const store = new FileConfigStore(configPath);
+    await store.load();
+
+    store.setProviderConfig({
+      primary: { name: 'Primary', provider: 'openai', model: 'gpt-4o', apiKey: 'sk-plain' },
+      fallback: { name: 'Fallback', provider: 'anthropic', model: 'claude-sonnet-4', apiKey: 'sk-ant' },
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    const raw = await readFile(configPath, 'utf-8');
+    const data = JSON.parse(raw);
+    expect(data.providerConfig.primary.provider).toBe('openai');
+    expect(data.providerConfig.primary.apiKey).toBeUndefined();
+    expect(data.providerConfig.fallback.apiKey).toBeUndefined();
   });
 
   it('onChange listeners fire on FileConfigStore mutations', async () => {

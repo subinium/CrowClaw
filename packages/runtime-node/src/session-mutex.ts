@@ -22,10 +22,13 @@ export class SessionMutex {
   }
 
   async acquire(sessionId: string): Promise<() => void> {
-    // Evict oldest entries if at capacity (prevents unbounded memory growth)
+    // Refuse new sessions at capacity. Evicting a live chain would break
+    // serialization — a subsequent acquire for the evicted session would
+    // create a fresh chain that runs concurrently with the previous holder.
+    // Live entries self-clean in their release callback, so hitting the cap
+    // means there really are that many active sessions.
     if (this.chains.size >= this.maxSessions && !this.chains.has(sessionId)) {
-      const oldest = this.chains.keys().next().value;
-      if (oldest !== undefined) this.chains.delete(oldest);
+      throw new Error(`SessionMutex at capacity (${this.maxSessions} active sessions)`);
     }
 
     const existing = this.chains.get(sessionId) ?? Promise.resolve();

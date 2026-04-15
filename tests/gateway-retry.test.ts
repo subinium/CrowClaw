@@ -64,6 +64,36 @@ describe('executeWithRetry', () => {
     expect(result.value).toEqual({ id: 42, name: 'test' });
   });
 
+  it('retries gateway-style {ok:false} results and propagates last error', async () => {
+    let callCount = 0;
+    const result = await executeWithRetry(
+      async () => {
+        callCount++;
+        if (callCount < 3) {
+          return { ok: false, error: `fail ${callCount}` };
+        }
+        return { ok: true, platform: 'telegram' };
+      },
+      { maxAttempts: 3, baseDelayMs: 1 },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.attempts).toBe(3);
+    expect(callCount).toBe(3);
+  });
+
+  it('returns failure when every attempt produces {ok:false}', async () => {
+    const result = await executeWithRetry(
+      async () => ({ ok: false, error: 'telegram API said no' }),
+      { maxAttempts: 2, baseDelayMs: 1 },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.attempts).toBe(2);
+    expect(result.lastError).toBe('telegram API said no');
+    expect(result.value).toEqual({ ok: false, error: 'telegram API said no' });
+  });
+
   it('aborts mid-retry when signal fires during backoff', async () => {
     const controller = new AbortController();
     let callCount = 0;

@@ -290,8 +290,12 @@ export class GatewayRunner {
         resolve();
         return;
       }
-      const timer = setTimeout(resolve, ms);
-      const onAbort = () => {
+      let onAbort: (() => void) | undefined;
+      const timer = setTimeout(() => {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      onAbort = () => {
         clearTimeout(timer);
         resolve();
       };

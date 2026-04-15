@@ -4,7 +4,6 @@
  */
 
 import { connectEventStream } from './sse.js';
-import { getAuthToken } from './api.js';
 
 export interface WsCallbacks {
   onEvent: (event: { type: string; data: Record<string, unknown> }) => void;
@@ -25,9 +24,10 @@ const MAX_FAILURES_BEFORE_FALLBACK = 3;
 
 const buildWsUrl = (): string => {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const base = `${protocol}//${location.host}/ws`;
-  const token = getAuthToken();
-  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  // Same-origin WebSocket carries the HttpOnly auth cookie automatically.
+  // We intentionally do NOT append `?token=...` — query strings leak into
+  // access logs and the Referer header even when the connection is TLS.
+  return `${protocol}//${location.host}/ws`;
 };
 
 export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {

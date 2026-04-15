@@ -3,8 +3,6 @@
  * Ported from vanilla JS sndStream() + handleStreamEvent().
  */
 
-import { getAuthToken } from './api.js';
-
 export interface StreamEvent {
   type: 'text-delta' | 'tool-start' | 'tool-end' | 'iteration-start' | 'error' | 'done';
   content?: string;
@@ -38,18 +36,11 @@ export const streamMessage = (
   callbacks: StreamCallbacks,
 ): AbortController => {
   const controller = new AbortController();
-  const authToken = getAuthToken();
-
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
 
   fetch(`${location.origin}/api/sessions/${sessionId}/stream`, {
     method: 'POST',
-    headers,
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify({ message }),
     signal: controller.signal,
   })
