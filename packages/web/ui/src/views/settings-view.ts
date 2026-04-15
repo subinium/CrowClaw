@@ -110,12 +110,29 @@ interface DiagnosticsInfo {
   lastHeartbeat: string;
 }
 
+interface FeedbackStats {
+  total: number;
+  success: number;
+  failure: number;
+  byTool: Record<string, { ok: number; fail: number }>;
+}
+
+interface FeedbackEntry {
+  timestamp: string;
+  toolName: string;
+  ok: boolean;
+  durationMs?: number;
+  error?: string;
+  sessionId: string;
+}
+
 type SettingsTab =
   | 'agent'
   | 'security'
   | 'usage'
   | 'system'
-  | 'memory';
+  | 'memory'
+  | 'feedback';
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -127,6 +144,7 @@ const TABS: { key: SettingsTab; label: string }[] = [
   { key: 'usage', label: 'Usage' },
   { key: 'system', label: 'System' },
   { key: 'memory', label: 'Memory' },
+  { key: 'feedback', label: 'Feedback' },
 ];
 
 const SCOPES = ['All', 'Session', 'User', 'Workspace'] as const;
@@ -610,6 +628,10 @@ export class SettingsView extends LitElement {
   // Diagnostics
   @state() private diagnostics: DiagnosticsInfo | null = null;
 
+  // Feedback
+  @state() private feedbackStats: FeedbackStats | null = null;
+  @state() private feedbackEntries: FeedbackEntry[] = [];
+
   // Debounce timer for memory search
   private _memorySearchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -653,6 +675,9 @@ export class SettingsView extends LitElement {
         break;
       case 'memory':
         this._loadMemorySessions();
+        break;
+      case 'feedback':
+        this._loadFeedback();
         break;
     }
   }
@@ -798,6 +823,17 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _loadFeedback() {
+    try {
+      const data = await api<{ stats: FeedbackStats; entries: FeedbackEntry[] }>('/api/feedback');
+      this.feedbackStats = data.stats ?? null;
+      this.feedbackEntries = data.entries ?? [];
+    } catch {
+      this.feedbackStats = null;
+      this.feedbackEntries = [];
+    }
+  }
+
   /* ---------------------------------------------------------------- */
   /*  Actions                                                         */
   /* ---------------------------------------------------------------- */
@@ -816,6 +852,7 @@ export class SettingsView extends LitElement {
       const msg =
         error instanceof Error ? error.message : 'Failed to save configuration.';
       this.agentStatus = { msg, ok: false };
+      showToast(msg, 'error');
     } finally {
       this.agentSaving = false;
     }
@@ -944,6 +981,8 @@ export class SettingsView extends LitElement {
         return this._renderSystem();
       case 'memory':
         return this._renderMemory();
+      case 'feedback':
+        return this._renderFeedback();
       default:
         return nothing;
     }
@@ -1683,6 +1722,138 @@ export class SettingsView extends LitElement {
             `
           : html`<div class="status-msg" style="color:var(--text-muted)">
               Select a session to browse its memories.
+            </div>`}
+      </div>
+    `;
+  }
+
+  /* ---- Feedback ---- */
+
+  private _renderFeedback() {
+    const stats = this.feedbackStats;
+    const successRate = stats && stats.total > 0
+      ? ((stats.success / stats.total) * 100).toFixed(1)
+      : '0.0';
+
+    return html`
+      <div class="section-block">
+        <div class="section-header">Feedback Ledger</div>
+
+        ${stats
+          ? html`
+              <!-- Summary cards -->
+              <div class="summary-row">
+                <div class="summary-card">
+                  <div class="label">Total Calls</div>
+                  <div class="value">${stats.total}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Success</div>
+                  <div class="value" style="color:var(--success)">${stats.success}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Failure</div>
+                  <div class="value" style="color:var(--error)">${stats.failure}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Success Rate</div>
+                  <div class="value">${successRate}%</div>
+                </div>
+              </div>
+
+              <!-- Per-tool breakdown -->
+              <div class="sec-h">Per-Tool Breakdown</div>
+              ${Object.keys(stats.byTool).length > 0
+                ? html`
+                    <div class="sub-card" style="overflow-x:auto;margin-bottom:var(--sp-5)">
+                      <table class="data-table">
+                        <thead>
+                          <tr>
+                            <th>Tool</th>
+                            <th>Success</th>
+                            <th>Failure</th>
+                            <th>Success Rate</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${Object.entries(stats.byTool).map(
+                            ([tool, counts]) => {
+                              const total = counts.ok + counts.fail;
+                              const rate = total > 0
+                                ? ((counts.ok / total) * 100).toFixed(1)
+                                : '0.0';
+                              return html`
+                                <tr>
+                                  <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                                    ${tool}
+                                  </td>
+                                  <td style="color:var(--success)">${counts.ok}</td>
+                                  <td style="color:var(--error)">${counts.fail}</td>
+                                  <td>${rate}%</td>
+                                </tr>
+                              `;
+                            },
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  `
+                : html`<div class="status-msg" style="color:var(--text-muted)">
+                    No per-tool data yet.
+                  </div>`}
+            `
+          : html`<div class="status-msg">Loading feedback data...</div>`}
+
+        <!-- Recent entries -->
+        <div class="sec-h">Recent Entries</div>
+        ${this.feedbackEntries.length > 0
+          ? html`
+              <div class="sub-card" style="overflow-x:auto">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Tool</th>
+                      <th>Status</th>
+                      <th>Duration</th>
+                      <th>Session</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${this.feedbackEntries.slice(0, 50).map(
+                      (entry) => html`
+                        <tr>
+                          <td style="white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs)">
+                            ${formatTime(entry.timestamp)}
+                          </td>
+                          <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                            ${entry.toolName}
+                          </td>
+                          <td>
+                            <span class="tag" style="color:${entry.ok ? 'var(--success)' : 'var(--error)'}">
+                              ${entry.ok ? 'OK' : 'FAIL'}
+                            </span>
+                            ${entry.error
+                              ? html`<span style="font-size:var(--text-xs);color:var(--text-muted);margin-left:var(--sp-1)" title=${entry.error}>
+                                  ${entry.error.length > 40 ? `${entry.error.slice(0, 40)}...` : entry.error}
+                                </span>`
+                              : nothing}
+                          </td>
+                          <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                            ${entry.durationMs != null ? `${entry.durationMs}ms` : '--'}
+                          </td>
+                          <td style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
+                            ${entry.sessionId.length > 8 ? `${entry.sessionId.slice(0, 8)}...` : entry.sessionId}
+                          </td>
+                        </tr>
+                      `,
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            `
+          : html`<div class="status-msg" style="color:var(--text-muted)">
+              No feedback entries recorded.
             </div>`}
       </div>
     `;

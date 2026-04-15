@@ -34,6 +34,9 @@ Module._load = function(request, parent, isMain) {
   return origLoad.apply(this, arguments);
 };
 
+// Register ESM loader hook to also mock @cloudflare/* for ESM imports
+register('./mock-cloudflare-loader.mjs', import.meta.url);
+
 // Now import the runtime
 const { createNodeRuntime } = await import('../packages/runtime-node/dist/index.js');
 
@@ -45,9 +48,14 @@ if (process.env.OPENROUTER_API_KEY && !process.env.OPENROUTER_BASE_URL) {
   process.env.OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 }
 
+// Read version from package.json instead of hardcoding
+import { readFile as readFileSync } from 'node:fs/promises';
+const pkg = JSON.parse(await readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
 const port = parseInt(process.env.PORT ?? '3333', 10);
 const runtime = createNodeRuntime({
   workingDirectory: process.cwd(),
+  version: pkg.version,
 });
 
 // Static file serving for /docs/* assets (logo, hero, etc.)
@@ -106,7 +114,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(port, () => {
-  console.log(`CrowClaw v0.3.1 running at http://localhost:${port}`);
+  console.log(`CrowClaw v${pkg.version} running at http://localhost:${port}`);
   console.log(`Dashboard token: ${process.env.CROWCLAW_DASHBOARD_TOKEN ? 'SET' : 'NOT SET (open access)'}`);
   console.log(`Working directory: ${process.cwd()}`);
   console.log('');

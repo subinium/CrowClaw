@@ -70,6 +70,7 @@ export interface ProviderSlot {
 export interface ProviderConfig {
   primary: ProviderSlot;
   fallback?: ProviderSlot;
+  fast?: ProviderSlot;         // for simple queries (complexity router)
   vision?: ProviderSlot;       // for image analysis
   compression?: ProviderSlot;  // for context compression (cheap model)
   embedding?: ProviderSlot;    // for memory embeddings
