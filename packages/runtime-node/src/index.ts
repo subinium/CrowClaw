@@ -1,4 +1,4 @@
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
@@ -1360,6 +1360,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       memories.push(feedbackDigest);
     }
 
+    // Complexity-based model routing: use fast provider slot for simple queries
+    const providerCfg = configStore.getProviderConfig();
+    if (providerCfg?.fast && !overrides?.model) {
+      const complexity = scoreComplexity(input.userMessage, buildConfiguredToolRegistry(overrides).list().length);
+      const selectedModel = selectModelForComplexity(complexity, providerCfg.primary.model, providerCfg.fast.model);
+      if (selectedModel !== providerCfg.primary.model) {
+        overrides = { ...overrides, model: selectedModel };
+      }
+    }
+
     // Timestamp the start of this turn for accurate new-message detection
     const turnStartedAt = new Date().toISOString();
 
@@ -1962,7 +1972,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/health') {
-        return Response.json({ ok: true, service: 'crowclaw', runtime: 'node' });
+        return Response.json({ ok: true, service: 'crowclaw', runtime: 'node', version });
       }
 
       // Public discovery endpoint (no auth required)

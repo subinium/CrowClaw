@@ -1388,6 +1388,11 @@ export class ChatView extends LitElement {
         this._applyHighlighting();
       },
       onError: (error) => {
+        if (error.includes('falling back')) {
+          // Informational: stream continues with fallback provider
+          this.messages = [...this.messages, { role: 'system', content: error, createdAt: new Date().toISOString() }];
+          return;
+        }
         this.thinking = false;
         this.streaming = false;
         this.aborting = false;
