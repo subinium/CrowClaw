@@ -5,6 +5,26 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.3.6] — 2026-04-16 — Security, sync, and retry audit fixes
+
+### Security (CRITICAL / HIGH)
+- **Fail-close when bound to non-localhost without a dashboard token.** `runtime-node` previously only gated routes tagged as "dangerous". `/api/events`, `/api/sessions/:id/message`, `/api/mcp/call`, and `/ws` were left open, so an instance bound to `0.0.0.0` without `CROWCLAW_DASHBOARD_TOKEN` leaked live session events, accepted prompts, and executed tools. Every protected surface now returns 500 until a token is set; webhook routes keep working because they carry their own per-platform secret.
+- **`POST /api/providers/config` no longer echoes stored apiKeys.** The previous handler merged the inbound payload with stored secrets and then responded with the raw merged config, leaking every persisted provider key — including slots the caller never touched. The POST response now uses the same `***` redaction as the GET handler.
+- **Stop persisting provider apiKeys and gateway tokens to disk.** `FileConfigStore` wrote `apiKey` values in plaintext into `~/.crowclaw/runtime-config.json` despite a comment saying otherwise, and wrote `token: '***'` for gateway configs — which then reloaded as the literal string `'***'`, silently corrupting Telegram/Slack/Discord delivery on every restart. Secrets are now stripped before serialization; users provide them via env vars or the dashboard after a restart.
+- **Dashboard auth no longer stores the raw token on the client.** `packages/web/ui/src/lib/{api,sse,ws}.ts` no longer keeps the token in `sessionStorage`, no longer attaches it as `Authorization: Bearer`, and no longer appends `?token=...` to the `/ws` URL (which leaked into access logs and Referer headers). Auth rides the existing HttpOnly cookie over same-origin credentials; the `/ws` upgrade handler now accepts that cookie and a new `POST /api/auth/logout` lets sign-out actually clear it. Server still accepts `Authorization: Bearer` from non-browser clients.
+
+### Reliability (HIGH / MEDIUM)
+- **Gateway retry now treats `{ok: false}` as a retryable failure.** `sendTelegramMessage` and friends report API errors as `{ok: false, error}` instead of throwing, so `executeWithRetry` used to return success on the very first failure and `GatewayRunner` would silently drop replies. The retry helper now detects the gateway envelope, retries with exponential backoff, and exposes the last error/value through `RetryResult`.
+- **Config writes are serialized and atomic.** `FileConfigStore.persistToDisk()` was fire-and-forget (`void ...`), so back-to-back mutators raced on a full-file rewrite. Writes now chain through a shared promise queue and land via temp file + `rename()`, matching the snapshot of the state observed when the caller invoked the mutator.
+- **`SessionMutex` refuses to evict a live chain.** At `maxSessions` capacity the old code deleted the oldest entry even if it was currently locked or queued, which let a subsequent `acquire()` on the evicted session create a fresh chain and run concurrently with the original holder. New behaviour: throw when adding a brand-new session would exceed the cap (existing sessions still queue).
+- **`GatewayRunner.sleep()` cleans up its abort listener on timeout.** Long pollers no longer accumulate one `abort` listener per poll cycle.
+
+### Tests
+- `tests/provider-factory.test.ts`: gateway token / webhook secret / provider apiKey must never land on disk, and reloaded stores must not inherit the `***` placeholder.
+- `tests/session-mutex.test.ts`: regression test for the overflow eviction bug.
+- `tests/gateway-retry.test.ts`: `{ok:false}` results now drive retries and propagate the last error.
+- Test count 2157 → 2161.
+
 ## [0.3.5] — 2026-04-16 — Dashboard contract drift fix + senior-pass cleanup
 
 ### Fixed
