@@ -85,4 +85,28 @@ describe('SessionMutex', () => {
     r2();
     expect(mutex.activeCount).toBe(0);
   });
+
+  it('throws when capacity is reached instead of silently evicting a live chain', async () => {
+    const mutex = new SessionMutex({ maxSessions: 2 });
+
+    // Fill to capacity with two live sessions
+    const r1 = await mutex.acquire('s1');
+    const r2 = await mutex.acquire('s2');
+    expect(mutex.activeCount).toBe(2);
+
+    // A third distinct session must NOT evict an active chain — old behaviour
+    // removed 's1' from the map, letting a subsequent 's1' acquire skip the
+    // queue and run concurrently with the existing holder.
+    await expect(mutex.acquire('s3')).rejects.toThrow(/capacity/);
+
+    // Re-entering an existing session is still allowed (it chains behind r1)
+    const queued = mutex.acquire('s1');
+
+    r1();
+    r2();
+
+    const r1b = await queued;
+    r1b();
+    expect(mutex.activeCount).toBe(0);
+  });
 });

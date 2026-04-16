@@ -1,28 +1,30 @@
 /**
  * API client for CrowClaw dashboard.
- * Ported from vanilla JS `ap()` function.
+ *
+ * Authentication is handled entirely by the server-issued `crowclaw_auth`
+ * HttpOnly cookie. The raw dashboard token is never stored in the browser
+ * (sessionStorage / localStorage) or sent on every request, because:
+ *   - HttpOnly cookies survive XSS that reaches JS-accessible storage
+ *   - Tokens in Authorization headers or query strings leak into logs,
+ *     proxies, and Referer headers
  */
 
-const TOKEN_KEY = 'cc_auth_token';
+export const getAuthToken = (): null => null;
 
-const storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null;
-
-let authToken: string | null = storage?.getItem(TOKEN_KEY) ?? null;
-
-export const setAuthToken = (token: string | null) => {
-  authToken = token;
-  if (token) {
-    storage?.setItem(TOKEN_KEY, token);
-  } else {
-    storage?.removeItem(TOKEN_KEY);
-  }
+export const setAuthToken = (_token: string | null): void => {
+  // Intentionally a no-op. Server owns auth state via HttpOnly cookie.
 };
 
-export const getAuthToken = () => authToken;
-
-export const clearAuthToken = () => {
-  authToken = null;
-  storage?.removeItem(TOKEN_KEY);
+/**
+ * Sign the user out by asking the server to expire the auth cookie.
+ * Failures are swallowed because the UI state transition must continue
+ * regardless of the network response.
+ */
+export const clearAuthToken = (): void => {
+  void fetch(`${location.origin}/api/auth/logout`, {
+    method: 'POST',
+    credentials: 'same-origin',
+  }).catch(() => { /* best-effort logout */ });
 };
 
 export interface ApiOptions extends RequestInit {
@@ -47,10 +49,6 @@ export const api = async <T = unknown>(path: string, options?: ApiOptions): Prom
     'content-type': 'application/json',
     ...(fetchOpts.headers as Record<string, string>),
   };
-
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
 
   const response = await fetch(`${location.origin}${path}`, {
     ...fetchOpts,
@@ -84,7 +82,7 @@ export const api = async <T = unknown>(path: string, options?: ApiOptions): Prom
 };
 
 /**
- * Check if user is authenticated via cookie or token.
+ * Check if user is authenticated via cookie.
  */
 export const checkAuth = async (): Promise<boolean> => {
   try {
@@ -96,7 +94,8 @@ export const checkAuth = async (): Promise<boolean> => {
 };
 
 /**
- * Verify token and obtain auth.
+ * Verify token and obtain auth. On success the server issues an HttpOnly
+ * cookie and we throw the raw token away immediately.
  */
 export const verifyToken = async (token: string): Promise<boolean> => {
   try {
@@ -104,11 +103,7 @@ export const verifyToken = async (token: string): Promise<boolean> => {
       method: 'POST',
       body: JSON.stringify({ token }),
     });
-    if (data.ok) {
-      setAuthToken(token);
-      return true;
-    }
-    return false;
+    return data.ok === true;
   } catch {
     return false;
   }
