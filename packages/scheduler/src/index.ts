@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 export {
@@ -678,9 +678,18 @@ interface FileStoreData {
   lastSavedAt: string;
 }
 
+/** Cap run-history per job so `scheduler-jobs.json` doesn't grow unbounded. */
+const RUN_HISTORY_CAP = 100;
+
 export class FileSchedulerStore implements SchedulerStore {
   private jobs: Map<string, CronJobDefinition> | null = null;
   private runHistoryMap: Map<string, JobRunRecord[]> | null = null;
+  /**
+   * Serialize persist() writes so concurrent mutators (saveJob + pauseJob + recordRun)
+   * don't race on the full-file rewrite. Previously fire-and-forget `await this.persist()`
+   * inside separate handlers could interleave `writeFile` calls and corrupt the file.
+   */
+  private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
@@ -740,6 +749,10 @@ export class FileSchedulerStore implements SchedulerStore {
     await this.ensureLoaded();
     const records = this.runHistoryMap!.get(record.jobId) ?? [];
     records.push(record);
+    // Trim to prevent unbounded growth on long-running servers.
+    if (records.length > RUN_HISTORY_CAP) {
+      records.splice(0, records.length - RUN_HISTORY_CAP);
+    }
     this.runHistoryMap!.set(record.jobId, records);
     await this.persist();
   }
@@ -772,18 +785,26 @@ export class FileSchedulerStore implements SchedulerStore {
   }
 
   private async persist(): Promise<void> {
+    // Snapshot at the moment the mutator called us; enqueue the write.
+    // This matches the pattern added to `FileConfigStore` in v0.3.6 — without it,
+    // two rapid `saveJob` calls could both fire-and-forget `writeFile`, leaving
+    // the file truncated or corrupted.
     const history: Record<string, JobRunRecord[]> = {};
     for (const [jobId, records] of this.runHistoryMap!) {
       history[jobId] = records;
     }
-
     const data: FileStoreData = {
       jobs: [...this.jobs!.values()],
       runHistory: history,
       lastSavedAt: new Date().toISOString(),
     };
-
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(data, null, 2), 'utf-8');
+    const body = JSON.stringify(data, null, 2);
+    const tmpPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
+    this.persistQueue = this.persistQueue.then(async () => {
+      await mkdir(dirname(this.filePath), { recursive: true });
+      await writeFile(tmpPath, body, 'utf-8');
+      await rename(tmpPath, this.filePath);
+    });
+    return this.persistQueue;
   }
 }

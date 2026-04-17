@@ -1228,13 +1228,15 @@ export class AgentSessionDurableObject {
       if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
       const body = (await request.json()) as { label?: string; trigger?: string };
 
-      // Extract tool results from session messages
+      // Extract tool results from session messages. Read the authoritative
+      // `metadata.ok` stored by core's toolMessage() — prior regex scrape
+      // falsely flagged outputs containing "error" as failed.
       const toolResults = session.messages
         .filter((m): m is typeof m & { role: 'tool' } => m.role === 'tool')
         .map((m) => ({
           toolName: m.name ?? 'unknown',
           runtime: 'worker' as const,
-          ok: !m.content?.match(/error|fail/i),
+          ok: (m.metadata as { ok?: boolean } | undefined)?.ok ?? true,
           output: m.content,
         }));
 

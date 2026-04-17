@@ -309,9 +309,11 @@ describe('HIGH: Gateway deny-by-default', () => {
     setEnvToken(undefined);
   });
 
-  it('generic webhook returns 403 when no gateway policy configured', async () => {
+  it('generic webhook returns 403 when no gateway secret configured', async () => {
     const runtime = createNodeRuntime({ hostname: '127.0.0.1' });
 
+    // v0.4.0: the HMAC-secret gate runs before the access-policy gate, so the
+    // first deny-by-default layer users hit is now "secret not configured".
     const response = await runtime.fetch(
       makeRequest('/api/gateway/webhook', {
         method: 'POST',
@@ -321,7 +323,7 @@ describe('HIGH: Gateway deny-by-default', () => {
 
     expect(response.status).toBe(403);
     const data = await response.json() as { error: string };
-    expect(data.error).toContain('No access policy configured');
+    expect(data.error).toContain('secret not configured');
   });
 });
 

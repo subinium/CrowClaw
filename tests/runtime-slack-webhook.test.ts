@@ -26,7 +26,7 @@ describe('slack webhook runtime integration', () => {
       type: 'event_callback',
       event: { channel: 'C-1', user: 'U-1', text: 'deploy slack' }
     });
-    const timestamp = '1700000000';
+    const timestamp = Math.floor(Date.now() / 1000).toString();
     const signature = await buildSlackSignature(signingSecret, timestamp, body);
 
     const response = await runtime.fetch(new Request('http://localhost/webhooks/slack', {
@@ -78,7 +78,7 @@ describe('slack webhook runtime integration', () => {
     const signingSecret = 'slack-test-secret';
     const runtime = createNodeRuntime({ configStorePath: null, slackSigningSecret: signingSecret });
     const body = JSON.stringify({ type: 'url_verification', challenge: 'challenge-123' });
-    const timestamp = '1700000000';
+    const timestamp = Math.floor(Date.now() / 1000).toString();
     const signature = await buildSlackSignature(signingSecret, timestamp, body);
 
     const response = await runtime.fetch(new Request('http://localhost/webhooks/slack', {
@@ -101,7 +101,7 @@ describe('slack webhook runtime integration', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-slack-request-timestamp': '1700000000',
+        'x-slack-request-timestamp': Math.floor(Date.now() / 1000).toString(),
         'x-slack-signature': 'v0=deadbeef'
       },
       body
@@ -122,13 +122,14 @@ describe('slack webhook runtime integration', () => {
       type: 'event_callback',
       event: { channel: 'C-4', user: 'U-4', text: 'deploy signed slack ok' }
     });
-    const signature = await buildSlackSignature('correct-secret', '1700000001', body);
+    const ts1 = Math.floor(Date.now() / 1000).toString();
+    const signature = await buildSlackSignature('correct-secret', ts1, body);
 
     const response = await runtime.fetch(new Request('http://localhost/webhooks/slack', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-slack-request-timestamp': '1700000001',
+        'x-slack-request-timestamp': ts1,
         'x-slack-signature': signature
       },
       body
@@ -164,7 +165,7 @@ describe('slack webhook runtime integration', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-slack-request-timestamp': '1700000002',
+        'x-slack-request-timestamp': Math.floor(Date.now() / 1000).toString(),
         'x-slack-signature': 'v0=bad'
       },
       body
@@ -194,13 +195,14 @@ describe('slack webhook runtime integration', () => {
       type: 'event_callback',
       event: { channel: 'C-6', user: 'U-6', text: 'cf signed slack ok' }
     });
-    const signature = await buildSlackSignature('correct-secret', '1700000003', body);
+    const ts3 = Math.floor(Date.now() / 1000).toString();
+    const signature = await buildSlackSignature('correct-secret', ts3, body);
 
     const response = await runtimeCloudflare.fetch(new Request('https://example.com/webhooks/slack', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-slack-request-timestamp': '1700000003',
+        'x-slack-request-timestamp': ts3,
         'x-slack-signature': signature
       },
       body

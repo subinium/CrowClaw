@@ -42,6 +42,7 @@ export class WebSocketManager {
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private unsubscribeEventBus: (() => void) | null = null;
   private abortHandler: AbortHandler | null = null;
+  private statsProvider: (() => { sessions: number; subscribers: number }) | null = null;
 
   get connectionCount(): number {
     return this.connections.size;
@@ -51,6 +52,13 @@ export class WebSocketManager {
     this.abortHandler = handler;
   }
 
+  /** Provide live stats for the heartbeat payload. Dashboard reads these
+   *  to render "N clients connected" badges. Previously WS only sent `ping`
+   *  while SSE sent `heartbeat` — UI count was stuck at 0 on WS deployments. */
+  setStatsProvider(provider: () => { sessions: number; subscribers: number }): void {
+    this.statsProvider = provider;
+  }
+
   start(eventBus: EventBus): void {
     this.unsubscribeEventBus = eventBus.subscribe((event: RuntimeEvent) => {
       this.broadcast(event.type, { ...event.data, timestamp: event.timestamp });
@@ -58,6 +66,7 @@ export class WebSocketManager {
 
     this.heartbeatInterval = setInterval(() => {
       const now = new Date().toISOString();
+      const stats = this.statsProvider?.() ?? { sessions: 0, subscribers: this.connections.size };
       const toRemove: WebSocket[] = [];
       for (const [ws, conn] of this.connections) {
         if (!conn.alive) {
@@ -66,6 +75,7 @@ export class WebSocketManager {
         }
         conn.alive = false;
         this.sendTo(ws, { type: 'ping', timestamp: now });
+        this.sendTo(ws, { type: 'heartbeat', timestamp: now, sessions: stats.sessions, subscribers: stats.subscribers });
       }
       for (const ws of toRemove) {
         this.removeConnection(ws);

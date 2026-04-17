@@ -12,4 +12,13 @@ export interface RuntimeEnv {
   OPENAI_MODEL?: string;
   MCP_BASE_URL?: string;
   SLACK_SIGNING_SECRET?: string;
+  /**
+   * When set, every /api/* and /ws request must present either
+   *   `Authorization: Bearer <CROWCLAW_DASHBOARD_TOKEN>` OR
+   *   a cookie `crowclaw_auth=<HMAC-derived>` obtained from /api/auth/verify.
+   * When unset, the deployment is treated as public and rejects every /api/*
+   * route (fail-closed). Only /health and /webhooks/* remain accessible.
+   */
+  CROWCLAW_DASHBOARD_TOKEN?: string;
+  GENERIC_WEBHOOK_SECRET?: string;
 }

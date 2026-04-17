@@ -47,7 +47,7 @@ interface SecurityStatus {
 }
 
 interface SecurityEvent {
-  time: string;
+  timestamp: string;
   type: string;
   severity: 'info' | 'warning' | 'critical';
   detail: string;
@@ -797,7 +797,9 @@ export class SettingsView extends LitElement {
     }
     try {
       const params = new URLSearchParams();
-      if (this.memoryScope !== 'All') params.set('scope', this.memoryScope);
+      // Backend expects lowercase scope names (session/user/workspace); the
+      // UI displays capitalized labels. Normalize on the wire.
+      if (this.memoryScope !== 'All') params.set('scope', this.memoryScope.toLowerCase());
       const q = params.toString();
       const data = await api<{ records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }> }>(
         `/api/sessions/${this.memorySessionId}/memories${q ? `?${q}` : ''}`,
@@ -1320,7 +1322,7 @@ export class SettingsView extends LitElement {
                       (ev) => html`
                         <tr>
                           <td style="white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs)">
-                            ${formatTime(ev.time)}
+                            ${formatTime(ev.timestamp)}
                           </td>
                           <td><span class="tag">${ev.type}</span></td>
                           <td>
