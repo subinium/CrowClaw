@@ -10,6 +10,11 @@ export interface EmbeddingMemoryStoreOptions {
   embeddingProvider: EmbeddingProvider;
   similarityThreshold?: number;
   deduplicationThreshold?: number;
+  /** Cap total vectors held in the in-memory index. FIFO eviction beyond the
+   *  cap (oldest insertion order). Without a cap, the linear-scan `search()`
+   *  crosses 100ms around 10k entries and grows without bound. Defaults to
+   *  10_000 — pair with a real ANN backend for anything higher. */
+  maxVectors?: number;
 }
 
 /** Cosine similarity between two vectors. Returns 0 if either vector has zero magnitude. */
@@ -39,9 +44,24 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 /** Simple in-memory embedding index for vector similarity search. */
 export class EmbeddingIndex {
   private readonly vectors = new Map<string, number[]>();
+  private readonly maxVectors: number | undefined;
 
-  add(id: string, vector: number[]): void {
+  constructor(options?: { maxVectors?: number }) {
+    this.maxVectors = options?.maxVectors;
+  }
+
+  /** Returns the id of the evicted record, if eviction fired. */
+  add(id: string, vector: number[]): string | null {
     this.vectors.set(id, vector);
+    // FIFO eviction once capped — Map preserves insertion order.
+    if (this.maxVectors !== undefined && this.vectors.size > this.maxVectors) {
+      const oldest = this.vectors.keys().next().value;
+      if (oldest !== undefined && oldest !== id) {
+        this.vectors.delete(oldest);
+        return oldest;
+      }
+    }
+    return null;
   }
 
   remove(id: string): void {
@@ -88,15 +108,18 @@ export class EmbeddingMemoryStore implements MemoryStore {
   private readonly embeddingProvider: EmbeddingProvider;
   private readonly similarityThreshold: number;
   private readonly deduplicationThreshold: number;
-  private readonly index = new EmbeddingIndex();
+  private readonly index: EmbeddingIndex;
   /** Maps record id -> record for dedup lookups. */
   private readonly recordCache = new Map<string, MemoryRecord>();
+  private readonly maxVectors: number;
 
   constructor(options: EmbeddingMemoryStoreOptions) {
     this.baseStore = options.baseStore;
     this.embeddingProvider = options.embeddingProvider;
     this.similarityThreshold = options.similarityThreshold ?? 0.7;
     this.deduplicationThreshold = options.deduplicationThreshold ?? 0.95;
+    this.maxVectors = options.maxVectors ?? 10_000;
+    this.index = new EmbeddingIndex({ maxVectors: this.maxVectors });
   }
 
   async write(record: MemoryRecord): Promise<void> {
@@ -127,8 +150,10 @@ export class EmbeddingMemoryStore implements MemoryStore {
       }
     }
 
-    // No duplicate — insert as new
-    this.index.add(record.id, embedding);
+    // No duplicate — insert as new. Prune recordCache alongside the index
+    // so the two stay the same size (otherwise recordCache leaks past maxVectors).
+    const evicted = this.index.add(record.id, embedding);
+    if (evicted) this.recordCache.delete(evicted);
     this.recordCache.set(record.id, record);
     await this.baseStore.write(record);
   }

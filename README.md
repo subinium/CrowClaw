@@ -2,7 +2,7 @@
   <img src="./docs/hero.png" alt="CrowClaw" width="720" />
   <h1 align="center">CrowClaw</h1>
   <p align="center">
-    <strong>A self-improving TypeScript agent framework that learns from every conversation.</strong>
+    <strong>TypeScript agent framework that learns from its own conversations.</strong>
   </p>
   <p align="center">
     <a href="https://www.npmjs.com/package/crowclaw"><img src="https://img.shields.io/npm/v/crowclaw?color=cb3837" alt="npm" /></a>
@@ -10,92 +10,85 @@
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
     <img src="https://img.shields.io/badge/tests-2161%20passed-brightgreen.svg" alt="Tests" />
+    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.4.3-blue.svg" alt="Changelog" /></a>
   </p>
 </p>
 
 ---
 
-> **Beta.** Core systems are functional and tested (2161 tests). APIs may change before 1.0 -- pin to minor versions for stability.
+> **Beta, single-maintainer, moving fast.** Core systems are tested (2161 tests) and the security/reliability surface has been through a five-agent cross-audit (see v0.4.x in [CHANGELOG.md](./CHANGELOG.md)). APIs may break between minor versions -- pin exactly.
 
-## Why CrowClaw
+## What it is
 
-Most agent frameworks give you a tool loop and stop there. CrowClaw closes the loop: your agent extracts reusable skills from conversations, publishes them, and injects them into future runs -- automatically. The more it works, the better it gets.
+A TypeScript agent loop with four things bolted together that most frameworks make you wire yourself:
 
-We [studied 30+ agent frameworks](https://github.com/subinium/awesome-agent-frameworks), identified what each one does best, and built one that combines them:
+1. **A real multi-turn tool loop** (50+ tools, retries, fallbacks, approval gates, checkpoint/rollback).
+2. **A learning loop** -- the agent extracts skills from completed conversations, publishes them, injects them into future runs.
+3. **Inbound webhook normalizers for 8 messaging platforms** (Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS) and outbound senders for 6.
+4. **A live dashboard + CLI REPL + scheduled execution** sitting on top of the same runtime, on Node or Cloudflare Workers.
 
-| What you need | CrowClaw | Typical frameworks |
-|---|---|---|
-| **Learning from conversations** | Auto-extracts skills, publishes to registry, injects into future prompts | Manual prompt engineering |
-| **Multi-platform delivery** | 8 platforms (Telegram, Discord, Slack, WhatsApp, Signal, Email, Matrix, SMS) with webhook normalization, rate limiting, retry | Usually 1-2, or BYO |
-| **Operator surface** | Web dashboard, CLI REPL, scheduled execution, batch processing, checkpoint/rollback | API-only or minimal UI |
-| **Production hardening** | SSRF protection, CSP nonce, prompt injection scanning, auth rate limiting, session mutex, graceful shutdown | Security as afterthought |
-| **Runs anywhere** | Node.js, Cloudflare Workers, CLI, Docker | Usually single runtime |
+It started as a TypeScript port of [Hermes Agent](https://github.com/NousResearch/hermes-agent), then absorbed patterns from [OpenClaw](https://docs.openclaw.ai), [NeMo Agent Toolkit](https://github.com/NVIDIA/NeMo-Agent-Toolkit), and a [survey of ~30 other frameworks](https://github.com/subinium/awesome-agent-frameworks). Credit, influences, and the design-heritage table are at the bottom.
 
-<details>
-<summary><strong>How CrowClaw compares to specific frameworks</strong></summary>
+### Is this for you?
 
-- **vs LangChain/LlamaIndex**: CrowClaw is opinionated where they are flexible. You get a working agent with 50+ tools, a dashboard, and a learning loop out of the box -- not a toolkit to assemble one.
-- **vs Vercel AI SDK**: Vercel focuses on frontend AI UX. CrowClaw focuses on backend agent autonomy -- scheduled tasks, multi-turn tool loops, cross-platform delivery.
-- **vs CrewAI/AutoGen**: Multi-agent orchestration frameworks. CrowClaw is a single-agent framework with delegation, designed for depth (learning, checkpoints, security) over breadth (agent graphs).
-- **vs OpenClaw/Hermes Agent**: CrowClaw is a direct evolution. TypeScript-native, runs on Cloudflare Workers, adds security hardening, batch processing, and checkpoint/rollback that the originals don't have.
-
-</details>
-
-## The Story
-
-CrowClaw started as an effort to bring [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Python) to Cloudflare Workers. Porting it to TypeScript opened up a chance to rethink the architecture -- so we [studied dozens of agent frameworks](https://github.com/subinium/awesome-agent-frameworks), distilled the best patterns from each, and built a framework that actually closes the loop: your agent gets better every time it completes a task.
-
-It runs a multi-turn tool loop, learns skills from conversations, schedules autonomous tasks, and delivers results across 8 messaging platforms.
+- **Yes, if** you want a single opinionated runtime that already speaks HTTP, MCP, Slack, and cron; and you want the agent to get measurably better at repeated tasks without you hand-writing prompts.
+- **Probably not, if** you want a lightweight SDK to drop into an existing Next.js app -- [Vercel AI SDK](https://sdk.vercel.ai) is closer. Or if you need multi-agent graphs -- [CrewAI](https://www.crewai.com) or [AutoGen](https://microsoft.github.io/autogen/) are closer.
 
 ## Quickstart
 
-**Requirements**: Node.js >= 22
+**Requirements**: Node.js >= 22.
 
 ```bash
 git clone https://github.com/subinium/crowclaw.git
 cd crowclaw
-npm install
-npm run build
+npm install && npm run build
 
-# Configure an LLM provider
-cp .env.example .env
-# Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env
+# Provider (at least one)
+export OPENAI_API_KEY=sk-...
+# or: export ANTHROPIC_API_KEY=sk-ant-...
 
-# Start the interactive CLI
+# Interactive REPL (talks to the same runtime the dashboard uses)
 node packages/cli/dist/index.js
 ```
 
 ```
-crowclaw> hello!
-[cli-1] CrowClaw received: hello!
-
-crowclaw> /tools
-crowclaw> /help
+crowclaw> /doctor       # show configured provider, tool count, security state
+crowclaw> /tools        # list registered tools
+crowclaw> what day is it
+CrowClaw: Today is 2026-04-17.
+crowclaw> fetch https://news.ycombinator.com and summarize the top 3 stories
+...
 ```
 
-### API Server
+### HTTP server + dashboard
 
 ```bash
-npm run dev   # starts on :8787
+# Start a local HTTP server + the Lit dashboard on :3117
+node packages/cli/dist/index.js serve
 
-curl -X POST http://localhost:8787/api/sessions/demo/message \
+# Dashboard: http://localhost:3117/
+# API example:
+curl -X POST http://localhost:3117/api/sessions/demo/message \
   -H 'content-type: application/json' \
   -d '{"userMessage": "What can you do?"}'
-
-# Response:
-# { "ok": true, "response": "I can help with...", "sessionId": "demo" }
 ```
 
-### Docker
+Bind to a non-localhost interface and the runtime refuses to serve `/api/*` until `CROWCLAW_DASHBOARD_TOKEN` is set — the dashboard uses an HttpOnly cookie derived from that token. See [Security](#security) below.
 
-```bash
-docker build -t crowclaw .
-docker run -p 8787:8787 -e OPENAI_API_KEY=sk-... crowclaw
-```
+### What you can actually build
 
-## End-to-End Example
+Three recipes that exist today, as much to prove the agent-loop surface as anything:
 
-A complete agent that uses tools, matches skills, and responds:
+1. **A Slack bot that learns from its replies.**
+   Configure a Slack bot (signing secret in `.env`), point its Events URL at `https://<your-host>/webhooks/slack`, and every DM becomes a `SessionState` with its own scheduler context. After a task finishes, `LearningPipeline.autoCapture` extracts a skill draft from the conversation — approve it from the dashboard, and the next relevant DM gets that skill auto-injected.
+2. **A daily briefing cron.** `createScheduledAgentJob({ schedule: '0 9 * * *', task: 'Summarize yesterday\\'s GitHub issues in #INGEST', deliverTo: { platform: 'telegram', config: { botToken, chatId } } })` and the scheduler runs it against your chosen provider + tool registry at 09:00. Output goes out the same gateway as your inbound Slack.
+3. **A replayable debug session.** Run an agent task, checkpoint-per-iteration is on by default; if the 7th step blew up, `restoreFromCheckpoint` grabs step 6's state + `toolResults` + `loopState`, tweak the config, and `createReplaySession` starts a fresh session from that point — useful for prompt-engineering regressions.
+
+None of these require a separate task queue, webhook normalizer, or scheduler — they're the same runtime.
+
+## Minimal programmatic example
+
+If you're embedding the runtime in your own Node process rather than using the CLI:
 
 ```typescript
 import { AgentLoop } from '@crowclaw/core'
@@ -611,7 +604,7 @@ Before opening a PR:
 
 ## Design Heritage
 
-CrowClaw is built on patterns distilled from studying dozens of agent frameworks. See [awesome-agent-frameworks](https://github.com/subinium/awesome-agent-frameworks) for the full survey. Below are the primary influences and what we adopted from each.
+The interesting patterns came from other people's projects. Below is who-from-where. See [awesome-agent-frameworks](https://github.com/subinium/awesome-agent-frameworks) for the full survey.
 
 ### Hermes Agent (Python, NousResearch)
 

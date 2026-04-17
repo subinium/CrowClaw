@@ -5,6 +5,30 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.4.3] — 2026-04-17 — Quickstart unblocked, CIDR proxies, capacity caps, README honest pass
+
+Last of the v0.4.x polish pass. The audit backlog has been drained of everything that moves the needle at this project's current user count (one). Future hardening queued in HISTORY for when demand actually lands.
+
+### Reliability
+- **`node packages/cli/dist/index.js` boots on plain Node.** The v0.4.0 audit flagged this as an `EXAMPLE_BROKEN`: `@cloudflare/sandbox` transitively imports `@cloudflare/containers` whose ESM index violates Node's strict-specifier resolution (`import './lib/container'` without `.js`). Loading it at `packages/sandbox-executor/src/index.ts:2` failed the whole CLI boot. Switched to `import type` + a top-level `try { await import('@cloudflare/sandbox') } catch {}` that caches `getSandbox` if it loaded, otherwise disables the Cloudflare sandbox path gracefully. Node users finally get a working `doctor`, `serve`, and interactive REPL.
+
+### Security
+- **CIDR-aware trusted-proxy allowlist.** `CROWCLAW_TRUSTED_PROXIES=10.0.0.0/24,fe80::/10,1.2.3.4` is now parsed into real IPv4 + IPv6 CIDR matchers (the v0.4.2 release shipped exact-IP match only). IPv4-mapped IPv6 (`::ffff:10.0.0.1`) is unwrapped to the IPv4 form, and the IPv6 zone-id suffix (`%eth0`) is stripped, so a CIDR like `10.0.0.0/24` matches clients that reach a dual-stack socket as either form.
+- **Dashboard nonce injection replaced with a tag-aware walker.** The regex `/<script(?![^>]*\bsrc\b)/g` had documented edge cases (`<scriptsrc=...>`, attributes straddling newlines, future contributors adding `<script data-foo>`). `injectScriptNonce()` now walks token-by-token, confirms the character after `<script` is a real boundary, and honors a real `src="..."` attribute (doesn't get confused by `srcset`).
+
+### Capacity
+- **`InMemoryCheckpointStore(maxCheckpoints?: number)` FIFO-evicts beyond the cap.** Default wiring in `createNodeRuntime` / `AgentSessionDurableObject` sets `maxCheckpoints: 1000`. Without this, a long-running server with `autoCheckpoint` on accumulates one checkpoint per iteration forever.
+- **`EmbeddingMemoryStore(maxVectors?: number)` default cap 10,000.** `EmbeddingIndex.add` returns the evicted id so the outer `recordCache` stays the same size as the index — previously the two drifted because only the index was bounded.
+
+### README honest pass
+- Hero rewritten to say what the framework actually is, not what it beats. Dropped the "Most agent frameworks…" framing and the comparison table (moved comparisons into an "Is this for you?" paragraph that names specific competitors and who to choose instead).
+- Quickstart fixed: `node packages/cli/dist/index.js` is no longer broken at startup; example queries updated to something you can actually run.
+- Added three concrete recipes ("Slack bot that learns from replies", "daily briefing cron", "replayable debug session") that correspond to features already shipping — you can build them today.
+- Status line is blunt: "Beta, single-maintainer, moving fast" instead of the prior breezy version.
+
+### Tests
+- 2161/2161 passing.
+
 ## [0.4.2] — 2026-04-17 — Cloudflare drift + trusted-proxy + memory / checkpoint perf
 
 Third pass on the v0.4.0 deferred backlog. Closes the three easy-to-see CF contract gaps from the contract audit, adds a real trusted-proxy allowlist for the auth throttle, and cuts the two biggest hot-path allocations (`InMemoryMemoryStore.write` and redundant checkpoint message clones).

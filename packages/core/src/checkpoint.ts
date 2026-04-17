@@ -38,11 +38,30 @@ export interface CheckpointStore {
   deleteBySession(sessionId: string): Promise<number>;
 }
 
+export interface InMemoryCheckpointStoreOptions {
+  /** Cap total checkpoints held in memory. FIFO eviction by insertion order
+   *  keeps the newest N. Unbounded by default to preserve prior behavior,
+   *  but production callers should always set this — a long-running server
+   *  with autoCheckpoint on accumulates one checkpoint per iteration forever. */
+  maxCheckpoints?: number;
+}
+
 export class InMemoryCheckpointStore implements CheckpointStore {
   private readonly store = new Map<string, SessionCheckpoint>();
+  private readonly maxCheckpoints: number | undefined;
+
+  constructor(options?: InMemoryCheckpointStoreOptions) {
+    this.maxCheckpoints = options?.maxCheckpoints;
+  }
 
   async save(checkpoint: SessionCheckpoint): Promise<void> {
     this.store.set(checkpoint.id, structuredClone(checkpoint));
+    // FIFO eviction: Map iteration order preserves insertion order, so
+    // the first entry is always the oldest.
+    if (this.maxCheckpoints !== undefined && this.store.size > this.maxCheckpoints) {
+      const oldest = this.store.keys().next().value;
+      if (oldest !== undefined) this.store.delete(oldest);
+    }
   }
 
   async get(id: string): Promise<SessionCheckpoint | null> {

@@ -139,7 +139,7 @@ export class AgentSessionDurableObject {
   private readonly memoryService: MemoryService;
   private readonly workspaceStore = new InMemoryWorkspaceStore();
   private readonly schedulerStore = new InMemorySchedulerStore();
-  private readonly checkpointStore = new InMemoryCheckpointStore();
+  private readonly checkpointStore = new InMemoryCheckpointStore({ maxCheckpoints: 1000 });
   private readonly skillStore = new InMemorySkillStore();
   private readonly learning = new LearningPipeline(this.skillStore);
   private readonly mcpClient: McpClient;
