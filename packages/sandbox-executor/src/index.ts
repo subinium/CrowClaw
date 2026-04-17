@@ -1,5 +1,23 @@
 /// <reference types="node" />
-import { getSandbox, type Sandbox as CloudflareSandbox } from '@cloudflare/sandbox';
+// Type-only import: the actual `getSandbox` value comes from the `_getSandboxFn`
+// below, which is loaded via top-level dynamic import with a try/catch so Node
+// deployments don't fail at module-eval time. `@cloudflare/sandbox` transitively
+// loads `@cloudflare/containers`, which ships an ESM index that violates Node's
+// strict specifier resolution (imports `./lib/container` without `.js`).
+import type { Sandbox as CloudflareSandbox } from '@cloudflare/sandbox';
+
+type GetSandboxFn = (ns: unknown, id: string) => CloudflareSandbox;
+let _getSandboxFn: GetSandboxFn | null = null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const mod = await import('@cloudflare/sandbox');
+  _getSandboxFn = mod.getSandbox as unknown as GetSandboxFn;
+} catch {
+  // Cloudflare sandbox not loadable in this runtime (plain Node, etc.).
+  // Sandbox-dependent tool calls will return null and fall through to the
+  // local-process path or a runtime-level 400, which is the correct behavior.
+  _getSandboxFn = null;
+}
 import type { ToolDefinition, ToolExecutionContext, ToolExecutionResult } from '@crowclaw/core';
 import type { ToolRegistry } from '@crowclaw/tools';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -486,9 +504,11 @@ function resolveSandbox(context: ToolExecutionContext): CloudflareSandbox | null
   if (!env.Sandbox) {
     return null;
   }
-
+  if (!_getSandboxFn) {
+    return null;
+  }
   const sandboxId = context.workspaceId ?? context.sessionId;
-  return getSandbox(env.Sandbox as never, sandboxId) as CloudflareSandbox;
+  return _getSandboxFn(env.Sandbox as never, sandboxId);
 }
 
 // ---------------------------------------------------------------------------

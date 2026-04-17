@@ -693,6 +693,104 @@ function renderBrowserClickRefResult(url: string, ref: string) {
 // Rate Limiter — simple in-memory, per-key, sliding-window
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// CIDR matching for trusted-proxy allowlist
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a predicate that matches an IP (already normalized) against a CIDR
+ * or single-IP entry. IPv4 entries compare as 32-bit integers; IPv6 as a
+ * pair of 64-bit integers. Returns null for unparseable input.
+ *
+ * Accepts:
+ *   - `10.0.0.1`               (single IPv4, equivalent to /32)
+ *   - `10.0.0.0/24`            (IPv4 CIDR)
+ *   - `::1`                    (single IPv6, equivalent to /128)
+ *   - `fe80::/10`              (IPv6 CIDR)
+ */
+type CidrMatcher = (ip: string) => boolean;
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let out = 0;
+  for (const part of parts) {
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    out = (out << 8) | n;
+  }
+  return out >>> 0;
+}
+
+function ipv6ToBigInt(ip: string): bigint | null {
+  // Handle IPv4-mapped form ::ffff:1.2.3.4 by converting the trailing dotted quad.
+  const dotIdx = ip.lastIndexOf('.');
+  let normalized = ip;
+  if (dotIdx !== -1) {
+    const v4Start = ip.lastIndexOf(':', dotIdx);
+    if (v4Start === -1) return null;
+    const v4 = ipv4ToInt(ip.slice(v4Start + 1));
+    if (v4 === null) return null;
+    normalized = `${ip.slice(0, v4Start + 1)}${(v4 >>> 16).toString(16)}:${(v4 & 0xffff).toString(16)}`;
+  }
+  // Expand `::` into enough zero groups to reach 8 total.
+  const parts = normalized.split('::');
+  if (parts.length > 2) return null;
+  const leading = parts[0] ? parts[0].split(':') : [];
+  const trailing = parts[1] ? parts[1].split(':') : [];
+  const fill = 8 - leading.length - trailing.length;
+  if (fill < 0) return null;
+  const groups = [...leading, ...Array(fill).fill('0'), ...trailing];
+  if (groups.length !== 8) return null;
+  let out = 0n;
+  for (const g of groups) {
+    const n = parseInt(g || '0', 16);
+    if (Number.isNaN(n) || n < 0 || n > 0xffff) return null;
+    out = (out << 16n) | BigInt(n);
+  }
+  return out;
+}
+
+function parseCidrMatcher(entry: string): CidrMatcher | null {
+  const [addr, bitsRaw] = entry.split('/');
+  if (!addr) return null;
+  // IPv4
+  if (!addr.includes(':')) {
+    const base = ipv4ToInt(addr);
+    if (base === null) return null;
+    const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) return null;
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    const baseMasked = (base & mask) >>> 0;
+    return (ip: string) => {
+      const ipInt = ipv4ToInt(ip);
+      if (ipInt === null) return false;
+      return ((ipInt & mask) >>> 0) === baseMasked;
+    };
+  }
+  // IPv6
+  const base = ipv6ToBigInt(addr);
+  if (base === null) return null;
+  const bits = bitsRaw === undefined ? 128 : Number(bitsRaw);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 128) return null;
+  const mask = bits === 0 ? 0n : ((1n << BigInt(bits)) - 1n) << BigInt(128 - bits);
+  const baseMasked = base & mask;
+  return (ip: string) => {
+    const ipInt = ipv6ToBigInt(ip);
+    if (ipInt === null) return false;
+    return (ipInt & mask) === baseMasked;
+  };
+}
+
+/** Strip IPv6 zone id (`%eth0`) and unwrap IPv4-mapped `::ffff:1.2.3.4` to `1.2.3.4`
+ *  so a CIDR like `10.0.0.0/24` matches clients that reach the socket as the
+ *  IPv4-mapped form on dual-stack sockets. */
+function normalizeIp(ip: string): string {
+  const noZone = ip.split('%')[0]!;
+  const mapped = noZone.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  return mapped ? mapped[1]! : noZone;
+}
+
 class RateLimiter {
   private requests = new Map<string, number[]>();
   private readonly maxKeys: number;
@@ -738,6 +836,50 @@ const API_CSP = "default-src 'none'; frame-ancestors 'none'";
 /** Generate a cryptographic nonce for CSP. */
 function generateNonce(): string {
   return randomBytes(16).toString('base64');
+}
+
+/**
+ * Inject a CSP nonce into every inline `<script>` tag in `html`. Replaces the
+ * v0.3.6-era regex `/<script(?![^>]*\bsrc\b)/g` which had known edge cases:
+ *   - `<scriptsrc=...>` (no space) matched incorrectly as a "no src" tag.
+ *   - Contributors adding a `src=""` (empty src) would get a nonce injected.
+ * This walks the string tag-by-tag, checks the character after `<script` is a
+ * real boundary (space/tab/newline/`>`), and honors any real `src="..."`.
+ */
+function injectScriptNonce(html: string, nonce: string): string {
+  const out: string[] = [];
+  let i = 0;
+  while (i < html.length) {
+    const next = html.indexOf('<script', i);
+    if (next === -1) {
+      out.push(html.slice(i));
+      break;
+    }
+    out.push(html.slice(i, next));
+    const afterScript = next + '<script'.length;
+    const nextChar = html[afterScript];
+    // `<scriptxxx` — not a real <script> tag, emit verbatim and keep scanning.
+    if (nextChar !== ' ' && nextChar !== '>' && nextChar !== '\t' && nextChar !== '\n' && nextChar !== '/') {
+      out.push(html.slice(next, afterScript));
+      i = afterScript;
+      continue;
+    }
+    const tagEnd = html.indexOf('>', afterScript);
+    if (tagEnd === -1) {
+      out.push(html.slice(next));
+      break;
+    }
+    const attrs = html.slice(afterScript, tagEnd);
+    // Tags with `src=...` load an external script; CSP allows them via
+    // `script-src https://cdnjs.cloudflare.com`. Inline (no src) needs a nonce.
+    if (/\bsrc\s*=/.test(attrs)) {
+      out.push(html.slice(next, tagEnd + 1));
+    } else {
+      out.push(`<script nonce="${nonce}"${attrs}>`);
+    }
+    i = tagEnd + 1;
+  }
+  return out.join('');
 }
 
 /** CSP for dashboard pages (nonce-based script-src, unsafe-inline for styles). */
@@ -1580,7 +1722,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     }, { status: 403 });
   }
 
-  const checkpointStore = new InMemoryCheckpointStore();
+  // Cap at 1000 checkpoints across all sessions. With autoCheckpoint on,
+  // a long-running server accumulates one per iteration forever — the cap
+  // keeps in-memory growth bounded. FIFO evicts the oldest.
+  const checkpointStore = new InMemoryCheckpointStore({ maxCheckpoints: 1000 });
 
   // Delivery function — routes scheduled job results to gateway platforms
   const deliverToGateway: DeliveryFn = async (target: DeliveryTarget, content: string) => {
@@ -1758,14 +1903,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // but the global 60/min auth backstop from v0.4.1 still applies.
       const trustedProxiesRaw = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } })
         .process?.env?.CROWCLAW_TRUSTED_PROXIES;
-      const trustedProxies = trustedProxiesRaw
-        ? new Set(trustedProxiesRaw.split(',').map((s) => s.trim()).filter(Boolean))
+      const trustedProxyMatchers = trustedProxiesRaw
+        ? trustedProxiesRaw.split(',').map((s) => s.trim()).filter(Boolean).map(parseCidrMatcher).filter((m): m is CidrMatcher => m !== null)
         : null;
       const getClientIp = (req: Request): string => {
-        const remoteAddr = req.headers.get('x-crowclaw-remote-addr') ?? '127.0.0.1';
+        const remoteAddr = normalizeIp(req.headers.get('x-crowclaw-remote-addr') ?? '127.0.0.1');
         if (configStore.getTrustProxy() || options.trustProxy) {
-          if (trustedProxies && !trustedProxies.has(remoteAddr)) {
-            // Remote addr is not in the allowlist — don't trust the header.
+          if (trustedProxyMatchers && !trustedProxyMatchers.some((m) => m(remoteAddr))) {
+            // Remote addr doesn't match any allowlist entry (IP or CIDR).
             return remoteAddr;
           }
           return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
@@ -1949,8 +2094,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
         const { DASHBOARD_HTML } = await import('@crowclaw/web');
         const nonce = generateNonce();
-        // Inject nonce into inline <script> tags for CSP compliance
-        const nonceHtml = DASHBOARD_HTML.replace(/<script(?![^>]*\bsrc\b)/g, `<script nonce="${nonce}"`);
+        // Inject nonce via a tag-aware walker (not regex — see comment on
+        // injectScriptNonce for the edge cases it handles).
+        const nonceHtml = injectScriptNonce(DASHBOARD_HTML, nonce);
         return new Response(nonceHtml, {
           headers: {
             'content-type': 'text/html; charset=utf-8',
