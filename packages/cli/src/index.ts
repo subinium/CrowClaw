@@ -2613,6 +2613,14 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
         if (typeof value === 'string') headers.set(key, value);
         else if (Array.isArray(value)) headers.set(key, value.join(', '));
       }
+      // Pass the raw socket remote address into the runtime so the trusted-proxy
+      // check in getClientIp() can compare against CROWCLAW_TRUSTED_PROXIES.
+      // Strip any client-supplied value first — otherwise a caller could send
+      // `x-crowclaw-remote-addr: 127.0.0.1` to spoof it.
+      headers.delete('x-crowclaw-remote-addr');
+      if (req.socket?.remoteAddress) {
+        headers.set('x-crowclaw-remote-addr', req.socket.remoteAddress);
+      }
 
       const bodyChunks: Buffer[] = [];
       for await (const chunk of req) {

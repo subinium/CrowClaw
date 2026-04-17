@@ -46,15 +46,30 @@ function matchesScope(record: MemoryRecord, scope: MemoryRecord['scope'], scopeK
   return record.scope === scope && (!scopeKey || record.scopeKey === scopeKey);
 }
 
+/**
+ * Pre-index a record's searchable text once at write time so `matchesQuery`
+ * can skip repeated `JSON.stringify(metadata).toLowerCase()` on every search.
+ * We stash it on a weakly-typed symbol field so the serialized MemoryRecord
+ * shape stays stable across storage boundaries.
+ */
+const SEARCH_BLOB = Symbol('searchBlob');
+type IndexedRecord = MemoryRecord & { [SEARCH_BLOB]?: string };
+
+function buildSearchBlob(record: MemoryRecord): string {
+  return `${record.summary}\n${record.tags.join('\n')}\n${JSON.stringify(record.metadata ?? {})}`.toLowerCase();
+}
+
+function getSearchBlob(record: IndexedRecord): string {
+  if (record[SEARCH_BLOB] !== undefined) return record[SEARCH_BLOB]!;
+  const blob = buildSearchBlob(record);
+  record[SEARCH_BLOB] = blob;
+  return blob;
+}
+
 function matchesQuery(record: MemoryRecord, query: string): boolean {
   const needle = normalizeNeedle(query);
-  if (!needle) {
-    return true;
-  }
-
-  return record.summary.toLowerCase().includes(needle)
-    || record.tags.some((tag) => tag.toLowerCase().includes(needle))
-    || JSON.stringify(record.metadata ?? {}).toLowerCase().includes(needle);
+  if (!needle) return true;
+  return getSearchBlob(record as IndexedRecord).includes(needle);
 }
 
 function sortByNewest(records: MemoryRecord[]): MemoryRecord[] {
@@ -143,15 +158,33 @@ export class InMemoryMemoryStore implements MemoryStore {
   }
 
   async searchByScope(scope: MemoryRecord['scope'], query: string, limit = 10, scopeKey?: string): Promise<MemoryRecord[]> {
-    return sortByNewest([...this.store.values()].flat())
-      .filter((record) => matchesScope(record, scope, scopeKey))
-      .filter((record) => matchesQuery(record, query))
-      .slice(0, limit);
+    // Filter first (cheap scope check), then query (cached search blob).
+    // Previous implementation ran query filter over every record in every
+    // session regardless of scope, then flattened + stringified metadata
+    // per-record — catastrophic at 10 sessions × 100 memories.
+    const out: MemoryRecord[] = [];
+    for (const records of this.store.values()) {
+      for (const record of records) {
+        if (matchesScope(record, scope, scopeKey) && matchesQuery(record, query)) {
+          out.push(record);
+        }
+      }
+    }
+    return sortByNewest(out).slice(0, limit);
   }
 
   async write(record: MemoryRecord): Promise<void> {
-    const current = this.store.get(record.sessionId) ?? [];
-    this.store.set(record.sessionId, [...current, record]);
+    // Mutate the bucket in place (O(1) append) instead of `[...current, record]`
+    // which copied the entire array on every insert — the spread made write()
+    // O(n) and amortized session insertion O(n²).
+    const existing = this.store.get(record.sessionId);
+    // Pre-compute search blob once so later matchesQuery() calls are O(|needle|).
+    (record as IndexedRecord)[SEARCH_BLOB] = buildSearchBlob(record);
+    if (existing) {
+      existing.push(record);
+    } else {
+      this.store.set(record.sessionId, [record]);
+    }
   }
 
   async list(sessionId: string): Promise<MemoryRecord[]> {
@@ -159,9 +192,13 @@ export class InMemoryMemoryStore implements MemoryStore {
   }
 
   async listByScope(scope: MemoryRecord['scope'], limit = 50, scopeKey?: string): Promise<MemoryRecord[]> {
-    return sortByNewest([...this.store.values()].flat())
-      .filter((record) => matchesScope(record, scope, scopeKey))
-      .slice(0, limit);
+    const out: MemoryRecord[] = [];
+    for (const records of this.store.values()) {
+      for (const record of records) {
+        if (matchesScope(record, scope, scopeKey)) out.push(record);
+      }
+    }
+    return sortByNewest(out).slice(0, limit);
   }
 }
 

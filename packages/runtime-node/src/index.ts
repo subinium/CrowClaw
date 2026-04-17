@@ -1746,14 +1746,33 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
       const bindHostname = options.hostname ?? '127.0.0.1';
       const isLocalhost = isLocalhostAddress(bindHostname);
-      // Extract client IP — reads trustProxy from configStore (persisted, dynamic)
+      // Extract client IP — reads trustProxy from configStore (persisted, dynamic).
+      //
+      // Trusted-proxy allowlist (v0.4.2+): when trustProxy is on AND the caller
+      // sets CROWCLAW_TRUSTED_PROXIES=<comma-separated IPs>, we only honor
+      // X-Forwarded-For if the upstream remote address (injected by the Node HTTP
+      // wrapper as `x-crowclaw-remote-addr`) is in that list. Without this, an
+      // attacker who reaches the exposed port directly can spoof X-Forwarded-For
+      // to rotate source IPs past the per-IP rate limiter. If trustProxy is on
+      // but no allowlist is configured, we keep the legacy behavior (full trust)
+      // but the global 60/min auth backstop from v0.4.1 still applies.
+      const trustedProxiesRaw = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } })
+        .process?.env?.CROWCLAW_TRUSTED_PROXIES;
+      const trustedProxies = trustedProxiesRaw
+        ? new Set(trustedProxiesRaw.split(',').map((s) => s.trim()).filter(Boolean))
+        : null;
       const getClientIp = (req: Request): string => {
+        const remoteAddr = req.headers.get('x-crowclaw-remote-addr') ?? '127.0.0.1';
         if (configStore.getTrustProxy() || options.trustProxy) {
+          if (trustedProxies && !trustedProxies.has(remoteAddr)) {
+            // Remote addr is not in the allowlist — don't trust the header.
+            return remoteAddr;
+          }
           return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
             ?? req.headers.get('x-real-ip')
-            ?? '127.0.0.1';
+            ?? remoteAddr;
         }
-        return '127.0.0.1';
+        return remoteAddr;
       };
 
       // Fail-close: if we're bound to a non-localhost interface and no dashboard

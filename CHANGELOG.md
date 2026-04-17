@@ -5,6 +5,35 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.4.2] — 2026-04-17 — Cloudflare drift + trusted-proxy + memory / checkpoint perf
+
+Third pass on the v0.4.0 deferred backlog. Closes the three easy-to-see CF contract gaps from the contract audit, adds a real trusted-proxy allowlist for the auth throttle, and cuts the two biggest hot-path allocations (`InMemoryMemoryStore.write` and redundant checkpoint message clones).
+
+### Security (HIGH)
+- **Trusted-proxy allowlist.** `CROWCLAW_TRUSTED_PROXIES=10.0.0.1,10.0.0.2` gates `X-Forwarded-For` trust: with `trustProxy` on, the runtime now reads the TCP remote address (injected by the CLI's HTTP wrapper as `x-crowclaw-remote-addr`) and only honors the forwarded header when the remote address is in the allowlist. Without this, a caller reaching the exposed port directly could spoof XFF and rotate past the per-IP rate limiter even after the v0.4.1 global backstop. The CLI strips any client-supplied `x-crowclaw-remote-addr` before forwarding, so the header can't be forged.
+
+### Reliability (Cloudflare parity)
+- **`/api/system/status.counts` shape matched to Node.** Added `bridgeProcesses` and `bridgeAliveProcesses` (both reported as `0` on CF since Durable Objects don't manage host processes) and dropped the non-Node `sessions` field. Overview panel counts now render on CF without `undefined` fallbacks.
+- **`/api/skills` now returns `requiredTools`.** Skill-tool-chip row on the Agent view stopped rendering empty on CF deployments.
+- **`/api/presets` returns `activeAgent` / `activeToolset` / `activeMcp`.** Previously returned only the preset lists; CF UI couldn't mark any preset as active. Fields are `null` until the CF runtime learns to persist the active selection (v0.4.3 scope).
+
+### Performance
+- **`InMemoryMemoryStore.write()` went from O(n) to O(1) per record.** Previous code ran `[...current, record]` on every insert, so a session with 1000 memories allocated a fresh 1000-element array on the 1001st write. Now mutates the bucket in place.
+- **Pre-indexed memory search.** Each record stores a lowercased `summary + tags + metadata JSON` blob (cached on first access via a `Symbol` field) so `matchesQuery` becomes a single `includes()` instead of running `JSON.stringify(metadata).toLowerCase()` per-record per-search.
+- **`searchByScope` / `listByScope`** no longer `[...this.store.values()].flat()` — single pass that filters scope and query in one loop.
+- **Checkpoint creation: dropped the redundant pre-clone.** `createCheckpoint({ ...session, messages: [...nextMessages] }, ...)` in five call sites cloned `nextMessages` then the function cloned it again via `structuredClone`. Removed the `[...nextMessages]` spread; the in-function clone is still authoritative, so stored checkpoints are still independent of live session state.
+
+### Tests
+- 2161/2161 passing. All changes are internal contract or perf — public shapes remain the same except `/api/system/status.counts` (added fields) and `/api/presets` (added `active*` fields), both UI-additive.
+
+### Still deferred (v0.4.3+)
+- CSP `style-src 'unsafe-inline'` → nonce (requires inline-style audit of the Lit dashboard; nonce + unsafe-inline is mutually exclusive in strict CSP3).
+- `runtime-node/src/index.ts` 5400-line split.
+- Cloudflare full endpoint parity (~25 routes still missing: auth, config, security, providers, MCP CRUD, scheduler lifecycle, gateway admin).
+- `EmbeddingMemoryStore.search` linear scan at 10k+ vectors.
+- Full CIDR support for trusted-proxy (current allowlist is exact-match only).
+- Dashboard HTML parser-based nonce injection (replace the current regex, which has known edge cases on future `<script>` patterns).
+
 ## [0.4.1] — 2026-04-17 — Deferred audit items from v0.4.0
 
 Follow-up release draining the "deferred to v0.4.1" backlog that v0.4.0 explicitly carved out.

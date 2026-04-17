@@ -314,10 +314,15 @@ export class AgentSessionDurableObject {
         gateway: {
           slackSigningSecretConfigured: Boolean(this.env.SLACK_SIGNING_SECRET)
         },
+        // Counts shape matches Node's `summarizeSessionRecord` so the
+        // Overview panel renders the same fields on both runtimes. Prior
+        // CF response omitted bridgeProcesses / bridgeAliveProcesses and
+        // carried a `sessions` key that Node did not.
         counts: {
-          sessions: sessions.length,
-          browserSessions: this.browserSessions.size,
           bridgeSessions: this.codeBridgeSessions.size,
+          bridgeProcesses: 0,
+          bridgeAliveProcesses: 0,
+          browserSessions: this.browserSessions.size,
           schedulerJobs: (await this.schedulerStore.listJobs()).length
         }
       });
@@ -328,11 +333,14 @@ export class AgentSessionDurableObject {
       const allSkills = this.skillRegistry.resolveAll();
       const stats = this.skillRegistry.stats();
       return Response.json({
+        // `requiredTools` mirrors Node runtime so the Agent view can render
+        // tool-chip rows on skill cards (was empty on CF deployments).
         skills: allSkills.map(({ skill, enabled }) => ({
           slug: skill.manifest.name,
           title: this.skillRegistry.getDisplayTitle(skill.manifest.name) ?? skill.manifest.name,
           summary: skill.manifest.description,
           triggerPhrases: skill.manifest.triggers,
+          requiredTools: skill.manifest.tools ?? [],
           status: this.skillRegistry.getStatus(skill.manifest.name) ?? 'published',
           source: (skill.manifest.category as 'builtin' | 'learned' | 'local') ?? 'builtin',
           enabled,
@@ -344,10 +352,15 @@ export class AgentSessionDurableObject {
 
     if (request.method === 'GET' && url.pathname.endsWith('/presets')) {
       const mcpNames = listMcpPresetNames();
+      // `activeAgent`/`activeToolset`/`activeMcp` fields let the Agent view
+      // decorate the "Active" badge. CF previously returned only the lists.
       return Response.json({
         agents: listAgentPresets(),
         toolsets: listToolsetPresets(),
-        mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) }))
+        mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) })),
+        activeAgent: null,
+        activeToolset: null,
+        activeMcp: null,
       });
     }
 
