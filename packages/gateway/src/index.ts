@@ -1,13 +1,16 @@
 export type GatewayPlatform = 'webhook' | 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'signal' | 'email' | 'matrix' | 'sms';
 
-// Inline URL safety check (gateway is zero-dep, cannot import from @crowclaw/core)
+// Inline URL safety check (gateway is zero-dep, cannot import from @crowclaw/core).
+// Patterns kept in sync with `packages/core/src/security.ts` PRIVATE_IP_PATTERNS —
+// update both when changing. IPv4-mapped IPv6, CGNAT, and multicast ranges included
+// to close v0.3.6 audit gaps.
 function validateFetchUrl(url: string): { safe: boolean; reason?: string } {
   try {
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol)) return { safe: false, reason: `Disallowed protocol: ${parsed.protocol}` };
-    const h = parsed.hostname;
-    if (/^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|169\.254\.|localhost$|.*\.local$|.*\.internal$)/i.test(h)) return { safe: false, reason: 'Private network' };
-    if (/^(fc00:|fe80:|::1$)/i.test(h)) return { safe: false, reason: 'Private network' };
+    const h = parsed.hostname.replace(/^\[|\]$/g, '');
+    if (/^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|22[4-9]\.|23\d\.|localhost$|.*\.local$|.*\.internal$)/i.test(h)) return { safe: false, reason: 'Private network' };
+    if (/^(fc00:|fd[0-9a-f]{2}:|fe80:|ff[0-9a-f]{2}:|::ffff:|0:0:0:0:0:ffff:|0:0:0:0:0:0:|::1$|::$)/i.test(h)) return { safe: false, reason: 'Private network' };
     return { safe: true };
   } catch { return { safe: false, reason: 'Invalid URL' }; }
 }

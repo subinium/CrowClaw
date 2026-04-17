@@ -280,26 +280,45 @@ export function resolveProvidersFromConfig(
   }
 
   if (config.embedding) {
-    // Create a simple embedding adapter wrapping the provider
-    const embeddingProvider = createProviderFromSlot(config.embedding, fallbackApiKey);
+    // Call a real embedding endpoint. Prior versions asked the LLM to
+    // "generate a numerical embedding vector" via generate(), then threw away
+    // the response and used Math.sin(hash). That wasted tokens for zero signal
+    // and misled callers who trusted the "semantic memory recall" claim.
+    const slot = config.embedding;
+    const apiKey = slot.apiKey || fallbackApiKey || '';
+    const baseUrl = (slot.baseUrl ?? inferBaseUrlForProvider(slot.provider)).replace(/\/$/, '');
+    const model = slot.model || 'text-embedding-3-small';
+    if (!apiKey) {
+      throw new Error(`Embedding slot "${slot.name}" requires an apiKey (direct or fallback).`);
+    }
     result.embedding = {
       async embed(texts: string[]): Promise<number[][]> {
-        // Use the provider's generate to create embeddings via prompt
-        // This is a simplified adapter — real embedding would use a dedicated API
-        const results: number[][] = [];
-        for (const text of texts) {
-          const response = await embeddingProvider.generate({
-            messages: [{ role: 'user', content: `Generate a numerical embedding vector for: ${text}`, createdAt: new Date().toISOString() }],
-            availableTools: [],
-          });
-          // Parse or return a placeholder — real implementations use embedding APIs
-          const hash = Array.from(text).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-          results.push(Array.from({ length: 8 }, (_, i) => Math.sin(hash + i) * (response.usage?.totalTokens ?? 1)));
+        if (texts.length === 0) return [];
+        const res = await fetch(`${baseUrl}/embeddings`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({ input: texts, model }),
+        });
+        if (!res.ok) {
+          throw new Error(`Embeddings API ${res.status}: ${(await res.text()).slice(0, 200)}`);
         }
-        return results;
+        const payload = (await res.json()) as { data?: Array<{ embedding: number[] }> };
+        if (!payload.data) {
+          throw new Error('Embeddings API response missing `data` array');
+        }
+        return payload.data.map((d) => d.embedding);
       },
     };
   }
 
   return result;
+}
+
+function inferBaseUrlForProvider(provider: string): string {
+  if (provider === 'anthropic') return 'https://api.anthropic.com/v1';
+  if (provider === 'openrouter') return 'https://openrouter.ai/api/v1';
+  return 'https://api.openai.com/v1';
 }

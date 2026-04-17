@@ -3,24 +3,40 @@
 // ---------------------------------------------------------------------------
 
 const PRIVATE_IP_PATTERNS = [
-  /^127\./,
-  /^10\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./,
-  /^0\./,
-  /^169\.254\./,
-  /^fc00:/i,
-  /^fe80:/i,
-  /^::1$/,
+  /^127\./,                              // 127.0.0.0/8 loopback
+  /^10\./,                               // 10.0.0.0/8 RFC1918
+  /^172\.(1[6-9]|2\d|3[01])\./,          // 172.16.0.0/12 RFC1918
+  /^192\.168\./,                         // 192.168.0.0/16 RFC1918
+  /^0\./,                                // 0.0.0.0/8 "this network"
+  /^169\.254\./,                         // 169.254.0.0/16 link-local (AWS/GCP IMDS)
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // 100.64.0.0/10 CGNAT
+  /^22[4-9]\./, /^23\d\./,               // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+  /^::1$/,                               // IPv6 loopback
+  /^::$/,                                // IPv6 unspecified
+  /^fc00:/i, /^fd[0-9a-f]{2}:/i,         // fc00::/7 ULA (covers both fc00 and fd00)
+  /^fe80:/i,                             // fe80::/10 link-local
+  /^ff[0-9a-f]{2}:/i,                    // ff00::/8 multicast
+  /^::ffff:/i,                           // IPv4-mapped IPv6 (::ffff:10.0.0.1 etc.)
+  /^0:0:0:0:0:ffff:/i,                   // IPv4-mapped long form
+  /^0:0:0:0:0:0:/i,                      // other abbreviated-zero forms
   /^localhost$/i,
   /^.*\.local$/i,
   /^.*\.internal$/i
 ];
 
+/**
+ * Check if a bare IP address (already resolved) matches a private/internal range.
+ * Separate from isPrivateUrl so DNS-rebinding-aware callers can validate the
+ * resolved IP, not just the hostname string.
+ */
+export function isPrivateIpAddress(ip: string): boolean {
+  return PRIVATE_IP_PATTERNS.some(p => p.test(ip));
+}
+
 export function isPrivateUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    const hostname = parsed.hostname;
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
     return PRIVATE_IP_PATTERNS.some(p => p.test(hostname));
   } catch {
     return true; // invalid URLs are treated as private
@@ -41,6 +57,40 @@ export function validateFetchUrl(url: string): { safe: boolean; reason?: string 
     return { safe: true };
   } catch {
     return { safe: false, reason: 'Invalid URL format' };
+  }
+}
+
+/**
+ * DNS-rebinding-safe URL validation. Resolves the hostname via the caller-supplied
+ * resolver (Node: dns.lookup, CF: ignore DNS and skip), then checks every resolved
+ * IP against private ranges. Prevents the attack where validation sees a public IP
+ * but fetch() re-resolves to 127.0.0.1 or 169.254.169.254 with a 1s-TTL DNS record.
+ *
+ * Callers should then fetch with `redirect: 'manual'` and re-validate on each hop
+ * to prevent redirect-based bypass.
+ */
+export async function resolveAndValidateUrl(
+  url: string,
+  resolver: (hostname: string) => Promise<string[]>
+): Promise<{ safe: boolean; reason?: string; resolvedIps?: string[] }> {
+  const base = validateFetchUrl(url);
+  if (!base.safe) return base;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^\[|\]$/g, '');
+    // Literal IPs skip DNS (no rebinding risk).
+    if (/^[0-9.]+$/.test(host) || host.includes(':')) {
+      return { safe: true, resolvedIps: [host] };
+    }
+    const ips = await resolver(host);
+    if (ips.length === 0) return { safe: false, reason: 'Hostname did not resolve to any IP' };
+    const badIp = ips.find(ip => isPrivateIpAddress(ip));
+    if (badIp) {
+      return { safe: false, reason: `Hostname resolves to private IP: ${badIp}`, resolvedIps: ips };
+    }
+    return { safe: true, resolvedIps: ips };
+  } catch (err) {
+    return { safe: false, reason: `DNS resolution failed: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -190,7 +240,9 @@ export function containsSecrets(text: string): { detected: boolean; patterns: st
 // ---------------------------------------------------------------------------
 
 const CREDENTIAL_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
-  { name: 'openai_key', pattern: /sk-[a-zA-Z0-9]{20,}/g },
+  // Include `_-` in the charset so modern OpenAI key formats (sk-proj-*, sk-svcacct-*)
+  // get fully redacted instead of stopping at the first dash.
+  { name: 'openai_key', pattern: /sk-[a-zA-Z0-9_-]{20,}/g },
   { name: 'anthropic_key', pattern: /sk-ant-[a-zA-Z0-9-]{20,}/g },
   { name: 'github_token_ghp', pattern: /ghp_[a-zA-Z0-9]{36}/g },
   { name: 'github_token_gho', pattern: /gho_[a-zA-Z0-9]{36}/g },
@@ -199,7 +251,12 @@ const CREDENTIAL_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
   { name: 'slack_token', pattern: /xox[bpar]-[a-zA-Z0-9-]+/g },
   { name: 'aws_key', pattern: /AKIA[A-Z0-9]{16}/g },
   { name: 'bearer_token', pattern: /Bearer\s+[a-zA-Z0-9._-]{20,}/g },
-  { name: 'generic_credential', pattern: /[a-zA-Z_]{0,30}(?:key|token|secret|password|credential)[a-zA-Z_]{0,30}\s{0,5}[:=]\s{0,5}["'][^"']{8,80}["']/gi },
+  // Prior pattern `[a-zA-Z_]{0,30}(?:key|token|...)[a-zA-Z_]{0,30}` was
+  // catastrophic-backtracking prone on adversarial inputs (aaaa...). The
+  // replacement uses a non-backtracking letter-boundary (look-around without
+  // nested quantifiers) so it still catches `DB_SECRET = "..."` while refusing
+  // to walk over arbitrary-length filler.
+  { name: 'generic_credential', pattern: /(?<![a-zA-Z])(?:api[_-]?key|access[_-]?token|auth[_-]?token|key|token|secret|password|credential)(?![a-zA-Z])\s{0,5}[:=]\s{0,5}["'][^"']{8,80}["']/gi },
   { name: 'private_key_block', pattern: /-----BEGIN[A-Z ]*PRIVATE KEY-----[^-]+-----END[A-Z ]*PRIVATE KEY-----/g },
 ];
 

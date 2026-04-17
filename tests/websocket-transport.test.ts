@@ -177,7 +177,7 @@ describe('WebSocketManager', () => {
   });
 
   describe('heartbeat', () => {
-    it('sends ping after 15 seconds', () => {
+    it('sends ping and heartbeat after 15 seconds', () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
       manager.addConnection(ws as unknown as WebSocket, true);
@@ -185,10 +185,13 @@ describe('WebSocketManager', () => {
       // Mark as alive (addConnection sets alive=true)
       vi.advanceTimersByTime(15_000);
 
-      // connected msg + ping
-      expect(ws.sent.length).toBe(2);
+      // connected msg + ping + heartbeat stats
+      expect(ws.sent.length).toBe(3);
       const ping = JSON.parse(ws.sent[1]);
       expect(ping.type).toBe('ping');
+      const heartbeat = JSON.parse(ws.sent[2]);
+      expect(heartbeat.type).toBe('heartbeat');
+      expect(heartbeat).toHaveProperty('subscribers');
     });
 
     it('disconnects unresponsive clients after two heartbeat cycles', () => {

@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHmac } from 'node:crypto';
 import runtimeCloudflare from '@crowclaw/runtime-cloudflare';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
+
+function signGenericWebhook(secret: string, body: string): string {
+  return 'sha256=' + createHmac('sha256', secret).update(body).digest('hex');
+}
 
 vi.mock('@cloudflare/sandbox', () => ({
   Sandbox: class Sandbox {},
@@ -15,17 +20,29 @@ describe('generic webhook runtime integration', () => {
 
   it('routes generic webhook payloads through the node runtime', async () => {
     const runtime = createNodeRuntime({ configStorePath: null });
-    // Configure a gateway policy for the 'webhook' platform so deny-by-default doesn't block
+    // v0.4.0 requires an HMAC signature on generic webhook payloads. Configure
+    // the secret via gateway config FIRST (since /config replaces the stored
+    // record), then set the access policy so deny-by-default doesn't block.
+    const webhookSecret = 'unit-test-generic-secret';
+    await runtime.fetch(new Request('http://localhost/api/gateway/webhook/config', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true, webhookSecret })
+    }));
     await runtime.fetch(new Request('http://localhost/api/gateway/webhook/policy', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' })
     }));
 
+    const body = JSON.stringify({ chatId: 'room-1', userId: 'user-1', text: 'hello webhook' });
     const response = await runtime.fetch(new Request('http://localhost/api/gateway/webhook', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chatId: 'room-1', userId: 'user-1', text: 'hello webhook' })
+      headers: {
+        'content-type': 'application/json',
+        'x-crowclaw-signature': signGenericWebhook(webhookSecret, body),
+      },
+      body,
     }));
 
     const payload = await response.json() as { finalResponse: string; session: { sessionId: string } };

@@ -267,7 +267,9 @@ function toolMessage(result: ToolExecutionResult, maxLength?: number): Conversat
     name: result.toolName,
     content,
     createdAt: nowIso(),
-    metadata: result.metadata
+    // Preserve the authoritative ok flag — checkpoint + restore flows that
+    // previously scraped content for /error|fail/i now read this directly.
+    metadata: { ...(result.metadata ?? {}), ok: result.ok },
   };
 }
 

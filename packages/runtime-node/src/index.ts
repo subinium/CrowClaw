@@ -1,3 +1,6 @@
+import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
 import { SessionMutex } from './session-mutex.js';
@@ -734,12 +737,7 @@ const API_CSP = "default-src 'none'; frame-ancestors 'none'";
 
 /** Generate a cryptographic nonce for CSP. */
 function generateNonce(): string {
-  try {
-    const { randomBytes } = require('node:crypto') as { randomBytes: (size: number) => Buffer };
-    return randomBytes(16).toString('base64');
-  } catch {
-    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-  }
+  return randomBytes(16).toString('base64');
 }
 
 /** CSP for dashboard pages (nonce-based script-src, unsafe-inline for styles). */
@@ -809,36 +807,13 @@ function parseCookieToken(cookieHeader: string | null): string | null {
 
 /** Derive a cookie-safe token from the dashboard token (never store raw token in cookie). */
 function deriveCookieToken(dashToken: string): string {
-  try {
-    const { createHmac } = require('node:crypto') as { createHmac: (algo: string, key: string) => { update: (data: string) => { digest: (enc: string) => string } } };
-    return createHmac('sha256', dashToken).update('crowclaw:cookie').digest('hex');
-  } catch {
-    // Fallback: simple hash (not cryptographically ideal, but better than raw token)
-    let hash = 0;
-    const str = dashToken + ':cookie';
-    for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
-    }
-    return 'ck_' + Math.abs(hash).toString(36);
-  }
+  return createHmac('sha256', dashToken).update('crowclaw:cookie').digest('hex');
 }
 
 /** Constant-time string comparison to prevent timing side-channel attacks. */
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  try {
-    const { timingSafeEqual: tse } = require('node:crypto') as { timingSafeEqual: (a: Buffer, b: Buffer) => boolean };
-    return tse(bufA, bufB);
-  } catch {
-    // Fallback: constant-time XOR comparison
-    let result = 0;
-    for (let i = 0; i < bufA.length; i++) {
-      result |= bufA[i]! ^ bufB[i]!;
-    }
-    return result === 0;
-  }
+  return cryptoTimingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +824,20 @@ function verifyTelegramWebhookSecret(request: Request, secret: string): boolean 
   const headerSecret = request.headers.get('x-telegram-bot-api-secret-token');
   if (!headerSecret) return false;
   return timingSafeEqual(headerSecret, secret);
+}
+
+/**
+ * Verify generic webhook HMAC signature. Prior to v0.4.0 this route accepted
+ * unsigned requests, letting any caller who knew a whitelisted channelId drive
+ * the agent (arbitrary LLM calls billed against the operator's keys). Now
+ * requires `X-CrowClaw-Signature: sha256=<hex>` matching HMAC_SHA256(secret, body).
+ */
+function verifyGenericWebhookSignature(headerValue: string | null, secret: string, rawBody: string): boolean {
+  if (!headerValue) return false;
+  const match = headerValue.match(/^sha256=([a-f0-9]+)$/i);
+  if (!match) return false;
+  const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+  return timingSafeEqual(match[1]!.toLowerCase(), expected.toLowerCase());
 }
 
 async function verifyDiscordWebhookSignature(
@@ -942,14 +931,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const schedulerStore = (() => {
     if (options.schedulerStore) return options.schedulerStore;
     if (options.schedulerStorePath === null) return new InMemorySchedulerStore();
-    try {
-      const os = require('node:os') as { homedir(): string };
-      const path = require('node:path') as { join(...parts: string[]): string };
-      const schedulerPath = options.schedulerStorePath ?? path.join(os.homedir(), '.crowclaw', 'scheduler-jobs.json');
-      return new FileSchedulerStore(schedulerPath);
-    } catch {
-      return new InMemorySchedulerStore();
-    }
+    const schedulerPath = options.schedulerStorePath ?? joinPath(homedir(), '.crowclaw', 'scheduler-jobs.json');
+    return new FileSchedulerStore(schedulerPath);
   })();
   const skillStore = options.skillStore ?? new InMemorySkillStore();
   const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
@@ -962,15 +945,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // store by passing an explicit configStorePath.
   const isVitest = typeof process !== 'undefined'
     && (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test');
-  const defaultConfigPath = (() => {
-    try {
-      const os = require('node:os') as { homedir(): string };
-      const path = require('node:path') as { join(...parts: string[]): string };
-      return path.join(os.homedir(), '.crowclaw', 'runtime-config.json');
-    } catch {
-      return null;
-    }
-  })();
+  const defaultConfigPath = joinPath(homedir(), '.crowclaw', 'runtime-config.json');
   const configStore: RuntimeConfigStore =
     options.configStorePath === null || (isVitest && options.configStorePath === undefined)
       ? new RuntimeConfigStore()
@@ -987,16 +962,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // --- Hermes parity: ContextEngine, FrozenMemory, MessageStore ---
   const messageStore: MessageStoreInterface = new InMemoryMessageStore();
 
-  const frozenMemoryStore = (() => {
-    try {
-      const os = require('node:os') as { homedir(): string };
-      const path = require('node:path') as { join(...parts: string[]): string };
-      const memDir = path.join(os.homedir(), '.crowclaw', 'memory');
-      return new FileFrozenStore(memDir);
-    } catch {
-      return new InMemoryFrozenStore();
-    }
-  })();
+  const frozenMemoryStore = new FileFrozenStore(joinPath(homedir(), '.crowclaw', 'memory'));
   const frozenMemory = new FrozenMemory(frozenMemoryStore, 'MEMORY');
   const frozenUserProfile = new FrozenMemory(frozenMemoryStore, 'USER');
 
@@ -1045,6 +1011,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   });
   const sessionController = new SessionController(eventBus);
   const wsManager = new WebSocketManager();
+  wsManager.setStatsProvider(() => ({
+    sessions: (store as unknown as { size?: number }).size ?? 0,
+    subscribers: eventBus.subscriberCount,
+  }));
   wsManager.start(eventBus);
   wsManager.onAbort((sid) => sessionController.abort(sid));
 
@@ -1771,6 +1741,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     eventBus,
     feedbackLedger,
     async fetch(request: Request): Promise<Response> {
+     try {
       const url = new URL(request.url);
       const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
       const bindHostname = options.hostname ?? '127.0.0.1';
@@ -2133,7 +2104,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           bridgeSummary: summarizeBridgeSessionsAggregate(codeBridgeSessions, bridgeProcesses),
           bridgeSessions: bridgeSessionSummary,
           bridgeProcesses: bridgeProcessSummary,
-          mcp: dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null,
+          mcp: (() => {
+            // Dashboard reads `.mcp.servers?.length` to render the "N servers"
+            // badge on the Overview panel. `getStatus()` exposes cache-level
+            // state only; attach the server list from `getServerStatus()` so
+            // the UI count tracks reality.
+            const status = dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null;
+            if (!status) return null;
+            const serverStatus = (dynamicMcpClient as unknown as { getServerStatus?: () => Record<string, unknown> }).getServerStatus?.() ?? {};
+            return { ...status, servers: Object.keys(serverStatus) };
+          })(),
           gateway: {
             slackSigningSecretConfigured: Boolean(options.slackSigningSecret)
           },
@@ -3092,7 +3072,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && (url.pathname === '/api/gateway/webhook' || url.pathname === '/webhooks/generic')) {
-        const payload = await request.json() as { channelId?: string; chatId?: string; userId?: string; text?: string; message?: string };
+        // Require HMAC signature: prior releases accepted unsigned requests,
+        // so any caller who knew a whitelisted channelId could drive the agent.
+        // Fail-closed: no secret → 403 instead of allowing.
+        const genericSecret = configStore.getGatewayConfig('webhook')?.webhookSecret;
+        if (!genericSecret) {
+          return Response.json({ ok: false, error: 'Generic webhook secret not configured' }, { status: 403 });
+        }
+        const rawBody = await request.text();
+        if (!verifyGenericWebhookSignature(request.headers.get('x-crowclaw-signature'), genericSecret, rawBody)) {
+          return Response.json({ ok: false, error: 'Invalid webhook signature' }, { status: 403 });
+        }
+        const payload = JSON.parse(rawBody) as { channelId?: string; chatId?: string; userId?: string; text?: string; message?: string };
         const message = normalizeGenericWebhook(payload);
         const accessResponse = enforceGatewayAccess(message);
         if (accessResponse) {
@@ -3245,6 +3236,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         {
           const signature = request.headers.get('x-slack-signature') ?? '';
           const timestamp = request.headers.get('x-slack-request-timestamp') ?? '';
+          // Replay-window check: reject requests signed more than 5 minutes ago.
+          // Without this, a captured signed body (from leaked logs or a tapped
+          // proxy) replays forever. Matches Slack's documented recommendation.
+          const tsNum = parseInt(timestamp, 10);
+          if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 300) {
+            return Response.json({ ok: false, error: 'Slack timestamp outside replay window.' }, { status: 401 });
+          }
           const verified = await verifySlackSignature({
             signingSecret: slackSecret,
             timestamp,
@@ -4528,13 +4526,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
           const body = (await request.json()) as { label?: string; trigger?: string };
 
-          // Extract tool results from session messages
+          // Extract tool results from session messages. Read the authoritative
+          // `metadata.ok` stored by `toolMessage()`; prior code scraped the
+          // content for /error|fail/i which falsely flagged "No errors found"
+          // as failed, poisoning checkpoints used for restore/replay.
           const toolResults = session.messages
             .filter((m): m is typeof m & { role: 'tool' } => m.role === 'tool')
             .map((m) => ({
               toolName: m.name ?? 'unknown',
               runtime: 'worker' as const,
-              ok: !m.content?.match(/error|fail/i),
+              ok: (m.metadata as { ok?: boolean } | undefined)?.ok ?? true,
               output: m.content,
             }));
 
@@ -4612,10 +4613,36 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             const results = await memoryService.recallByScope(body.scope, body.query, limit, body.scopeKey);
             return Response.json({ ok: true, source: 'memory', scope: body.scope, scopeKey: body.scopeKey, results });
           }
-          const results = body.source === 'memory'
-            ? await memoryStore.search(sessionId, body.query, limit)
-            : await store.search(sessionId, body.query, limit);
-          return Response.json({ ok: true, source: body.source ?? 'session', results });
+          if (body.source === 'memory') {
+            const results = await memoryStore.search(sessionId, body.query, limit);
+            return Response.json({ ok: true, source: 'memory', results });
+          }
+          // Session search: remap SessionSearchHit → { messageIndex, role, content }
+          // Dashboard uses messageIndex for click-through scroll; without remap
+          // the UI silently renders empty chips that scroll nowhere.
+          const rawHits = await store.search(sessionId, body.query, limit);
+          const session = await store.get(sessionId);
+          const messages = session?.messages ?? [];
+          const needle = body.query.toLowerCase();
+          const results = rawHits.map((hit) => {
+            const idx = messages.findIndex((m) =>
+              typeof m.content === 'string' && m.content === hit.content,
+            );
+            const fallbackIdx = idx >= 0
+              ? idx
+              : messages.findIndex((m) =>
+                  typeof m.content === 'string' && m.content.toLowerCase().includes(needle),
+                );
+            const messageIndex = fallbackIdx >= 0 ? fallbackIdx : 0;
+            const role = messages[messageIndex]?.role ?? 'user';
+            return {
+              messageIndex,
+              role,
+              content: hit.content,
+              score: hit.rank ?? 0,
+            };
+          });
+          return Response.json({ ok: true, source: 'session', results });
         }
 
         if (action === 'stream') {
@@ -4738,13 +4765,26 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({ ok: true, config: configStore.snapshot() });
       }
 
-      // Provider config save
+      // Provider config save — persist through configStore (no process.env mutation).
+      // Concurrent POSTs previously raced on process.env and lost state on restart;
+      // configStore writes are serialized via its atomic queue and survive reboot.
       if (request.method === 'POST' && url.pathname === routePaths.config.provider) {
         const body = await request.json() as { apiKey?: string; baseUrl?: string; model?: string; provider?: string };
-        if (body.apiKey) process.env.OPENROUTER_API_KEY = body.apiKey;
-        if (body.baseUrl) process.env.OPENROUTER_BASE_URL = body.baseUrl;
-        if (body.model) process.env.OPENROUTER_MODEL = body.model;
-        return Response.json({ ok: true, model: body.model, provider: body.provider || 'openrouter' });
+        const existing = configStore.getProviderConfig()?.primary;
+        const providerName = body.provider ?? existing?.provider ?? 'openrouter';
+        const model = body.model ?? existing?.model ?? 'anthropic/claude-sonnet-4';
+        const apiKey = body.apiKey ?? existing?.apiKey;
+        if (!apiKey) {
+          return Response.json({ ok: false, error: 'Missing API key' }, { status: 400 });
+        }
+        configStore.setProviderSlot('primary', {
+          name: existing?.name ?? providerName,
+          provider: providerName,
+          model,
+          apiKey,
+          baseUrl: body.baseUrl ?? existing?.baseUrl,
+        });
+        return Response.json({ ok: true, model, provider: providerName });
       }
 
       // Provider connection test (onboarding)
@@ -4842,6 +4882,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           enabled?: boolean;
           channelId?: string;
           muted?: boolean;
+          webhookSecret?: string;
           // Platform-specific connection params — persisted in `extra` so probe
           // and outbound delivery can read them without a redundant round-trip.
           webhookUrl?: string;
@@ -4863,6 +4904,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         configStore.setGatewayConfig(platform, {
           enabled: body.enabled ?? existing?.enabled ?? true,
           token: body.token ?? existing?.token,
+          webhookSecret: body.webhookSecret ?? existing?.webhookSecret,
           extra: Object.keys(mergedExtra).length > 0 ? mergedExtra : existing?.extra,
         });
         eventBus.emit('gateway:status', { platform, enabled: body.enabled ?? existing?.enabled ?? true });
@@ -5283,7 +5325,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (dashToken && !wsAuthenticated) {
           return new Response('Unauthorized — authenticated cookie or Authorization header required', { status: 401 });
         }
-        return handleWebSocketUpgrade(request, eventBus, wsManager, wsAuthenticated || !dashToken);
+        // Only the owner-of-the-host (localhost + no token configured) gets
+        // "authenticated" privileges (can send session:abort). Without this
+        // tightening, any local process or malicious page could abort sessions
+        // by ID via cross-site WebSocket on localhost dev deployments.
+        const privileged = wsAuthenticated || (!dashToken && isLocalhost);
+        return handleWebSocketUpgrade(request, eventBus, wsManager, privileged);
       }
 
       // --- Config schema routes ---
@@ -5396,6 +5443,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       return new Response('Not found', { status: 404 });
+     } catch (err: unknown) {
+       // Top-level guard: any unhandled throw from a route (mutex capacity,
+       // JSON parse, provider resolution) previously propagated to the HTTP
+       // server which echoed `err.message` to the client, leaking internal
+       // state (session IDs, stack traces). Swallow and log instead.
+       const message = err instanceof Error ? err.message : String(err);
+       const stack = err instanceof Error ? err.stack : undefined;
+       log.error('Unhandled fetch error', { component: 'runtime', path: new URL(request.url).pathname, error: message, stack });
+       return Response.json({ error: 'Internal error' }, { status: 500 });
+     }
     }
   };
 }

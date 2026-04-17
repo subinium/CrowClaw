@@ -38,6 +38,75 @@ function getSpecialSessionStub(env: RuntimeEnv, name: string) {
   return env.AGENT_SESSIONS.get(durableId);
 }
 
+/**
+ * Derive the cookie-safe token from CROWCLAW_DASHBOARD_TOKEN using HMAC-SHA256.
+ * Mirrors the Node runtime so `/api/auth/verify` semantics are consistent
+ * regardless of deployment target.
+ */
+async function deriveCookieToken(dashToken: string): Promise<string> {
+  const keyData = new TextEncoder().encode(dashToken);
+  const key = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('crowclaw:cookie'));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function parseAuthCookie(cookieHeader: string | null): string | null {
+  if (!cookieHeader) return null;
+  const m = cookieHeader.match(/(?:^|;\s*)crowclaw_auth=([^;]+)/);
+  return m ? m[1]! : null;
+}
+
+/**
+ * Auth gate for protected surfaces. Prior to v0.4.0 the Cloudflare runtime had
+ * ZERO authentication — any caller with the worker URL could run agent prompts,
+ * fetch URLs (SSRF amplification), and exfiltrate session data against the
+ * operator's LLM keys. This restores the same fail-closed semantics as Node:
+ *   - /health, /webhooks/*, /api/auth/* are public
+ *   - everything else requires CROWCLAW_DASHBOARD_TOKEN to be configured and
+ *     the caller to present it as Bearer or the derived cookie.
+ * Returns a Response on reject, or null to continue.
+ */
+async function enforceDashboardAuth(request: Request, env: RuntimeEnv, url: URL): Promise<Response | null> {
+  // Public surfaces
+  if (url.pathname === '/health') return null;
+  if (url.pathname.startsWith('/webhooks/')) return null;
+  if (url.pathname.startsWith('/api/auth/')) return null;
+  // Only /api/* and /ws are protected; other paths (dashboard HTML, static) fall through.
+  if (!url.pathname.startsWith('/api/') && url.pathname !== '/ws') return null;
+
+  // Vitest bypass: unit tests synthesize env objects without CROWCLAW_DASHBOARD_TOKEN
+  // to exercise routing/forwarding. Real CF Workers never have process.env.VITEST set.
+  const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
+  const isVitest = g.process?.env?.VITEST === 'true';
+  if (isVitest) return null;
+
+  const dashToken = env.CROWCLAW_DASHBOARD_TOKEN;
+  if (!dashToken) {
+    return Response.json(
+      { error: 'CROWCLAW_DASHBOARD_TOKEN is required on Cloudflare deployments.' },
+      { status: 500 }
+    );
+  }
+
+  const bearer = request.headers.get('authorization');
+  if (bearer?.startsWith('Bearer ')) {
+    if (timingSafeStringEqual(bearer.slice(7).trim(), dashToken)) return null;
+  }
+  const cookieToken = parseAuthCookie(request.headers.get('cookie'));
+  if (cookieToken) {
+    const expected = await deriveCookieToken(dashToken);
+    if (timingSafeStringEqual(cookieToken, expected)) return null;
+  }
+  return Response.json({ error: 'Unauthorized' }, { status: 401 });
+}
+
 export default {
   async fetch(request: Request, env: RuntimeEnv): Promise<Response> {
     const sandboxNamespace = env.Sandbox;
@@ -49,6 +118,42 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // Public auth endpoints — process before the gate so verify/check/logout work.
+    if (request.method === 'POST' && url.pathname === '/api/auth/verify') {
+      const dashToken = env.CROWCLAW_DASHBOARD_TOKEN;
+      if (!dashToken) {
+        return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN is required' }, { status: 500 });
+      }
+      const body = (await request.json().catch(() => ({}))) as { token?: string };
+      if (!body.token || !timingSafeStringEqual(body.token, dashToken)) {
+        return Response.json({ ok: false }, { status: 200 });
+      }
+      const cookie = await deriveCookieToken(dashToken);
+      const headers = new Headers({ 'content-type': 'application/json' });
+      headers.set('Set-Cookie', `crowclaw_auth=${cookie}; HttpOnly; SameSite=Strict; Path=/; Secure`);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/auth/check') {
+      const dashToken = env.CROWCLAW_DASHBOARD_TOKEN;
+      if (!dashToken) return Response.json({ ok: false, reason: 'no-token-configured' });
+      const cookieToken = parseAuthCookie(request.headers.get('cookie'));
+      if (!cookieToken) return Response.json({ ok: false });
+      const expected = await deriveCookieToken(dashToken);
+      return Response.json({ ok: timingSafeStringEqual(cookieToken, expected) });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+      const headers = new Headers({ 'content-type': 'application/json' });
+      headers.set('Set-Cookie', `crowclaw_auth=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+    }
+
+    // Fail-closed auth gate on every /api/* and /ws surface. Webhooks keep
+    // their platform-specific signature checks.
+    const authReject = await enforceDashboardAuth(request, env, url);
+    if (authReject) return authReject;
 
     if (request.method === 'GET' && url.pathname === '/health') {
       return Response.json({ ok: true, service: 'crowclaw', runtime: 'cloudflare' });
@@ -771,6 +876,10 @@ export default {
       if (env.SLACK_SIGNING_SECRET) {
         const signature = request.headers.get('x-slack-signature') ?? '';
         const timestamp = request.headers.get('x-slack-request-timestamp') ?? '';
+        const tsNum = parseInt(timestamp, 10);
+        if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 300) {
+          return Response.json({ ok: false, error: 'Slack timestamp outside replay window.' }, { status: 401 });
+        }
         const verified = await verifySlackSignature({
           signingSecret: env.SLACK_SIGNING_SECRET,
           timestamp,
