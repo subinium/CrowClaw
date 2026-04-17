@@ -1292,7 +1292,16 @@ export class AgentSessionDurableObject {
       if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
       const restored = restoreFromCheckpoint(checkpoint, session);
       await this.sessionStore.put(restored.session);
-      return Response.json({ ok: true, restoredTo: cpId, messageCount: restored.session.messages.length });
+      // Surface toolResults + loopState (previously dropped) so the Cloudflare
+      // restore path matches Node — UIs can thread them into the next run().
+      return Response.json({
+        ok: true,
+        restoredTo: cpId,
+        messageCount: restored.session.messages.length,
+        toolResults: restored.toolResults,
+        loopState: restored.loopState,
+        restoredIteration: checkpoint.iteration,
+      });
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/replay')) {

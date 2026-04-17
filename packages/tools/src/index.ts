@@ -302,9 +302,14 @@ function defaultScopeKey(scope: 'session' | 'user' | 'workspace' | undefined, co
 
 export class ToolRegistry implements ToolCatalog, ToolExecutor {
   private readonly tools = new Map<string, ToolDefinition>();
+  /** Memoized manifest snapshot. Invalidated on register(). AgentLoop.run calls
+   *  list() ~9x per iteration (budget check, prompt build, reflection, etc.);
+   *  rebuilding the array each time dominated iteration overhead at ≥50 tools. */
+  private manifestCache: ToolManifest[] | null = null;
 
   register(definition: ToolDefinition): this {
     this.tools.set(definition.manifest.name, definition);
+    this.manifestCache = null;
     return this;
   }
 
@@ -313,7 +318,10 @@ export class ToolRegistry implements ToolCatalog, ToolExecutor {
   }
 
   list(): ToolManifest[] {
-    return [...this.tools.values()].map((tool) => tool.manifest);
+    if (!this.manifestCache) {
+      this.manifestCache = [...this.tools.values()].map((tool) => tool.manifest);
+    }
+    return this.manifestCache;
   }
 
   get(name: string): ToolDefinition | undefined {

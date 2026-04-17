@@ -1779,10 +1779,22 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Must run before auth handlers which return early.
       if (url.pathname === '/api/auth/verify' && request.method === 'POST') {
         const clientIp = getClientIp(request);
+        // Per-IP limit stops honest clients from self-DOSing. Global limit
+        // blunts the X-Forwarded-For rotation trick: a proxy that sets XFF
+        // lets an attacker cycle client IPs, so without this a brute-forcer
+        // gets essentially unlimited attempts. 60/min total is well above
+        // legitimate retry patterns but caps an attacker at ~1 attempt/sec.
         if (!authRateLimiter.check(clientIp, 10, 60_000)) {
-          log.warn('Auth rate limit exceeded', { component: 'security', clientIp, path: url.pathname });
+          log.warn('Auth rate limit exceeded (per-IP)', { component: 'security', clientIp, path: url.pathname });
           return Response.json(
             { error: 'Too many authentication attempts. Limit: 10 per minute.' },
+            { status: 429, headers: { 'Retry-After': '60' } }
+          );
+        }
+        if (!authRateLimiter.check('__global_auth__', 60, 60_000)) {
+          log.warn('Auth rate limit exceeded (global)', { component: 'security', clientIp, path: url.pathname });
+          return Response.json(
+            { error: 'Too many authentication attempts. Server-wide limit: 60 per minute.' },
             { status: 429, headers: { 'Retry-After': '60' } }
           );
         }
@@ -4579,7 +4591,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
           const restored = restoreFromCheckpoint(checkpoint, session);
           await store.put(restored.session);
-          return Response.json({ ok: true, restoredTo: cpId, messageCount: restored.session.messages.length });
+          // Previously only `restored.session` was persisted — toolResults and
+          // loopState (iteration counters, pendingToolCalls, systemPrompt)
+          // were silently dropped, so the next turn resumed from a blank loop
+          // state even though the checkpoint carried that data. Surface them
+          // to the client so the caller can thread them into the next run(),
+          // and echo the restored iteration so UIs can show where we rewound to.
+          return Response.json({
+            ok: true,
+            restoredTo: cpId,
+            messageCount: restored.session.messages.length,
+            toolResults: restored.toolResults,
+            loopState: restored.loopState,
+            restoredIteration: checkpoint.iteration,
+          });
         }
 
         if (action === 'replay') {
