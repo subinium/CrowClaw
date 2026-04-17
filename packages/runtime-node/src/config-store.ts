@@ -261,6 +261,13 @@ export class RuntimeConfigStore {
   }
 
   getPendingPairingsMap(): Map<string, { code: string; platform: string; senderId: string; channelId: string; createdAt: string; expiresAt: string }> {
+    // Prune expired entries on every read — otherwise the inbound gateway
+    // message path accumulates stale challenges forever (1h expiry × high
+    // inbound traffic → thousands of dead rows persisted to disk).
+    const now = Date.now();
+    for (const [key, p] of this.config.pendingPairings) {
+      if (new Date(p.expiresAt).getTime() < now) this.config.pendingPairings.delete(key);
+    }
     return this.config.pendingPairings;
   }
 

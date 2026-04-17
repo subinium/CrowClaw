@@ -802,14 +802,41 @@ export class AgentLoop {
   /** Apply redaction to tool output if security policy requires it */
   private redactToolResult(result: ToolExecutionResult): ToolExecutionResult {
     if (!this.securityPolicy.redactToolOutput) return result;
-    const redacted = redactToolOutputFn(result.output);
-    if (redacted === result.output) return result;
-    this.securityAuditLog?.record({
-      type: 'credential_redacted',
-      severity: 'info',
-      detail: `Credentials/PII redacted in output from tool "${result.toolName}"`,
-    });
-    return { ...result, output: redacted, metadata: { ...result.metadata, securityRedacted: true } };
+    let output = result.output;
+    let mutated = false;
+    // Credential + PII redaction (existing).
+    const redacted = redactToolOutputFn(output);
+    if (redacted !== output) {
+      output = redacted;
+      mutated = true;
+      this.securityAuditLog?.record({
+        type: 'credential_redacted',
+        severity: 'info',
+        detail: `Credentials/PII redacted in output from tool "${result.toolName}"`,
+      });
+    }
+    // Second-order prompt-injection scan. Indirect injection (malicious HTML
+    // in a fetched page, poisoned file contents) is the #1 mitigation gap in
+    // agent frameworks — before v0.4.1 tool output flowed back into the LLM
+    // unchecked. When we detect it, wrap the output in <untrusted-content>
+    // tags so the LLM is primed to treat it as data, not instructions.
+    const injectionScan = scanForEnhancedInjection(output);
+    if (injectionScan.detected) {
+      const threatCount = injectionScan.threats.length;
+      output = `<untrusted-content source="tool:${result.toolName}" reason="prompt-injection-detected:threats=${threatCount}">\n${output}\n</untrusted-content>`;
+      mutated = true;
+      const topThreats = injectionScan.threats
+        .slice(0, 2)
+        .map((t) => (typeof t === 'string' ? t : (t as { description?: string }).description ?? 'unknown'))
+        .join('; ');
+      this.securityAuditLog?.record({
+        type: 'injection_detected',
+        severity: threatCount >= 3 ? 'critical' : 'warning',
+        detail: `Prompt injection in output from tool "${result.toolName}" (threats=${threatCount}: ${topThreats})`,
+      });
+    }
+    if (!mutated) return result;
+    return { ...result, output, metadata: { ...result.metadata, securityRedacted: true } };
   }
 
   /**
@@ -1592,12 +1619,16 @@ export class AgentLoop {
           };
           const safetyPartition = this.partitionToolCallsBySafety(streamToolCalls);
           if (safetyPartition) {
-            // Safety-aware streaming execution
+            // Safety-aware streaming execution.
+            // Track tool-call → id via a Map so we don't mutate incoming objects
+            // (providers may return frozen/pooled instances where property
+            // assignment is a silent no-op, dropping the id).
+            const resolvedIds = new Map<ToolCall, string>();
             const concurrentStartTime = Date.now();
             // Emit tool-start for parallel tools, execute in parallel
             for (const tc of safetyPartition.parallel) {
               const toolCallId = (tc as ToolCall & { id?: string }).id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
-              (tc as any)._resolvedId = toolCallId;
+              resolvedIds.set(tc, toolCallId);
               yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
             }
             if (safetyPartition.parallel.length > 0) {
@@ -1606,7 +1637,7 @@ export class AgentLoop {
               );
               for (let i = 0; i < settled.length; i++) {
                 const tc = safetyPartition.parallel[i];
-                const toolCallId = (tc as any)._resolvedId ?? `tc-${tc.name}`;
+                const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
                 const s = settled[i];
                 const result: ToolExecutionResult = s.status === 'fulfilled'
                   ? s.value
@@ -1633,9 +1664,10 @@ export class AgentLoop {
           } else {
             // No safety annotations: fall back to all-parallel
             const concurrentStartTime = Date.now();
+            const resolvedIds = new Map<ToolCall, string>();
             for (const tc of streamToolCalls) {
               const toolCallId = tc.id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
-              (tc as any)._resolvedId = toolCallId;
+              resolvedIds.set(tc, toolCallId);
               yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
             }
             const settled = await Promise.allSettled(
@@ -1643,7 +1675,7 @@ export class AgentLoop {
             );
             for (let i = 0; i < settled.length; i++) {
               const tc = streamToolCalls[i];
-              const toolCallId = (tc as any)._resolvedId ?? `tc-${tc.name}`;
+              const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
               const s = settled[i];
               const result: ToolExecutionResult = s.status === 'fulfilled'
                 ? s.value

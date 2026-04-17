@@ -1,5 +1,5 @@
 import { readFile, writeFile, readdir, access, unlink, rename as fsRename, mkdir, stat } from 'node:fs/promises';
-import { resolve, relative, dirname, extname } from 'node:path';
+import { resolve, relative, dirname, extname, isAbsolute } from 'node:path';
 
 export interface WorkspaceFile {
   path: string;
@@ -73,7 +73,16 @@ export class FileWorkspaceStore implements WorkspaceStore {
 
   private resolveSafe(filePath: string): string {
     const resolved = resolve(this.rootDir, filePath);
-    if (!resolved.startsWith(this.rootDir + '/') && resolved !== this.rootDir) {
+    // Cross-platform containment check: on Windows, `resolve` returns
+    // backslash-separated paths (`C:\workspace\...`), so `startsWith(rootDir + '/')`
+    // returned false even for legitimate in-root paths — and conversely, could
+    // miss `..\..\etc\passwd` style traversals because the pre-v0.4.1 check
+    // compared with `/` only. `relative()` is platform-aware: a legitimate
+    // in-root path returns "" or a subpath; a traversal returns "..", and an
+    // absolute path on a different drive returns a rooted string.
+    const rel = relative(this.rootDir, resolved);
+    const isInRoot = rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+    if (!isInRoot) {
       throw new Error(`Path traversal blocked: ${filePath}`);
     }
     return resolved;
