@@ -1137,7 +1137,7 @@ export class AgentLoop {
           const def = this.tools.get(tc.name);
           const dangerousSignals = collectDangerousInputSignals(tc.input);
           if (def?.manifest.dangerLevel === 'high' || dangerousSignals.length > 0) {
-            await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
+            await this.checkpointStore.save(createCheckpoint({ ...session, messages: nextMessages }, toolResults, iteration, 'pre-dangerous'));
             break; // Only one pre-dangerous checkpoint per iteration
           }
         }
@@ -1264,7 +1264,7 @@ export class AgentLoop {
 
       // Track 1.4: Auto-checkpoint at end of iteration
       if (this.autoCheckpoint && this.checkpointStore) {
-        await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
+        await this.checkpointStore.save(createCheckpoint({ ...session, messages: nextMessages }, toolResults, iteration, 'iteration'));
       }
 
       // Tiered budget warnings (Hermes pattern) — inject ephemeral hints
@@ -1718,7 +1718,7 @@ export class AgentLoop {
             if (needsApproval) {
               // Track 1.4: Checkpoint before dangerous tool
               if (this.autoCheckpoint && this.checkpointStore) {
-                await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'pre-dangerous'));
+                await this.checkpointStore.save(createCheckpoint({ ...session, messages: nextMessages }, toolResults, iteration, 'pre-dangerous'));
               }
 
               const context: ToolExecutionContext = {
@@ -1800,7 +1800,7 @@ export class AgentLoop {
 
         // Track 1.4: Auto-checkpoint at end of iteration
         if (this.autoCheckpoint && this.checkpointStore) {
-          await this.checkpointStore.save(createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, iteration, 'iteration'));
+          await this.checkpointStore.save(createCheckpoint({ ...session, messages: nextMessages }, toolResults, iteration, 'iteration'));
         }
 
         streamIterationsCompleted = iteration + 1;
@@ -1837,7 +1837,7 @@ export class AgentLoop {
       // Save completion checkpoint
       if (this.autoCheckpoint && this.checkpointStore) {
         await this.checkpointStore.save(
-          createCheckpoint({ ...session, messages: [...nextMessages] }, toolResults, this.maxToolIterations, 'completion')
+          createCheckpoint({ ...session, messages: nextMessages }, toolResults, this.maxToolIterations, 'completion')
         );
       }
       yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
