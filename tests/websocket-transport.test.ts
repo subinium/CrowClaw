@@ -123,13 +123,15 @@ describe('WebSocketManager', () => {
   });
 
   describe('broadcasting', () => {
-    it('broadcasts to all connections', () => {
+    it('broadcasts to all connections', async () => {
       const ws1 = new MockWebSocket();
       const ws2 = new MockWebSocket();
       manager.addConnection(ws1 as unknown as WebSocket, true);
       manager.addConnection(ws2 as unknown as WebSocket, true);
 
       manager.broadcast('chat:message', { text: 'hello' });
+      // Per-subscriber outbound queue flushes via queueMicrotask (#52).
+      await vi.advanceTimersByTimeAsync(0);
 
       // ws1 has connected msg + broadcast, ws2 has connected msg + broadcast
       const msg1 = JSON.parse(ws1.sent[1]);
@@ -138,23 +140,53 @@ describe('WebSocketManager', () => {
       expect(msg2).toEqual({ type: 'chat:message', data: { text: 'hello' } });
     });
 
-    it('removes connection that throws on send', () => {
+    it('removes connection that throws on send', async () => {
       const ws = new MockWebSocket();
       manager.addConnection(ws as unknown as WebSocket, true);
       ws.readyState = MockWebSocket.CLOSED;
 
       manager.broadcast('chat:message', { text: 'hello' });
+      // Send error surfaces during the async flush; let it run.
+      await vi.advanceTimersByTimeAsync(0);
       expect(manager.connectionCount).toBe(0);
+    });
+
+    it('drops oldest frames when subscriber queue overflows', async () => {
+      const ws = new MockWebSocket();
+      // Block ws.send so the queue fills up before any flush completes.
+      let release: (() => void) | null = null;
+      const blockUntilReleased = new Promise<void>((resolve) => { release = resolve; });
+      const originalSend = ws.send.bind(ws);
+      ws.send = async (data: string) => {
+        await blockUntilReleased;
+        originalSend(data);
+      };
+      manager.addConnection(ws as unknown as WebSocket, true);
+
+      // No microtask runs between broadcasts (no awaits), so all 106 queue up
+      // synchronously. Frames 1-100 fill the queue, frames 101-106 each evict
+      // the oldest, producing 6 drops.
+      const TOTAL = 106;
+      for (let i = 0; i < TOTAL; i++) {
+        manager.broadcast('chat:message', { i });
+      }
+
+      const stats = manager.getStats();
+      expect(stats.subscribers).toBe(1);
+      expect(stats.totalDropped).toBe(6);
+
+      release?.();
     });
   });
 
   describe('EventBus relay', () => {
-    it('relays EventBus events to connected clients', () => {
+    it('relays EventBus events to connected clients', async () => {
       const ws = new MockWebSocket();
       manager.start(eventBus);
       manager.addConnection(ws as unknown as WebSocket, true);
 
       eventBus.emit('chat:message', { content: 'test' });
+      await vi.advanceTimersByTimeAsync(0);
 
       // connected msg + relayed event
       expect(ws.sent.length).toBe(2);
@@ -227,7 +259,7 @@ describe('WebSocketManager', () => {
   });
 
   describe('selective channel subscription', () => {
-    it('filters events by subscribed channels', () => {
+    it('filters events by subscribed channels', async () => {
       const ws = new MockWebSocket();
       manager.addConnection(ws as unknown as WebSocket, true);
 
@@ -235,6 +267,7 @@ describe('WebSocketManager', () => {
 
       manager.broadcast('chat:message', { text: 'included' });
       manager.broadcast('job:start', { id: 'excluded' });
+      await vi.advanceTimersByTimeAsync(0);
 
       // connected + pong (from subscribe is not a ping, no pong) + chat:message broadcast
       const messages = ws.sent.slice(1).map(s => JSON.parse(s));
@@ -243,12 +276,13 @@ describe('WebSocketManager', () => {
       expect(types).not.toContain('job:start');
     });
 
-    it('receives all events when no subscribe message sent', () => {
+    it('receives all events when no subscribe message sent', async () => {
       const ws = new MockWebSocket();
       manager.addConnection(ws as unknown as WebSocket, true);
 
       manager.broadcast('chat:message', { text: 'a' });
       manager.broadcast('job:start', { id: 'b' });
+      await vi.advanceTimersByTimeAsync(0);
 
       // connected + 2 broadcasts
       expect(ws.sent.length).toBe(3);
@@ -267,7 +301,7 @@ describe('WebSocketManager', () => {
       expect(pong.timestamp).toBeDefined();
     });
 
-    it('handles subscribe message', () => {
+    it('handles subscribe message', async () => {
       const ws = new MockWebSocket();
       manager.addConnection(ws as unknown as WebSocket, true);
 
@@ -275,6 +309,7 @@ describe('WebSocketManager', () => {
 
       manager.broadcast('chat:stream', { delta: 'x' });
       manager.broadcast('chat:error', { error: 'y' });
+      await vi.advanceTimersByTimeAsync(0);
 
       const messages = ws.sent.slice(1).map(s => JSON.parse(s));
       expect(messages.some((m: { type: string }) => m.type === 'chat:stream')).toBe(true);

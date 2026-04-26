@@ -74,8 +74,8 @@ import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from 
 import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun, type DeliveryFn, type DeliveryTarget } from '@crowclaw/scheduler';
 import { AcpServer } from '@crowclaw/acp';
 import { RuntimeConfigStore, FileConfigStore } from './config-store.js';
-import type { CodeBridgeSession } from './bridge-state.js';
-import { ensureBrowserSession, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
+import { pruneStaleBridgeSessions, type CodeBridgeSession } from './bridge-state.js';
+import { ensureBrowserSession, pruneStaleBrowserSessions, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
 import { handleCodeBridgeRoutes } from './bridge-routes.js';
 import type { BridgeProcessRecord } from './bridge-process.js';
 import { routePaths } from './route-paths.js';
@@ -791,6 +791,16 @@ function normalizeIp(ip: string): string {
   return mapped ? mapped[1]! : noZone;
 }
 
+/**
+ * Sliding-window rate limiter (#48).
+ *
+ * Stores per-key timestamps in a sorted deque (oldest at index 0). On each
+ * `check`, expired entries at the head are dropped via a single in-place
+ * `splice(0, i)` instead of allocating a fresh `filter` array. With N entries
+ * per key and K keys, the previous implementation was O(N) allocation +
+ * O(N) copy on every check; this is O(expired) with no allocation in the
+ * common steady-state path.
+ */
 class RateLimiter {
   private requests = new Map<string, number[]>();
   private readonly maxKeys: number;
@@ -801,15 +811,23 @@ class RateLimiter {
 
   check(key: string, maxRequests: number, windowMs: number): boolean {
     const now = Date.now();
-    const timestamps = this.requests.get(key) ?? [];
     const windowStart = now - windowMs;
-    const recent = timestamps.filter((t) => t > windowStart);
-    if (recent.length >= maxRequests) {
-      this.requests.set(key, recent);
+    let timestamps = this.requests.get(key);
+    if (!timestamps) {
+      timestamps = [];
+      this.requests.set(key, timestamps);
+    } else if (timestamps.length > 0 && timestamps[0]! <= windowStart) {
+      // Drop expired entries from the head (sorted oldest-first) in one splice.
+      let expired = 0;
+      while (expired < timestamps.length && timestamps[expired]! <= windowStart) {
+        expired++;
+      }
+      if (expired > 0) timestamps.splice(0, expired);
+    }
+    if (timestamps.length >= maxRequests) {
       return false; // rate limited
     }
-    recent.push(now);
-    this.requests.set(key, recent);
+    timestamps.push(now); // monotonic — preserves sorted order
     // Evict oldest entry if at capacity (prevents unbounded memory growth)
     if (this.requests.size > this.maxKeys) {
       const oldest = this.requests.keys().next().value;
@@ -817,6 +835,109 @@ class RateLimiter {
     }
     return true; // allowed
   }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency-store atomic claim helper (#29, #34)
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomic claim against a `GatewayIdempotencyStore`. Returns `true` if the
+ * key was newly recorded (caller proceeds), `false` if a still-valid entry
+ * already existed (caller should treat as a duplicate).
+ *
+ * Prefers the store's native `markIfAbsent` when available; falls back to
+ * a `has` + `mark` pair which is only race-safe on single-process JS stores
+ * (no `await` between the two calls). The fallback exists for backward
+ * compatibility with custom stores that haven't implemented `markIfAbsent`
+ * yet — runtime-node's default `InMemoryGatewayIdempotencyStore` always
+ * exposes the atomic primitive.
+ */
+async function claimIdempotency(
+  store: { markIfAbsent?: (key: string, ttlMs?: number) => Promise<boolean>; has: (key: string) => Promise<boolean>; mark: (key: string) => Promise<void> },
+  key: string,
+): Promise<boolean> {
+  if (typeof store.markIfAbsent === 'function') {
+    return store.markIfAbsent(key);
+  }
+  if (await store.has(key)) return false;
+  await store.mark(key);
+  return true;
+}
+
+/**
+ * Best-effort release of an idempotency claim (#29, #34). Used when the
+ * downstream agent run threw — we want the next retry delivery to be
+ * processed instead of permanently swallowed as a duplicate.
+ */
+async function releaseIdempotency(
+  store: { unmark?: (key: string) => Promise<void> },
+  key: string,
+): Promise<void> {
+  if (typeof store.unmark === 'function') {
+    try { await store.unmark(key); } catch { /* best-effort */ }
+  }
+  // No fallback: legacy `mark`-only stores can't be unmarked, so the retry
+  // would be considered a duplicate. Acceptable trade-off — the default
+  // InMemoryGatewayIdempotencyStore exposes `unmark`.
+}
+
+// ---------------------------------------------------------------------------
+// SSE subscriber tracking (#41) and broadcast format cache (#49)
+// ---------------------------------------------------------------------------
+
+/**
+ * Live SSE subscriber bookkeeping (#41). Each entry tracks the active
+ * `ReadableStreamDefaultController`, its heartbeat timer, and the EventBus
+ * unsubscribe so SIGTERM drain can flush in one pass instead of waiting
+ * for individual `request.signal` aborts that may never fire on abrupt
+ * termination.
+ */
+interface SseSubscriber {
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  heartbeat: ReturnType<typeof setInterval>;
+  unsubscribe: () => void;
+}
+
+/**
+ * Pre-serialize a single SSE event frame (#49). The previous SSE handler
+ * called `JSON.stringify(data)` once per subscriber per event — for N
+ * subscribers and M events that's N×M serializations. With this helper the
+ * frame is built once at emit time and the same string is enqueued into
+ * every subscriber's controller.
+ */
+function formatSseFrame(event: string, payload: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Cookie-token derivation cache (#47)
+// ---------------------------------------------------------------------------
+
+/**
+ * Memoize `deriveCookieToken(dashToken)` so the per-request HMAC
+ * computation only runs once per distinct dashboard token value. The token
+ * is read from `process.env.CROWCLAW_DASHBOARD_TOKEN` and almost never
+ * changes during the lifetime of a process; computing the SHA-256 HMAC on
+ * every `/api/auth/check`, `/api/auth/verify`, /api/* gate, and `/ws`
+ * upgrade was wasted work on every authenticated dashboard request.
+ *
+ * Cache is keyed by the raw token so a runtime restart with a rotated token
+ * picks up the new value automatically.
+ */
+let cachedDashTokenForCookie: string | null = null;
+let cachedDerivedCookieValue = '';
+function getDerivedCookieToken(dashToken: string | undefined): string {
+  if (!dashToken) {
+    cachedDashTokenForCookie = null;
+    cachedDerivedCookieValue = '';
+    return '';
+  }
+  if (dashToken !== cachedDashTokenForCookie) {
+    cachedDashTokenForCookie = dashToken;
+    cachedDerivedCookieValue = deriveCookieToken(dashToken);
+  }
+  return cachedDerivedCookieValue;
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +1052,7 @@ function isGatewayMutationRoute(pathname: string): boolean {
   return /^\/api\/gateway\/[^/]+\/(config|policy)$/.test(pathname);
 }
 
-const SESSION_DANGEROUS_ACTIONS = new Set(['abort', 'compact', 'steer']);
+const SESSION_DANGEROUS_ACTIONS = new Set(['abort', 'stop', 'compact', 'steer']);
 
 function isDangerousRoute(pathname: string): boolean {
   return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route)) || isGatewayMutationRoute(pathname);
@@ -1159,6 +1280,22 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }));
   wsManager.start(eventBus);
   wsManager.onAbort((sid) => sessionController.abort(sid));
+
+  // #41: track every open SSE subscriber so SIGTERM drain can flush them in
+  //      one pass instead of waiting for each `request.signal` to fire (which
+  //      doesn't reliably happen on abrupt server shutdown).
+  const sseSubscribers = new Set<SseSubscriber>();
+
+  // #42: track in-flight `learning.autoCapture` promises so SIGTERM drain can
+  //      await them (with a 5s cap) instead of dropping skill captures on
+  //      shutdown. autoCapture is fire-and-forget on the hot path, so without
+  //      this set the runtime would lose skills that were almost saved.
+  const inFlightLearning = new Set<Promise<void>>();
+  const trackLearning = (p: Promise<unknown>): void => {
+    const wrapped = p.then(() => undefined, () => undefined);
+    inFlightLearning.add(wrapped);
+    wrapped.finally(() => { inFlightLearning.delete(wrapped); });
+  };
 
   const skillRegistry = new SkillRegistry({ skillStore });
 
@@ -1868,6 +2005,51 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     }
   }
 
+  /**
+   * #41 + #42: Graceful drain on SIGTERM. Closes every open SSE controller
+   * and clears every heartbeat timer in one pass (so the server doesn't wait
+   * for individual `request.signal.abort` events that may never fire on
+   * abrupt shutdown), then awaits in-flight `learning.autoCapture` promises
+   * with a 5s cap so skill captures aren't silently dropped.
+   *
+   * Idempotent and safe to call from a process.on('SIGTERM', ...) handler.
+   * Returns a summary so the host CLI can log what was drained.
+   */
+  async function shutdown(timeoutMs: number = 5_000): Promise<{ ssEClosed: number; learningAwaited: number; learningPending: number }> {
+    // 1. Flush every open SSE subscriber. Close the controller, clear the
+    //    heartbeat, and unsubscribe from the EventBus so we don't fire
+    //    any further events into a closed stream.
+    const ssEClosed = sseSubscribers.size;
+    for (const sub of sseSubscribers) {
+      clearInterval(sub.heartbeat);
+      sub.unsubscribe();
+      try { sub.controller.close(); } catch { /* already closed */ }
+    }
+    sseSubscribers.clear();
+
+    // 2. Await in-flight learning.autoCapture with a hang cap so a stuck
+    //    extractor can't block shutdown indefinitely. Promises are wrapped
+    //    in trackLearning() which swallows errors, so allSettled is safe.
+    const pending = [...inFlightLearning];
+    const learningAwaited = pending.length;
+    if (pending.length > 0) {
+      const timeout = new Promise<'timeout'>((resolve) => {
+        const t = setTimeout(() => resolve('timeout'), timeoutMs);
+        // Don't keep the process alive just for this timer.
+        if (typeof (t as { unref?: () => void }).unref === 'function') (t as { unref(): void }).unref();
+      });
+      await Promise.race([
+        Promise.allSettled(pending),
+        timeout,
+      ]);
+    }
+    return {
+      ssEClosed,
+      learningAwaited,
+      learningPending: inFlightLearning.size,
+    };
+  }
+
   return {
     tools,
     store,
@@ -1885,6 +2067,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     sessionMutex,
     eventBus,
     feedbackLedger,
+    shutdown,
     async fetch(request: Request): Promise<Response> {
      try {
       const url = new URL(request.url);
@@ -1974,7 +2157,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
         const body = (await request.json()) as { token?: string };
         if (dashToken && timingSafeEqual(body.token ?? '', dashToken)) {
-          const cookieValue = deriveCookieToken(dashToken);
+          const cookieValue = getDerivedCookieToken(dashToken);
           const secureSuffix = isLocalhost ? '' : '; Secure';
           const headers = new Headers({ 'content-type': 'application/json' });
           headers.set('Set-Cookie', `crowclaw_auth=${cookieValue}; HttpOnly; SameSite=Strict; Path=/${secureSuffix}`);
@@ -2003,7 +2186,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (!dashToken) {
           return Response.json({ authenticated: isLocalhost });
         }
-        const derivedCookie = deriveCookieToken(dashToken);
+        const derivedCookie = getDerivedCookieToken(dashToken);
         return Response.json({ authenticated: (cookieAuth !== null && timingSafeEqual(cookieAuth, derivedCookie)) || (headerAuth !== null && timingSafeEqual(headerAuth, dashToken)) });
       }
 
@@ -2017,7 +2200,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const authHeader = request.headers.get('authorization');
         const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
         const cookieToken = parseCookieToken(request.headers.get('cookie'));
-        const derivedCookie = dashToken ? deriveCookieToken(dashToken) : '';
+        const derivedCookie = getDerivedCookieToken(dashToken);
         const tokenMatch = dashToken ? ((bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) || (cookieToken !== null && timingSafeEqual(cookieToken, derivedCookie))) : false;
 
         // Dangerous routes ALWAYS require auth, regardless of localhost
@@ -2231,6 +2414,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/status') {
+        // #35: prune-on-read for stale bridge / browser sessions before we
+        //      enumerate them — the count returned in the response should
+        //      reflect what the runtime would actually serve, not entries
+        //      that have been idle for >1h with no chance of resumption.
+        pruneStaleBridgeSessions(codeBridgeSessions);
+        pruneStaleBrowserSessions(browserSessions);
         const dynamicMcpClient = mcpClient as unknown as { getStatus?: () => unknown };
         const bridgeProcessSummary = [...bridgeProcesses.values()].map((process) => ({
           sessionId: process.sessionId,
@@ -2373,6 +2562,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/release-check') {
+        // #35: prune-on-read here too — release-check is a heavy enumeration
+        //      that's a natural place to flush stale entries.
+        pruneStaleBridgeSessions(codeBridgeSessions);
+        pruneStaleBrowserSessions(browserSessions);
         const dynamicMcpClient = mcpClient as unknown as {
           getStatus?: () => unknown;
           inspect?: (options?: { refresh?: boolean }) => Promise<unknown>;
@@ -3047,35 +3240,68 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/events') {
-        const stream = new ReadableStream({
+        const encoder = new TextEncoder();
+        let entry: SseSubscriber | null = null;
+        const stream = new ReadableStream<Uint8Array>({
           start(controller) {
-            const encoder = new TextEncoder();
-            const send = (event: string, data: unknown) => {
+            const sendFrame = (frame: string): void => {
               try {
-                controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+                controller.enqueue(encoder.encode(frame));
               } catch { /* stream closed */ }
             };
 
-            send('status', { type: 'connected', timestamp: new Date().toISOString() });
+            sendFrame(formatSseFrame('status', { type: 'connected', timestamp: new Date().toISOString() }));
 
-            // Subscribe to all runtime events
+            // #49: pre-format the SSE frame once at emit time. Previously each
+            //      subscriber re-stringified the same payload on every event,
+            //      so M events × N subscribers = N×M stringifies. Now the
+            //      EventBus listener formats once and every subscriber's
+            //      controller enqueues the same string.
             const unsubscribe = eventBus.subscribe((event) => {
-              send(event.type, { ...event.data, timestamp: event.timestamp });
+              const frame = formatSseFrame(event.type, { ...event.data, timestamp: event.timestamp });
+              sendFrame(frame);
             });
 
             const heartbeat = setInterval(() => {
-              send('heartbeat', {
+              sendFrame(formatSseFrame('heartbeat', {
                 timestamp: new Date().toISOString(),
                 sessions: (store as unknown as { size?: number }).size ?? 0,
                 subscribers: eventBus.subscriberCount,
-              });
+              }));
             }, 15000);
 
-            request.signal?.addEventListener('abort', () => {
-              unsubscribe();
-              clearInterval(heartbeat);
-              try { controller.close(); } catch { /* already closed */ }
-            });
+            // #41: register with the runtime-wide subscriber set so
+            //      shutdown() can flush every controller and clear every
+            //      heartbeat in one pass.
+            entry = { controller, heartbeat, unsubscribe };
+            sseSubscribers.add(entry);
+
+            const cleanup = (): void => {
+              if (!entry) return;
+              sseSubscribers.delete(entry);
+              entry.unsubscribe();
+              clearInterval(entry.heartbeat);
+              try { entry.controller.close(); } catch { /* already closed */ }
+              entry = null;
+            };
+
+            // request.signal fires for fetch-style abort; the underlying
+            // Node IncomingMessage 'close' event fires when the TCP socket
+            // disconnects — wire both so we don't leak entries when the
+            // browser tab closes without the abort signal propagating.
+            request.signal?.addEventListener('abort', cleanup);
+            const reqAny = request as unknown as { on?: (ev: string, cb: () => void) => void };
+            if (typeof reqAny.on === 'function') {
+              try { reqAny.on('close', cleanup); } catch { /* not a Node-style emitter */ }
+            }
+          },
+          cancel() {
+            // ReadableStream cancel — fires when the consumer detaches.
+            if (!entry) return;
+            sseSubscribers.delete(entry);
+            entry.unsubscribe();
+            clearInterval(entry.heartbeat);
+            entry = null;
           }
         });
 
@@ -3266,27 +3492,36 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomically claim the idempotency key BEFORE running the agent.
+        //      Previous code did `has()` then `mark()` AFTER `runAgent()`, so two
+        //      concurrent retries of the same delivery could both pass the
+        //      `has()` check, both invoke the agent, and both bill the provider.
+        //      Now `markIfAbsent` returns `true` on the winning attempt and the
+        //      loser short-circuits as a duplicate. On agent failure we
+        //      `unmark` so the next retry isn't permanently swallowed.
         const idempotencyKey = buildGatewayIdempotencyKey(message);
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message) });
-        }
         const sessionId = buildGatewaySessionKey(message);
-        // Debounce: merge rapid-fire messages from the same sender
-        const debouncedText = await gatewayDebouncer.debounce(
-          message.platform, message.userId ?? 'unknown', message.channelId ?? 'unknown', message.text
-        );
-        const result = await runConfiguredAgent({
-          sessionId,
-          userMessage: debouncedText,
-          userId: message.userId,
-          workspaceId: message.channelId,
-          systemPrompt: 'You are CrowClaw handling a generic webhook runtime event.'
-        });
-        await memoryService.captureSessionSummary(sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId });
         }
-        return Response.json(result);
+        try {
+          // Debounce: merge rapid-fire messages from the same sender
+          const debouncedText = await gatewayDebouncer.debounce(
+            message.platform, message.userId ?? 'unknown', message.channelId ?? 'unknown', message.text
+          );
+          const result = await runConfiguredAgent({
+            sessionId,
+            userMessage: debouncedText,
+            userId: message.userId,
+            workspaceId: message.channelId,
+            systemPrompt: 'You are CrowClaw handling a generic webhook runtime event.'
+          });
+          await memoryService.captureSessionSummary(sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
+        }
       }
 
       if (request.method === 'POST' && url.pathname === '/api/gateway/inspect') {
@@ -3333,18 +3568,36 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return accessResponse;
         }
         const dispatch = buildDiscordDispatch(payload as never)!;
-        const debouncedDiscordText = await gatewayDebouncer.debounce(
-          'discord', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedDiscordText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling a Discord runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        return Response.json(result);
+        // #34: Discord didn't have an idempotency check at all — Discord
+        //      retries deliveries when its 3s ack timeout elapses, so the
+        //      same `/command` invocation could fire `runAgent()` twice and
+        //      bill the provider twice. The Discord payload's top-level `id`
+        //      is the interaction id, which is unique per delivery and
+        //      stable across retries; we key on `discord:<channelId>:<id>`.
+        const interactionId = (payload as { id?: unknown })?.id;
+        const idempotencyKey = typeof interactionId === 'string' && interactionId.length > 0
+          ? `discord:${message.channelId}:${interactionId}`
+          : null;
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: dispatch.sessionId });
+        }
+        try {
+          const debouncedDiscordText = await gatewayDebouncer.debounce(
+            'discord', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedDiscordText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling a Discord runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
+        }
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/telegram') {
@@ -3367,9 +3620,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic markIfAbsent claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
         const dispatch = buildTelegramDispatch(payload as never)!;
         const telegramToken = configStore.getGatewayConfig('telegram')?.token;
@@ -3388,9 +3643,6 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           });
           typing?.stop();
           await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-          if (idempotencyKey) {
-            await gatewayIdempotencyStore.mark(idempotencyKey);
-          }
           // Send the agent response back to the Telegram chat
           if (telegramToken && chatId && result.finalResponse) {
             await sendTelegramMessage(telegramToken, chatId, result.finalResponse, { parseMode: 'Markdown' });
@@ -3398,6 +3650,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json(result);
         } catch (err: unknown) {
           typing?.stop();
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
           throw err;
         }
       }
@@ -3442,26 +3695,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
-        const dispatch = buildSlackDispatch(payload as never)!;
-        const debouncedSlackText = await gatewayDebouncer.debounce(
-          'slack', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedSlackText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling a Slack runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        try {
+          const dispatch = buildSlackDispatch(payload as never)!;
+          const debouncedSlackText = await gatewayDebouncer.debounce(
+            'slack', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedSlackText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling a Slack runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
         }
-        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/whatsapp') {
@@ -3484,26 +3741,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
-        const dispatch = buildWhatsAppDispatch(payload as never)!;
-        const debouncedWhatsAppText = await gatewayDebouncer.debounce(
-          'whatsapp', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedWhatsAppText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling a WhatsApp runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        try {
+          const dispatch = buildWhatsAppDispatch(payload as never)!;
+          const debouncedWhatsAppText = await gatewayDebouncer.debounce(
+            'whatsapp', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedWhatsAppText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling a WhatsApp runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
         }
-        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/signal') {
@@ -3526,26 +3787,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
-        const dispatch = buildSignalDispatch(payload as never)!;
-        const debouncedSignalText = await gatewayDebouncer.debounce(
-          'signal', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedSignalText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling a Signal runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        try {
+          const dispatch = buildSignalDispatch(payload as never)!;
+          const debouncedSignalText = await gatewayDebouncer.debounce(
+            'signal', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedSignalText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling a Signal runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
         }
-        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/email') {
@@ -3568,26 +3833,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
-        const dispatch = buildEmailDispatch(payload as never)!;
-        const debouncedEmailText = await gatewayDebouncer.debounce(
-          'email', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedEmailText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling an Email runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        try {
+          const dispatch = buildEmailDispatch(payload as never)!;
+          const debouncedEmailText = await gatewayDebouncer.debounce(
+            'email', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedEmailText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling an Email runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
         }
-        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/matrix') {
@@ -3610,26 +3879,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
-        const dispatch = buildMatrixDispatch(payload as never)!;
-        const debouncedMatrixText = await gatewayDebouncer.debounce(
-          'matrix', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedMatrixText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling a Matrix runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        try {
+          const dispatch = buildMatrixDispatch(payload as never)!;
+          const debouncedMatrixText = await gatewayDebouncer.debounce(
+            'matrix', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedMatrixText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling a Matrix runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
         }
-        return Response.json(result);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhooks/sms') {
@@ -3652,26 +3925,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
-        if (idempotencyKey && await gatewayIdempotencyStore.has(idempotencyKey)) {
-          return Response.json({ ok: true, duplicate: true, sessionId: buildGatewaySessionKey(message!) });
+        const sessionKey = buildGatewaySessionKey(message!);
+        if (idempotencyKey && !(await claimIdempotency(gatewayIdempotencyStore, idempotencyKey))) {
+          return Response.json({ ok: true, duplicate: true, sessionId: sessionKey });
         }
-        const dispatch = buildSmsDispatch(payload as never)!;
-        const debouncedSmsText = await gatewayDebouncer.debounce(
-          'sms', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
-        );
-        const result = await runConfiguredAgent({
-          sessionId: dispatch.sessionId,
-          userMessage: debouncedSmsText,
-          userId: dispatch.payload.userId,
-          workspaceId: dispatch.payload.workspaceId,
-          systemPrompt: 'You are CrowClaw handling an SMS runtime event.'
-        });
-        await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
-        if (idempotencyKey) {
-          await gatewayIdempotencyStore.mark(idempotencyKey);
+        try {
+          const dispatch = buildSmsDispatch(payload as never)!;
+          const debouncedSmsText = await gatewayDebouncer.debounce(
+            'sms', dispatch.payload.userId ?? 'unknown', dispatch.payload.workspaceId ?? 'unknown', dispatch.payload.userMessage
+          );
+          const result = await runConfiguredAgent({
+            sessionId: dispatch.sessionId,
+            userMessage: debouncedSmsText,
+            userId: dispatch.payload.userId,
+            workspaceId: dispatch.payload.workspaceId,
+            systemPrompt: 'You are CrowClaw handling an SMS runtime event.'
+          });
+          await memoryService.captureSessionSummary(dispatch.sessionId, result.session.messages);
+          return Response.json(result);
+        } catch (err: unknown) {
+          if (idempotencyKey) await releaseIdempotency(gatewayIdempotencyStore, idempotencyKey);
+          throw err;
         }
-        return Response.json(result);
       }
 
 
@@ -3867,6 +4144,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/browser/session') {
+        // #35: prune-on-read so a query for a stale session id returns the
+        //      empty/default state instead of a 1h+ idle entry.
+        pruneStaleBrowserSessions(browserSessions);
         const sessionId = url.searchParams.get('sessionId') ?? '';
         return Response.json(sessionId
           ? (browserSessions.get(sessionId) ?? { sessionId, currentUrl: null, history: [], lastSnapshot: null, lastRefs: [] })
@@ -4674,6 +4954,28 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: result.aborted, ...result });
         }
 
+        if (action === 'stop') {
+          // #59: synchronous stop endpoint — signals abort the same way the
+          //      WebSocket `session:abort` handler does, then waits up to 5s
+          //      for the session to clear from the active-sessions set.
+          //      Returns 200 if the session stopped within the deadline,
+          //      202 if the abort was signalled but the session is still
+          //      winding down (caller can poll /api/sessions/active).
+          const STOP_HANG_CAP_MS = 5_000;
+          const result = sessionController.abort(sessionId);
+          if (!result.aborted) {
+            return Response.json({ ok: false, status: 'not-active', reason: result.reason ?? 'Session is not active' }, { status: 404 });
+          }
+          const deadline = Date.now() + STOP_HANG_CAP_MS;
+          while (Date.now() < deadline) {
+            if (!sessionController.isActive(sessionId)) {
+              return Response.json({ ok: true, status: 'stopped', sessionId });
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          return Response.json({ ok: true, status: 'pending', sessionId }, { status: 202 });
+        }
+
         if (action === 'compact') {
           const session = await store.get(sessionId);
           if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
@@ -4887,7 +5189,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                   await memoryService.captureSessionSummary(sessionId, updatedSession.messages);
                   const toolMsgs = updatedSession.messages.filter(m => m.role === 'tool' || (m.role === 'assistant' && m.content?.includes('tool')));
                   if (toolMsgs.length > 0) {
-                    learning.autoCapture(updatedSession.messages, sessionId).catch(() => { /* best-effort */ });
+                    // #42: track for SIGTERM drain so the autoCapture survives shutdown.
+                    trackLearning(learning.autoCapture(updatedSession.messages, sessionId));
                   }
                   eventBus.emit('chat:complete', { sessionId, toolCount: toolMsgs.length });
                   eventBus.emit('session:updated', { sessionId, messageCount: updatedSession.messages.length });
@@ -4929,7 +5232,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         await memoryService.captureSessionSummary(sessionId, result.session.messages);
         // Auto-capture skills from completed conversations (Hermes self-improvement pattern)
         if (result.toolResults.length > 0) {
-          learning.autoCapture(result.session.messages, sessionId).catch(() => { /* best-effort */ });
+          // #42: track for SIGTERM drain so the autoCapture survives shutdown.
+          trackLearning(learning.autoCapture(result.session.messages, sessionId));
         }
         eventBus.emit('chat:complete', { sessionId, toolCount: result.toolResults.length });
         eventBus.emit('session:updated', { sessionId, messageCount: result.session.messages.length });
@@ -5507,7 +5811,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const bearerHeader = request.headers.get('authorization');
         const wsBearer = bearerHeader?.startsWith('Bearer ') ? bearerHeader.slice(7) : null;
 
-        const derivedCookie = dashToken ? deriveCookieToken(dashToken) : '';
+        const derivedCookie = getDerivedCookieToken(dashToken);
         const cookieMatches = !!dashToken && cookieAuth !== null && timingSafeEqual(cookieAuth, derivedCookie);
         const bearerMatches = !!dashToken && wsBearer !== null && timingSafeEqual(wsBearer, dashToken);
         const wsAuthenticated = cookieMatches || bearerMatches;

@@ -24,23 +24,40 @@ const DEFAULT_LIMIT: PlatformLimit = { maxPerMinute: 30 };
 export class PlatformRateLimiter {
   private timestamps = new Map<string, number[]>();
 
+  /**
+   * Drop expired timestamps from the front of the deque in-place.
+   * Timestamps are kept sorted ascending, so we can locate the first
+   * non-expired entry with a single linear scan and splice it off.
+   * Allocates only the small array returned by `splice` (and only when
+   * something actually expired). In steady state this is O(0) work.
+   */
+  private pruneExpired(arr: number[], cutoff: number): void {
+    let i = 0;
+    while (i < arr.length && arr[i] <= cutoff) i++;
+    if (i > 0) arr.splice(0, i);
+  }
+
   /** Check if a message can be sent on this platform. Returns true if allowed. */
   check(platform: GatewayPlatform | string): boolean {
     const limit = PLATFORM_LIMITS[platform] ?? DEFAULT_LIMIT;
     const now = Date.now();
-    const windowMs = 60_000;
-    const windowStart = now - windowMs;
+    const cutoff = now - 60_000;
 
-    const existing = this.timestamps.get(platform) ?? [];
-    const recent = existing.filter((t) => t > windowStart);
+    let arr = this.timestamps.get(platform);
+    if (!arr) {
+      arr = [];
+      this.timestamps.set(platform, arr);
+    }
 
-    if (recent.length >= limit.maxPerMinute) {
-      this.timestamps.set(platform, recent);
+    this.pruneExpired(arr, cutoff);
+
+    if (arr.length >= limit.maxPerMinute) {
       return false;
     }
 
-    recent.push(now);
-    this.timestamps.set(platform, recent);
+    // Timestamps stay sorted ascending because Date.now() is monotonic-enough
+    // for our window math. We append, never insert in the middle.
+    arr.push(now);
     return true;
   }
 
@@ -53,9 +70,10 @@ export class PlatformRateLimiter {
   remaining(platform: GatewayPlatform | string): number {
     const limit = PLATFORM_LIMITS[platform] ?? DEFAULT_LIMIT;
     const now = Date.now();
-    const windowStart = now - 60_000;
-    const existing = this.timestamps.get(platform) ?? [];
-    const recent = existing.filter((t) => t > windowStart);
-    return Math.max(limit.maxPerMinute - recent.length, 0);
+    const cutoff = now - 60_000;
+    const arr = this.timestamps.get(platform);
+    if (!arr) return limit.maxPerMinute;
+    this.pruneExpired(arr, cutoff);
+    return Math.max(limit.maxPerMinute - arr.length, 0);
   }
 }

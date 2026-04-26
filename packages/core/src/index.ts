@@ -7,6 +7,7 @@ import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from '
 import type { DetailedUsageTracker } from './usage-tracker.js';
 import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand, SecurityAuditLog } from './security.js';
 import { splitWithPairPreservation, extractPreflightFacts } from './compression-utils.js';
+import { isHardlineBlocked, HARDLINE_BLOCKLIST } from './hardline-blocklist.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -117,6 +118,11 @@ export interface ProviderResponse {
 export interface ProviderAdapter {
   generate(request: ProviderRequest): Promise<ProviderResponse>;
   countTokens?(messages: ConversationMessage[]): number;
+  /** #56 (provider contract, optional): if implemented, returns model-specific
+   *  tool-use guidance text that the agent loop appends to the system prompt.
+   *  Detected at runtime via `typeof provider.getToolUseGuidance === 'function'`
+   *  so providers that don't implement it don't pay any cost. */
+  getToolUseGuidance?(modelId: string): string | null;
 }
 
 export interface SessionLineage {
@@ -134,6 +140,10 @@ export interface SessionState {
   messages: ConversationMessage[];
   updatedAt: string;
   lineage?: SessionLineage;
+  /** #57 (scheduler contract): millisecond timestamp of the most recent tool
+   *  execution in this session. AgentLoop updates this after every tool call;
+   *  the scheduler reads it to detect stalled sessions for idle-shutdown. */
+  lastToolActivityAt?: number;
 }
 
 export interface SessionStore {
@@ -229,6 +239,9 @@ export interface AgentLoopOptions {
   maxErrorReflections?: number;
   /** Enable plan-before-act: inject planning instructions and replan on failure. Default: false */
   planBeforeAct?: boolean;
+  /** #53: extra hardline patterns appended to the static defaults. Matched
+   *  *before* the approval gate; matches short-circuit with no human prompt. */
+  hardlineBlocklist?: ReadonlyArray<{ pattern: RegExp; description: string }>;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -445,6 +458,13 @@ export class AgentLoop {
   private readonly errorReflection: boolean;
   private readonly maxErrorReflections: number;
   private readonly planBeforeAct: boolean;
+  /** #54: queue of pending /steer guidance per session. Drained at the top of
+   *  every loop iteration and prepended as a one-shot system message — never
+   *  written to session.messages, so the same nudge isn't replayed on restore. */
+  private readonly pendingSteers = new Map<string, string[]>();
+  /** #53: extra hardline patterns supplied by the operator at construction
+   *  time (e.g., loaded from env config). Merged with the static defaults. */
+  private readonly hardlineBlocklist: ReadonlyArray<{ pattern: RegExp; description: string }>;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -493,6 +513,34 @@ export class AgentLoop {
     this.errorReflection = options.errorReflection ?? true;
     this.maxErrorReflections = options.maxErrorReflections ?? 3;
     this.planBeforeAct = options.planBeforeAct ?? false;
+    this.hardlineBlocklist = options.hardlineBlocklist ?? [];
+  }
+
+  /**
+   * #54: Mid-run course correction. Operator submits guidance via the control
+   * channel (WS / REST); the next loop iteration drains pending steers and
+   * prepends them as a one-shot system message before the next LLM call.
+   * Steer text is never written to session.messages — restore replay should
+   * not re-apply old nudges, and the LLM's response captures the actual
+   * behavior change in the assistant message it produces.
+   */
+  steer(sessionId: string, guidance: string): void {
+    if (!guidance || !guidance.trim()) return;
+    const queue = this.pendingSteers.get(sessionId);
+    if (queue) {
+      queue.push(guidance);
+    } else {
+      this.pendingSteers.set(sessionId, [guidance]);
+    }
+  }
+
+  /** #54: Pop and return any pending steer guidance for this session. Called
+   *  at the top of each loop iteration. */
+  private drainPendingSteers(sessionId: string): string[] {
+    const queue = this.pendingSteers.get(sessionId);
+    if (!queue || queue.length === 0) return [];
+    this.pendingSteers.delete(sessionId);
+    return queue;
   }
 
   /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
@@ -897,6 +945,31 @@ export class AgentLoop {
       return this.redactToolResult(rawResult);
     }
 
+    // #53: Hardline blocklist — sits *before* the approval gate. Matches are
+    // unrecoverable (whole-disk wipes, fork bombs, force-push to protected
+    // branches, etc.). No operator prompt is shown — preventing consent
+    // fatigue from repeated adversarial suggestions.
+    const hardline = isHardlineBlocked(toolCall, this.hardlineBlocklist);
+    if (hardline.blocked) {
+      this.securityAuditLog?.record({
+        type: 'command_blocked',
+        severity: 'critical',
+        detail: `hardline-blocked: ${hardline.description} (pattern: ${hardline.pattern})`,
+        sessionId: input.sessionId,
+      });
+      return {
+        toolName: definition.manifest.name,
+        runtime: definition.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
+        ok: false,
+        output: `Tool call rejected by hardline blocklist: ${hardline.description}`,
+        metadata: {
+          blockedByHardline: true,
+          hardlinePattern: hardline.pattern,
+          hardlineDescription: hardline.description,
+        },
+      };
+    }
+
     // Command scanning: check tool input for dangerous commands
     const commandScan = this.scanToolCommandInput(toolCall);
     if (commandScan.blocked) {
@@ -1015,6 +1088,13 @@ export class AgentLoop {
     let finalResponse: string | undefined;
     let tokenBudgetExceeded = false;
 
+    // #44 perf: snapshot tool catalog once per run. ToolRegistry.list() is
+    // memoized but still crosses a method boundary; the loop reads it twice
+    // per iteration (system prompt + provider request). Tools registered
+    // mid-run are out of scope by design — we want a stable contract for
+    // the duration of a single user-facing run.
+    const toolList = this.tools.list();
+
     // Match skills against user query
     let matchedSkills: MatchedSkill[] | undefined;
     if (this.skills.length > 0) {
@@ -1028,7 +1108,7 @@ export class AgentLoop {
         }));
 
         // Warn about required tools that aren't registered
-        const registeredToolNames = new Set(this.tools.list().map(t => t.name));
+        const registeredToolNames = new Set(toolList.map(t => t.name));
         for (const ms of matchedSkills) {
           if (ms.tools) {
             for (const toolName of ms.tools) {
@@ -1052,22 +1132,42 @@ export class AgentLoop {
       baseSystemPrompt = baseSystemPrompt ? `${baseSystemPrompt}${planningDirective}` : planningDirective;
     }
 
+    // #56 (provider contract): if the provider exposes getToolUseGuidance,
+    // append the model-specific tool-use guidance to the base system prompt.
+    // Detected by duck-typing — providers that don't implement it pay nothing.
+    const providerWithGuidance = this.provider as { getToolUseGuidance?: (modelId: string) => string | null };
+    if (typeof providerWithGuidance.getToolUseGuidance === 'function') {
+      const guidance = providerWithGuidance.getToolUseGuidance('unknown');
+      if (guidance) {
+        baseSystemPrompt = baseSystemPrompt ? `${baseSystemPrompt}\n\n${guidance}` : guidance;
+      }
+    }
+
+    // #43 perf: build the system prompt once. Inputs (toolList, personaPrompt,
+    // basePrompt, agentPreset, matchedSkills, memories) are invariant across
+    // iterations within a single run — buildSystemPromptForRequest internally
+    // sorts the tool list and concatenates several string sections. At
+    // maxToolIterations: 12 with 20+ tools, this saves ~12-24 rebuilds per
+    // run. If a future feature mutates matchedSkills mid-run, gate this with
+    // a `dirty` flag and recompute on demand.
+    const cachedSystemPrompt = this.buildSystemPromptForRequest({
+      personaPrompt: this.personaPrompt,
+      basePrompt: baseSystemPrompt,
+      runtimeName: this.runtimeName,
+      sessionId: input.sessionId,
+      workspaceId: input.workspaceId,
+      userId: input.userId,
+      availableTools: toolList,
+      matchedSkills,
+      agentPreset: this.agentPreset,
+      memories: input.memories,
+    });
+
     // Track 2.3: Use prompt caching-aware system prompt builder
     const buildRequest = (msgs: ConversationMessage[]): ProviderRequest => ({
-      systemPrompt: this.buildSystemPromptForRequest({
-        personaPrompt: this.personaPrompt,
-        basePrompt: baseSystemPrompt,
-        runtimeName: this.runtimeName,
-        sessionId: input.sessionId,
-        workspaceId: input.workspaceId,
-        userId: input.userId,
-        availableTools: this.tools.list(),
-        matchedSkills,
-        agentPreset: this.agentPreset,
-        memories: input.memories,
-      }),
+      systemPrompt: cachedSystemPrompt,
       messages: msgs,
-      availableTools: this.tools.list(),
+      availableTools: toolList,
       signal: input.signal,
     });
 
@@ -1106,6 +1206,19 @@ export class AgentLoop {
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
       ensureNotAborted(input.signal);
+
+      // #54: Drain pending /steer guidance — operator submitted via control
+      // channel since the last iteration. Inject as a one-shot system
+      // message *for this turn only*; never persist into nextMessages so
+      // that on session restore the same nudge isn't replayed against
+      // historical conversation state.
+      const steerMessages = this.drainPendingSteers(input.sessionId);
+      const turnExtraMessages: ConversationMessage[] = steerMessages.map(g => ({
+        role: 'system',
+        content: `[OPERATOR STEER] ${g}`,
+        createdAt: nowIso(),
+        metadata: { steer: true },
+      }));
 
       // Track 1.2: Check token budget before continuing
       const budgetCheck = this.checkTokenBudget(totalTokensConsumed);
@@ -1191,6 +1304,14 @@ export class AgentLoop {
       }
 
       const encounteredToolError = iterationResults.some((result) => !result.ok);
+
+      // #57 (scheduler contract): record tool activity timestamp on the
+      // session. The scheduler reads this to detect stalled sessions for
+      // idle-shutdown. Only update if at least one tool actually ran.
+      if (iterationResults.length > 0) {
+        session.lastToolActivityAt = Date.now();
+      }
+
       const iterationWarning = budgetStatus(iteration + 1, this.maxToolIterations, this.budgetWarningThreshold, this.budgetCriticalThreshold);
 
       // Track 1.2: Merge token budget warning with iteration budget warning
@@ -1273,21 +1394,12 @@ export class AgentLoop {
         nextMessages.push({ role: 'system', content: budgetHint, createdAt: nowIso(), metadata: { budgetHint: true } });
       }
 
+      // #43/#44 perf: reuse cachedSystemPrompt + toolList instead of rebuilding.
+      // #54: prepend any drained steer messages for *this turn only*.
       currentResponse = await this.generateWithFallbacks({
-        systemPrompt: this.buildSystemPromptForRequest({
-          personaPrompt: this.personaPrompt,
-          basePrompt: baseSystemPrompt,
-          runtimeName: this.runtimeName,
-          sessionId: input.sessionId,
-          workspaceId: input.workspaceId,
-          userId: input.userId,
-          availableTools: this.tools.list(),
-          matchedSkills,
-          agentPreset: this.agentPreset,
-          memories: input.memories,
-        }),
-        messages: nextMessages,
-        availableTools: this.tools.list(),
+        systemPrompt: cachedSystemPrompt,
+        messages: turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages,
+        availableTools: toolList,
         signal: input.signal
       }, {
         sessionId: input.sessionId,
@@ -1356,6 +1468,9 @@ export class AgentLoop {
       workspaceId: input.workspaceId ?? session.workspaceId,
       messages: compression.messages,
       updatedAt: nowIso(),
+      // #57: forward lastToolActivityAt so persisted session reflects when
+      // the agent last did real tool work (not just when it last responded).
+      lastToolActivityAt: session.lastToolActivityAt,
       lineage: compression.compressedCount > 0
         ? {
             ...baseLineage,
@@ -1446,6 +1561,9 @@ export class AgentLoop {
     let accumulatedUsage: ProviderResponseUsage | undefined;
     const toolResults: ToolExecutionResult[] = [];
 
+    // #44 perf: snapshot tool catalog once for the duration of this stream.
+    const streamToolList = this.tools.list();
+
     // Match skills
     let matchedSkills: MatchedSkill[] | undefined;
     if (this.skills.length > 0) {
@@ -1459,7 +1577,7 @@ export class AgentLoop {
         }));
 
         // Warn about required tools that aren't registered
-        const registeredToolNames = new Set(this.tools.list().map(t => t.name));
+        const registeredToolNames = new Set(streamToolList.map(t => t.name));
         for (const ms of matchedSkills) {
           if (ms.tools) {
             for (const toolName of ms.tools) {
@@ -1472,6 +1590,28 @@ export class AgentLoop {
       }
     }
 
+    // #56 (provider contract): apply tool-use guidance for streaming path too.
+    let streamBasePrompt: string | undefined = streamInjectionWarning;
+    const streamProviderWithGuidance = this.provider as { getToolUseGuidance?: (modelId: string) => string | null };
+    if (typeof streamProviderWithGuidance.getToolUseGuidance === 'function') {
+      const guidance = streamProviderWithGuidance.getToolUseGuidance('unknown');
+      if (guidance) {
+        streamBasePrompt = streamBasePrompt ? `${streamBasePrompt}\n\n${guidance}` : guidance;
+      }
+    }
+
+    // #43 perf: cache the system prompt once for the stream.
+    const cachedStreamSystemPrompt = this.buildSystemPromptForRequest({
+      basePrompt: streamBasePrompt,
+      runtimeName: this.runtimeName,
+      sessionId: session.sessionId,
+      workspaceId: session.workspaceId,
+      userId: session.userId,
+      availableTools: streamToolList,
+      matchedSkills,
+      agentPreset: this.agentPreset,
+    });
+
     let streamErrorReflectionCount = 0;
     let streamIterationsCompleted = 0;
     let lastStreamHadToolCalls = false;
@@ -1481,22 +1621,19 @@ export class AgentLoop {
         ensureNotAborted(signal);
         yield { type: 'iteration-start', iteration };
 
-        // Stream from provider
-        const systemPrompt = this.buildSystemPromptForRequest({
-          basePrompt: streamInjectionWarning,
-          runtimeName: this.runtimeName,
-          sessionId: session.sessionId,
-          workspaceId: session.workspaceId,
-          userId: session.userId,
-          availableTools: this.tools.list(),
-          matchedSkills,
-          agentPreset: this.agentPreset,
-        });
+        // #54: drain pending /steer guidance for this turn (streaming path).
+        const streamSteers = this.drainPendingSteers(session.sessionId);
+        const streamTurnExtra: ConversationMessage[] = streamSteers.map(g => ({
+          role: 'system',
+          content: `[OPERATOR STEER] ${g}`,
+          createdAt: nowIso(),
+          metadata: { steer: true },
+        }));
 
         const request: ProviderRequest = {
-          systemPrompt,
-          messages: nextMessages,
-          availableTools: this.tools.list(),
+          systemPrompt: cachedStreamSystemPrompt,
+          messages: streamTurnExtra.length > 0 ? [...streamTurnExtra, ...nextMessages] : nextMessages,
+          availableTools: streamToolList,
           signal,
         };
 
@@ -1693,6 +1830,32 @@ export class AgentLoop {
             const toolStartTime = Date.now();
             yield { type: 'tool-start', toolName: tc.name, toolCallId, input: tc.input };
 
+            // #53: Hardline blocklist in streaming path — before approval.
+            const streamHardline = isHardlineBlocked({ name: tc.name, input: tc.input }, this.hardlineBlocklist);
+            if (streamHardline.blocked) {
+              this.securityAuditLog?.record({
+                type: 'command_blocked',
+                severity: 'critical',
+                detail: `hardline-blocked: ${streamHardline.description} (pattern: ${streamHardline.pattern})`,
+                sessionId: session.sessionId,
+              });
+              const blockedResult: ToolExecutionResult = {
+                toolName: tc.name,
+                runtime: 'worker',
+                ok: false,
+                output: `Tool call rejected by hardline blocklist: ${streamHardline.description}`,
+                metadata: {
+                  blockedByHardline: true,
+                  hardlinePattern: streamHardline.pattern,
+                  hardlineDescription: streamHardline.description,
+                },
+              };
+              toolResults.push(blockedResult);
+              nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
+              yield { type: 'tool-end', toolName: tc.name, toolCallId, result: blockedResult.output, ok: false, durationMs: Date.now() - toolStartTime };
+              continue;
+            }
+
             // Security: command scanning in streaming path
             const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input });
             if (streamCmdScan.blocked) {
@@ -1777,6 +1940,12 @@ export class AgentLoop {
           }
         }
 
+        // #57 (scheduler contract): record tool activity timestamp on the
+        // session whenever any tool ran in this iteration.
+        if (iterationToolResults.length > 0) {
+          session.lastToolActivityAt = Date.now();
+        }
+
         if (encounteredToolError) {
           if (this.errorReflection && streamErrorReflectionCount < this.maxErrorReflections) {
             streamErrorReflectionCount++;
@@ -1807,7 +1976,9 @@ export class AgentLoop {
         yield { type: 'iteration-end', iteration };
       }
 
-      // Synthesize on exhaustion (mirrors run() behavior)
+      // Synthesize on exhaustion (mirrors run() behavior).
+      // Synthesis runs once with no tools available — must rebuild the system
+      // prompt because availableTools differs from the cached version.
       if (lastStreamHadToolCalls && streamIterationsCompleted >= this.maxToolIterations && this.synthesizeOnExhaustion) {
         nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
         const synthesisRequest: ProviderRequest = {
@@ -1845,6 +2016,55 @@ export class AgentLoop {
       yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
     }
   }
+}
+
+/**
+ * #55: Forked-context child session helper.
+ *
+ * When a parent agent delegates to a child via `delegate.task` (or similar)
+ * with `forkContext: true`, the child should start with a clean conversation
+ * history seeded only with the delegated task. The previous behavior shared
+ * `parent.messages` directly, which contaminated the child's reasoning with
+ * parent-specific context and forced the child to re-derive intent from
+ * conversation it didn't author.
+ *
+ * Tool output flows back to the parent as a single tool result, just like a
+ * sandboxed call. Children get a unique sessionId nested under the parent so
+ * trace UIs can reconstruct the call tree.
+ *
+ * The TOOLS package owns the delegation tool itself and is responsible for
+ * calling this helper when its `forkContext` option is enabled.
+ */
+export function forkSession(
+  parent: SessionState,
+  task: string,
+  childAgentId: string,
+  childSessionIdSuffix?: string,
+): SessionState {
+  const suffix = childSessionIdSuffix
+    ?? `child-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    agentId: childAgentId,
+    sessionId: `${parent.sessionId}/${suffix}`,
+    userId: parent.userId,
+    workspaceId: parent.workspaceId,
+    messages: [{
+      role: 'user',
+      content: task,
+      createdAt: new Date().toISOString(),
+      metadata: {
+        forkedFrom: parent.sessionId,
+        forkedFromAgent: parent.agentId,
+      },
+    }],
+    updatedAt: new Date().toISOString(),
+    lineage: {
+      // Trace back to the original root so observability can reconstruct
+      // the full call tree even when delegation nests several levels deep.
+      rootSessionId: parent.lineage?.rootSessionId ?? parent.sessionId,
+      compressionCount: 0,
+    },
+  };
 }
 
 export { buildSystemPrompt, buildMemoryPrefix, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
@@ -1914,3 +2134,5 @@ export { ContextEngine, loadContextFiles, formatContextForPrompt, type ContextFi
 export { identifyToolPairs, splitWithPairPreservation, extractPreflightFacts, createCompressionChild, type ToolCallPair, type ChildSessionResult } from './compression-utils.js';
 
 export { scoreComplexity, selectModelForComplexity, type ComplexityLevel, type ComplexityScore } from './complexity-router.js';
+
+export { HARDLINE_BLOCKLIST, isHardlineBlocked, type HardlineBlockResult } from './hardline-blocklist.js';

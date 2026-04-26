@@ -98,4 +98,135 @@ describe('MCP server', () => {
     expect(tools.length).toBeGreaterThanOrEqual(1);
     expect(tools.every(t => t.inputSchema.type === 'object')).toBe(true);
   });
+
+  // ------------------------------------------------------------------------
+  // #27 — owner-only tool gating at the MCP bridge boundary
+  // ------------------------------------------------------------------------
+
+  describe('owner-only tool gating (#27)', () => {
+    function createGatedServer() {
+      return new CrowClawMcpServer(
+        {
+          run: async (input) => ({ finalResponse: `Reply: ${input.userMessage}` })
+        },
+        { name: 'crowclaw-test', version: '0.1.0', ownerToken: 'secret-owner-token' }
+      );
+    }
+
+    it('hides ownerOnly tools from non-owner tools/list responses', async () => {
+      const server = createGatedServer();
+      const response = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/list'
+        // no _meta.token
+      });
+
+      const result = response.result as { tools: Array<{ name: string; ownerOnly?: boolean }> };
+      const names = result.tools.map(t => t.name);
+      expect(names).not.toContain('crowclaw.chat');
+      expect(names).not.toContain('crowclaw.sessions.list');
+      expect(names).not.toContain('crowclaw.sessions.get');
+      expect(names).not.toContain('crowclaw.memories.search');
+      // Non-owner-only tools remain visible
+      expect(names).toContain('crowclaw.tools.list');
+    });
+
+    it('exposes ownerOnly tools to callers that present the owner token', async () => {
+      const server = createGatedServer();
+      const response = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/list',
+        _meta: { token: 'secret-owner-token' }
+      });
+
+      const result = response.result as { tools: Array<{ name: string }> };
+      const names = result.tools.map(t => t.name);
+      expect(names).toContain('crowclaw.chat');
+      expect(names).toContain('crowclaw.sessions.list');
+    });
+
+    it('rejects ownerOnly tools/call from non-owner clients', async () => {
+      const server = createGatedServer();
+      const response = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'crowclaw.chat',
+          arguments: { sessionId: 's1', message: 'hi' }
+        }
+      });
+
+      expect(response.error).toBeDefined();
+      // Result must NOT execute the agent loop
+      expect(response.result).toBeUndefined();
+    });
+
+    it('rejects ownerOnly tools/call when token mismatches', async () => {
+      const server = createGatedServer();
+      const response = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: {
+          name: 'crowclaw.chat',
+          arguments: { sessionId: 's1', message: 'hi' }
+        },
+        _meta: { token: 'wrong-token' }
+      });
+
+      expect(response.error).toBeDefined();
+      expect(response.result).toBeUndefined();
+    });
+
+    it('allows ownerOnly tools/call when caller presents owner token', async () => {
+      const server = createGatedServer();
+      const response = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: {
+          name: 'crowclaw.chat',
+          arguments: { sessionId: 's1', message: 'hi' }
+        },
+        _meta: { token: 'secret-owner-token' }
+      });
+
+      expect(response.error).toBeUndefined();
+      const result = response.result as { content: Array<{ text: string }> };
+      expect(result.content[0].text).toContain('Reply: hi');
+    });
+
+    it('crowclaw.tools.list filters ownerOnly tool names for non-owner callers', async () => {
+      const server = createGatedServer();
+      const response = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 6,
+        method: 'tools/call',
+        params: {
+          name: 'crowclaw.tools.list',
+          arguments: {}
+        }
+      });
+
+      const result = response.result as { content: Array<{ text: string }> };
+      const payload = JSON.parse(result.content[0].text) as { tools: string[] };
+      expect(payload.tools).not.toContain('crowclaw.chat');
+      expect(payload.tools).not.toContain('crowclaw.memories.search');
+    });
+
+    it('legacy mode (no ownerToken configured) treats every caller as owner', async () => {
+      const server = createTestServer(); // no ownerToken
+      const list = await server.handleRequest({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/list'
+      });
+
+      const names = (list.result as { tools: Array<{ name: string }> }).tools.map(t => t.name);
+      expect(names).toContain('crowclaw.chat');
+    });
+  });
 });

@@ -1,5 +1,5 @@
 import { getSandbox } from '@cloudflare/sandbox';
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, type ParsedSkillFile, type ProviderAdapter, type CheckpointTrigger, type SessionState } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, validateFetchUrl, type ParsedSkillFile, type ProviderAdapter, type CheckpointTrigger, type SessionState } from '@crowclaw/core';
 import { buildGatewayDeliveryPlan, normalizeGatewayRequest } from '@crowclaw/gateway';
 import { InMemorySkillStore, LearningPipeline, SkillRegistry, getBuiltInSkills } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, getMcpPresetDescription, listMcpPresetNames } from '@crowclaw/mcp';
@@ -13,7 +13,130 @@ import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets } from '@
 import { InMemoryWorkspaceStore } from '@crowclaw/workspace';
 import type { RuntimeEnv } from './env';
 
-type DurableObjectState = { id: { toString(): string } };
+/**
+ * Build-time version literal injected via `wrangler.jsonc` `define`. Replaces
+ * the prior hardcoded `'0.1.0'` returned by `/api/system/status` (#40). Tests
+ * see a sentinel value via `vitest.config.ts`.
+ */
+declare const __CROWCLAW_VERSION__: string;
+
+/**
+ * Subset of `DurableObjectState` we use. Keeps the existing test signature
+ * (`{ id: { toString(): string } }`) satisfied while letting us optionally
+ * use `state.storage` for persistence (#31, #32, #33). Storage is treated
+ * as optional because legacy tests synthesize state without it.
+ */
+type DurableObjectStateLite = {
+  id: { toString(): string };
+  storage?: {
+    get<T = unknown>(key: string): Promise<T | undefined>;
+    put<T = unknown>(key: string, value: T): Promise<void>;
+    delete(key: string): Promise<boolean>;
+  };
+};
+
+/** Storage key for the persisted gateway-idempotency map (#31). */
+const STORAGE_KEY_GATEWAY_IDEMPOTENCY = 'gateway:idempotency-keys';
+/** Storage key for the persisted scheduler-store snapshot (#32). */
+const STORAGE_KEY_SCHEDULER_JOBS = 'scheduler:jobs';
+/** Storage key for the persisted active-preset selection (#33). */
+const STORAGE_KEY_ACTIVE_PRESET = 'config-presets:active';
+/** Default TTL for idempotency keys (24h). Webhooks rarely retry past this. */
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+/** Eviction threshold for stale code/browser sessions (1h). Matches #35. */
+const SESSION_PRUNE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Persisted, TTL-bounded gateway-idempotency store (#31).
+ *
+ * Implements the new `GatewayIdempotencyStore` shape (markIfAbsent / unmark /
+ * has / mark) added by the GATEWAY agent. Backed by a `Map<string, expiresAt>`
+ * mirrored to DO storage so two requests across a DO restart still de-dupe.
+ *
+ * Prior implementation used an unbounded `Set<string>`. Busy webhook channels
+ * could OOM the 128 MB DO heap — see issue #31.
+ */
+class DurableObjectIdempotencyStore {
+  private readonly entries = new Map<string, number>();
+  private hydrated = false;
+
+  constructor(
+    private readonly storage: DurableObjectStateLite['storage'],
+    private readonly ttlMs: number = IDEMPOTENCY_TTL_MS,
+  ) {}
+
+  private async hydrate(): Promise<void> {
+    if (this.hydrated) return;
+    this.hydrated = true;
+    if (!this.storage) return;
+    try {
+      const persisted = await this.storage.get<Record<string, number>>(STORAGE_KEY_GATEWAY_IDEMPOTENCY);
+      if (persisted && typeof persisted === 'object') {
+        const now = Date.now();
+        for (const [key, expiresAt] of Object.entries(persisted)) {
+          if (typeof expiresAt === 'number' && expiresAt > now) {
+            this.entries.set(key, expiresAt);
+          }
+        }
+      }
+    } catch {
+      // Bad JSON or storage hiccup — continue with empty map.
+    }
+  }
+
+  /** Drop expired entries in-place. Cheap to call on every read. */
+  private evict(): void {
+    const now = Date.now();
+    for (const [key, expiresAt] of this.entries) {
+      if (expiresAt <= now) this.entries.delete(key);
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.storage) return;
+    const snapshot: Record<string, number> = {};
+    for (const [key, expiresAt] of this.entries) {
+      snapshot[key] = expiresAt;
+    }
+    try {
+      await this.storage.put(STORAGE_KEY_GATEWAY_IDEMPOTENCY, snapshot);
+    } catch {
+      // Storage write failures are non-fatal — in-memory copy is still bounded
+      // by TTL eviction.
+    }
+  }
+
+  /**
+   * Mark only if the key is not already present. Returns true when the key was
+   * newly recorded (caller should proceed) or false when it was a duplicate.
+   */
+  async markIfAbsent(key: string, ttlMs?: number): Promise<boolean> {
+    await this.hydrate();
+    this.evict();
+    if (this.entries.has(key)) return false;
+    this.entries.set(key, Date.now() + (ttlMs ?? this.ttlMs));
+    await this.persist();
+    return true;
+  }
+
+  async has(key: string): Promise<boolean> {
+    await this.hydrate();
+    this.evict();
+    return this.entries.has(key);
+  }
+
+  /** Compatibility shim. Prefer `markIfAbsent` for new call sites. */
+  async mark(key: string): Promise<void> {
+    await this.markIfAbsent(key);
+  }
+
+  async unmark(key: string): Promise<void> {
+    await this.hydrate();
+    if (this.entries.delete(key)) {
+      await this.persist();
+    }
+  }
+}
 
 function normalizeCheckpointTrigger(value: unknown): CheckpointTrigger {
   return value === 'iteration' || value === 'manual' || value === 'pre-dangerous' || value === 'error' || value === 'completion'
@@ -144,7 +267,8 @@ export class AgentSessionDurableObject {
   private readonly learning = new LearningPipeline(this.skillStore);
   private readonly mcpClient: McpClient;
   private readonly plugins = new PluginManager().register(new MemoryCapturePlugin());
-  private readonly gatewayIdempotencyKeys = new Set<string>();
+  /** Replaces the prior unbounded `Set<string>` (#31). */
+  private readonly gatewayIdempotency: DurableObjectIdempotencyStore;
   private readonly codeBridgeSessions = new Map<string, {
     maxToolCalls?: number;
     status: 'open' | 'closed';
@@ -157,12 +281,28 @@ export class AgentSessionDurableObject {
   private readonly browserSessions = new Map<string, { currentUrl?: string; history: string[]; lastSnapshot?: string; lastRefs: string[]; updatedAt: string }>();
   private readonly schedulerExecutor: SchedulerExecutor;
   private skillsInitialized = false;
+  /** Persisted scheduler hydration state (#32). Idempotent — runs once per DO. */
+  private schedulerHydrated = false;
+  /** Tracks whether the autonomous scheduler is "running" (logical only on CF). */
+  private autonomousRunning = false;
+  private autonomousLastTick: string | null = null;
+  /**
+   * Active config-preset selection (#33). Persisted via DO storage so the
+   * dashboard's "Active" badge survives DO eviction. Hydrated lazily.
+   */
+  private activePreset: { agent: string | null; toolset: string | null; mcp: string | null } = {
+    agent: null,
+    toolset: null,
+    mcp: null,
+  };
+  private activePresetHydrated = false;
 
-  constructor(private readonly state: DurableObjectState, private readonly env: RuntimeEnv) {
+  constructor(private readonly state: DurableObjectStateLite, private readonly env: RuntimeEnv) {
     this.sessionStore = new D1SessionStore(env.DB);
     this.memoryStore = new D1MemoryStore(env.DB);
     this.memoryService = new MemoryService(this.memoryStore);
     this.mcpClient = new McpClient(new McpHttpTransport({ baseUrl: env.MCP_BASE_URL ?? 'https://mcp.example.com' }));
+    this.gatewayIdempotency = new DurableObjectIdempotencyStore(state.storage);
 
     this.skillRegistry = new SkillRegistry({ skillStore: this.skillStore });
     this.skillRegistry.loadBuiltIn(getBuiltInSkills());
@@ -202,6 +342,100 @@ export class AgentSessionDurableObject {
     if (this.skillsInitialized) return;
     await this.skillRegistry.refreshLearned();
     this.skillsInitialized = true;
+  }
+
+  /**
+   * Restore the persisted scheduler snapshot into the in-memory store (#32).
+   * The SCHEDULER agent owns `serialize` / `deserialize`; if those aren't
+   * present yet, the call is a no-op and we fall back to in-memory only.
+   * Idempotent — runs once per DO instance.
+   */
+  private async ensureSchedulerHydrated(): Promise<void> {
+    if (this.schedulerHydrated) return;
+    this.schedulerHydrated = true;
+    if (!this.state.storage) return;
+    try {
+      const snapshot = await this.state.storage.get<unknown>(STORAGE_KEY_SCHEDULER_JOBS);
+      if (snapshot === undefined || snapshot === null) return;
+      const dynamicStore = this.schedulerStore as unknown as { deserialize?: (data: unknown) => void };
+      if (typeof dynamicStore.deserialize === 'function') {
+        dynamicStore.deserialize(snapshot);
+      }
+    } catch {
+      // Bad payload — start fresh rather than crashing the DO.
+    }
+  }
+
+  /**
+   * Persist the scheduler snapshot to DO storage. Call after every save / pause /
+   * resume / delete / recordRun to survive DO eviction (#32).
+   */
+  private async persistSchedulerState(): Promise<void> {
+    if (!this.state.storage) return;
+    const dynamicStore = this.schedulerStore as unknown as { serialize?: () => unknown };
+    if (typeof dynamicStore.serialize !== 'function') return;
+    try {
+      const snapshot = dynamicStore.serialize();
+      await this.state.storage.put(STORAGE_KEY_SCHEDULER_JOBS, snapshot);
+    } catch {
+      // Persist failures are non-fatal; the in-memory store still serves the
+      // current request.
+    }
+  }
+
+  /**
+   * Hydrate the active config-preset selection from DO storage (#33). Must run
+   * before any read or write to `this.activePreset` — guards against returning
+   * stale defaults after a DO restart.
+   */
+  private async ensureActivePresetHydrated(): Promise<void> {
+    if (this.activePresetHydrated) return;
+    this.activePresetHydrated = true;
+    if (!this.state.storage) return;
+    try {
+      const persisted = await this.state.storage.get<{ agent: string | null; toolset: string | null; mcp: string | null }>(
+        STORAGE_KEY_ACTIVE_PRESET,
+      );
+      if (persisted && typeof persisted === 'object') {
+        this.activePreset = {
+          agent: typeof persisted.agent === 'string' ? persisted.agent : null,
+          toolset: typeof persisted.toolset === 'string' ? persisted.toolset : null,
+          mcp: typeof persisted.mcp === 'string' ? persisted.mcp : null,
+        };
+      }
+    } catch {
+      // Continue with defaults.
+    }
+  }
+
+  private async persistActivePreset(): Promise<void> {
+    if (!this.state.storage) return;
+    try {
+      await this.state.storage.put(STORAGE_KEY_ACTIVE_PRESET, this.activePreset);
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  /**
+   * Drop closed code-bridge sessions older than 1h and stale browser sessions
+   * untouched in the same window (#35). Mirrors the v0.4.1 prune-on-read
+   * pattern applied to `getPendingPairingsMap`. Cheap to run on every list /
+   * inspect endpoint that touches these maps.
+   */
+  private pruneStaleSessions(): void {
+    const now = Date.now();
+    for (const [id, session] of this.codeBridgeSessions) {
+      if (session.status !== 'closed' || !session.closedAt) continue;
+      if (now - new Date(session.closedAt).getTime() > SESSION_PRUNE_TTL_MS) {
+        this.codeBridgeSessions.delete(id);
+      }
+    }
+    for (const [id, session] of this.browserSessions) {
+      if (now - new Date(session.updatedAt).getTime() > SESSION_PRUNE_TTL_MS) {
+        this.browserSessions.delete(id);
+      }
+    }
   }
 
   /** Create a fresh AgentLoop with current skills from the registry. */
@@ -289,6 +523,8 @@ export class AgentSessionDurableObject {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/system/status')) {
+      await this.ensureSchedulerHydrated();
+      this.pruneStaleSessions();
       const registry = createRegistry(this.sessionStore, this.memoryStore, this.workspaceStore, this.mcpClient);
       const listStore = this.sessionStore as D1SessionStore & SessionListStore;
       const sessions = typeof listStore.listRecent === 'function'
@@ -300,7 +536,10 @@ export class AgentSessionDurableObject {
         runtime: 'cloudflare',
         service: 'crowclaw',
         deployment: 'crowclaw-cloudflare',
-        version: '0.1.0',
+        // Build-time injection (#40). Wrangler `define` keeps this in lockstep
+        // with package.json on every deploy; the prior hardcoded '0.1.0'
+        // misled every dashboard Overview panel since v0.2.0.
+        version: __CROWCLAW_VERSION__,
         tools: registry.list().map((tool) => ({
           name: tool.name,
           description: tool.description,
@@ -351,16 +590,56 @@ export class AgentSessionDurableObject {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/presets')) {
+      await this.ensureActivePresetHydrated();
       const mcpNames = listMcpPresetNames();
-      // `activeAgent`/`activeToolset`/`activeMcp` fields let the Agent view
-      // decorate the "Active" badge. CF previously returned only the lists.
+      // `activeAgent`/`activeToolset`/`activeMcp` are now sourced from
+      // persisted DO storage (#33). Prior implementation hardcoded `null`,
+      // which permanently broke the dashboard's "Active" badge on CF.
       return Response.json({
         agents: listAgentPresets(),
         toolsets: listToolsetPresets(),
         mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) })),
-        activeAgent: null,
-        activeToolset: null,
-        activeMcp: null,
+        activeAgent: this.activePreset.agent,
+        activeToolset: this.activePreset.toolset,
+        activeMcp: this.activePreset.mcp,
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/config-presets/switch')) {
+      // Switch the active config-preset selection (#33). Body shape matches
+      // the dashboard's `/api/config-presets/switch` contract: any subset of
+      // { agent, toolset, mcp } updates only those fields. Pass `null` to
+      // clear a slot.
+      await this.ensureActivePresetHydrated();
+      const body = (await request.json().catch(() => ({}))) as {
+        agent?: string | null;
+        toolset?: string | null;
+        mcp?: string | null;
+      };
+      if (Object.prototype.hasOwnProperty.call(body, 'agent')) {
+        this.activePreset.agent = body.agent ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(body, 'toolset')) {
+        this.activePreset.toolset = body.toolset ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(body, 'mcp')) {
+        this.activePreset.mcp = body.mcp ?? null;
+      }
+      await this.persistActivePreset();
+      return Response.json({
+        ok: true,
+        activeAgent: this.activePreset.agent,
+        activeToolset: this.activePreset.toolset,
+        activeMcp: this.activePreset.mcp,
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/config-presets/active')) {
+      await this.ensureActivePresetHydrated();
+      return Response.json({
+        activeAgent: this.activePreset.agent,
+        activeToolset: this.activePreset.toolset,
+        activeMcp: this.activePreset.mcp,
       });
     }
 
@@ -408,10 +687,12 @@ export class AgentSessionDurableObject {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/scheduler/jobs')) {
+      await this.ensureSchedulerHydrated();
       return Response.json(await this.schedulerStore.listJobs());
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/scheduler/jobs')) {
+      await this.ensureSchedulerHydrated();
       const body = (await request.json()) as {
         id: string;
         everyMinutes?: number;
@@ -440,12 +721,110 @@ export class AgentSessionDurableObject {
         timeoutMs: body.timeoutMs,
       });
       await this.schedulerStore.saveJob(job);
+      await this.persistSchedulerState();
       return Response.json(job);
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/scheduler/tick')) {
+      await this.ensureSchedulerHydrated();
       const results = await this.schedulerExecutor.tick();
+      this.autonomousLastTick = new Date().toISOString();
+      // Tick mutates run history + nextRunAt — persist so the next DO instance
+      // doesn't replay completed jobs.
+      await this.persistSchedulerState();
       return Response.json({ ok: true, results });
+    }
+
+    // ---- Scheduler lifecycle endpoints (#39) ----
+    // Mirrors `packages/runtime-node/src/route-paths.ts:105-116`. Pre-existing
+    // CF dashboard buttons (pause/resume/delete/history/dry-run/start/stop/status)
+    // 404-d silently before this; now they round-trip through DO storage so the
+    // mutations survive DO eviction (see ensureSchedulerHydrated / #32).
+
+    {
+      // Match /scheduler/jobs/:id/(pause|resume|history|dry-run) and DELETE /scheduler/jobs/:id
+      const jobActionMatch = url.pathname.match(/\/scheduler\/jobs\/([^/]+)\/(pause|resume|history|dry-run)$/);
+      const jobDeleteMatch = url.pathname.match(/\/scheduler\/jobs\/([^/]+)$/);
+
+      if (request.method === 'POST' && jobActionMatch) {
+        await this.ensureSchedulerHydrated();
+        const jobId = decodeURIComponent(jobActionMatch[1]!);
+        const action = jobActionMatch[2];
+        if (action === 'pause') {
+          const result = await this.schedulerExecutor.pauseJob(jobId);
+          if (!result) return Response.json({ error: 'Job not found' }, { status: 404 });
+          await this.persistSchedulerState();
+          return Response.json(result);
+        }
+        if (action === 'resume') {
+          const result = await this.schedulerExecutor.resumeJob(jobId);
+          if (!result) return Response.json({ error: 'Job not found' }, { status: 404 });
+          await this.persistSchedulerState();
+          return Response.json(result);
+        }
+        if (action === 'dry-run') {
+          try {
+            const record = await this.schedulerExecutor.dryRun(jobId);
+            return Response.json(record);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return Response.json({ error: msg }, { status: 404 });
+          }
+        }
+      }
+
+      if (request.method === 'GET' && jobActionMatch) {
+        await this.ensureSchedulerHydrated();
+        const jobId = decodeURIComponent(jobActionMatch[1]!);
+        const action = jobActionMatch[2];
+        if (action === 'history') {
+          const limitParam = url.searchParams.get('limit');
+          const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+          const history = await this.schedulerStore.getRunHistory(jobId, limit);
+          return Response.json(history);
+        }
+      }
+
+      if (
+        request.method === 'DELETE'
+        && jobDeleteMatch
+        // Avoid double-matching the action routes above (which also match this regex).
+        && !jobActionMatch
+      ) {
+        await this.ensureSchedulerHydrated();
+        const jobId = decodeURIComponent(jobDeleteMatch[1]!);
+        const deleted = await this.schedulerExecutor.deleteJob(jobId);
+        if (!deleted) return Response.json({ error: 'Job not found' }, { status: 404 });
+        await this.persistSchedulerState();
+        return Response.json({ ok: true });
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/scheduler/start')) {
+      // CF DOs cannot run a setInterval — autonomous ticking arrives via a
+      // wrangler cron trigger (or the dashboard's manual /tick call). The
+      // start/stop endpoints flip a logical flag the Overview UI surfaces;
+      // the runner is the cron trigger itself.
+      this.autonomousRunning = true;
+      return Response.json({ ok: true, running: true });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/scheduler/stop')) {
+      this.autonomousRunning = false;
+      return Response.json({ ok: true, running: false });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/scheduler/status')) {
+      await this.ensureSchedulerHydrated();
+      const jobs = await this.schedulerStore.listJobs();
+      return Response.json({
+        running: this.autonomousRunning,
+        // CF cron triggers are scheduled in wrangler.jsonc; we report the
+        // wrangler default (60s) so the dashboard renders a sane number.
+        interval: 60_000,
+        lastTick: this.autonomousLastTick,
+        jobCount: jobs.length,
+      });
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/gateway/idempotency')) {
@@ -454,11 +833,11 @@ export class AgentSessionDurableObject {
       if (!key) {
         return Response.json({ ok: false, duplicate: false });
       }
-      const duplicate = this.gatewayIdempotencyKeys.has(key);
-      if (!duplicate) {
-        this.gatewayIdempotencyKeys.add(key);
-      }
-      return Response.json({ ok: true, duplicate });
+      // markIfAbsent atomically returns false when the key was already present
+      // (i.e. duplicate). The persisted, TTL-bounded store closes #31's OOM
+      // vector that the prior unbounded `Set` allowed.
+      const newlyMarked = await this.gatewayIdempotency.markIfAbsent(key);
+      return Response.json({ ok: true, duplicate: !newlyMarked });
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/gateway/inspect')) {
@@ -485,6 +864,17 @@ export class AgentSessionDurableObject {
 
     if (request.method === 'POST' && url.pathname.endsWith('/web/fetch')) {
       const body = (await request.json()) as { url: string };
+      // SSRF guard (#26). Closes parity with the Node runtime which has called
+      // `validateFetchUrl` since v0.4.0. Even though CF auth gates the dashboard
+      // caller, an authenticated operator could otherwise pivot any internal CF
+      // metadata service (169.254.x), CGNAT, ULA, IPv4-mapped IPv6, etc.
+      const ssrf = validateFetchUrl(body.url);
+      if (!ssrf.safe) {
+        return Response.json(
+          { ok: false, error: 'SSRF blocked', reason: ssrf.reason },
+          { status: 403 },
+        );
+      }
       const response = await fetch(body.url);
       return new Response(await response.text(), {
         status: response.status,
@@ -618,6 +1008,10 @@ export class AgentSessionDurableObject {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/code/bridge/status')) {
+      // Prune-on-read (#35): drop closed sessions older than 1h before
+      // returning status. Mirrors the v0.4.1 fix applied to the pending-pairings
+      // map — keeps DO heap bounded under bursty connect/close traffic.
+      this.pruneStaleSessions();
       const sessionId = url.searchParams.get('sessionId') ?? this.state.id.toString();
       const session = this.codeBridgeSessions.get(sessionId);
       return Response.json({
@@ -634,6 +1028,7 @@ export class AgentSessionDurableObject {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/code/bridge/transcript')) {
+      this.pruneStaleSessions();
       const sessionId = url.searchParams.get('sessionId') ?? this.state.id.toString();
       const session = this.codeBridgeSessions.get(sessionId);
       return Response.json({
@@ -961,6 +1356,9 @@ export class AgentSessionDurableObject {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/browser/session')) {
+      // Prune-on-read (#35): browser sessions become stale 1h after their last
+      // updatedAt timestamp. Same pattern as code-bridge above.
+      this.pruneStaleSessions();
       const sessionId = url.searchParams.get('sessionId') ?? this.state.id.toString();
       const session = this.browserSessions.get(sessionId);
       return Response.json(session ?? { sessionId, currentUrl: null, history: [], lastSnapshot: null, lastRefs: [] });

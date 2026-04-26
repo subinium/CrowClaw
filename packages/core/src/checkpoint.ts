@@ -5,7 +5,16 @@ export interface SessionCheckpoint {
   sessionId: string;
   iteration: number;
   createdAt: string;
+  /** Snapshot of session.messages at checkpoint time. Held as a shallow array
+   *  copy (slice) instead of a deep clone — the agent loop only appends to
+   *  session.messages, so message objects themselves are never mutated and
+   *  shallow snapshots are safe. Use messageCursor to reconstruct the
+   *  historical view from a live session.messages without storing the array. */
   messages: ConversationMessage[];
+  /** #45: Length of session.messages at save time. With an append-only history
+   *  this is sufficient to recover the historical view via
+   *  session.messages.slice(0, messageCursor) without cloning the full array. */
+  messageCursor: number;
   toolResults: ToolExecutionResult[];
   metadata: {
     agentId: string;
@@ -48,6 +57,9 @@ export interface InMemoryCheckpointStoreOptions {
 
 export class InMemoryCheckpointStore implements CheckpointStore {
   private readonly store = new Map<string, SessionCheckpoint>();
+  /** #46: Per-session secondary index of checkpoint ids in save order.
+   *  Avoids O(total_checkpoints) scan + sort + clone in listBySession/getLatest. */
+  private readonly bySession = new Map<string, string[]>();
   private readonly maxCheckpoints: number | undefined;
 
   constructor(options?: InMemoryCheckpointStoreOptions) {
@@ -56,11 +68,28 @@ export class InMemoryCheckpointStore implements CheckpointStore {
 
   async save(checkpoint: SessionCheckpoint): Promise<void> {
     this.store.set(checkpoint.id, structuredClone(checkpoint));
+    const ids = this.bySession.get(checkpoint.sessionId);
+    if (ids) {
+      ids.push(checkpoint.id);
+    } else {
+      this.bySession.set(checkpoint.sessionId, [checkpoint.id]);
+    }
     // FIFO eviction: Map iteration order preserves insertion order, so
-    // the first entry is always the oldest.
+    // the first entry is always the oldest. Keep bySession in sync.
     if (this.maxCheckpoints !== undefined && this.store.size > this.maxCheckpoints) {
       const oldest = this.store.keys().next().value;
-      if (oldest !== undefined) this.store.delete(oldest);
+      if (oldest !== undefined) {
+        const evicted = this.store.get(oldest);
+        this.store.delete(oldest);
+        if (evicted) {
+          const sessionIds = this.bySession.get(evicted.sessionId);
+          if (sessionIds) {
+            const idx = sessionIds.indexOf(oldest);
+            if (idx !== -1) sessionIds.splice(idx, 1);
+            if (sessionIds.length === 0) this.bySession.delete(evicted.sessionId);
+          }
+        }
+      }
     }
   }
 
@@ -70,29 +99,62 @@ export class InMemoryCheckpointStore implements CheckpointStore {
   }
 
   async listBySession(sessionId: string): Promise<SessionCheckpoint[]> {
-    return [...this.store.values()]
-      .filter(cp => cp.sessionId === sessionId)
+    const ids = this.bySession.get(sessionId);
+    if (!ids || ids.length === 0) return [];
+    // Sort by iteration to preserve callers' previous ordering guarantees.
+    // Per-session list size is small relative to total store size, so this
+    // is a meaningful improvement over scanning every entry.
+    const checkpoints: SessionCheckpoint[] = [];
+    for (const id of ids) {
+      const cp = this.store.get(id);
+      if (cp) checkpoints.push(cp);
+    }
+    return checkpoints
       .sort((a, b) => a.iteration - b.iteration)
       .map(cp => structuredClone(cp));
   }
 
   async getLatest(sessionId: string): Promise<SessionCheckpoint | null> {
-    const checkpoints = await this.listBySession(sessionId);
-    return checkpoints.length > 0 ? checkpoints[checkpoints.length - 1] : null;
+    const ids = this.bySession.get(sessionId);
+    if (!ids || ids.length === 0) return null;
+    // O(per-session) max iteration scan — much smaller than full-store walk.
+    let bestId: string | undefined;
+    let bestIteration = -Infinity;
+    for (const id of ids) {
+      const cp = this.store.get(id);
+      if (!cp) continue;
+      if (cp.iteration >= bestIteration) {
+        bestIteration = cp.iteration;
+        bestId = id;
+      }
+    }
+    if (!bestId) return null;
+    const cp = this.store.get(bestId);
+    return cp ? structuredClone(cp) : null;
   }
 
   async delete(id: string): Promise<boolean> {
-    return this.store.delete(id);
+    const cp = this.store.get(id);
+    const removed = this.store.delete(id);
+    if (removed && cp) {
+      const ids = this.bySession.get(cp.sessionId);
+      if (ids) {
+        const idx = ids.indexOf(id);
+        if (idx !== -1) ids.splice(idx, 1);
+        if (ids.length === 0) this.bySession.delete(cp.sessionId);
+      }
+    }
+    return removed;
   }
 
   async deleteBySession(sessionId: string): Promise<number> {
+    const ids = this.bySession.get(sessionId);
+    if (!ids) return 0;
     let count = 0;
-    for (const [id, cp] of this.store) {
-      if (cp.sessionId === sessionId) {
-        this.store.delete(id);
-        count++;
-      }
+    for (const id of ids) {
+      if (this.store.delete(id)) count++;
     }
+    this.bySession.delete(sessionId);
     return count;
   }
 
@@ -101,7 +163,19 @@ export class InMemoryCheckpointStore implements CheckpointStore {
   }
 }
 
-/** Create a checkpoint from current session state */
+/** Create a checkpoint from current session state.
+ *
+ *  #45 perf: replaces per-iteration `structuredClone(session.messages)` with
+ *  a length-cursor + shallow array slice. The agent loop only appends to
+ *  session.messages (never mutates earlier entries in place), so a slice of
+ *  the array is a stable historical snapshot — message *objects* are still
+ *  shared with the live session, but that's safe because they're treated as
+ *  immutable conversation entries. `messageCursor` records the exact length
+ *  for callers that want to recover the historical view from a live session
+ *  via `session.messages.slice(0, messageCursor)`. `toolResults` is still
+ *  deep-cloned because callers pass through accumulator arrays that they
+ *  may continue to mutate after createCheckpoint returns.
+ */
 export function createCheckpoint(
   session: SessionState,
   toolResults: ToolExecutionResult[],
@@ -110,16 +184,18 @@ export function createCheckpoint(
   label?: string,
   loopState?: SessionCheckpoint['loopState'],
 ): SessionCheckpoint {
+  const messageCursor = session.messages.length;
   return {
     id: `cp-${session.sessionId}-${iteration}-${trigger}-${Date.now().toString(36)}`,
     sessionId: session.sessionId,
     iteration,
     createdAt: new Date().toISOString(),
-    messages: structuredClone(session.messages),
+    messages: session.messages.slice(0, messageCursor),
+    messageCursor,
     toolResults: structuredClone(toolResults),
     metadata: {
       agentId: session.agentId,
-      messageCount: session.messages.length,
+      messageCount: messageCursor,
       toolCallCount: toolResults.length,
       trigger,
       label,
@@ -134,15 +210,27 @@ export interface RestoredSession {
   loopState?: SessionCheckpoint['loopState'];
 }
 
-/** Restore a session from a checkpoint */
+/** Restore a session from a checkpoint.
+ *
+ *  #45 perf: when the checkpoint carries a `messageCursor` and the live
+ *  session.messages has at least that many entries, slice from the live
+ *  session — this avoids paying the deep-clone cost again on restore for
+ *  the in-memory hot path. Falls back to cloning the checkpoint's stored
+ *  messages snapshot when the live session has been truncated/replaced
+ *  (e.g., after compression or for a file-store round-trip).
+ */
 export function restoreFromCheckpoint(
   checkpoint: SessionCheckpoint,
   session: SessionState,
 ): RestoredSession {
+  const cursor = checkpoint.messageCursor ?? checkpoint.messages.length;
+  const restoredMessages = session.messages.length >= cursor
+    ? session.messages.slice(0, cursor)
+    : structuredClone(checkpoint.messages);
   return {
     session: {
       ...session,
-      messages: structuredClone(checkpoint.messages),
+      messages: restoredMessages,
       updatedAt: new Date().toISOString(),
       lineage: {
         ...(session.lineage ?? { rootSessionId: session.sessionId, compressionCount: 0 }),

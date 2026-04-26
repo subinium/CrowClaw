@@ -134,3 +134,31 @@ export function endBridgeCall(session: CodeBridgeSession): void {
     session.leaseExpiresAt = new Date(Date.now() + session.idleTimeoutMs).toISOString();
   }
 }
+
+/**
+ * #35: Drop sessions whose `lastActivityAt` is older than `maxAgeMs` and
+ * which have no active calls in flight. Mirrors the prune-on-read pattern
+ * used by `getPendingPairingsMap` in `config-store.ts` so long-running
+ * runtimes don't accumulate dead bridge sessions forever (each entry holds
+ * a transcript array which can grow without bound).
+ *
+ * Skips sessions with `activeCallCount > 0` so we never delete a session
+ * that's mid-tool-call. Returns the number of entries removed.
+ */
+export function pruneStaleBridgeSessions(
+  sessions: Map<string, CodeBridgeSession>,
+  maxAgeMs: number = 60 * 60 * 1000, // 1 hour default
+  now: number = Date.now(),
+): number {
+  let removed = 0;
+  for (const [key, session] of sessions) {
+    if (session.activeCallCount > 0) continue;
+    const ts = new Date(session.lastActivityAt).getTime();
+    if (!Number.isFinite(ts)) continue;
+    if (now - ts > maxAgeMs) {
+      sessions.delete(key);
+      removed++;
+    }
+  }
+  return removed;
+}

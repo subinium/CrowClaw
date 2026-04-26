@@ -169,14 +169,15 @@ export class EmbeddingMemoryStore implements MemoryStore {
       return [];
     }
 
-    // Fetch all records from base store for this session, then filter by index hits
-    const allRecords = await this.baseStore.list(sessionId);
-    const hitIds = new Set(hits.map((h) => h.id));
-    const scoreMap = new Map(hits.map((h) => [h.id, h.score]));
-
-    return allRecords
-      .filter((r) => hitIds.has(r.id))
-      .sort((a, b) => (scoreMap.get(b.id) ?? 0) - (scoreMap.get(a.id) ?? 0))
+    // Pull only the matching records instead of `list(sessionId)` + filter.
+    // For a 1k-record session with 5 hits this collapses 1000 reads to 5.
+    // `getByIds` preserves input order, so the score ranking from `index.search`
+    // (already sorted desc) carries through. We still filter by sessionId
+    // because the index is global across sessions.
+    const hitIds = hits.map((h) => h.id);
+    const fetched = await this.baseStore.getByIds(hitIds);
+    return fetched
+      .filter((record) => record.sessionId === sessionId)
       .slice(0, limit);
   }
 
@@ -196,13 +197,12 @@ export class EmbeddingMemoryStore implements MemoryStore {
       return [];
     }
 
-    const allRecords = await this.baseStore.listByScope(scope, limit * 2, scopeKey);
-    const hitIds = new Set(hits.map((h) => h.id));
-    const scoreMap = new Map(hits.map((h) => [h.id, h.score]));
-
-    return allRecords
-      .filter((r) => hitIds.has(r.id))
-      .sort((a, b) => (scoreMap.get(b.id) ?? 0) - (scoreMap.get(a.id) ?? 0))
+    // Fetch ranked hits directly, then scope-filter — avoids paging the entire
+    // scope just to intersect with k matches.
+    const hitIds = hits.map((h) => h.id);
+    const fetched = await this.baseStore.getByIds(hitIds);
+    return fetched
+      .filter((record) => record.scope === scope && (!scopeKey || record.scopeKey === scopeKey))
       .slice(0, limit);
   }
 
@@ -216,5 +216,9 @@ export class EmbeddingMemoryStore implements MemoryStore {
     scopeKey?: string
   ): Promise<MemoryRecord[]> {
     return this.baseStore.listByScope(scope, limit, scopeKey);
+  }
+
+  async getByIds(ids: string[]): Promise<MemoryRecord[]> {
+    return this.baseStore.getByIds(ids);
   }
 }

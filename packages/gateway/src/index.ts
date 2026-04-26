@@ -366,20 +366,117 @@ export interface GatewayDeliveryPlan {
   workspaceId?: string;
 }
 
+/**
+ * Idempotency store for inbound webhook deliveries.
+ *
+ * `markIfAbsent` is the atomic primitive used by runtimes to decide whether
+ * a delivery has already been processed; it returns `true` when the key was
+ * newly recorded and `false` when an unexpired entry already existed. The
+ * legacy `mark` method remains for backcompat and internally delegates to
+ * `markIfAbsent`.
+ */
 export interface GatewayIdempotencyStore {
+  /**
+   * Atomically record `key` if it is not already present.
+   * Returns `true` if the key was newly recorded, `false` if a still-valid
+   * entry already existed. The optional `ttlMs` overrides the store default.
+   */
+  markIfAbsent(key: string, ttlMs?: number): Promise<boolean>;
+  /** Remove `key`. Used when downstream processing fails and the caller
+   * wants the next retry delivery to be considered fresh. */
+  unmark(key: string): Promise<void>;
+  /** Whether `key` has an unexpired entry. */
   has(key: string): Promise<boolean>;
-  mark(key: string): Promise<void>;
+  /** Backcompat shim — equivalent to `markIfAbsent` but discards the result. */
+  mark(key: string, ttlMs?: number): Promise<void>;
 }
 
+/**
+ * In-memory bounded idempotency store.
+ *
+ * Bounds:
+ * - Per-entry TTL (default 24h) — entries expire automatically.
+ * - Global cap on `maxEntries` (default 100k) — oldest expiring entries are
+ *   evicted first when the cap is exceeded. This prevents unbounded heap
+ *   growth on long-running gateways at high webhook rates.
+ *
+ * Pruning runs on every mutation; `has`/`markIfAbsent` also reject expired
+ * entries inline so a key whose TTL elapsed is reported as absent.
+ */
 export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore {
-  private readonly keys = new Set<string>();
+  // Map preserves insertion order. Because TTL is uniform per call, entries
+  // inserted earlier expire earlier, so the iteration order also doubles as
+  // an "oldest expiresAt first" ordering for cap-based eviction.
+  private readonly entries = new Map<string, number>(); // key -> expiresAt epoch ms
+  private readonly defaultTtlMs: number;
+  private readonly maxEntries: number;
 
-  async has(key: string): Promise<boolean> {
-    return this.keys.has(key);
+  constructor(opts?: { defaultTtlMs?: number; maxEntries?: number }) {
+    this.defaultTtlMs = opts?.defaultTtlMs ?? 24 * 60 * 60 * 1000; // 24h
+    this.maxEntries = opts?.maxEntries ?? 100_000;
   }
 
-  async mark(key: string): Promise<void> {
-    this.keys.add(key);
+  /** Drop expired entries, then enforce the maxEntries cap by removing the
+   * oldest (earliest-inserted) keys. Runs in O(expired + overflow). */
+  private prune(now: number): void {
+    // 1. Drop expired entries.
+    for (const [key, expiresAt] of this.entries) {
+      if (expiresAt <= now) {
+        this.entries.delete(key);
+      } else {
+        // Map iteration follows insertion order, so once we hit a non-expired
+        // entry we *might* still find expired ones later if TTLs differed —
+        // but in practice TTLs are uniform per call site, so we can break.
+        // Fall through and continue scanning to be safe against mixed TTLs.
+        // (Cost: O(n) over live entries on very polluted maps. Acceptable
+        //  because prune runs once per mutation, not per check.)
+      }
+    }
+    // 2. Enforce cap by evicting oldest entries first.
+    if (this.entries.size > this.maxEntries) {
+      const overflow = this.entries.size - this.maxEntries;
+      let removed = 0;
+      for (const key of this.entries.keys()) {
+        if (removed >= overflow) break;
+        this.entries.delete(key);
+        removed++;
+      }
+    }
+  }
+
+  async markIfAbsent(key: string, ttlMs: number = this.defaultTtlMs): Promise<boolean> {
+    const now = Date.now();
+    this.prune(now);
+    const existing = this.entries.get(key);
+    if (existing !== undefined && existing > now) {
+      return false;
+    }
+    // If the existing entry was expired, delete first so re-set lands at the
+    // tail of insertion order (matching new-entry semantics for eviction).
+    if (existing !== undefined) {
+      this.entries.delete(key);
+    }
+    this.entries.set(key, now + ttlMs);
+    return true;
+  }
+
+  async unmark(key: string): Promise<void> {
+    this.entries.delete(key);
+  }
+
+  async has(key: string): Promise<boolean> {
+    const expiresAt = this.entries.get(key);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= Date.now()) {
+      // Lazy expiration: drop the stale entry.
+      this.entries.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  async mark(key: string, ttlMs?: number): Promise<void> {
+    await this.markIfAbsent(key, ttlMs);
   }
 }
 
@@ -413,8 +510,22 @@ export interface SlackEditPayload extends SlackSendPayload {
   ts: string;
 }
 
+/**
+ * Input for `verifySlackSignature`.
+ *
+ * Pass either `signingSecret` (resolved by the caller) or `secretProvider`
+ * (a callback the verifier invokes per-request). The callback form lets the
+ * runtime read the latest secret from `configStore` on every webhook so that
+ * dashboard rotations take effect immediately without restarting the worker.
+ *
+ * Precedence when both are provided: `secretProvider` wins. This matches the
+ * documented OpenClaw 2026.4.23-beta.4 lookup order: configStore -> env -> options.
+ * If `secretProvider` returns `undefined` or an empty string, verification fails
+ * (treating "no secret configured" as "deny", per signature-verifier semantics).
+ */
 export interface SlackSignatureInput {
-  signingSecret: string;
+  signingSecret?: string;
+  secretProvider?: () => string | undefined;
   timestamp: string;
   body: string;
   signature: string;
@@ -913,11 +1024,16 @@ export async function buildSlackSignature(signingSecret: string, timestamp: stri
 }
 
 export async function verifySlackSignature(input: SlackSignatureInput): Promise<boolean> {
-  if (!input.signingSecret || !input.timestamp || !input.body || !input.signature) {
+  // Resolve the secret per-call: a `secretProvider` callback wins over a
+  // pre-resolved `signingSecret`. This lets runtimes pass a closure over
+  // `configStore.getGatewayConfig('slack')?.signingSecret` so rotations
+  // through the dashboard take effect immediately without restart.
+  const resolved = input.secretProvider ? input.secretProvider() : input.signingSecret;
+  if (!resolved || !input.timestamp || !input.body || !input.signature) {
     return false;
   }
 
-  const expected = await buildSlackSignature(input.signingSecret, input.timestamp, input.body);
+  const expected = await buildSlackSignature(resolved, input.timestamp, input.body);
   return timingSafeEqual(expected, input.signature);
 }
 

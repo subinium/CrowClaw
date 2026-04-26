@@ -7,6 +7,7 @@ import {
   getBridgeIdleInfo,
   getBridgeLeaseInfo,
   markBridgeHeartbeat,
+  pruneStaleBridgeSessions,
   type CodeBridgeSession
 } from './bridge-state.js';
 import { routePaths } from './route-paths.js';
@@ -317,6 +318,11 @@ export async function handleCodeBridgeRoutes(
   url: URL,
   options: HandleCodeBridgeRoutesOptions
 ): Promise<Response | null> {
+  // #35: prune stale bridge sessions on every code-bridge call so long-running
+  //      runtimes don't accumulate dead entries forever. Each session holds a
+  //      transcript array that grows without bound; the previous code only
+  //      cleared sessions on explicit `/bridge/close` or `/bridge/terminate`.
+  pruneStaleBridgeSessions(options.codeBridgeSessions);
   if (request.method === 'POST' && url.pathname === routePaths.code.exec) {
     const body = (await request.json()) as { language?: string; code?: string; cwd?: string; timeoutMs?: number; toolBridge?: boolean; maxToolCalls?: number };
     const language = typeof body.language === 'string' ? body.language : 'javascript';
