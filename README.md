@@ -9,14 +9,14 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#project-structure"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-2161%20passed-brightgreen.svg" alt="Tests" />
-    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.4.3-blue.svg" alt="Changelog" /></a>
+    <img src="https://img.shields.io/badge/tests-2187%20passed-brightgreen.svg" alt="Tests" />
+    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.5.0-blue.svg" alt="Changelog" /></a>
   </p>
 </p>
 
 ---
 
-> **Beta, single-maintainer, moving fast.** Core systems are tested (2161 tests) and the security/reliability surface has been through a five-agent cross-audit (see v0.4.x in [CHANGELOG.md](./CHANGELOG.md)). APIs may break between minor versions -- pin exactly.
+> **Beta, single-maintainer, moving fast.** Core systems are tested (2187 tests) and the security/reliability surface has been through a five-agent cross-audit plus a 38-issue v0.5.0 sweep (see [CHANGELOG.md](./CHANGELOG.md)). APIs may break between minor versions -- pin exactly.
 
 ## What it is
 

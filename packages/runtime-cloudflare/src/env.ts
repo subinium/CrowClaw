@@ -21,4 +21,10 @@ export interface RuntimeEnv {
    */
   CROWCLAW_DASHBOARD_TOKEN?: string;
   GENERIC_WEBHOOK_SECRET?: string;
+  /**
+   * Discord application public key used to verify Ed25519 signatures on
+   * `/webhooks/discord`. When unset, the webhook handler returns 403 — same
+   * fail-closed semantics as the Node runtime (#24).
+   */
+  DISCORD_PUBLIC_KEY?: string;
 }

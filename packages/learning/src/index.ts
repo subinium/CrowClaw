@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { ConversationMessage } from '@crowclaw/core';
 
 export interface CompletionSignal {
@@ -35,6 +36,8 @@ export interface SkillStore {
   list(): Promise<StoredSkillDraft[]>;
   save(draft: StoredSkillDraft): Promise<void>;
   get(id: string): Promise<StoredSkillDraft | null>;
+  /** Returns true if a draft with the given id exists. Used by upsert paths. */
+  has?(id: string): Promise<boolean>;
 }
 
 export interface SkillMatch {
@@ -56,6 +59,10 @@ export class InMemorySkillStore implements SkillStore {
 
   async get(id: string): Promise<StoredSkillDraft | null> {
     return this.drafts.get(id) ?? null;
+  }
+
+  async has(id: string): Promise<boolean> {
+    return this.drafts.has(id);
   }
 }
 
@@ -107,6 +114,16 @@ export class FileSkillStore implements SkillStore {
         return null;
       }
       throw error;
+    }
+  }
+
+  async has(id: string): Promise<boolean> {
+    const filePath = path.join(this.basePath, `${id}.json`);
+    try {
+      await fs.promises.access(filePath);
+      return true;
+    } catch {
+      return false;
     }
   }
 }
@@ -334,31 +351,71 @@ export class LearningPipeline {
     this.registry = registry;
   }
 
-  async captureDraft(messages: ConversationMessage[], title: string): Promise<StoredSkillDraft> {
+  /**
+   * Compute a deterministic draft id from the title + message content fingerprint.
+   * Same conversation + title → same id, so retried/double-invoked autoCapture
+   * calls upsert into the same row instead of producing duplicate drafts (#36).
+   */
+  private computeDeterministicId(messages: ConversationMessage[], title: string, trigger?: string): string {
+    const fingerprint = messages
+      .map((m) => `${m.role}:${m.content}`)
+      .join('\n');
+    const key = `${title}:${trigger ?? 'auto'}:${fingerprint}`;
+    const hash = createHash('sha256').update(key).digest('hex').slice(0, 12);
+    return `draft-${hash}`;
+  }
+
+  async captureDraft(
+    messages: ConversationMessage[],
+    title: string,
+    options?: { trigger?: string },
+  ): Promise<StoredSkillDraft> {
+    const draftId = this.computeDeterministicId(messages, title, options?.trigger);
+    const existing = await this.getExistingDraft(draftId);
+    const now = new Date().toISOString();
+
     // Use LLM extraction if provider is available
     if (this.extractionProvider) {
       const llmDraft = await this.extractionProvider.extractSkill(messages);
       if (llmDraft) {
-        await this.store.save(llmDraft);
-        return llmDraft;
+        const merged: StoredSkillDraft = {
+          ...llmDraft,
+          id: draftId,
+          createdAt: existing?.createdAt ?? llmDraft.createdAt ?? now,
+          updatedAt: now,
+          status: existing?.status ?? llmDraft.status ?? 'draft',
+          ratings: existing?.ratings ?? llmDraft.ratings ?? { helpful: 0, unhelpful: 0 },
+          version: (existing?.version ?? llmDraft.version ?? 0) + (existing ? 1 : 0) || 1,
+        };
+        await this.store.save(merged);
+        return merged;
       }
     }
 
     // Fall back to heuristic extraction
     const draft = extractSkillDraft(messages, title);
-    const now = new Date().toISOString();
     const stored: StoredSkillDraft = {
       ...draft,
-      id: crypto.randomUUID(),
-      status: 'draft',
-      createdAt: now,
+      id: draftId,
+      status: existing?.status ?? 'draft',
+      createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       markdown: renderSkillMarkdown(draft),
-      version: 1,
-      ratings: { helpful: 0, unhelpful: 0 },
+      version: existing ? (existing.version ?? 1) + 1 : 1,
+      ratings: existing?.ratings ?? { helpful: 0, unhelpful: 0 },
     };
     await this.store.save(stored);
     return stored;
+  }
+
+  /** Look up an existing draft by id, falling back to has()+get() on stores
+   *  that don't implement has(). */
+  private async getExistingDraft(id: string): Promise<StoredSkillDraft | null> {
+    if (this.store.has) {
+      const exists = await this.store.has(id);
+      if (!exists) return null;
+    }
+    return this.store.get(id);
   }
 
   async publishDraft(id: string): Promise<StoredSkillDraft> {
@@ -416,10 +473,14 @@ export class LearningPipeline {
     await this.store.save(updated);
   }
 
-  async autoCapture(messages: ConversationMessage[], title?: string): Promise<StoredSkillDraft | null> {
+  async autoCapture(
+    messages: ConversationMessage[],
+    title?: string,
+    options?: { trigger?: string },
+  ): Promise<StoredSkillDraft | null> {
     const signal = detectTaskCompletion(messages);
     if (!signal.completed || signal.confidence === 'low') return null;
-    return this.captureDraft(messages, title ?? 'auto-captured-skill');
+    return this.captureDraft(messages, title ?? 'auto-captured-skill', options);
   }
 
   async refineDraft(id: string, newMessages: ConversationMessage[]): Promise<StoredSkillDraft> {

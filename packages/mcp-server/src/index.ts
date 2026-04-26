@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { timingSafeEqual } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // MCP protocol types
@@ -12,6 +13,12 @@ export interface McpServerToolDefinition {
     properties: Record<string, unknown>;
     required?: string[];
   };
+  /**
+   * If true, this tool exposes owner-privileged surfaces (scheduler controls,
+   * arbitrary chat → underlying privileged tools, session/memory state).
+   * Non-owner MCP clients must not see or execute these. (#27)
+   */
+  ownerOnly?: boolean;
 }
 
 export interface McpServerRequest {
@@ -19,6 +26,14 @@ export interface McpServerRequest {
   id: number | string;
   method: string;
   params?: Record<string, unknown>;
+  /**
+   * Caller identity supplied by the transport layer (#27). When the MCP server
+   * is started with `ownerToken`, requests must carry a matching token here to
+   * see/invoke `ownerOnly: true` tools. Stdio transport accepts an `_meta.token`
+   * field on the JSON-RPC envelope; HTTP/SSE transports should plumb it from
+   * `Authorization: Bearer ...`. If absent, the request is treated as non-owner.
+   */
+  _meta?: { token?: string; [key: string]: unknown };
 }
 
 export interface McpServerResponse {
@@ -49,25 +64,63 @@ const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
 const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
+/** Application-level: tool exists but caller lacks privilege (#27). */
+const FORBIDDEN = -32001;
+
+/** Constant-time token comparison. Returns false on length mismatch or empty. */
+function tokensMatch(expected: string | undefined, provided: string | undefined): boolean {
+  if (!expected) return true; // no owner token configured → all callers are owner
+  if (!provided) return false;
+  const a = Buffer.from(expected, 'utf-8');
+  const b = Buffer.from(provided, 'utf-8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 // ---------------------------------------------------------------------------
 // CrowClawMcpServer
 // ---------------------------------------------------------------------------
 
+export interface CrowClawMcpServerOptions {
+  name?: string;
+  version?: string;
+  /**
+   * If set, MCP clients must provide a matching token in `request._meta.token`
+   * to see/invoke `ownerOnly: true` tools (#27). The transport layer is
+   * responsible for plumbing the token from the underlying connection
+   * (stdio: JSON-RPC `_meta`, HTTP/SSE: `Authorization: Bearer ...`).
+   *
+   * If omitted, the bridge runs in legacy mode where every caller is treated
+   * as owner. Stdio is intended for local owner-only use, but operators
+   * exposing the bridge to remote clients MUST set this.
+   */
+  ownerToken?: string;
+}
+
 export class CrowClawMcpServer {
+  private readonly ownerToken?: string;
+
   constructor(
     private readonly agentLoop: McpAgentLoop,
-    private readonly options?: {
-      name?: string;
-      version?: string;
-    },
-  ) {}
+    private readonly options?: CrowClawMcpServerOptions,
+  ) {
+    this.ownerToken = options?.ownerToken;
+  }
 
+  /**
+   * Returns ALL tool definitions, including owner-only ones. Callers that
+   * surface tools to MCP clients must filter via {@link getVisibleTools} based
+   * on caller identity. Kept for backwards compatibility with existing tests.
+   */
   getToolDefinitions(): McpServerToolDefinition[] {
     return [
       {
         name: 'crowclaw.chat',
         description: 'Send a message to the CrowClaw agent and get a response.',
+        // Marked owner-only because the underlying agent loop can call
+        // privileged tools (scheduler.create, terminal, sandbox.run) without
+        // the MCP bridge being able to introspect intent.
+        ownerOnly: true,
         inputSchema: {
           type: 'object',
           properties: {
@@ -86,6 +139,7 @@ export class CrowClawMcpServer {
       {
         name: 'crowclaw.sessions.list',
         description: 'List all active CrowClaw sessions.',
+        ownerOnly: true,
         inputSchema: {
           type: 'object',
           properties: {},
@@ -94,6 +148,7 @@ export class CrowClawMcpServer {
       {
         name: 'crowclaw.sessions.get',
         description: 'Get details of a specific CrowClaw session.',
+        ownerOnly: true,
         inputSchema: {
           type: 'object',
           properties: {
@@ -116,6 +171,7 @@ export class CrowClawMcpServer {
       {
         name: 'crowclaw.memories.search',
         description: 'Search memories stored by the CrowClaw agent.',
+        ownerOnly: true,
         inputSchema: {
           type: 'object',
           properties: {
@@ -134,8 +190,25 @@ export class CrowClawMcpServer {
     ];
   }
 
+  /** Filter tool definitions visible to a caller based on their privilege (#27). */
+  getVisibleTools(callerToken?: string): McpServerToolDefinition[] {
+    const isOwner = tokensMatch(this.ownerToken, callerToken);
+    if (isOwner) return this.getToolDefinitions();
+    return this.getToolDefinitions().filter((t) => !t.ownerOnly);
+  }
+
+  /** True if the caller is allowed to invoke the named tool (#27). */
+  private callerCanInvoke(toolName: string, callerToken?: string): boolean {
+    const definition = this.getToolDefinitions().find((t) => t.name === toolName);
+    if (!definition) return false;
+    if (!definition.ownerOnly) return true;
+    return tokensMatch(this.ownerToken, callerToken);
+  }
+
   async handleRequest(request: McpServerRequest): Promise<McpServerResponse> {
     const id = request.id;
+    const callerToken =
+      typeof request._meta?.token === 'string' ? request._meta.token : undefined;
 
     try {
       switch (request.method) {
@@ -154,12 +227,13 @@ export class CrowClawMcpServer {
           });
 
         case 'tools/list':
+          // Filter ownerOnly tools out of the listing for non-owner callers (#27).
           return this.respondOk(id, {
-            tools: this.getToolDefinitions(),
+            tools: this.getVisibleTools(callerToken),
           });
 
         case 'tools/call':
-          return this.handleToolCall(id, request.params);
+          return this.handleToolCall(id, request.params, callerToken);
 
         case 'resources/list':
           return this.respondOk(id, { resources: [] });
@@ -186,12 +260,25 @@ export class CrowClawMcpServer {
   private async handleToolCall(
     id: number | string,
     params?: Record<string, unknown>,
+    callerToken?: string,
   ): Promise<McpServerResponse> {
     const toolName = params?.['name'];
     const args = (params?.['arguments'] ?? {}) as Record<string, unknown>;
 
     if (typeof toolName !== 'string') {
       return this.respondError(id, INVALID_PARAMS, 'Missing tool name');
+    }
+
+    // Owner gate: reject ownerOnly tool invocations from non-owner callers (#27).
+    // We respond with METHOD_NOT_FOUND for ownerOnly tools rather than a more
+    // descriptive code, to avoid leaking that the tool exists at all to
+    // unauthenticated callers (mirrors the dashboard-token + scope pattern).
+    if (!this.callerCanInvoke(toolName, callerToken)) {
+      const definition = this.getToolDefinitions().find((t) => t.name === toolName);
+      if (definition?.ownerOnly) {
+        return this.respondError(id, FORBIDDEN, `Tool requires owner privilege: ${toolName}`);
+      }
+      return this.respondError(id, METHOD_NOT_FOUND, `Unknown tool: ${toolName}`);
     }
 
     switch (toolName) {
@@ -251,12 +338,14 @@ export class CrowClawMcpServer {
       }
 
       case 'crowclaw.tools.list':
+        // Mirror the visibility filter on the meta tool listing — non-owner
+        // callers must not learn that ownerOnly tools exist (#27).
         return this.respondOk(id, {
           content: [
             {
               type: 'text',
               text: JSON.stringify(
-                { tools: this.getToolDefinitions().map((t) => t.name) },
+                { tools: this.getVisibleTools(callerToken).map((t) => t.name) },
                 null,
                 2,
               ),

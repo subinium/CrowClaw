@@ -340,7 +340,17 @@ export class ToolRegistry implements ToolCatalog, ToolExecutor {
       };
     }
 
-    return tool.execute(input, context);
+    // Wall-clock duration for observability (#58). Includes network/IO end-to-end.
+    // Surfaced via `result.metadata.duration_ms` so existing `tool:result` consumers
+    // (LearningPipeline, dashboard latency tracking) can read it without changes
+    // to the cross-package PluginHookPayloads contract.
+    const start = performance.now();
+    const result = await tool.execute(input, context);
+    const duration_ms = Math.round(performance.now() - start);
+    return {
+      ...result,
+      metadata: { ...(result.metadata ?? {}), duration_ms }
+    };
   }
 }
 

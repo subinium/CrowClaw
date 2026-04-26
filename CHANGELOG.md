@@ -5,6 +5,78 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.5.0] — 2026-04-26 — 38-issue sweep: backend audit + Hermes/OpenClaw parity + perf
+
+A single release closing a 38-issue audit backlog. The issue list was generated from a five-agent triage (security/reliability/contract/perf + external-pattern research against the Apr-2026 month of NousResearch/hermes-agent and openclaw/openclaw activity). All 38 landed in this release; 26 source files modified, 5 new files, +2725 / -431 lines, **2187 tests passing** (up from 2161).
+
+### Security (BLOCKER / CRITICAL)
+- **Cloudflare Discord webhook now verifies Ed25519 signatures** (#24). Previously the CF runtime forwarded any payload to the Durable Object — anyone with the worker URL could forge Discord interactions and run the agent against the operator's LLM keys. Closes the same class of bug v0.4.0 fixed for `/webhooks/generic` and `/api/gateway/webhook`. CF now requires `DISCORD_PUBLIC_KEY` env binding; fail-closed when unset.
+- **VITEST runtime auth bypass replaced with build-time guard** (#25). `enforceDashboardAuth` previously read `globalThis.process?.env?.VITEST` at runtime — coupling production behavior to test-environment shape. Now uses `__CROWCLAW_TEST_MODE__` injected via Wrangler `define` (default `false`). Production bundles dead-code-eliminate the bypass entirely.
+- **Cloudflare `web/fetch` SSRF validation** (#26). `agent-do.ts` now runs `validateFetchUrl` before `fetch(body.url)`, matching the Node runtime. Closes the SSRF amplification path that auth alone didn't cover (private/CGNAT/ULA/IPv4-mapped IPv6 ranges).
+- **Hardline blocklist** (#53). New static blocklist in `@crowclaw/core` short-circuits the approval gate for unrecoverable commands (recursive root delete, raw-disk overwrites, fork bombs, force-push to protected branches). Closes the "consent fatigue" attack where the same destructive command could spam the approval queue. Operator-extensible via `hardlineBlocklist` config.
+- **MCP bridge owner-only enforcement** (#27). Audit found classification (c) — the bridge surfaced and executed all 5 fixed tools with no caller identity check. `crowclaw.chat`, `crowclaw.sessions.list`, `crowclaw.sessions.get`, `crowclaw.memories.search` now `ownerOnly`. Adds `ownerToken` constructor option + `_meta.token` on requests; `getVisibleTools(callerToken)` filters `tools/list`; `tools/call` checks `timingSafeEqual` before invocation.
+- **Per-request webhook secret resolution** (#28). `verifySlackSignature` now accepts a `secretProvider: () => string | undefined` callback so runtimes can read `configStore.getGatewayConfig('slack')?.signingSecret` per call. Rotated secrets take effect immediately without restart. Backcompat preserved.
+
+### Reliability (CRITICAL)
+- **Atomic webhook idempotency** (#29). Previously `has(key) → run agent → mark(key)` allowed duplicate webhook deliveries within the agent's latency window to both pass and both fire. New `markIfAbsent(key, ttlMs?)` is atomic check-and-set; on agent failure, `unmark(key)` rolls back. Applied to generic/Telegram/Slack/WhatsApp/Signal/Email/Matrix/SMS handlers.
+- **Bounded gateway idempotency stores** (#30, #31). Replaced unbounded `Set<string>` with `Map<string, number>` (key → expiresAt) — 24h TTL default + 100k entry cap, `prune()` on every mutation. CF DO variant adds `DurableObjectIdempotencyStore` backed by `state.storage` for persistence across DO eviction.
+- **Cloudflare scheduler persistence** (#32). The CF runtime previously used `InMemorySchedulerStore` — DO eviction wiped all jobs silently. Now hydrates from `state.storage` on construct, persists after every save/pause/resume/recordRun via the SCHEDULER package's new `serialize()` / `deserialize()` round-trip.
+- **Cloudflare active-preset persistence** (#33, deferred from v0.4.2). New `POST /api/config-presets/switch` + `GET /api/config-presets/active` endpoints, persisted via DO storage. The dashboard's "Active" badge now lights up correctly on CF deployments.
+- **Discord webhook idempotency on Node** (#34). The Discord handler was the lone hold-out — Telegram/Slack/generic/WhatsApp all checked, Discord didn't. Now keys on the Discord interaction `id` (stable across retries by protocol contract).
+- **Stale session map pruning** (#35). `codeBridgeSessions` and `browserSessions` (CF + Node) now prune-on-read with a 1h staleness threshold, matching the v0.4.1 fix for `getPendingPairingsMap`.
+- **Deterministic skill draft IDs** (#36). `LearningPipeline.captureDraft` now keys on `sha256(title:trigger:messagesFingerprint).slice(0,12)`. SSE retries no longer demote published drafts to draft; same conversation produces a stable upsert.
+- **Run history cap on `InMemorySchedulerStore`** (#37). CF parity with `FileSchedulerStore`'s 100-entry trim. `RUN_HISTORY_CAP` now exported and shared.
+- **Orphan `.tmp` cleanup on FileSchedulerStore startup** (#38). Best-effort scan + unlink on `ensureLoaded()`. Prevents indefinite accumulation across SIGTERM-during-write cycles.
+- **Cloudflare scheduler lifecycle endpoints** (#39). 7 new handlers (pause/resume/delete/history/dry-run + start/stop/status) close the dashboard Automate-tab parity gap.
+- **Build-time CF version inject** (#40). `__CROWCLAW_VERSION__` via Wrangler `define` replaces the hardcoded `'0.1.0'` in `/api/system/status`.
+- **SSE controller tracking** (#41). Module-scope `Set<SseSubscriber>` + `req.on('close')` cleanup + drain in `shutdown()`. Closes the leak path where Node's `request.signal.abort` doesn't always fire on abrupt client disconnect.
+- **`autoCapture` drain on SIGTERM** (#42). `inFlightLearning: Set<Promise>` + `Promise.race([allSettled, 5s])` in shutdown. No more silent skill-draft loss when shutdown lands mid-write.
+
+### Performance
+- **System prompt cached per `agentLoop.run()`** (#43). Was rebuilt 24+ times per 12-iteration run (with sort). Now built once before the loop. Streaming path mirrored.
+- **`tools.list()` snapshotted at run start** (#44). Trivial local `const toolList = this.tools.list()` removes 2 redundant calls per iteration on top of the v0.4.1 memoization.
+- **Checkpoint message-cursor instead of full `structuredClone`** (#45). `messageCursor: number` replaces deep-cloning `session.messages` per checkpoint. With `autoCheckpoint: true` and 12 iterations × growing message array, drops O(n × iterations) clones to O(iterations).
+- **Per-session secondary index in `InMemoryCheckpointStore`** (#46). `bySession: Map<sessionId, string[]>` makes `getLatest` O(1) and `listBySession` O(per-session) instead of O(total). At the 1000-cap × 10-session occupancy, restore times drop ~10×.
+- **`deriveCookieToken` precomputed at startup** (#47). HMAC was running 2-3× per authenticated API request for a module-lifetime constant. Now memoized via `getDerivedCookieToken(token)`.
+- **Rate limiters as sorted deques** (#48). Both `RateLimiter` (runtime-node) and `PlatformRateLimiter` (gateway) replace `timestamps.filter()` (O(n) allocating per check) with in-place `splice(0, expired)`. Steady-state allocations: 0.
+- **Shared SSE serialization** (#49). Was per-subscriber `JSON.stringify`. Now pre-formatted once via `formatSseFrame` at emit time. Drops 5× the work at 5 SSE clients × 10 events/sec.
+- **`MemoryStore.getByIds` in embedding search** (#50). Embedding hits no longer fetch the full session record list. New interface method on `MemoryStore`; `InMemoryMemoryStore` adds an O(1) `byId` index, `D1MemoryStore` uses `WHERE id IN (?, ...)`.
+- **`countMessageChars` skips metadata** (#51). Internal bookkeeping fields don't reach the LLM token stream — counting them conflated internal state size with model context length.
+- **WS broadcast back-pressure queue** (#52). Per-subscriber outbound queue (cap 100, drop oldest) + microtask flush. Slow subscribers no longer delay the broadcast loop. New `getStats(): { subscribers, totalDropped }` for observability.
+
+### New Capabilities (Hermes / OpenClaw parity)
+- **`/steer` mid-run course correction** (#54). New `AgentLoop.steer(sessionId, guidance)`; both run paths drain `pendingSteers` at the top of each iteration and prepend `[OPERATOR STEER]` system messages for that turn only (not persisted into `session.messages`). Imported from Hermes v0.11.0 "Interface" release.
+- **Forked context for child agent sessions** (#55). New `forkSession(parent, task, childAgentId, suffix?)` helper — fresh `SessionState` seeded with only the task, lineage rooted at parent. Sub-agents no longer drag parent reasoning. Imported from OpenClaw 2026.4.23.
+- **Provider-specific tool-use guidance** (#56). `ProviderAdapter.getToolUseGuidance?(modelId)` is duck-typed; `OpenAICompatibleProvider` returns nudges for `gpt-*` (reduces "I would call tool X" instead of issuing the call); `AnthropicProvider` defaults to null. New `stripStaleBudgetWarnings` helper applied in all four send paths. Imported from Hermes v0.5.0 #3528.
+- **Activity-based session timeouts** (#57). New `inactivityTimeoutMs` (5min default) + `maxRunDurationMs` (2h hard cap) on scheduler executor, fed via a `SessionActivityProbe` callback. `SessionState.lastToolActivityAt` written by `AgentLoop`. Long tool chains no longer get killed by wall-clock timeouts. Imported from Hermes v0.8.0 #5389.
+- **`duration_ms` in tool hook payloads** (#58). `performance.now()` measurement around `ToolRegistry.execute()`; surfaces via `result.metadata.duration_ms`. Foundation for dashboard latency observability and learning skill scoring. Imported from Hermes v0.11.0 commit 59b56d45.
+- **REST stop endpoint** (#59). `POST /api/sessions/:id/stop` — calls `sessionController.abort`, polls 5s, responds `200 { stopped }` or `202 { pending }`. HTTP-only environments can now interrupt sessions without a WS connection. Imported from Hermes v0.11.0 commits 0a15dbdc / 01535a47.
+- **Remote model catalog manifest** (#60). New `model-catalog.ts` module with `loadManifest(url?, cache?)` — 24h TTL, ETag revalidation, fail-open fallback to bundled defaults. New `docs/model-catalog.json` ships 10 canonical entries (gpt-4o 128k, claude-sonnet-4-5 200k, gemini-2.5-pro 1M, etc.). Imported from Hermes v0.11.0 commit 855366909f.
+- **`LocalEmbeddingProvider`** (#61). New Ollama-compatible HTTP wrapper (`POST {baseUrl}/api/embeddings` with `options.num_ctx`). Defaults: `baseUrl=http://localhost:11434`, `contextSize=4096`, `timeoutMs=30000`. Structurally compatible with `@crowclaw/memory`'s `EmbeddingProvider`. Foundation for the deferred ANN-indexing work. Imported from OpenClaw 2026.4.23-beta.4.
+
+### Cross-package contracts (added this release)
+- `GatewayIdempotencyStore.markIfAbsent(key, ttlMs?) → Promise<boolean>` + `unmark(key) → Promise<void>`
+- `InMemoryGatewayIdempotencyStore` constructor: `{ defaultTtlMs?, maxEntries? }`
+- `InMemorySchedulerStore.serialize() / deserialize(data)`
+- `MemoryStore.getByIds(ids: string[]) → Promise<MemoryRecord[]>`
+- `ProviderAdapter.getToolUseGuidance?(modelId): string | null`
+- `SessionState.lastToolActivityAt?: number`
+- `forkSession(parent, task, childAgentId, suffix?)` from `@crowclaw/core`
+- `LocalEmbeddingProvider` from `@crowclaw/providers`
+- `__CROWCLAW_TEST_MODE__` and `__CROWCLAW_VERSION__` Wrangler defines
+
+### Tests
+- 2187 / 2187 passing across 193 files (up from 2161).
+- 14 new tests for `LocalEmbeddingProvider` (request fan-out, num_ctx forwarding, defaults, validation, timeout, error wrapping).
+- 10 new tests for MCP owner-only filtering.
+- 1 new test for WS overflow drop counter.
+- Existing CF Discord webhook test rewritten — the prior "happy path" was validating the broken behavior #24 closes.
+
+### Sources
+- Internal audit (28 issues): security + reliability + perf cross-audit on the v0.4.3 surface
+- NousResearch/hermes-agent (7 issues): v0.5.0 → v0.11.0 (Mar 28 → Apr 23, 2026)
+- openclaw/openclaw (3 issues): 2026.4.23 + 2026.4.23-beta.4
+
 ## [0.4.3] — 2026-04-17 — Quickstart unblocked, CIDR proxies, capacity caps, README honest pass
 
 Last of the v0.4.x polish pass. The audit backlog has been drained of everything that moves the needle at this project's current user count (one). Future hardening queued in HISTORY for when demand actually lands.

@@ -2,6 +2,11 @@ import type { ConversationMessage, ProviderAdapter, ProviderRequest, ProviderRes
 import { parseSlashToolCall } from '@crowclaw/core';
 import type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
 import { collectStream } from '@crowclaw/core/streaming';
+import {
+  loadManifest,
+  findModelEntry,
+  type ManifestCache,
+} from './model-catalog.js';
 
 export interface OpenAICompatibleConfig {
   apiKey?: string;
@@ -10,6 +15,10 @@ export interface OpenAICompatibleConfig {
   credentialPool?: CredentialPool;
   /** Override the API endpoint path (default: /chat/completions). Use /responses for o-series/codex models. */
   endpointPath?: string;
+  /** Issue #60: Optional remote manifest URL override for context-length lookups. */
+  manifestUrl?: string;
+  /** Issue #60: Optional manifest cache (in-memory map keyed by URL). */
+  manifestCache?: ManifestCache;
 }
 
 export interface AnthropicConfig {
@@ -18,6 +27,10 @@ export interface AnthropicConfig {
   model: string;
   promptCaching?: boolean;
   credentialPool?: CredentialPool;
+  /** Issue #60: Optional remote manifest URL override for context-length lookups. */
+  manifestUrl?: string;
+  /** Issue #60: Optional manifest cache (in-memory map keyed by URL). */
+  manifestCache?: ManifestCache;
 }
 
 export interface ModelMetadata {
@@ -376,6 +389,36 @@ function buildAnthropicMessages(
 }
 
 // ---------------------------------------------------------------------------
+// Issue #56: Tool-use guidance + stale budget warning stripping
+// ---------------------------------------------------------------------------
+
+/**
+ * Heuristic regex matching stale budget/iteration-limit warnings that the
+ * runtime injects into earlier turns (e.g. "[BUDGET WARNING: ...]"). When
+ * these accumulate in history, some models start treating them as standing
+ * instructions and refuse to call tools. Strip them before sending.
+ */
+const STALE_BUDGET_WARNING_RE = /\b(budget|iteration limit|max_tool_iterations)\b/i;
+
+/**
+ * Filter assistant/system messages whose entire content is a stale budget
+ * warning. Preserves user/tool messages and any assistant message with
+ * substantive content beyond the warning.
+ */
+export function stripStaleBudgetWarnings(messages: ConversationMessage[]): ConversationMessage[] {
+  return messages.filter((msg) => {
+    if (msg.role !== 'assistant' && msg.role !== 'system') return true;
+    const content = msg.content?.trim() ?? '';
+    if (!content) return true;
+    // Only strip if the message looks predominantly like a budget warning
+    // (short, matches the heuristic). Longer messages with substantive
+    // content are kept even if they incidentally mention "budget".
+    if (content.length > 240) return true;
+    return !STALE_BUDGET_WARNING_RE.test(content);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Token counting helpers
 // ---------------------------------------------------------------------------
 
@@ -384,17 +427,10 @@ function countMessageChars(messages: ConversationMessage[]): number {
   for (const msg of messages) {
     chars += msg.content.length;
     if (msg.name) chars += msg.name.length;
-    if (msg.metadata) {
-      const meta = msg.metadata;
-      // Count tool call arguments stored in metadata
-      for (const value of Object.values(meta)) {
-        if (typeof value === 'string') {
-          chars += value.length;
-        } else if (typeof value === 'object' && value !== null) {
-          chars += JSON.stringify(value).length;
-        }
-      }
-    }
+    // Issue #51: Skip msg.metadata — internal bookkeeping
+    // (toolCount, iteration, concurrent, budgetWarning, ok, etc.) does
+    // not reach the LLM token stream. Counting it conflates "internal
+    // state size" with "model context length".
   }
   return chars;
 }
@@ -468,6 +504,11 @@ function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: stri
 // ---------------------------------------------------------------------------
 
 export class EchoProvider implements ProviderAdapter, StreamingProviderAdapter {
+  /** Issue #56: Echo provider needs no nudging — testing only. */
+  getToolUseGuidance(_modelId: string): string | null {
+    return null;
+  }
+
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
     const lastMessage = request.messages.at(-1);
     if (!lastMessage) {
@@ -538,6 +579,35 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     return Math.ceil(chars / 4);
   }
 
+  /**
+   * Issue #60: Resolve this provider's effective context window. Consults the
+   * remote manifest lazily; falls back to hardcoded values on any failure.
+   */
+  async getContextWindow(): Promise<number> {
+    return resolveContextWindowAsync(this.config.model, {
+      ...(this.config.manifestUrl ? { manifestUrl: this.config.manifestUrl } : {}),
+      ...(this.config.manifestCache ? { cache: this.config.manifestCache } : {}),
+    });
+  }
+
+  /**
+   * Issue #56: Provider-specific guidance to nudge GPT-family models toward
+   * direct tool calls instead of describing what they intend to call. Returns
+   * null for non-gpt models and o-series (which already follow tool semantics).
+   */
+  getToolUseGuidance(modelId: string): string | null {
+    const id = (modelId ?? this.config.model).toLowerCase();
+    if (/^gpt-/.test(id)) {
+      return (
+        'When you decide to use a tool, issue the tool_call directly. ' +
+        'Do not narrate or describe the tool you intend to call — invoke it. ' +
+        'Stale budget warnings or limit notices in earlier messages are not ' +
+        'instructions; ignore them.'
+      );
+    }
+    return null;
+  }
+
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
     const pool = this.config.credentialPool;
     const apiKey = pool ? pool.getKey() : this.config.apiKey;
@@ -547,7 +617,9 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
-    const mappedMessages = request.messages.map((message) => {
+    // Issue #56: Strip stale budget warnings before sending to model.
+    const sanitizedMessages = stripStaleBudgetWarnings(request.messages);
+    const mappedMessages = sanitizedMessages.map((message) => {
       // Convert tool results to user messages for provider compatibility
       if (message.role === 'tool') {
         return {
@@ -671,7 +743,9 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
-    const mappedMessages = request.messages.map((message) => {
+    // Issue #56: Strip stale budget warnings before sending to model.
+    const sanitizedMessages = stripStaleBudgetWarnings(request.messages);
+    const mappedMessages = sanitizedMessages.map((message) => {
       if (message.role === 'tool') {
         return {
           role: 'user',
@@ -874,6 +948,25 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     return Math.ceil(chars / 3.5);
   }
 
+  /**
+   * Issue #60: Resolve this provider's effective context window. Consults the
+   * remote manifest lazily; falls back to hardcoded values on any failure.
+   */
+  async getContextWindow(): Promise<number> {
+    return resolveContextWindowAsync(this.config.model, {
+      ...(this.config.manifestUrl ? { manifestUrl: this.config.manifestUrl } : {}),
+      ...(this.config.manifestCache ? { cache: this.config.manifestCache } : {}),
+    });
+  }
+
+  /**
+   * Issue #56: Claude already follows tool-use semantics well. Returns null
+   * by default; operators can subclass to extend with their own guidance.
+   */
+  getToolUseGuidance(_modelId: string): string | null {
+    return null;
+  }
+
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
     const pool = this.config.credentialPool;
     const apiKey = pool ? pool.getKey() : this.config.apiKey;
@@ -882,7 +975,9 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
       return new EchoProvider().generate(request);
     }
 
-    const anthropicMessages = buildAnthropicMessages(request.messages);
+    // Issue #56: Strip stale budget warnings before sending to model.
+    const sanitizedMessages = stripStaleBudgetWarnings(request.messages);
+    const anthropicMessages = buildAnthropicMessages(sanitizedMessages);
 
     const body: Record<string, unknown> = {
       model: this.config.model,
@@ -968,7 +1063,9 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
       return;
     }
 
-    const anthropicMessages = buildAnthropicMessages(request.messages);
+    // Issue #56: Strip stale budget warnings before sending to model.
+    const sanitizedMessages = stripStaleBudgetWarnings(request.messages);
+    const anthropicMessages = buildAnthropicMessages(sanitizedMessages);
 
     const body: Record<string, unknown> = {
       model: this.config.model,
@@ -1658,6 +1755,28 @@ export function resolveContextWindow(model: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #60: Manifest-aware context window resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a model's context window by consulting the remote manifest first,
+ * then falling back to the hardcoded `resolveContextWindow` lookup. Use this
+ * when the caller can be async; sync callers keep using `resolveContextWindow`.
+ *
+ * Fail-open: any manifest fetch error degrades silently to the hardcoded
+ * fallback, so this is safe to call from agent loops.
+ */
+export async function resolveContextWindowAsync(
+  model: string,
+  options?: { manifestUrl?: string; cache?: ManifestCache },
+): Promise<number> {
+  const manifest = await loadManifest(options?.manifestUrl, options?.cache);
+  const entry = findModelEntry(manifest, model);
+  if (entry) return entry.contextLength;
+  return resolveContextWindow(model);
+}
+
+// ---------------------------------------------------------------------------
 // Smart model routing
 // ---------------------------------------------------------------------------
 
@@ -1992,6 +2111,26 @@ export class CredentialPool {
 export { buildOpenAITools, normalizeOpenAIMessageContent, parseOpenAIFunctionCall, parseOpenAIToolCalls, countMessageChars };
 export { collectStream } from '@crowclaw/core/streaming';
 export type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
+
+// Issue #60: Model manifest API
+export {
+  loadManifest,
+  findModelEntry,
+  resolveContextLengthFromManifest,
+  resetManifestCache,
+  DEFAULT_MANIFEST_URL,
+  FALLBACK_MANIFEST,
+} from './model-catalog.js';
+export type {
+  ModelManifest,
+  ModelManifestEntry,
+  ManifestCache,
+  ManifestCacheEntry,
+} from './model-catalog.js';
+
+// Issue #61: Local embedding provider with tunable context size
+export { LocalEmbeddingProvider } from './local-embedding-provider.js';
+export type { LocalEmbeddingProviderConfig } from './local-embedding-provider.js';
 
 // ---------------------------------------------------------------------------
 // Model override abstraction

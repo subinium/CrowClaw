@@ -54,6 +54,59 @@ describe('learning loop foundation', () => {
     expect(all).toHaveLength(1);
     expect(all[0]?.status).toBe('published');
   });
+
+  // ------------------------------------------------------------------------
+  // #36 — deterministic ID + upsert dedup
+  // ------------------------------------------------------------------------
+
+  it('captureDraft produces a deterministic id and dedupes repeated calls (#36)', async () => {
+    const store = new InMemorySkillStore();
+    const pipeline = new LearningPipeline(store);
+    const messages = [
+      { role: 'user' as const, content: 'set up CI', createdAt: '2025-01-01T00:00:00.000Z' },
+      { role: 'assistant' as const, content: 'CI pipeline configured. All done.', createdAt: '2025-01-01T00:00:01.000Z' },
+    ];
+
+    const first = await pipeline.captureDraft(messages, 'session-abc');
+    const second = await pipeline.captureDraft(messages, 'session-abc');
+
+    // Same id, no duplicate row.
+    expect(second.id).toBe(first.id);
+    expect(first.id.startsWith('draft-')).toBe(true);
+    const all = await pipeline.listDrafts();
+    expect(all).toHaveLength(1);
+    // Second call increments version (upsert path).
+    expect(second.version).toBe(2);
+  });
+
+  it('captureDraft preserves status on upsert so published drafts are not silently demoted (#36)', async () => {
+    const store = new InMemorySkillStore();
+    const pipeline = new LearningPipeline(store);
+    const messages = [
+      { role: 'user' as const, content: 'deploy app', createdAt: '2025-01-01T00:00:00.000Z' },
+      { role: 'assistant' as const, content: 'Deployed. All done.', createdAt: '2025-01-01T00:00:01.000Z' },
+    ];
+
+    const first = await pipeline.captureDraft(messages, 'session-xyz');
+    await pipeline.publishDraft(first.id);
+
+    // Re-capture (e.g., SSE retry) — must not flip status back to 'draft'.
+    const second = await pipeline.captureDraft(messages, 'session-xyz');
+    expect(second.id).toBe(first.id);
+    expect(second.status).toBe('published');
+  });
+
+  it('captureDraft trigger option produces distinct ids per trigger (#36)', async () => {
+    const pipeline = new LearningPipeline(new InMemorySkillStore());
+    const messages = [
+      { role: 'user' as const, content: 'task', createdAt: '' },
+      { role: 'assistant' as const, content: 'Done.', createdAt: '' },
+    ];
+
+    const auto = await pipeline.captureDraft(messages, 'session-1', { trigger: 'auto' });
+    const manual = await pipeline.captureDraft(messages, 'session-1', { trigger: 'manual' });
+    expect(auto.id).not.toBe(manual.id);
+  });
 });
 
 // --- Helper: create a StoredSkillDraft for testing ---

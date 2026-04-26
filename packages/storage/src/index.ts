@@ -36,6 +36,13 @@ export interface MemoryStore {
   write(record: MemoryRecord): Promise<void>;
   list(sessionId: string): Promise<MemoryRecord[]>;
   listByScope(scope: MemoryRecord['scope'], limit?: number, scopeKey?: string): Promise<MemoryRecord[]>;
+  /**
+   * Fetch records by id in a single round-trip. Order of the returned array
+   * matches `ids`; missing ids are omitted (not nulled). Used by hot paths
+   * like embedding-store search where loading the full session just to filter
+   * down to k hits is wasteful at session scale.
+   */
+  getByIds(ids: string[]): Promise<MemoryRecord[]>;
 }
 
 function normalizeNeedle(query: string): string {
@@ -150,6 +157,9 @@ export class InMemorySessionStore implements SessionStore, SessionSearchStore, S
 
 export class InMemoryMemoryStore implements MemoryStore {
   private readonly store = new Map<string, MemoryRecord[]>();
+  /** Secondary index for O(1) `getByIds` lookups so consumers don't have to
+   *  scan every session bucket to find a record by id. */
+  private readonly byId = new Map<string, MemoryRecord>();
 
   async search(sessionId: string, query: string, limit = 10): Promise<MemoryRecord[]> {
     return sortByNewest(this.store.get(sessionId) ?? [])
@@ -181,10 +191,19 @@ export class InMemoryMemoryStore implements MemoryStore {
     // Pre-compute search blob once so later matchesQuery() calls are O(|needle|).
     (record as IndexedRecord)[SEARCH_BLOB] = buildSearchBlob(record);
     if (existing) {
-      existing.push(record);
+      // Replace in-place if the same id already exists (e.g. embedding-store
+      // dedup merge writes the same id back). Without this the bucket would
+      // accumulate stale copies and `getByIds` could surface them.
+      const idx = existing.findIndex((r) => r.id === record.id);
+      if (idx >= 0) {
+        existing[idx] = record;
+      } else {
+        existing.push(record);
+      }
     } else {
       this.store.set(record.sessionId, [record]);
     }
+    this.byId.set(record.id, record);
   }
 
   async list(sessionId: string): Promise<MemoryRecord[]> {
@@ -199,6 +218,17 @@ export class InMemoryMemoryStore implements MemoryStore {
       }
     }
     return sortByNewest(out).slice(0, limit);
+  }
+
+  async getByIds(ids: string[]): Promise<MemoryRecord[]> {
+    // Preserve the input order so callers ranking by score upstream (e.g. the
+    // embedding store) get back records in the same order they asked for.
+    const out: MemoryRecord[] = [];
+    for (const id of ids) {
+      const record = this.byId.get(id);
+      if (record) out.push(record);
+    }
+    return out;
   }
 }
 
@@ -419,6 +449,47 @@ export class D1MemoryStore implements MemoryStore {
 
     const row = await statement.first<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
     return row ? [this.mapRow(row)] : [];
+  }
+
+  async getByIds(ids: string[]): Promise<MemoryRecord[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    // Build positional placeholders (`?1, ?2, ...`) to match the rest of the
+    // file's binding style and to keep the query safely parameterized — never
+    // interpolate user-supplied ids directly into SQL.
+    const placeholders = ids.map((_, index) => `?${index + 1}`).join(', ');
+    const statement = this.db
+      .prepare(
+        `SELECT id, session_id, scope, scope_key, summary, tags_json, created_at, metadata_json
+         FROM memories
+         WHERE id IN (${placeholders})`
+      )
+      .bind(...ids);
+
+    let rows: Array<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }> = [];
+
+    if (statement.all) {
+      const results = await statement.all<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
+      rows = results.results;
+    } else if (statement.first) {
+      // Fallback for D1-likes that only support `first` — best-effort, returns
+      // at most one row. Real D1/SQLite always exposes `all`.
+      const single = await statement.first<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
+      rows = single ? [single] : [];
+    }
+
+    // Preserve caller-provided `ids` ordering so upstream ranked sequences
+    // (e.g. embedding score order) survive the round-trip — `IN (...)` makes
+    // no guarantee about result order across SQL engines.
+    const byId = new Map(rows.map((row) => [row.id, this.mapRow(row)]));
+    const out: MemoryRecord[] = [];
+    for (const id of ids) {
+      const record = byId.get(id);
+      if (record) out.push(record);
+    }
+    return out;
   }
 }
 

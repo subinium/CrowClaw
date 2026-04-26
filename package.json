@@ -1,6 +1,6 @@
 {
   "name": "crowclaw",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "type": "module",
   "description": "A self-improving TypeScript agent framework that learns from every conversation.",
   "bin": {

@@ -1,5 +1,5 @@
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile, writeFile, mkdir, rename, readdir, unlink } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 export {
   type CronExpression,
@@ -15,6 +15,29 @@ import {
   parseCron,
   nextCronOccurrence,
 } from './cron-parser.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Cap run-history per job so the file-backed store and in-memory store can't
+ * grow unbounded. Shared by `InMemorySchedulerStore.recordRun` and
+ * `FileSchedulerStore.recordRun` to keep CF / Node parity.
+ */
+export const RUN_HISTORY_CAP = 100;
+
+/**
+ * Default per-tool inactivity window before the scheduler considers an in-flight
+ * job stalled. Five minutes mirrors the agent-side default in `@crowclaw/core`.
+ */
+export const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Default hard cap for total run duration. Two hours is a backstop for cases
+ * where activity heartbeats keep firing but the job is effectively wedged.
+ */
+export const DEFAULT_MAX_RUN_DURATION_MS = 2 * 60 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,7 +77,20 @@ export interface CronJobDefinition {
   lastRunResult?: string; // Truncated result
   runCount?: number;
   maxRuns?: number; // Auto-disable after N runs
+  /** @deprecated Use `inactivityTimeoutMs` for activity-based or `maxRunDurationMs` for the hard cap. Falls back to inactivity timeout when set. */
   timeoutMs?: number; // Per-run timeout (default: 60000)
+  /**
+   * Per-job inactivity timeout. The executor aborts the run if no tool
+   * activity is observed for this many ms. Mirrors agent-side
+   * `lastToolActivityAt` tracking added in `@crowclaw/core`.
+   * Defaults to `DEFAULT_INACTIVITY_TIMEOUT_MS` (5 min).
+   */
+  inactivityTimeoutMs?: number;
+  /**
+   * Hard cap on total run wall-clock duration regardless of activity.
+   * Defaults to `DEFAULT_MAX_RUN_DURATION_MS` (2 hours).
+   */
+  maxRunDurationMs?: number;
   // Grace window
   graceWindowMs?: number; // Default: 300_000 (5 min). Skip job if overdue by more than this.
   // Run archival
@@ -116,6 +152,20 @@ export interface DeliveryFn {
     target: DeliveryTarget,
     content: string,
   ): Promise<{ ok: boolean; error?: string }>;
+}
+
+/**
+ * Probe used by the executor to decide if an in-flight job has stalled.
+ * Returns the ISO timestamp of the most recent tool execution for the given
+ * session, or `null` if the session has no recorded activity yet.
+ *
+ * Hosts wire this up against `SessionState.lastToolActivityAt` (added by
+ * `@crowclaw/core`). The scheduler intentionally avoids importing
+ * `@crowclaw/core` to keep the package free of cross-runtime deps; instead
+ * it accepts this duck-typed probe.
+ */
+export interface SessionActivityProbe {
+  (sessionId: string): Promise<string | null> | string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,8 +233,55 @@ export class InMemorySchedulerStore implements SchedulerStore {
   async recordRun(record: JobRunRecord): Promise<void> {
     const records = this.runHistory.get(record.jobId) ?? [];
     records.push(record);
+    // Mirror the FileSchedulerStore cap so the in-memory store (used by CF
+    // Durable Objects after serialize/deserialize) can't grow unbounded.
+    if (records.length > RUN_HISTORY_CAP) {
+      records.splice(0, records.length - RUN_HISTORY_CAP);
+    }
     this.runHistory.set(record.jobId, records);
   }
+
+  // -- Cross-runtime serialization (used by CF Durable Object storage) --
+
+  /**
+   * Snapshot the store state for round-tripping through external storage
+   * (e.g. CF Durable Object `state.storage`). Pairs with `deserialize`.
+   */
+  serialize(): SerializedSchedulerStore {
+    const history: Record<string, JobRunRecord[]> = {};
+    for (const [jobId, records] of this.runHistory) {
+      history[jobId] = [...records];
+    }
+    return {
+      jobs: [...this.jobs.values()],
+      history,
+    };
+  }
+
+  /**
+   * Replace the store state with a previously serialized snapshot.
+   * Existing in-memory state is cleared first.
+   */
+  deserialize(data: SerializedSchedulerStore): void {
+    this.jobs.clear();
+    for (const job of data.jobs ?? []) {
+      this.jobs.set(job.id, job);
+    }
+    this.runHistory.clear();
+    for (const [jobId, records] of Object.entries(data.history ?? {})) {
+      this.runHistory.set(jobId, [...records]);
+    }
+  }
+}
+
+/**
+ * Wire-format snapshot of an `InMemorySchedulerStore`. Consumed by the CF
+ * Durable Object adapter (issue #32) to persist scheduler state across
+ * hibernation / restarts without re-implementing the store.
+ */
+export interface SerializedSchedulerStore {
+  jobs: CronJobDefinition[];
+  history: Record<string, JobRunRecord[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +415,10 @@ export function createScheduledAgentJob(options: {
   model?: string;
   deliverTo?: DeliveryTarget;
   maxRuns?: number;
+  /** @deprecated Prefer `inactivityTimeoutMs` and `maxRunDurationMs`. */
   timeoutMs?: number;
+  inactivityTimeoutMs?: number;
+  maxRunDurationMs?: number;
   graceWindowMs?: number;
 }): CronJobDefinition {
   const now = new Date();
@@ -346,6 +446,8 @@ export function createScheduledAgentJob(options: {
     deliverTo: options.deliverTo,
     maxRuns: options.maxRuns,
     timeoutMs: options.timeoutMs,
+    inactivityTimeoutMs: options.inactivityTimeoutMs,
+    maxRunDurationMs: options.maxRunDurationMs,
     graceWindowMs: options.graceWindowMs,
     runCount: 0,
     totalRuns: 0,
@@ -433,12 +535,37 @@ export async function markJobRun(
 // Scheduler executor
 // ---------------------------------------------------------------------------
 
+export interface SchedulerExecutorOptions {
+  /**
+   * Optional probe that returns the most recent tool-activity timestamp for a
+   * given session id. When provided, the executor uses inactivity-based
+   * timeouts (`inactivityTimeoutMs`) instead of pure wall-clock timeouts.
+   * Hosts read this from `SessionState.lastToolActivityAt`.
+   */
+  activityProbe?: SessionActivityProbe;
+  /**
+   * Default inactivity timeout in ms applied when a job omits
+   * `inactivityTimeoutMs`. Overridable per-job.
+   */
+  defaultInactivityTimeoutMs?: number;
+  /**
+   * Default hard cap on total run duration. Overridable per-job via
+   * `maxRunDurationMs`.
+   */
+  defaultMaxRunDurationMs?: number;
+}
+
 export class SchedulerExecutor {
+  private readonly options: SchedulerExecutorOptions;
+
   constructor(
     private readonly store: SchedulerStore,
     private readonly runAgent: AgentRunFn,
     private readonly deliver?: DeliveryFn,
-  ) {}
+    options: SchedulerExecutorOptions = {},
+  ) {
+    this.options = options;
+  }
 
   /** Execute all due jobs. Returns results for each executed job. */
   async tick(now?: Date): Promise<SchedulerTickResult[]> {
@@ -552,23 +679,78 @@ export class SchedulerExecutor {
 
   private async executeJob(job: CronJobDefinition): Promise<SchedulerTickResult> {
     const sessionId = `sched-${job.id}-${Date.now()}`;
-    const timeoutMs = job.timeoutMs ?? 60_000;
+    const startMs = Date.now();
+    // Resolve effective timeouts. Backward compatibility:
+    //   - Legacy `timeoutMs` is honoured as the inactivity window when the
+    //     newer `inactivityTimeoutMs` is omitted, since that's what existing
+    //     callers semantically expected (hard timeout from start).
+    //   - The hard cap (`maxRunDurationMs`) defaults to the larger 2h backstop
+    //     unless explicitly overridden.
+    const inactivityTimeoutMs =
+      job.inactivityTimeoutMs ??
+      job.timeoutMs ??
+      this.options.defaultInactivityTimeoutMs ??
+      DEFAULT_INACTIVITY_TIMEOUT_MS;
+    const maxRunDurationMs =
+      job.maxRunDurationMs ??
+      this.options.defaultMaxRunDurationMs ??
+      DEFAULT_MAX_RUN_DURATION_MS;
+    // Preserve the legacy "Job timed out" error message when callers haven't
+    // opted into the new activity-based timeout fields. This keeps existing
+    // tests / log scrapers stable. New fields (`inactivityTimeoutMs`,
+    // `maxRunDurationMs`) opt callers into the more descriptive messages.
+    const usingLegacyTimeoutOnly =
+      job.inactivityTimeoutMs === undefined &&
+      job.maxRunDurationMs === undefined;
+    // Track last activity locally; seed with start time so the first tick is
+    // measured against the run start. The probe (when wired up by the host)
+    // overrides this with `SessionState.lastToolActivityAt` from CORE.
+    let lastActivityMs = startMs;
 
+    let watchdog: ReturnType<typeof setInterval> | null = null;
     try {
-      const agentResult = await Promise.race([
-        this.runAgent({
-          sessionId,
-          userMessage: job.task,
-          agentId: `scheduler-${job.id}`,
-          skillSlugs: job.skillSlugs,
-          agentPreset: job.agentPreset,
-          toolsetPreset: job.toolsetPreset,
-          model: job.model,
-        }),
-        new Promise<never>((_resolve, reject) => {
-          setTimeout(() => reject(new Error('Job timed out')), timeoutMs);
-        }),
-      ]);
+      const agentPromise = this.runAgent({
+        sessionId,
+        userMessage: job.task,
+        agentId: `scheduler-${job.id}`,
+        skillSlugs: job.skillSlugs,
+        agentPreset: job.agentPreset,
+        toolsetPreset: job.toolsetPreset,
+        model: job.model,
+      });
+
+      const watchdogPromise = new Promise<never>((_resolve, reject) => {
+        // Tick at half the inactivity window (capped at 30s) so we surface a
+        // stall within ~1.5x the configured timeout in the worst case.
+        const tickMs = Math.min(Math.max(inactivityTimeoutMs / 2, 1_000), 30_000);
+        watchdog = setInterval(() => {
+          void this.refreshLastActivity(sessionId, lastActivityMs).then((next) => {
+            lastActivityMs = next;
+            const now = Date.now();
+            if (now - startMs > maxRunDurationMs) {
+              reject(
+                new Error(
+                  usingLegacyTimeoutOnly
+                    ? 'Job timed out'
+                    : `Job exceeded max run duration (${maxRunDurationMs}ms)`,
+                ),
+              );
+              return;
+            }
+            if (now - lastActivityMs > inactivityTimeoutMs) {
+              reject(
+                new Error(
+                  usingLegacyTimeoutOnly
+                    ? 'Job timed out'
+                    : `Job stalled: no tool activity for ${inactivityTimeoutMs}ms`,
+                ),
+              );
+            }
+          });
+        }, tickMs);
+      });
+
+      const agentResult = await Promise.race([agentPromise, watchdogPromise]);
 
       // Deliver if target configured
       let deliveryResult: { ok: boolean; error?: string } | undefined;
@@ -597,6 +779,30 @@ export class SchedulerExecutor {
         error: msg,
         executedAt: new Date().toISOString(),
       };
+    } finally {
+      if (watchdog !== null) clearInterval(watchdog);
+    }
+  }
+
+  /**
+   * Resolve the latest tool-activity timestamp for the in-flight session.
+   * Falls back to the previous value when the probe is unset, returns null,
+   * or throws — the watchdog must remain best-effort and never escalate
+   * probe failures into job failures.
+   */
+  private async refreshLastActivity(
+    sessionId: string,
+    fallbackMs: number,
+  ): Promise<number> {
+    const probe = this.options.activityProbe;
+    if (!probe) return fallbackMs;
+    try {
+      const ts = await probe(sessionId);
+      if (!ts) return fallbackMs;
+      const parsed = Date.parse(ts);
+      return Number.isFinite(parsed) ? parsed : fallbackMs;
+    } catch {
+      return fallbackMs;
     }
   }
 }
@@ -677,9 +883,6 @@ interface FileStoreData {
   runHistory: Record<string, JobRunRecord[]>;
   lastSavedAt: string;
 }
-
-/** Cap run-history per job so `scheduler-jobs.json` doesn't grow unbounded. */
-const RUN_HISTORY_CAP = 100;
 
 export class FileSchedulerStore implements SchedulerStore {
   private jobs: Map<string, CronJobDefinition> | null = null;
@@ -764,6 +967,11 @@ export class FileSchedulerStore implements SchedulerStore {
     this.jobs = new Map();
     this.runHistoryMap = new Map();
 
+    // Best-effort: clean up orphaned `<file>.<pid>.<ts>.tmp` siblings that a
+    // previous process crashed or was SIGKILLed before `rename()` could finish.
+    // Failures here must not block startup — the store still works without it.
+    await this.cleanupOrphanedTmpFiles();
+
     try {
       const raw = await readFile(this.filePath, 'utf-8');
       const data: FileStoreData = JSON.parse(raw);
@@ -781,6 +989,27 @@ export class FileSchedulerStore implements SchedulerStore {
         return;
       }
       throw err;
+    }
+  }
+
+  /**
+   * Remove leftover `<filePath>.<pid>.<ts>.tmp` files from prior runs that
+   * crashed between `writeFile` and `rename`. Swallows all errors — this is
+   * housekeeping only and must not block scheduler startup.
+   */
+  private async cleanupOrphanedTmpFiles(): Promise<void> {
+    try {
+      const dir = dirname(this.filePath);
+      const base = basename(this.filePath);
+      const entries = await readdir(dir);
+      const orphans = entries.filter(
+        (name) => name.startsWith(`${base}.`) && name.endsWith('.tmp'),
+      );
+      await Promise.all(
+        orphans.map((name) => unlink(join(dir, name)).catch(() => {})),
+      );
+    } catch {
+      // Directory may not exist yet, or be unreadable; ignore.
     }
   }
 

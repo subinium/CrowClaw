@@ -4,6 +4,14 @@
   "main": "packages/runtime-cloudflare/src/index.ts",
   "compatibility_date": "2026-04-11",
   "compatibility_flags": ["nodejs_compat"],
+  // Build-time defines. `__CROWCLAW_TEST_MODE__` replaces a prior runtime
+  // `process.env.VITEST` check (#25 — fail-closed against future polyfills).
+  // `__CROWCLAW_VERSION__` is consumed by `/api/system/status` (#40); keep in
+  // lockstep with `package.json` during release/vX.Y.Z.
+  "define": {
+    "__CROWCLAW_TEST_MODE__": "false",
+    "__CROWCLAW_VERSION__": "\"0.4.3\""
+  },
   "durable_objects": {
     "bindings": [
       {

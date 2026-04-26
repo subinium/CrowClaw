@@ -33,6 +33,60 @@ import { AgentSessionDurableObject } from './agent-do';
 
 export { AgentSessionDurableObject, Sandbox };
 
+/**
+ * Build-time flag. Wrangler replaces this with the literal `false` for production
+ * worker bundles via `wrangler.jsonc` `define`; vitest replaces it with `true`.
+ * Replaced the prior `process.env.VITEST` runtime check (#25) — runtime checks
+ * couple production behavior to test-environment shape and fail open if any
+ * polyfill ever exposes a partial `process` shim.
+ */
+declare const __CROWCLAW_TEST_MODE__: boolean;
+
+/** Hex string -> Uint8Array. Used by Discord Ed25519 signature verification. */
+function hexToUint8Array(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+/**
+ * Verify a Discord webhook signature using Ed25519. Mirrors the Node runtime's
+ * `verifyDiscordWebhookSignature` (`packages/runtime-node/src/index.ts:985-1013`).
+ * Closes #24 — prior CF handler accepted any payload, allowing forged Discord
+ * interactions against the operator's LLM keys.
+ */
+async function verifyDiscordWebhookSignature(
+  request: Request,
+  publicKey: string,
+  body: string
+): Promise<boolean> {
+  const signature = request.headers.get('x-signature-ed25519');
+  const timestamp = request.headers.get('x-signature-timestamp');
+  if (!signature || !timestamp) return false;
+
+  try {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      hexToUint8Array(publicKey).buffer as ArrayBuffer,
+      { name: 'Ed25519', namedCurve: 'Ed25519' } as EcKeyImportParams,
+      false,
+      ['verify']
+    );
+    const encoder = new TextEncoder();
+    const message = encoder.encode(timestamp + body);
+    return await crypto.subtle.verify(
+      'Ed25519',
+      key,
+      hexToUint8Array(signature).buffer as ArrayBuffer,
+      message
+    );
+  } catch {
+    return false;
+  }
+}
+
 function getSpecialSessionStub(env: RuntimeEnv, name: string) {
   const durableId = env.AGENT_SESSIONS.idFromName(name);
   return env.AGENT_SESSIONS.get(durableId);
@@ -81,11 +135,10 @@ async function enforceDashboardAuth(request: Request, env: RuntimeEnv, url: URL)
   // Only /api/* and /ws are protected; other paths (dashboard HTML, static) fall through.
   if (!url.pathname.startsWith('/api/') && url.pathname !== '/ws') return null;
 
-  // Vitest bypass: unit tests synthesize env objects without CROWCLAW_DASHBOARD_TOKEN
-  // to exercise routing/forwarding. Real CF Workers never have process.env.VITEST set.
-  const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
-  const isVitest = g.process?.env?.VITEST === 'true';
-  if (isVitest) return null;
+  // Vitest bypass replaced with build-time flag (#25). Wrangler replaces this
+  // with the literal `false` for production bundles, so esbuild dead-code-
+  // eliminates the bypass before deploy. Vitest sets it to `true`.
+  if (__CROWCLAW_TEST_MODE__) return null;
 
   const dashToken = env.CROWCLAW_DASHBOARD_TOKEN;
   if (!dashToken) {
@@ -732,6 +785,75 @@ export default {
       }));
     }
 
+    // Scheduler lifecycle parity routes (#39). Mirror the Node runtime's
+    // route-paths.scheduler shape so dashboard buttons (pause/resume/delete/
+    // history/dry-run/start/stop/status) work identically on CF.
+    {
+      const lifecycleMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)\/(pause|resume|history|dry-run)$/);
+      const deleteMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)$/);
+      if (lifecycleMatch && (request.method === 'GET' || request.method === 'POST')) {
+        const stub = getSpecialSessionStub(env, '__system__');
+        const internalPath = `https://internal/session/scheduler/jobs/${lifecycleMatch[1]}/${lifecycleMatch[2]}${url.search}`;
+        const init: RequestInit = {
+          method: request.method,
+          headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+        };
+        if (request.method === 'POST') init.body = await request.text();
+        return stub.fetch(new Request(internalPath, init));
+      }
+      // DELETE /api/scheduler/jobs/:id — only when not also a lifecycle action.
+      if (deleteMatch && !lifecycleMatch && request.method === 'DELETE') {
+        const stub = getSpecialSessionStub(env, '__system__');
+        return stub.fetch(new Request(`https://internal/session/scheduler/jobs/${deleteMatch[1]}`, {
+          method: 'DELETE',
+          headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+        }));
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/scheduler/start') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/scheduler/start', {
+        method: 'POST',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+      }));
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/scheduler/stop') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/scheduler/stop', {
+        method: 'POST',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+      }));
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/scheduler/status') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/scheduler/status', {
+        method: 'GET',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+      }));
+    }
+
+    // Active config-preset selection (#33). Routes match Node's
+    // `/api/config-presets/active` (GET) and `/api/config-presets/switch` (POST).
+    if (request.method === 'GET' && url.pathname === '/api/config-presets/active') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/config-presets/active', {
+        method: 'GET',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+      }));
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/config-presets/switch') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/config-presets/switch', {
+        method: 'POST',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+        body: await request.text(),
+      }));
+    }
+
     if (request.method === 'POST' && url.pathname === '/api/telegram/send') {
       const body = (await request.json()) as { botToken: string; chatId: string; text: string; parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'; disableWebPagePreview?: boolean };
       const response = await fetch(buildTelegramSendUrl(body.botToken), {
@@ -856,7 +978,22 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/webhooks/discord') {
-      const payload = await request.json();
+      // Ed25519 signature verification (#24). Fail-closed when the public key
+      // is not configured, matching the Node runtime's behavior at
+      // `runtime-node/src/index.ts:3313-3324`. The raw body must be read once
+      // for the signature check and reused for `JSON.parse` — re-reading the
+      // request stream throws.
+      const discordPubKey = env.DISCORD_PUBLIC_KEY;
+      if (!discordPubKey) {
+        return Response.json({ ok: false, error: 'Discord public key not configured' }, { status: 403 });
+      }
+      const rawBody = await request.text();
+      const sigValid = await verifyDiscordWebhookSignature(request, discordPubKey, rawBody);
+      if (!sigValid) {
+        return Response.json({ ok: false, error: 'Invalid Discord webhook signature' }, { status: 403 });
+      }
+
+      const payload = JSON.parse(rawBody);
       const dispatch = buildDiscordDispatch(payload as never);
       if (!dispatch) {
         return Response.json({ ok: false, ignored: true });
