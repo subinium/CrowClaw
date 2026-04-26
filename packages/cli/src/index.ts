@@ -7,6 +7,15 @@ import { homedir } from 'node:os';
 import type { NodeRuntimeOptions } from '@crowclaw/runtime-node';
 import { GatewayRunner, type GatewayStatus } from '@crowclaw/gateway';
 
+const CLI_VERSION: string = (() => {
+  try {
+    const pkgUrl = new URL('../package.json', import.meta.url);
+    return `v${(JSON.parse(readFileSync(pkgUrl, 'utf-8')) as { version?: string }).version ?? 'unknown'}`;
+  } catch {
+    return 'vunknown';
+  }
+})();
+
 const HISTORY_DIR = join(homedir(), '.crowclaw');
 const HISTORY_FILE_PATH = join(HISTORY_DIR, 'history');
 const MAX_HISTORY_LINES = 1000;
@@ -571,7 +580,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
 
 export function renderCliHelp(): string {
   return [
-    'CrowClaw CLI v0.1.0',
+    `CrowClaw CLI ${CLI_VERSION}`,
     '',
     'Usage: crowclaw [command] [options]',
     '',
@@ -2467,7 +2476,7 @@ export async function runCliOnboarding(): Promise<CrowClawConfig | null> {
 
 export async function startRepl(options: ReplOptions = {}): Promise<void> {
   const prompt = options.prompt ?? 'crowclaw> ';
-  const greeting = options.greeting ?? 'CrowClaw CLI v0.1.0\nType /help for commands, Ctrl+D to exit.\n';
+  const greeting = options.greeting ?? `CrowClaw CLI ${CLI_VERSION}\nType /help for commands, Ctrl+D to exit.\n`;
   const historyFilePath = options.historyFile ?? HISTORY_FILE_PATH;
 
   const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
