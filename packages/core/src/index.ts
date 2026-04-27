@@ -1,5 +1,5 @@
 import { PluginManager } from '@crowclaw/plugins';
-import { buildSystemPrompt, buildMemoryPrefix } from './prompt-builder.js';
+import { buildSystemPrompt, buildMemoryPrefix, type PromptBuilderInput } from './prompt-builder.js';
 import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
@@ -8,6 +8,7 @@ import type { DetailedUsageTracker } from './usage-tracker.js';
 import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand, SecurityAuditLog } from './security.js';
 import { splitWithPairPreservation, extractPreflightFacts } from './compression-utils.js';
 import { isHardlineBlocked, HARDLINE_BLOCKLIST } from './hardline-blocklist.js';
+import { stripReasoningContent } from './provider-switch.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -242,6 +243,24 @@ export interface AgentLoopOptions {
   /** #53: extra hardline patterns appended to the static defaults. Matched
    *  *before* the approval gate; matches short-circuit with no human prompt. */
   hardlineBlocklist?: ReadonlyArray<{ pattern: RegExp; description: string }>;
+  /** #79: Workspace bootstrap injection mode.
+   *  - 'auto' (default): inject runtime context (Runtime / Session / Workspace
+   *    / User) and the tool list into the system prompt.
+   *  - 'never': caller owns the entire prompt lifecycle. The bootstrap block
+   *    is suppressed; only `personaPrompt`, `basePrompt`, `agentPreset`, and
+   *    `matchedSkills` go into the system prompt. Tool-use guidance is also
+   *    suppressed. Used by external orchestrators that build their own prompt.
+   *  Mirrors OpenClaw v2026.4.24 `agents.defaults.contextInjection`. */
+  contextInjection?: 'auto' | 'never';
+  /** #83: identifier of the active primary provider (e.g. "deepseek",
+   *  "anthropic", "kimi"). Used to scrub reasoning_content / <think> blocks
+   *  on provider switches (fallback, fork, steer). Optional; if unset the
+   *  scrubber treats every switch as foreign and always strips. */
+  providerName?: string;
+  /** #83: identifiers of fallback providers, parallel to `fallbackProviders`.
+   *  When the loop trips into a fallback we use this to detect that the
+   *  active provider has changed and trigger reasoning-content scrubbing. */
+  fallbackProviderNames?: string[];
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -465,6 +484,12 @@ export class AgentLoop {
   /** #53: extra hardline patterns supplied by the operator at construction
    *  time (e.g., loaded from env config). Merged with the static defaults. */
   private readonly hardlineBlocklist: ReadonlyArray<{ pattern: RegExp; description: string }>;
+  /** #79: 'never' suppresses workspace bootstrap injection in system prompt. */
+  private readonly contextInjection: 'auto' | 'never';
+  /** #83: name of the primary provider, used to detect cross-provider
+   *  switches in the fallback chain so we can scrub reasoning content. */
+  private readonly providerName?: string;
+  private readonly fallbackProviderNames: string[];
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -514,6 +539,9 @@ export class AgentLoop {
     this.maxErrorReflections = options.maxErrorReflections ?? 3;
     this.planBeforeAct = options.planBeforeAct ?? false;
     this.hardlineBlocklist = options.hardlineBlocklist ?? [];
+    this.contextInjection = options.contextInjection ?? 'auto';
+    this.providerName = options.providerName;
+    this.fallbackProviderNames = options.fallbackProviderNames ?? [];
   }
 
   /**
@@ -694,7 +722,22 @@ export class AgentLoop {
     personaPrompt?: string;
     memories?: string[];
   }): string | undefined {
-    const prompt = buildSystemPrompt(promptParams);
+    // #79: When contextInjection is 'never', the caller owns the whole prompt
+    // lifecycle. We strip the runtime/workspace/tools bootstrap that
+    // buildSystemPrompt would otherwise add. PersonaPrompt + basePrompt +
+    // agentPreset + skills still flow through (they are caller-supplied or
+    // skill-driven, not bootstrap).
+    const effective: PromptBuilderInput = this.contextInjection === 'never'
+      ? {
+          basePrompt: promptParams.basePrompt,
+          personaPrompt: promptParams.personaPrompt,
+          agentPreset: promptParams.agentPreset,
+          matchedSkills: promptParams.matchedSkills,
+          // No runtimeName/sessionId/workspaceId/userId/availableTools/memories.
+          // No reasoningGuidance (suppressed by absence of availableTools).
+        }
+      : promptParams;
+    const prompt = buildSystemPrompt(effective);
     if (!prompt) return prompt;
     if (this.enablePromptCaching) {
       // Annotate system prompt for Anthropic prompt caching.
@@ -759,10 +802,25 @@ export class AgentLoop {
     pluginContext?: { sessionId: string; agentId: string }
   ): Promise<ProviderResponse> {
     const providers = [this.provider, ...this.fallbackProviders].slice(0, this.maxProviderAttempts);
+    const providerNames = [this.providerName, ...this.fallbackProviderNames].slice(0, this.maxProviderAttempts);
     let lastError: unknown;
+    // #83: track which provider we last sent to so a switch into a fallback
+    // can scrub any <think>/reasoning_content carried by the prior response.
+    let prevProviderName: string | undefined = undefined;
 
     for (const [providerIndex, provider] of providers.entries()) {
       ensureNotAborted(request.signal);
+      const currentName = providerNames[providerIndex];
+      // #83: if we just switched away from the primary into a fallback (or
+      // between two named fallbacks), scrub reasoning content before this
+      // provider sees the message history. Idempotent — a same-named retry
+      // is a no-op.
+      if (prevProviderName !== currentName && providerIndex > 0) {
+        const scrubbed = stripReasoningContent(request.messages, prevProviderName, currentName ?? 'unknown');
+        if (scrubbed !== request.messages) {
+          request = { ...request, messages: scrubbed };
+        }
+      }
       let attempt = 0;
       while (true) {
         try {
@@ -777,6 +835,7 @@ export class AgentLoop {
           });
 
           const response = await provider.generate(request);
+          prevProviderName = currentName;
           await this.plugins?.emit('provider:afterGenerate', {
             attempt: attempt + 1,
             providerIndex,
@@ -939,10 +998,42 @@ export class AgentLoop {
       agentId: input.agentId,
     });
 
+    // #95: pre-tool-call veto. Plugins can block a tool call before it runs.
+    // OR-aggregated across plugins; first veto short-circuits.
+    const pluginCtx = {
+      runtime: this.runtimeName,
+      sessionId: input.sessionId,
+      agentId: input.agentId,
+    };
+    if (this.plugins) {
+      const verdict = await this.plugins.preToolCall({
+        toolName: toolCall.name,
+        input: toolCall.input,
+        sessionId: input.sessionId,
+        agentId: input.agentId,
+      }, pluginCtx);
+      if (verdict.veto) {
+        this.securityAuditLog?.record({
+          type: 'command_blocked',
+          severity: 'warning',
+          detail: `plugin-veto: ${verdict.reason ?? 'no reason given'}`,
+          sessionId: input.sessionId,
+        });
+        const def = this.tools.get(toolCall.name);
+        return {
+          toolName: toolCall.name,
+          runtime: def?.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
+          ok: false,
+          output: `Tool call vetoed by plugin: ${verdict.reason ?? 'no reason given'}`,
+          metadata: { vetoedByPlugin: true, vetoReason: verdict.reason },
+        };
+      }
+    }
+
     const definition = this.tools.get(toolCall.name);
     if (!definition) {
       const rawResult = await this.tools.execute(toolCall.name, toolCall.input, context);
-      return this.redactToolResult(rawResult);
+      return this.applyResultPipeline(toolCall, rawResult, input);
     }
 
     // #53: Hardline blocklist — sits *before* the approval gate. Matches are
@@ -1018,10 +1109,59 @@ export class AgentLoop {
     // Append command scan warnings to output if present
     if (commandScan.warnings.length > 0) {
       const warned = { ...rawResult, output: `${rawResult.output}\n${commandScan.warnings.join('\n')}` };
-      return this.redactToolResult(warned);
+      return this.applyResultPipeline(toolCall, warned, input);
     }
 
-    return this.redactToolResult(rawResult);
+    return this.applyResultPipeline(toolCall, rawResult, input);
+  }
+
+  /**
+   * #95: Result post-processing pipeline.
+   * Order matters:
+   *   1. Core redaction (credentials/PII + injection wrap) — security-critical,
+   *      runs FIRST so plugins can never see raw secrets.
+   *   2. Plugin transform_tool_result hooks — cosmetic / domain-specific
+   *      adjustments (rewrite paths, attach annotations, override `ok`).
+   *      Plugins see redacted output, never the original bytes.
+   */
+  private async applyResultPipeline(
+    toolCall: ToolCall,
+    rawResult: ToolExecutionResult,
+    input: AgentRunInput,
+  ): Promise<ToolExecutionResult> {
+    const redacted = this.redactToolResult(rawResult);
+    if (!this.plugins) return redacted;
+
+    const transformed = await this.plugins.transformToolResult({
+      toolName: toolCall.name,
+      input: toolCall.input,
+      result: {
+        toolName: redacted.toolName,
+        ok: redacted.ok,
+        output: redacted.output,
+        metadata: redacted.metadata,
+      },
+      sessionId: input.sessionId,
+      agentId: input.agentId,
+    }, {
+      runtime: this.runtimeName,
+      sessionId: input.sessionId,
+      agentId: input.agentId,
+    });
+
+    if (
+      transformed.output === redacted.output &&
+      transformed.ok === redacted.ok &&
+      transformed.metadata === redacted.metadata
+    ) {
+      return redacted;
+    }
+    return {
+      ...redacted,
+      ok: transformed.ok,
+      output: transformed.output,
+      metadata: transformed.metadata,
+    };
   }
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
@@ -2035,14 +2175,61 @@ export class AgentLoop {
  * The TOOLS package owns the delegation tool itself and is responsible for
  * calling this helper when its `forkContext` option is enabled.
  */
+export interface ForkSessionOptions {
+  /**
+   * Suffix appended to the parent's `sessionId` to form the child's session
+   * id. Defaults to a random `child-<rand>` value.
+   */
+  childSessionIdSuffix?: string;
+  /**
+   * #84: Restrict the child's tool surface to a whitelist of tool names or
+   * toolset prefixes (e.g. `['memory', 'skills']` or fully-qualified names
+   * like `['memory.recall', 'skills.match']`).
+   *
+   * The TOOLS package reads this from the child's seed-message metadata
+   * (or via `getForkEnabledToolsets()`) and wraps the parent registry in a
+   * `FilteredToolCatalogExecutor` so the child literally cannot call
+   * anything outside the list. Mirrors Hermes PR #16569 (background review
+   * forks couldn't reach `terminal.*`).
+   *
+   * `undefined` = no restriction (legacy behavior, full inheritance).
+   * `[]`        = no tools at all (locked-down review fork).
+   */
+  enabledToolsets?: string[];
+  /**
+   * #84: Optional human-readable purpose stored on the child session for
+   * audit. Helps the privileged-context warning identify which forks should
+   * have been restricted.
+   */
+  purpose?: string;
+}
+
 export function forkSession(
   parent: SessionState,
   task: string,
   childAgentId: string,
-  childSessionIdSuffix?: string,
+  optionsOrSuffix?: ForkSessionOptions | string,
 ): SessionState {
-  const suffix = childSessionIdSuffix
+  // Backward-compat: legacy callers passed a bare suffix string. Detect and
+  // normalize so v0.5.0 callers keep working.
+  const opts: ForkSessionOptions = typeof optionsOrSuffix === 'string'
+    ? { childSessionIdSuffix: optionsOrSuffix }
+    : (optionsOrSuffix ?? {});
+  const suffix = opts.childSessionIdSuffix
     ?? `child-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // #84: lint-style warning when a fork is created without restriction.
+  // We can't fully detect privilege here (we don't see the parent's tool
+  // catalog), but a missing restriction is the riskier default and worth a
+  // single console.warn so operators notice. Suppressed when an explicit
+  // empty array is passed (lockdown).
+  if (opts.enabledToolsets === undefined && typeof console !== 'undefined') {
+    console.warn(
+      `[CrowClaw] forkSession created without enabledToolsets restriction (parent=${parent.sessionId} child-agent=${childAgentId}). ` +
+      `Child will inherit the parent's full tool surface. Pass { enabledToolsets: [...] } to scope the fork.`,
+    );
+  }
+
   return {
     agentId: childAgentId,
     sessionId: `${parent.sessionId}/${suffix}`,
@@ -2055,6 +2242,11 @@ export function forkSession(
       metadata: {
         forkedFrom: parent.sessionId,
         forkedFromAgent: parent.agentId,
+        // #84: restriction is recorded on the seed message so the runtime
+        // (which wires the child's catalog) can read it without a separate
+        // out-of-band channel.
+        ...(opts.enabledToolsets !== undefined ? { enabledToolsets: [...opts.enabledToolsets] } : {}),
+        ...(opts.purpose ? { forkPurpose: opts.purpose } : {}),
       },
     }],
     updatedAt: new Date().toISOString(),
@@ -2067,11 +2259,43 @@ export function forkSession(
   };
 }
 
+/**
+ * #84: Read the `enabledToolsets` restriction off a child session produced
+ * by `forkSession()`. Returns `undefined` when no restriction was applied
+ * (full inheritance).
+ *
+ * Tool runtimes call this to decide whether to wrap the parent's tool
+ * registry in a filter. Match logic (exact name vs. prefix) is left to the
+ * caller; this helper just returns the raw whitelist.
+ */
+export function getForkEnabledToolsets(session: SessionState): string[] | undefined {
+  const seed = session.messages[0];
+  if (!seed || seed.role !== 'user') return undefined;
+  const raw = seed.metadata?.enabledToolsets;
+  return Array.isArray(raw) && raw.every((x) => typeof x === 'string') ? (raw as string[]) : undefined;
+}
+
+/**
+ * #84: Decide whether a tool name should be visible to a child fork given
+ * its `enabledToolsets` whitelist. A toolset entry matches:
+ *   - exactly (`memory.recall === memory.recall`)
+ *   - or as a `<namespace>.` prefix (`memory` matches `memory.recall`,
+ *     `memory.store`, ...)
+ * Returns `true` when there is no restriction on the session.
+ */
+export function isToolAllowedForFork(session: SessionState, toolName: string): boolean {
+  const whitelist = getForkEnabledToolsets(session);
+  if (whitelist === undefined) return true; // unrestricted
+  return whitelist.some((entry) => entry === toolName || toolName.startsWith(`${entry}.`));
+}
+
 export { buildSystemPrompt, buildMemoryPrefix, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
 
 export {
   isPrivateUrl,
+  isPrivateIpAddress,
   validateFetchUrl,
+  resolveAndValidateUrl,
   scanForInjection,
   sanitizeText,
   redactPII,
@@ -2137,3 +2361,18 @@ export { identifyToolPairs, splitWithPairPreservation, extractPreflightFacts, cr
 export { scoreComplexity, selectModelForComplexity, type ComplexityLevel, type ComplexityScore } from './complexity-router.js';
 
 export { HARDLINE_BLOCKLIST, isHardlineBlocked, type HardlineBlockResult } from './hardline-blocklist.js';
+
+// #83: provider-switch hygiene — scrub <think>/reasoning_content on switch.
+export { stripReasoningContent, hasReasoningContent, type StripReasoningOptions } from './provider-switch.js';
+
+// #66: immutable approved-command value object — TOCTOU mitigation for the
+// approval → exec handoff. Sandbox-executor will accept only ApprovedCommand
+// and verify the hash before spawn (out-of-scope for this package).
+export {
+  freezeCommand,
+  verifyCommand,
+  isApprovedCommand,
+  CommandTamperedError,
+  type ApprovedCommand,
+  type ApprovedCommandShape,
+} from './approved-command.js';
