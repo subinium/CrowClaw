@@ -1,5 +1,24 @@
 import { redactStructuredData } from '@crowclaw/core';
-import type { MemoryProvider, MemoryRecord } from './memory-provider.js';
+import type {
+  MemoryProvider,
+  MemoryRecord,
+  SessionTranscriptMessage,
+} from './memory-provider.js';
+
+/**
+ * Per-provider outcome reported by `MemoryManager.shutdown`. Hosts can log
+ * failures without losing the rest of the fan-out result. (#85)
+ */
+export interface SessionEndResult {
+  /** Provider name as reported by `MemoryProvider.name`. */
+  provider: string;
+  /** Whether the provider's `onSessionEnd` ran (false when the hook was unset). */
+  invoked: boolean;
+  /** Whether the hook completed without throwing. */
+  ok: boolean;
+  /** Error message when `ok === false`. */
+  error?: string;
+}
 
 /**
  * Metadata flag that opts a single `store()` call out of credential
@@ -80,6 +99,42 @@ export class MemoryManager {
     const deduped = this.deduplicateByKey(merged);
 
     return deduped.slice(0, limit);
+  }
+
+  /**
+   * Fan a session-end transcript out to every provider's optional
+   * `onSessionEnd` hook. Issue #85 — previously the host passed `[]` here,
+   * which silently disabled dream-memory live capture and end-of-session
+   * summarisation. Callers MUST pass the live `session.messages` array.
+   *
+   * Errors are caught per-provider so a single failing backend does not
+   * abort the rest of the fan-out. Returns one `SessionEndResult` per
+   * registered provider, in registration order.
+   */
+  async shutdown(
+    sessionId: string,
+    messages: SessionTranscriptMessage[],
+  ): Promise<SessionEndResult[]> {
+    if (!Array.isArray(messages)) {
+      // Defensive: a host bug that passes `null`/`undefined` should not
+      // crash shutdown, but we surface it via an empty-transcript result so
+      // the issue is observable in logs.
+      messages = [];
+    }
+    return Promise.all(
+      this.providers.map(async (provider): Promise<SessionEndResult> => {
+        if (typeof provider.onSessionEnd !== 'function') {
+          return { provider: provider.name, invoked: false, ok: true };
+        }
+        try {
+          await provider.onSessionEnd(sessionId, messages);
+          return { provider: provider.name, invoked: true, ok: true };
+        } catch (err: unknown) {
+          const error = err instanceof Error ? err.message : String(err);
+          return { provider: provider.name, invoked: true, ok: false, error };
+        }
+      }),
+    );
   }
 
   /** Remove a key from ALL providers. Returns true if at least one provider removed it. */

@@ -383,9 +383,81 @@ function hasApprovalGate(input: Record<string, unknown>, context: ToolExecutionC
   if (input.__approvalGranted === true) return true;
   const env = context.env as Record<string, unknown> | undefined;
   if (env && env.crowclawApprovalGranted === true) return true;
-  const approval = (context as unknown as { approval?: unknown }).approval;
-  if (typeof approval === 'function') return true;
+  if (typeof getApprovalCallback(context) === 'function') return true;
   return false;
+}
+
+/**
+ * Public approval callback shape. Hosts attach one of these to a
+ * `ToolExecutionContext` (via `withApproval`) so any tool — including those
+ * dispatched concurrently through `Promise.all` (issue #86) — can ask for
+ * an explicit operator decision.
+ */
+export type ApprovalCallback = (request: {
+  toolName: string;
+  input: Record<string, unknown>;
+  sessionId: string;
+}) => Promise<boolean>;
+
+/**
+ * Issue #86 — when AgentLoop runs a parallel-safety partition through
+ * `Promise.all`, every concurrent worker reads from the *same* context
+ * object. Tools can no longer assume a fresh per-call context, so the
+ * approval reference must live somewhere stable. We snapshot it onto a
+ * dedicated symbol slot in `ToolRegistry.execute` and read it back here, so
+ * a host that mutates `context.approval` mid-flight cannot accidentally
+ * disable the gate for an in-flight worker.
+ */
+const APPROVAL_SLOT = Symbol.for('crowclaw.tools.approval');
+
+type ContextWithApproval = ToolExecutionContext & {
+  approval?: ApprovalCallback;
+  [APPROVAL_SLOT]?: ApprovalCallback;
+};
+
+function getApprovalCallback(
+  context: ToolExecutionContext,
+): ApprovalCallback | undefined {
+  const ctx = context as ContextWithApproval;
+  // Frozen snapshot wins — set by ToolRegistry.execute on every dispatch so
+  // concurrent Promise.all workers see a stable callback even if a later
+  // hook re-assigns `context.approval`.
+  const snapshot = ctx[APPROVAL_SLOT];
+  if (typeof snapshot === 'function') return snapshot;
+  if (typeof ctx.approval === 'function') return ctx.approval;
+  return undefined;
+}
+
+/**
+ * Attach an approval callback to a `ToolExecutionContext` for downstream
+ * tools. Returns a *new* context object so callers cannot accidentally
+ * mutate a shared parent context. AgentLoop should use this when fanning
+ * tool calls out across `Promise.all` workers (#86).
+ */
+export function withApproval(
+  context: ToolExecutionContext,
+  approval: ApprovalCallback,
+): ToolExecutionContext {
+  return { ...context, approval } as ToolExecutionContext;
+}
+
+/**
+ * Invoke the approval callback registered on the context, if any. Returns
+ * `false` when no callback is present, or when the callback rejects/throws —
+ * tools must fail closed on approval errors (#86).
+ */
+export async function requestApproval(
+  context: ToolExecutionContext,
+  toolName: string,
+  input: Record<string, unknown>,
+): Promise<boolean> {
+  const callback = getApprovalCallback(context);
+  if (!callback) return false;
+  try {
+    return await callback({ toolName, input, sessionId: context.sessionId });
+  } catch {
+    return false;
+  }
 }
 
 function normalizeScope(input: Record<string, unknown>): 'session' | 'user' | 'workspace' | undefined {
@@ -444,12 +516,30 @@ export class ToolRegistry implements ToolCatalog, ToolExecutor {
       };
     }
 
+    // Issue #86 — snapshot the host-supplied approval callback into a
+    // per-dispatch symbol slot so concurrent `Promise.all` tool workers
+    // see a stable reference. AgentLoop's safety-partition fan-out reuses
+    // a single context object across N parallel `executeToolCall` calls;
+    // without this snapshot, a later assignment to `context.approval`
+    // (e.g. a teardown hook) could disable the gate for an in-flight
+    // worker. We also clone the context so a tool that mutates
+    // `context.env` mid-call can't poison sibling workers.
+    const sourceCtx = context as ContextWithApproval;
+    const approvalSnapshot = sourceCtx.approval ?? sourceCtx[APPROVAL_SLOT];
+    const dispatchCtx = { ...context } as ContextWithApproval;
+    if (typeof approvalSnapshot === 'function') {
+      dispatchCtx[APPROVAL_SLOT] = approvalSnapshot;
+      // Preserve the public `.approval` property so older tools that read
+      // `context.approval` directly still see the callback.
+      dispatchCtx.approval = approvalSnapshot;
+    }
+
     // Wall-clock duration for observability (#58). Includes network/IO end-to-end.
     // Surfaced via `result.metadata.duration_ms` so existing `tool:result` consumers
     // (LearningPipeline, dashboard latency tracking) can read it without changes
     // to the cross-package PluginHookPayloads contract.
     const start = performance.now();
-    const result = await tool.execute(input, context);
+    const result = await tool.execute(input, dispatchCtx);
     const duration_ms = Math.round(performance.now() - start);
     return {
       ...result,
@@ -1395,6 +1485,50 @@ export function createLinePatchTool(): ToolDefinition {
   };
 }
 
+/**
+ * Issue #88 — Dedup-stub repetition tracker for `workspace.read`. Some
+ * agents stall by re-issuing the same read tool call back-to-back (the
+ * "read this file again to be sure" loop), wasting iterations and tokens.
+ * Once the same `(sessionId, path)` pair is read more than
+ * `WORKSPACE_READ_DEDUP_LIMIT` times, the tool short-circuits with a
+ * synthetic BLOCKED result. The agent loop surfaces the `tool:blocked_dedup`
+ * metadata flag so downstream observers (dashboard, learning pipeline) can
+ * count escalations without parsing the output string.
+ *
+ * Tracker scope: per-session, per-path. Keyed by `${sessionId}::${path}`.
+ * Reset by `resetWorkspaceReadDedup()` (test/host hook).
+ */
+export const WORKSPACE_READ_DEDUP_LIMIT = 3;
+const workspaceReadCounts = new Map<string, number>();
+
+function workspaceReadDedupKey(sessionId: string | undefined, path: string): string {
+  return `${sessionId ?? '__unknown__'}::${path}`;
+}
+
+/**
+ * Reset the per-session workspace-read dedup tracker. Hosts should call
+ * this on session end so a long-lived process doesn't leak state across
+ * unrelated sessions. Tests call it for isolation.
+ */
+export function resetWorkspaceReadDedup(sessionId?: string): void {
+  if (sessionId === undefined) {
+    workspaceReadCounts.clear();
+    return;
+  }
+  const prefix = `${sessionId}::`;
+  for (const key of [...workspaceReadCounts.keys()]) {
+    if (key.startsWith(prefix)) workspaceReadCounts.delete(key);
+  }
+}
+
+/** Inspect the current dedup count for `(sessionId, path)`. Test helper. */
+export function getWorkspaceReadDedupCount(
+  sessionId: string,
+  path: string,
+): number {
+  return workspaceReadCounts.get(workspaceReadDedupKey(sessionId, path)) ?? 0;
+}
+
 export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefinition {
   return {
     manifest: {
@@ -1408,15 +1542,53 @@ export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefiniti
       dangerLevel: 'low',
       inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File path to read' } }, required: ['path'] }
     },
-    async execute(input) {
+    async execute(input, context) {
       const path = typeof input.path === 'string' ? input.path : '';
+      if (!path) {
+        return {
+          toolName: 'workspace.read',
+          runtime: 'worker',
+          ok: false,
+          output: 'Missing path.',
+          metadata: { path }
+        };
+      }
+
+      // #88 — Dedup escalation. Bump *before* the read so a runaway loop is
+      // blocked on the third re-issue, not the fourth. The first
+      // WORKSPACE_READ_DEDUP_LIMIT attempts pass through unchanged.
+      const dedupKey = workspaceReadDedupKey(context.sessionId, path);
+      const previous = workspaceReadCounts.get(dedupKey) ?? 0;
+      const next = previous + 1;
+      workspaceReadCounts.set(dedupKey, next);
+      if (next > WORKSPACE_READ_DEDUP_LIMIT) {
+        return {
+          toolName: 'workspace.read',
+          runtime: 'worker',
+          ok: false,
+          output:
+            `BLOCKED: workspace.read("${path}") has already been called ${previous} times this session. ` +
+            `If the file content has not changed, use the prior result; otherwise call workspace.list / workspace.searchFiles to check the path.`,
+          metadata: {
+            path,
+            reads: next,
+            limit: WORKSPACE_READ_DEDUP_LIMIT,
+            blocked: true,
+            'tool:blocked_dedup': true,
+            sessionId: context.sessionId,
+          },
+        };
+      }
+
       const file = await workspace.read(path);
       return {
         toolName: 'workspace.read',
         runtime: 'worker',
         ok: Boolean(file),
         output: file?.content ?? 'Workspace file not found.',
-        metadata: file ? { path: file.path, updatedAt: file.updatedAt } : { path }
+        metadata: file
+          ? { path: file.path, updatedAt: file.updatedAt, reads: next }
+          : { path, reads: next }
       };
     }
   };

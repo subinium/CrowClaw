@@ -15,14 +15,43 @@ export interface MemoryRecord {
 }
 
 /**
+ * Minimal transcript shape consumed by `MemoryProvider.onSessionEnd`. Mirrors
+ * `ConversationMessage` from `@crowclaw/core` but is intentionally restated
+ * here so the memory package stays free of a runtime dep on core. Hosts can
+ * pass `session.messages` directly.
+ */
+export interface SessionTranscriptMessage {
+  role: string;
+  content: string;
+  createdAt?: string;
+  toolCallId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
  * Pluggable memory backend. Implementations wrap a concrete storage mechanism
  * (in-memory map, embedding index, external DB, etc.) behind a uniform interface.
+ *
+ * Issue #85 — `onSessionEnd` is the canonical hook for end-of-session memory
+ * consolidation (dream-memory live capture, session-summary writes, FTS
+ * indexing). Hosts MUST pass the actual `session.messages` transcript here,
+ * not `[]`. Previously some call sites passed an empty array, which silently
+ * disabled summarisation. Implementations that don't need transcripts can
+ * leave the hook unset.
  */
 export interface MemoryProvider {
   name: string;
   store(key: string, content: string, metadata?: Record<string, unknown>): Promise<void>;
   recall(query: string, limit?: number): Promise<MemoryRecord[]>;
   forget(key: string): Promise<boolean>;
+  /**
+   * Optional end-of-session hook. The host calls this with the full
+   * conversation transcript when a session terminates so the provider can
+   * persist a summary, embed the transcript, etc. Errors thrown here are
+   * caught by `MemoryManager.shutdown` and reported per-provider so one
+   * failing backend cannot abort the rest of the fan-out.
+   */
+  onSessionEnd?(sessionId: string, messages: SessionTranscriptMessage[]): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
