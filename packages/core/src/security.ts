@@ -285,6 +285,79 @@ export function redactToolOutput(output: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Structured-data redaction (#68 + #135 — single sink for log/event/memory)
+// ---------------------------------------------------------------------------
+
+/**
+ * Keys whose values should be replaced with `[REDACTED]` regardless of
+ * content. Matches case-insensitively as a whole-word boundary check on the
+ * key — `apiKey`, `api_key`, `X-Api-Key`, `bearerToken`, `Authorization` all
+ * hit. The walker still applies string-level credential redaction to other
+ * values so a leaked secret in `{ message: 'token=sk-...' }` is also caught.
+ *
+ * Parity: NemoClaw de97a00 (single redaction module) + OpenClaw 'avoid
+ * echoing rotated device tokens'.
+ */
+const SENSITIVE_KEY_PATTERN =
+  /(?:^|[^a-zA-Z0-9])(?:token|secret|api[_-]?key|access[_-]?token|auth[_-]?token|bearer|cookie|authorization|password|passwd|pwd|private[_-]?key|x[_-]?api[_-]?key|client[_-]?secret)(?:$|[^a-zA-Z0-9])/i;
+
+/**
+ * Walk an arbitrary value and return a new value with sensitive content
+ * replaced by `[REDACTED]`. Used by the logger and any other structured
+ * sink (event-bus, memory store, persisted transcripts) so secrets cannot
+ * leak through a single missed call site.
+ *
+ * Behavior:
+ * - String values: pass through `redactCredentials` (already detects keys/PEM/etc.).
+ * - Object/Map keys matching SENSITIVE_KEY_PATTERN: value replaced wholesale.
+ * - Recursive: traverses nested objects/arrays. Cycles are detected via
+ *   WeakSet and short-circuited to `'[CIRCULAR]'`.
+ * - Primitives (number/boolean/null/undefined): returned unchanged.
+ *
+ * The function returns a NEW value tree; the input is not mutated.
+ */
+export function redactStructuredData<T>(input: T): T {
+  const seen = new WeakSet<object>();
+  function walk(v: unknown, parentKey?: string): unknown {
+    if (typeof v === 'string') {
+      // If the parent key looks sensitive, blank the value entirely. This
+      // catches cases where the value isn't a recognizable token format
+      // (e.g. an opaque session id stored under `authorization`).
+      if (parentKey && SENSITIVE_KEY_PATTERN.test(parentKey)) {
+        return '[REDACTED]';
+      }
+      return redactCredentials(v);
+    }
+    if (v === null || v === undefined) return v;
+    if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint') {
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (seen.has(v)) return '[CIRCULAR]';
+      seen.add(v);
+      return v.map((item) => walk(item, parentKey));
+    }
+    if (typeof v === 'object') {
+      if (seen.has(v as object)) return '[CIRCULAR]';
+      seen.add(v as object);
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        if (SENSITIVE_KEY_PATTERN.test(k)) {
+          // Even keys are redacted — a number under `apiKey` shouldn't pass.
+          out[k] = '[REDACTED]';
+        } else {
+          out[k] = walk(val, k);
+        }
+      }
+      return out;
+    }
+    // Functions, symbols — drop to a placeholder rather than serialize.
+    return undefined;
+  }
+  return walk(input) as T;
+}
+
+// ---------------------------------------------------------------------------
 // Enhanced Prompt Injection Detection
 // ---------------------------------------------------------------------------
 

@@ -1,5 +1,17 @@
-import { readFile, writeFile, readdir, access, unlink, rename as fsRename, mkdir, stat } from 'node:fs/promises';
-import { resolve, relative, dirname, extname, isAbsolute } from 'node:path';
+import {
+  readFile,
+  writeFile,
+  readdir,
+  access,
+  unlink,
+  rename as fsRename,
+  mkdir,
+  stat,
+  realpath,
+  open as fsOpen,
+} from 'node:fs/promises';
+import { resolve, relative, dirname, extname, isAbsolute, basename, sep } from 'node:path';
+import { randomBytes } from 'node:crypto';
 
 export interface WorkspaceFile {
   path: string;
@@ -32,6 +44,60 @@ const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const DEFAULT_IGNORE_PATTERNS = ['node_modules', '.git', '.env', '.env.*', '*.pem', '*.key'];
 const MAX_SEARCH_MATCHES = 50;
 
+/**
+ * Thrown when a workspace path resolves (after realpath / symlink expansion)
+ * to a location outside the configured rootDir. Message includes
+ * "Path traversal blocked" so prior callers / tests matching that substring
+ * continue to work.
+ */
+export class WorkspacePathEscapeError extends Error {
+  readonly attemptedPath: string;
+  readonly resolvedPath: string;
+
+  constructor(attemptedPath: string, resolvedPath: string) {
+    super(`Path traversal blocked: ${attemptedPath} resolves to ${resolvedPath} outside workspace root`);
+    this.name = 'WorkspacePathEscapeError';
+    this.attemptedPath = attemptedPath;
+    this.resolvedPath = resolvedPath;
+  }
+}
+
+/**
+ * Resolve `p` under `rootReal`, expanding symlinks via realpath on the
+ * deepest existing ancestor. Returns the canonical absolute path even if
+ * the file does not yet exist. Throws WorkspacePathEscapeError if the
+ * canonical result is outside `rootReal`.
+ */
+async function realpathOrAncestor(rootReal: string, attempted: string, target: string): Promise<string> {
+  // Walk upward until we find an existing path; realpath that, then
+  // re-append the trailing components.
+  const trailing: string[] = [];
+  let current = target;
+  // Guard: bail out if we walk above filesystem root.
+  while (true) {
+    try {
+      const real = await realpath(current);
+      const canonical = trailing.length === 0 ? real : resolve(real, ...trailing);
+      const rel = relative(rootReal, canonical);
+      const inRoot = rel === '' || (!rel.startsWith('..' + sep) && rel !== '..' && !isAbsolute(rel));
+      if (!inRoot) {
+        throw new WorkspacePathEscapeError(attempted, canonical);
+      }
+      return canonical;
+    } catch (err: unknown) {
+      if (err instanceof WorkspacePathEscapeError) throw err;
+      // ENOENT (or similar): walk up
+      const parent = dirname(current);
+      if (parent === current) {
+        // Reached filesystem root without finding an existing ancestor.
+        throw new WorkspacePathEscapeError(attempted, target);
+      }
+      trailing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
 function matchesIgnorePattern(segment: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
     if (pattern.startsWith('*.')) {
@@ -63,6 +129,7 @@ export class FileWorkspaceStore implements WorkspaceStore {
   private readonly allowedExtensions: string[] | undefined;
   private readonly maxFileSize: number;
   private readonly ignorePatterns: string[];
+  private rootRealCache: string | null = null;
 
   constructor(rootDir: string, options?: FileWorkspaceStoreOptions) {
     this.rootDir = resolve(rootDir);
@@ -83,9 +150,44 @@ export class FileWorkspaceStore implements WorkspaceStore {
     const rel = relative(this.rootDir, resolved);
     const isInRoot = rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
     if (!isInRoot) {
-      throw new Error(`Path traversal blocked: ${filePath}`);
+      throw new WorkspacePathEscapeError(filePath, resolved);
     }
     return resolved;
+  }
+
+  /**
+   * Lazily resolves and caches the realpath of `rootDir`. The rootDir itself
+   * is trusted (operator-supplied), but we need its canonical form for
+   * containment checks against realpath'd children.
+   */
+  private async getRootReal(): Promise<string> {
+    if (this.rootRealCache !== null) return this.rootRealCache;
+    try {
+      this.rootRealCache = await realpath(this.rootDir);
+    } catch {
+      // rootDir might not exist yet (rare). Fall back to lexical resolve.
+      this.rootRealCache = this.rootDir;
+    }
+    return this.rootRealCache;
+  }
+
+  /**
+   * Resolve a workspace-relative path to an absolute path, expanding
+   * symlinks via realpath. If the file does not yet exist, walks up to
+   * the deepest existing ancestor for realpath, then re-appends the
+   * trailing components. Throws WorkspacePathEscapeError if the canonical
+   * path is outside rootDir.
+   *
+   * This is the security-critical resolver used for read/write/patch
+   * operations — it defends against in-workspace symlinks pointing
+   * outside the workspace (e.g. a symlink at `notes/passwd → /etc/passwd`
+   * placed by an attacker before the agent runs).
+   */
+  private async resolveSafeWithRealpath(filePath: string): Promise<string> {
+    // First-pass lexical check. Cheap, fails fast on `../etc/passwd` style.
+    const resolved = this.resolveSafe(filePath);
+    const rootReal = await this.getRootReal();
+    return realpathOrAncestor(rootReal, filePath, resolved);
   }
 
   private isIgnored(filePath: string): boolean {
@@ -102,28 +204,126 @@ export class FileWorkspaceStore implements WorkspaceStore {
   }
 
   async read(path: string): Promise<WorkspaceFile | null> {
+    let abs: string;
     try {
-      const abs = this.resolveSafe(path);
+      abs = await this.resolveSafeWithRealpath(path);
+    } catch (error: unknown) {
+      // Path-escape errors are always raised; missing-file errors are not.
+      if (error instanceof WorkspacePathEscapeError) throw error;
+      return null;
+    }
+    try {
       const content = await readFile(abs, 'utf-8');
       const stats = await stat(abs);
       return { path, content, updatedAt: stats.mtime.toISOString() };
-    } catch (error: unknown) {
-      if (error instanceof Error && error.message.startsWith('Path traversal')) throw error;
+    } catch {
       return null;
     }
   }
 
   async write(path: string, content: string): Promise<WorkspaceFile> {
-    const abs = this.resolveSafe(path);
     this.checkExtension(path);
     const bytes = Buffer.byteLength(content, 'utf-8');
     if (bytes > this.maxFileSize) {
       throw new Error(`File size ${bytes} exceeds max ${this.maxFileSize} bytes`);
     }
-    await mkdir(dirname(abs), { recursive: true });
-    await writeFile(abs, content, 'utf-8');
+    const abs = await this.atomicWrite(path, content);
     const stats = await stat(abs);
     return { path, content, updatedAt: stats.mtime.toISOString() };
+  }
+
+  /**
+   * Atomically write `content` to the workspace path `relPath`:
+   *   1. resolveSafe (lexical) the target
+   *   2. mkdir parent dir, then realpath parent and reject if outside root
+   *   3. open `<target>.tmp.<random>` with `wx` (exclusive create — fails if
+   *      a symlink/file with that name already exists)
+   *   4. write bytes, close, rename → target (atomic on POSIX)
+   *   5. realpath the final target — if it is somehow outside root, unlink
+   *      it and throw
+   *
+   * Returns the absolute (realpath'd) target path on success.
+   */
+  private async atomicWrite(relPath: string, content: string): Promise<string> {
+    const lexicalTarget = this.resolveSafe(relPath);
+    const rootReal = await this.getRootReal();
+
+    // Ensure the parent directory exists, then realpath it. Doing mkdir
+    // first lets us write into a freshly-created subtree; realpath after
+    // mkdir guarantees we resolve any symlinks introduced along the way.
+    const lexicalParent = dirname(lexicalTarget);
+    await mkdir(lexicalParent, { recursive: true });
+    const realParent = await realpathOrAncestor(rootReal, relPath, lexicalParent);
+
+    const targetName = basename(lexicalTarget);
+    const target = resolve(realParent, targetName);
+
+    // Re-verify the target itself is in-root after realpath of parent.
+    const targetRel = relative(rootReal, target);
+    if (targetRel.startsWith('..' + sep) || targetRel === '..' || isAbsolute(targetRel)) {
+      throw new WorkspacePathEscapeError(relPath, target);
+    }
+
+    const tmpName = `.${targetName}.tmp.${randomBytes(8).toString('hex')}`;
+    const tmpPath = resolve(realParent, tmpName);
+
+    // `wx` flag: exclusive create. If `tmpPath` somehow already exists
+    // (e.g. attacker-planted symlink with the random suffix — astronomically
+    // unlikely), the open fails with EEXIST rather than following the link.
+    let handle;
+    try {
+      handle = await fsOpen(tmpPath, 'wx');
+    } catch (err: unknown) {
+      throw new Error(
+        `Failed to create temp file for atomic write: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+    try {
+      await handle.writeFile(content, 'utf-8');
+    } finally {
+      await handle.close();
+    }
+
+    try {
+      await fsRename(tmpPath, target);
+    } catch (err: unknown) {
+      // Clean up the orphaned temp file before re-throwing.
+      try {
+        await unlink(tmpPath);
+      } catch {
+        // best-effort
+      }
+      throw err;
+    }
+
+    // Post-write re-validation: realpath the final target. If a symlink
+    // was swapped in between mkdir and rename, this will catch it.
+    let finalReal: string;
+    try {
+      finalReal = await realpath(target);
+    } catch (err: unknown) {
+      // realpath failure on a file we just wrote is itself suspicious.
+      try {
+        await unlink(target);
+      } catch {
+        // best-effort
+      }
+      throw new Error(
+        `Post-write realpath failed for ${relPath}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+    const finalRel = relative(rootReal, finalReal);
+    if (finalRel.startsWith('..' + sep) || finalRel === '..' || isAbsolute(finalRel)) {
+      try {
+        await unlink(target);
+      } catch {
+        // best-effort
+      }
+      throw new WorkspacePathEscapeError(relPath, finalReal);
+    }
+    return finalReal;
   }
 
   async list(prefix = ''): Promise<WorkspaceFile[]> {
@@ -160,12 +360,15 @@ export class FileWorkspaceStore implements WorkspaceStore {
   }
 
   async patchLines(path: string, patches: Array<{ line: number; value: string }>): Promise<WorkspaceFile> {
-    const abs = this.resolveSafe(path);
+    // Read existing content via the realpath-aware resolver; if the file
+    // doesn't exist yet, fall through with empty content.
     let content = '';
     try {
-      content = await readFile(abs, 'utf-8');
-    } catch {
-      // Start from empty if file doesn't exist
+      const absRead = await this.resolveSafeWithRealpath(path);
+      content = await readFile(absRead, 'utf-8');
+    } catch (error: unknown) {
+      if (error instanceof WorkspacePathEscapeError) throw error;
+      // ENOENT — start from empty.
     }
     const lines = content.split('\n');
     for (const patch of patches) {
@@ -177,25 +380,32 @@ export class FileWorkspaceStore implements WorkspaceStore {
       lines[index] = patch.value;
     }
     const newContent = lines.join('\n');
-    await mkdir(dirname(abs), { recursive: true });
-    await writeFile(abs, newContent, 'utf-8');
+    const bytes = Buffer.byteLength(newContent, 'utf-8');
+    if (bytes > this.maxFileSize) {
+      throw new Error(`File size ${bytes} exceeds max ${this.maxFileSize} bytes`);
+    }
+    const abs = await this.atomicWrite(path, newContent);
     const stats = await stat(abs);
     return { path, content: newContent, updatedAt: stats.mtime.toISOString() };
   }
 
   async patchText(path: string, replacements: Array<{ from: string; to: string }>): Promise<WorkspaceFile> {
-    const abs = this.resolveSafe(path);
     let content = '';
     try {
-      content = await readFile(abs, 'utf-8');
-    } catch {
-      // Start from empty if file doesn't exist
+      const absRead = await this.resolveSafeWithRealpath(path);
+      content = await readFile(absRead, 'utf-8');
+    } catch (error: unknown) {
+      if (error instanceof WorkspacePathEscapeError) throw error;
+      // ENOENT — start from empty.
     }
     for (const replacement of replacements) {
       content = content.split(replacement.from).join(replacement.to);
     }
-    await mkdir(dirname(abs), { recursive: true });
-    await writeFile(abs, content, 'utf-8');
+    const bytes = Buffer.byteLength(content, 'utf-8');
+    if (bytes > this.maxFileSize) {
+      throw new Error(`File size ${bytes} exceeds max ${this.maxFileSize} bytes`);
+    }
+    const abs = await this.atomicWrite(path, content);
     const stats = await stat(abs);
     return { path, content, updatedAt: stats.mtime.toISOString() };
   }

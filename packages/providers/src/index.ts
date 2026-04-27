@@ -41,6 +41,16 @@ export interface ModelMetadata {
   supportsPromptCaching: boolean;
   inputCostPerMillion?: number;
   outputCostPerMillion?: number;
+  /**
+   * Issue #87: Vision capability flag. Defaults to false when omitted so
+   * dispatch code (gateway) can safely treat absence as "no image support".
+   */
+  vision?: boolean;
+  /**
+   * Issue #98: Per-model request timeout (ms). Resolution precedence:
+   * model-level (this) → provider-level → global default. Optional.
+   */
+  requestTimeoutMs?: number;
 }
 
 interface OpenAIToolCall {
@@ -504,6 +514,11 @@ function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: stri
 // ---------------------------------------------------------------------------
 
 export class EchoProvider implements ProviderAdapter, StreamingProviderAdapter {
+  /** Issue #72: Echo provider accepts any key (testing). */
+  static validateKey(_key: string): KeyValidationResult {
+    return { ok: true };
+  }
+
   /** Issue #56: Echo provider needs no nudging — testing only. */
   getToolUseGuidance(_modelId: string): string | null {
     return null;
@@ -550,6 +565,13 @@ export class EchoProvider implements ProviderAdapter, StreamingProviderAdapter {
 
 export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProviderAdapter {
   constructor(private readonly config: OpenAICompatibleConfig) {}
+
+  /** Issue #72: Validate an OpenAI-shaped key. Static so callers can check
+   *  before constructing the provider. Subclasses (NVIDIA, xAI, Gemini) can
+   *  override at the call site by using `validateProviderKey('nvidia', key)`. */
+  static validateKey(key: string): KeyValidationResult {
+    return validateOpenAIKey(key);
+  }
 
   /** Create a copy with a different model (same API key and base URL) */
   withModel(model: string): OpenAICompatibleProvider {
@@ -932,6 +954,12 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
 
 export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdapter {
   constructor(private readonly config: AnthropicConfig) {}
+
+  /** Issue #72: Validate an Anthropic key. Static so callers can check
+   *  before constructing the provider. */
+  static validateKey(key: string): KeyValidationResult {
+    return validateAnthropicKey(key);
+  }
 
   /** Create a copy with a different model (same API key and base URL) */
   withModel(model: string): AnthropicProvider {
@@ -1715,12 +1743,203 @@ const modelMetadataCatalog: Record<string, ModelMetadata> = {
   }
 };
 
+/**
+ * Issue #87: Set of model ids known to accept image inputs. Used by
+ * `modelSupportsVision` and to enrich `ModelMetadata.vision` at lookup time
+ * without rewriting every catalog entry.
+ */
+const VISION_CAPABLE_MODELS = new Set<string>([
+  // OpenAI
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-4.1-nano',
+  'gpt-4o',
+  'gpt-4o-mini',
+  'gpt-4-turbo',
+  // Anthropic
+  'claude-opus-4',
+  'claude-sonnet-4',
+  'claude-sonnet-4-5',
+  'claude-haiku-3-5',
+  'claude-3-5-sonnet',
+  'claude-3-5-haiku',
+  'claude-3-opus',
+  // Google
+  'gemini-2.5-pro',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-pro',
+  'gemini-1.5-flash',
+  // Meta Llama 4 (multimodal)
+  'llama-4-maverick',
+  'llama-4-scout',
+]);
+
 export function getModelMetadata(model: string): ModelMetadata | null {
-  return modelMetadataCatalog[model] ?? null;
+  const meta = modelMetadataCatalog[model];
+  if (!meta) return null;
+  // Issue #87: enrich descriptor with vision capability when known.
+  return meta.vision === undefined && VISION_CAPABLE_MODELS.has(meta.id)
+    ? { ...meta, vision: true }
+    : meta;
 }
 
 export function listKnownModelMetadata(): ModelMetadata[] {
-  return Object.values(modelMetadataCatalog);
+  return Object.values(modelMetadataCatalog).map((m) =>
+    m.vision === undefined && VISION_CAPABLE_MODELS.has(m.id) ? { ...m, vision: true } : m,
+  );
+}
+
+/**
+ * Issue #87: Native multimodal vision routing.
+ * Returns true when the given model id is known to accept image content blocks.
+ * Falls back to pattern-matching on common vision-capable model name fragments.
+ */
+export function modelSupportsVision(model: string): boolean {
+  if (VISION_CAPABLE_MODELS.has(model)) return true;
+  const lower = model.toLowerCase();
+  // Conservative fallback patterns — only positive matches for families that
+  // are uniformly vision-capable. o-series is text-only; do not match.
+  if (/^(gpt-4o|gpt-4\.1)/.test(lower)) return true;
+  if (/^claude-(opus-4|sonnet-4|haiku-3-5|3-5|3-opus)/.test(lower)) return true;
+  if (/^gemini-(1\.5|2\.0|2\.5)/.test(lower)) return true;
+  if (/^llama-4/.test(lower)) return true;
+  return false;
+}
+
+/**
+ * Issue #87: Lightweight detector for image content in a ProviderRequest's
+ * messages. CrowClaw's `ConversationMessage.content` is a string today, but
+ * callers may attach image references via `metadata.attachments` or embed
+ * provider-shaped content blocks via JSON. This helper checks both:
+ *   1. `message.metadata.attachments` array containing entries of type 'image'.
+ *   2. Inline content that parses as a JSON array containing `{ type: 'image' }`
+ *      or `{ type: 'image_url' }` blocks (provider-native shape).
+ * Returns true on the first hit.
+ */
+export function requestContainsImage(messages: ConversationMessage[]): boolean {
+  for (const msg of messages) {
+    const attachments = (msg.metadata as { attachments?: Array<{ type?: string }> } | undefined)?.attachments;
+    if (Array.isArray(attachments) && attachments.some((a) => a?.type === 'image')) {
+      return true;
+    }
+    const content = msg.content;
+    if (typeof content === 'string' && content.length > 1 && (content.startsWith('[') || content.startsWith('{'))) {
+      try {
+        const parsed = JSON.parse(content) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const block of parsed) {
+            if (
+              block && typeof block === 'object' &&
+              ((block as { type?: string }).type === 'image' || (block as { type?: string }).type === 'image_url')
+            ) {
+              return true;
+            }
+          }
+        }
+      } catch {
+        // Not JSON — ignore.
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Issue #98: Resolve the effective request timeout (ms) for a model.
+ * Precedence: model-level → provider-level → global default.
+ * Returns `undefined` when no level configures one (caller decides).
+ */
+export function resolveRequestTimeoutMs(
+  model: string,
+  providerDefaultMs?: number,
+  globalDefaultMs?: number,
+): number | undefined {
+  const meta = getModelMetadata(model);
+  if (meta?.requestTimeoutMs !== undefined) return meta.requestTimeoutMs;
+  if (providerDefaultMs !== undefined) return providerDefaultMs;
+  return globalDefaultMs;
+}
+
+/**
+ * Issue #72: Per-provider API key schema validators. Each adapter exports a
+ * static `validateKey` so the gateway and CLI can reject obviously wrong keys
+ * up front instead of paying a network round-trip just to receive 401.
+ */
+export interface KeyValidationResult {
+  ok: boolean;
+  reason?: string;
+}
+
+export function validateAnthropicKey(key: string): KeyValidationResult {
+  if (typeof key !== 'string' || key.length === 0) {
+    return { ok: false, reason: 'API key is empty' };
+  }
+  if (!/^sk-ant-/.test(key)) {
+    return { ok: false, reason: 'Anthropic keys must start with "sk-ant-"' };
+  }
+  return { ok: true };
+}
+
+export function validateOpenAIKey(key: string): KeyValidationResult {
+  if (typeof key !== 'string' || key.length === 0) {
+    return { ok: false, reason: 'API key is empty' };
+  }
+  if (!/^sk-/.test(key)) {
+    return { ok: false, reason: 'OpenAI keys must start with "sk-"' };
+  }
+  // Reject Anthropic keys leaking into OpenAI config.
+  if (/^sk-ant-/.test(key)) {
+    return { ok: false, reason: 'This looks like an Anthropic key (sk-ant-…), not an OpenAI key' };
+  }
+  return { ok: true };
+}
+
+export function validateGeminiKey(key: string): KeyValidationResult {
+  if (typeof key !== 'string' || key.length === 0) {
+    return { ok: false, reason: 'API key is empty' };
+  }
+  if (!/^AIza/.test(key)) {
+    return { ok: false, reason: 'Gemini keys must start with "AIza"' };
+  }
+  return { ok: true };
+}
+
+export function validateNvidiaKey(key: string): KeyValidationResult {
+  if (typeof key !== 'string' || key.length === 0) {
+    return { ok: false, reason: 'API key is empty' };
+  }
+  if (!/^nvapi-/.test(key)) {
+    return { ok: false, reason: 'NVIDIA keys must start with "nvapi-"' };
+  }
+  return { ok: true };
+}
+
+export function validateXaiKey(key: string): KeyValidationResult {
+  if (typeof key !== 'string' || key.length === 0) {
+    return { ok: false, reason: 'API key is empty' };
+  }
+  if (!/^xai-/.test(key)) {
+    return { ok: false, reason: 'xAI keys must start with "xai-"' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate a key against a provider name. Unknown providers (e.g. local
+ * Ollama, custom OpenAI-compatible endpoints) accept any non-empty string.
+ */
+export function validateProviderKey(provider: string, key: string): KeyValidationResult {
+  const p = provider.toLowerCase();
+  if (p === 'anthropic') return validateAnthropicKey(key);
+  if (p === 'openai') return validateOpenAIKey(key);
+  if (p === 'gemini' || p === 'google') return validateGeminiKey(key);
+  if (p === 'nvidia') return validateNvidiaKey(key);
+  if (p === 'xai') return validateXaiKey(key);
+  if (typeof key !== 'string' || key.length === 0) {
+    return { ok: false, reason: 'API key is empty' };
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,3 +2370,9 @@ export function isModelOverridable(provider: ProviderAdapter): provider is Provi
 
 export { resolveApiMode, modelSupports, getEndpointForModel, listApiModes, getRequestShape } from './api-mode.js';
 export type { ApiMode, ApiModeCapabilities, ResolvedMode, ModeRequestShape } from './api-mode.js';
+
+// ---------------------------------------------------------------------------
+// v0.6.0 issue surface
+// ---------------------------------------------------------------------------
+// (Symbols defined above — re-listed here purely to advertise the public API.)
+// Exported names are already on the module scope; no re-export needed.

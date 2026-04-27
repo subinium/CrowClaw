@@ -43,31 +43,57 @@ const STORAGE_KEY_SCHEDULER_JOBS = 'scheduler:jobs';
 const STORAGE_KEY_ACTIVE_PRESET = 'config-presets:active';
 /** Default TTL for idempotency keys (24h). Webhooks rarely retry past this. */
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * Cap on idempotency entries held in DO memory (#117). Mirrors the Node-side
+ * `InMemoryGatewayIdempotencyStore` cap (gateway/src/index.ts:414) so the DO
+ * heap (~128 MB) cannot be exhausted by a busy webhook channel even when many
+ * keys arrive within the TTL window. When exceeded, the oldest-inserted keys
+ * are evicted first (Map preserves insertion order ⇒ also earliest expiresAt
+ * for uniform TTLs).
+ */
+const IDEMPOTENCY_MAX_ENTRIES = 100_000;
 /** Eviction threshold for stale code/browser sessions (1h). Matches #35. */
 const SESSION_PRUNE_TTL_MS = 60 * 60 * 1000;
 
 /**
- * Persisted, TTL-bounded gateway-idempotency store (#31).
+ * Persisted, TTL-bounded gateway-idempotency store (#31, #117, #153).
  *
  * Implements the new `GatewayIdempotencyStore` shape (markIfAbsent / unmark /
  * has / mark) added by the GATEWAY agent. Backed by a `Map<string, expiresAt>`
  * mirrored to DO storage so two requests across a DO restart still de-dupe.
  *
  * Prior implementation used an unbounded `Set<string>`. Busy webhook channels
- * could OOM the 128 MB DO heap — see issue #31.
+ * could OOM the 128 MB DO heap — see issue #31. #117 adds a hard `maxEntries`
+ * cap (oldest evicted first). #153 serializes concurrent first-call hydration
+ * via a stored `hydratePromise` so two callers awaiting `hydrate()` cannot both
+ * read storage and race-clobber the in-memory map.
  */
-class DurableObjectIdempotencyStore {
+export class DurableObjectIdempotencyStore {
   private readonly entries = new Map<string, number>();
-  private hydrated = false;
+  private hydratePromise: Promise<void> | null = null;
+  private readonly maxEntries: number;
 
   constructor(
     private readonly storage: DurableObjectStateLite['storage'],
     private readonly ttlMs: number = IDEMPOTENCY_TTL_MS,
-  ) {}
+    options?: { maxEntries?: number },
+  ) {
+    this.maxEntries = options?.maxEntries ?? IDEMPOTENCY_MAX_ENTRIES;
+  }
 
-  private async hydrate(): Promise<void> {
-    if (this.hydrated) return;
-    this.hydrated = true;
+  /**
+   * Hydrate from DO storage at most once. Concurrent callers share a single
+   * in-flight promise so they cannot each race their own `storage.get` →
+   * `entries.set` cycle (#153). The promise is captured before the first
+   * `await` so subsequent callers observe a non-null `hydratePromise`.
+   */
+  private hydrate(): Promise<void> {
+    if (this.hydratePromise) return this.hydratePromise;
+    this.hydratePromise = this.doHydrate();
+    return this.hydratePromise;
+  }
+
+  private async doHydrate(): Promise<void> {
     if (!this.storage) return;
     try {
       const persisted = await this.storage.get<Record<string, number>>(STORAGE_KEY_GATEWAY_IDEMPOTENCY);
@@ -84,11 +110,25 @@ class DurableObjectIdempotencyStore {
     }
   }
 
-  /** Drop expired entries in-place. Cheap to call on every read. */
+  /**
+   * Drop expired entries in-place, then enforce `maxEntries` by evicting the
+   * oldest-inserted keys first. Map iteration follows insertion order, so when
+   * TTLs are uniform per call site this also evicts the soonest-to-expire
+   * entries — matching the Node-side store's eviction semantics.
+   */
   private evict(): void {
     const now = Date.now();
     for (const [key, expiresAt] of this.entries) {
       if (expiresAt <= now) this.entries.delete(key);
+    }
+    if (this.entries.size > this.maxEntries) {
+      const overflow = this.entries.size - this.maxEntries;
+      let removed = 0;
+      for (const key of this.entries.keys()) {
+        if (removed >= overflow) break;
+        this.entries.delete(key);
+        removed++;
+      }
     }
   }
 
@@ -115,6 +155,7 @@ class DurableObjectIdempotencyStore {
     this.evict();
     if (this.entries.has(key)) return false;
     this.entries.set(key, Date.now() + (ttlMs ?? this.ttlMs));
+    this.evict();
     await this.persist();
     return true;
   }
@@ -135,6 +176,11 @@ class DurableObjectIdempotencyStore {
     if (this.entries.delete(key)) {
       await this.persist();
     }
+  }
+
+  /** Test-only: number of live entries currently held in memory. */
+  get size(): number {
+    return this.entries.size;
   }
 }
 

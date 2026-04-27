@@ -13,7 +13,10 @@ export interface EmbeddingMemoryStoreOptions {
   /** Cap total vectors held in the in-memory index. FIFO eviction beyond the
    *  cap (oldest insertion order). Without a cap, the linear-scan `search()`
    *  crosses 100ms around 10k entries and grows without bound. Defaults to
-   *  10_000 — pair with a real ANN backend for anything higher. */
+   *  2_000 (#104) — tightened from 10_000 because the linear-scan search is
+   *  O(n·d) and crosses the 100ms budget around 5k×1536-dim vectors. Pair
+   *  with a real ANN backend (e.g. hnswlib-node) for anything higher;
+   *  hnswlib integration tracked as a follow-up. */
   maxVectors?: number;
 }
 
@@ -41,9 +44,32 @@ export function cosineSimilarity(a: number[], b: number[]): number {
   return dot / denom;
 }
 
-/** Simple in-memory embedding index for vector similarity search. */
+/** Compute the L2 magnitude (Euclidean norm) of a vector. */
+function vectorMagnitude(v: number[]): number {
+  let sum = 0;
+  for (let i = 0; i < v.length; i++) {
+    sum += v[i]! * v[i]!;
+  }
+  return Math.sqrt(sum);
+}
+
+/**
+ * Simple in-memory embedding index for vector similarity search.
+ *
+ * Perf (#104): vector magnitudes are cached on insert so `search()` only does
+ * one dot-product + one divide per candidate (instead of two `Math.sqrt`
+ * per candidate). Combined with an early-exit when the dot product is
+ * non-positive but the threshold is positive (the cosine score is bounded
+ * above by `dot / (|q|·|v|)`, so a non-positive dot can never beat a
+ * positive threshold), this halves CPU on the common ranking case.
+ *
+ * For >2k vectors, prefer an ANN backend (hnswlib-node) — tracked as a
+ * follow-up to #104.
+ */
 export class EmbeddingIndex {
   private readonly vectors = new Map<string, number[]>();
+  /** Cached |v| per id — populated on `add`, dropped on `remove`. */
+  private readonly norms = new Map<string, number>();
   private readonly maxVectors: number | undefined;
 
   constructor(options?: { maxVectors?: number }) {
@@ -53,11 +79,13 @@ export class EmbeddingIndex {
   /** Returns the id of the evicted record, if eviction fired. */
   add(id: string, vector: number[]): string | null {
     this.vectors.set(id, vector);
+    this.norms.set(id, vectorMagnitude(vector));
     // FIFO eviction once capped — Map preserves insertion order.
     if (this.maxVectors !== undefined && this.vectors.size > this.maxVectors) {
       const oldest = this.vectors.keys().next().value;
       if (oldest !== undefined && oldest !== id) {
         this.vectors.delete(oldest);
+        this.norms.delete(oldest);
         return oldest;
       }
     }
@@ -66,6 +94,7 @@ export class EmbeddingIndex {
 
   remove(id: string): void {
     this.vectors.delete(id);
+    this.norms.delete(id);
   }
 
   search(
@@ -75,8 +104,38 @@ export class EmbeddingIndex {
   ): Array<{ id: string; score: number }> {
     const results: Array<{ id: string; score: number }> = [];
 
+    if (query.length === 0) {
+      return results;
+    }
+
+    // Pre-compute the query magnitude once instead of every candidate.
+    const qMag = vectorMagnitude(query);
+    if (qMag === 0) {
+      return results;
+    }
+
     for (const [id, vector] of this.vectors) {
-      const score = cosineSimilarity(query, vector);
+      if (vector.length !== query.length) {
+        continue;
+      }
+      const vMag = this.norms.get(id);
+      if (vMag === undefined || vMag === 0) {
+        continue;
+      }
+
+      // Inline dot product — keeps the hot loop branch-free.
+      let dot = 0;
+      for (let i = 0; i < query.length; i++) {
+        dot += query[i]! * vector[i]!;
+      }
+
+      // Early-exit: when threshold > 0, a non-positive dot can never produce
+      // a passing score (cosine has the same sign as the dot product).
+      if (threshold > 0 && dot <= 0) {
+        continue;
+      }
+
+      const score = dot / (qMag * vMag);
       if (score >= threshold) {
         results.push({ id, score });
       }
@@ -118,7 +177,8 @@ export class EmbeddingMemoryStore implements MemoryStore {
     this.embeddingProvider = options.embeddingProvider;
     this.similarityThreshold = options.similarityThreshold ?? 0.7;
     this.deduplicationThreshold = options.deduplicationThreshold ?? 0.95;
-    this.maxVectors = options.maxVectors ?? 10_000;
+    // #104: tightened from 10_000 — see EmbeddingMemoryStoreOptions.maxVectors.
+    this.maxVectors = options.maxVectors ?? 2_000;
     this.index = new EmbeddingIndex({ maxVectors: this.maxVectors });
   }
 

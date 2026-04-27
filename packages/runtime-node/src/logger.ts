@@ -2,6 +2,8 @@
 // Structured JSON logger — zero-dependency, pino-compatible API
 // ---------------------------------------------------------------------------
 
+import { redactStructuredData } from '@crowclaw/core';
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
 
 const LEVEL_VALUES: Record<LogLevel, number> = {
@@ -46,12 +48,17 @@ export function createLogger(
   function emit(level: LogLevel, msg: string, data?: Record<string, unknown>): void {
     if (LEVEL_VALUES[level] < minLevel) return;
 
+    // #68 + #135: walk `data` through the centralized redactor before merging
+    // into the log entry. Catches both key-name leaks (`{ token: '...' }`) and
+    // string-content leaks (`{ message: 'Bearer sk-...' }`).
+    const safeData = data ? redactStructuredData(data) : undefined;
+
     const entry: Record<string, unknown> = {
       level,
       time: Date.now(),
       ...bindings,
       msg,
-      ...data,
+      ...safeData,
     };
 
     const line = JSON.stringify(entry) + '\n';

@@ -356,6 +356,156 @@ export interface GatewayRetryPolicy {
   baseDelayMs: number;
 }
 
+/**
+ * GatewayConfig — central knobs the gateway honours when dispatching.
+ *
+ * Currently consumed by:
+ *   - Issue #92: `fallbackProviders` ordered chain on primary error.
+ *   - Issue #97: `maxRetries` / `maxAttempts` overrides for the retry executor.
+ *   - Issue #98: `requestTimeoutMs` provider-level default (model-level wins).
+ *
+ * Existing runner code does not yet read this directly — it's introduced as
+ * the canonical place for builders to attach gateway-wide policy. New
+ * dispatch helpers (`executeWithProviderFallback`, `resolveGatewayMaxAttempts`,
+ * `resolveGatewayRequestTimeoutMs`) consult it explicitly.
+ */
+export interface GatewayConfig {
+  /**
+   * Issue #92: Ordered fallback providers tried on primary failure.
+   * The primary is identified by the caller; this list contains *additional*
+   * providers in priority order. Empty/undefined disables fallback.
+   */
+  fallbackProviders?: string[];
+  /**
+   * Issue #97: Maximum retry attempts the gateway HTTP client should make
+   * before giving up. Overrides per-platform `buildGatewayRetryPolicy` when
+   * provided. Hermes calls this `api_max_retries`.
+   */
+  maxRetries?: number;
+  /**
+   * Issue #98: Provider-level request timeout (ms). Used as the fallback when
+   * the chosen model has no explicit `requestTimeoutMs`. Operators usually
+   * set this once per gateway and let model-level overrides handle outliers.
+   */
+  requestTimeoutMs?: number;
+  /**
+   * Issue #98: Absolute global default timeout (ms). Last-resort fallback
+   * when neither model nor provider declared a timeout.
+   */
+  globalRequestTimeoutMs?: number;
+}
+
+/**
+ * Issue #97: Resolve the effective max-attempt count for a given platform.
+ * Precedence: GatewayConfig.maxRetries → buildGatewayRetryPolicy(platform).maxAttempts.
+ *
+ * Note: Hermes' `api_max_retries` counts *additional* retries after the first
+ * try. Our `maxAttempts` counts total attempts (initial + retries), so we
+ * coerce by adding 1.
+ */
+export function resolveGatewayMaxAttempts(
+  platform: GatewayPlatform,
+  config?: GatewayConfig,
+): number {
+  if (config?.maxRetries !== undefined && config.maxRetries >= 0) {
+    return config.maxRetries + 1;
+  }
+  return buildGatewayRetryPolicy(platform).maxAttempts;
+}
+
+/**
+ * Issue #98: Resolve the effective request timeout (ms).
+ * Precedence: model-level → provider/gateway-level → global default.
+ * Returns `undefined` when no level configures one.
+ *
+ * The `modelTimeoutMs` argument is the value resolved upstream from
+ * `ModelMetadata.requestTimeoutMs` (see `@crowclaw/providers`).
+ */
+export function resolveGatewayRequestTimeoutMs(
+  modelTimeoutMs: number | undefined,
+  config?: GatewayConfig,
+): number | undefined {
+  if (modelTimeoutMs !== undefined) return modelTimeoutMs;
+  if (config?.requestTimeoutMs !== undefined) return config.requestTimeoutMs;
+  return config?.globalRequestTimeoutMs;
+}
+
+/**
+ * Issue #92: Result of a fallback chain attempt. `provider` reports which
+ * entry in the chain ultimately succeeded (or the last one tried on failure).
+ */
+export interface GatewayFallbackResult<T> {
+  ok: boolean;
+  value?: T;
+  provider: string;
+  attempts: number;
+  /** Each fallback hop in order: { provider, error }. Empty when primary worked. */
+  fallbacksUsed: Array<{ from: string; to: string }>;
+  lastError?: string;
+}
+
+/**
+ * Issue #92: Run `op(provider)` against the primary provider, then walk the
+ * `fallbackProviders` chain in order on failure. Each hop emits a
+ * `gateway:fallback_used` event via the optional `onFallback` hook (the
+ * gateway runtime is event-bus agnostic; the caller decides where it goes).
+ *
+ * `op` should throw or return `{ ok: false }`-shaped values for retryable
+ * failure; success is anything else.
+ */
+export async function executeWithProviderFallback<T>(
+  primary: string,
+  op: (provider: string) => Promise<T>,
+  config?: GatewayConfig,
+  onFallback?: (event: { from: string; to: string; reason: string }) => void,
+): Promise<GatewayFallbackResult<T>> {
+  const chain = [primary, ...(config?.fallbackProviders ?? [])];
+  const fallbacksUsed: Array<{ from: string; to: string }> = [];
+  let lastError: string | undefined;
+  let attempts = 0;
+
+  for (let i = 0; i < chain.length; i += 1) {
+    const provider = chain[i]!;
+    attempts += 1;
+    try {
+      const value = await op(provider);
+      // Treat `{ ok: false }` shaped responses as failure (mirrors retry.ts).
+      if (
+        value && typeof value === 'object' && 'ok' in value
+        && (value as { ok: unknown }).ok === false
+      ) {
+        const rawErr = (value as { error?: unknown }).error;
+        const errMsg = rawErr instanceof Error
+          ? rawErr.message
+          : String(rawErr ?? 'operation returned ok:false');
+        lastError = errMsg;
+        if (i + 1 < chain.length) {
+          const next = chain[i + 1]!;
+          fallbacksUsed.push({ from: provider, to: next });
+          if (onFallback) onFallback({ from: provider, to: next, reason: errMsg });
+        }
+        continue;
+      }
+      return { ok: true, value, provider, attempts, fallbacksUsed };
+    } catch (error: unknown) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (i + 1 < chain.length) {
+        const next = chain[i + 1]!;
+        fallbacksUsed.push({ from: provider, to: next });
+        if (onFallback) onFallback({ from: provider, to: next, reason: lastError });
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    provider: chain[chain.length - 1] ?? primary,
+    attempts,
+    fallbacksUsed,
+    ...(lastError ? { lastError } : {}),
+  };
+}
+
 export interface GatewayDeliveryPlan {
   platform: GatewayPlatform;
   sessionId: string;
@@ -1694,3 +1844,12 @@ export async function normalizeGatewayRequest(platform: GatewayPlatform, request
 export { GatewayRunner, type GatewayRunnerConfig, type GatewayRunnerPlatformConfig, type GatewayStatus } from './runner.js';
 export { executeWithRetry, type RetryResult } from './retry.js';
 export { PlatformRateLimiter } from './platform-rate-limiter.js';
+
+// Issue #91: Gateway-level credential pool with 401-rotation and least-used picker.
+export {
+  ProviderKeyPool,
+  GatewayCredentialPool,
+  type ProviderKeyPoolOptions,
+  type ProviderKeyPoolStatus,
+  type CredentialPoolCursor,
+} from './credential-pool.js';

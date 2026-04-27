@@ -28,6 +28,13 @@ export interface DreamMemoryStore {
 // InMemoryDreamStore
 // ---------------------------------------------------------------------------
 
+/**
+ * Hard cap on consolidated entries retained in `longTerm` (#122). Without a
+ * cap, repeated `consolidate()` calls grow the array unbounded and OOM the
+ * worker after enough sessions. Newest entries are kept; oldest evicted.
+ */
+const MAX_LONG_TERM = 500;
+
 export class InMemoryDreamStore implements DreamMemoryStore {
   private live: Map<string, { summary: string; createdAt: string }> = new Map();
   private longTerm: DreamEntry[] = [];
@@ -74,8 +81,13 @@ export class InMemoryDreamStore implements DreamMemoryStore {
       newEntries.push(entry);
     }
 
-    // Promote to long-term and clear live entries
+    // Promote to long-term and clear live entries.
     this.longTerm.push(...newEntries);
+    // Cap longTerm at MAX_LONG_TERM (#122). Splice the oldest entries from the
+    // front so the most recent consolidations always survive.
+    if (this.longTerm.length > MAX_LONG_TERM) {
+      this.longTerm.splice(0, this.longTerm.length - MAX_LONG_TERM);
+    }
     this.live.clear();
 
     return newEntries;

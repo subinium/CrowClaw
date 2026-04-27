@@ -1,5 +1,5 @@
 import type { ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
-import { validateFetchUrl } from '@crowclaw/core';
+import { resolveAndValidateUrl, validateFetchUrl } from '@crowclaw/core';
 
 export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
 export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js';
@@ -102,6 +102,38 @@ function quoteShell(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+// #129 — Strict allowlists for shell-injected identifiers. Validate before
+// quoting so a malicious image like `evil; curl ... ` is rejected outright,
+// not just escaped. quoteShell() is still applied as defense-in-depth.
+//
+// Docker image: lowercase namespace/repo[:tag][@digest]; allowed chars match
+// the Docker reference grammar plus port/host segments.
+const DOCKER_IMAGE_RE = /^[a-zA-Z0-9._/:@-]+$/;
+// Docker container: name or 64-hex id; Docker enforces [a-zA-Z0-9][a-zA-Z0-9_.-]+.
+const DOCKER_CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+// SSH target: [user@]host[:port]; allow the same as the issue spec.
+const SSH_TARGET_RE = /^[a-zA-Z0-9._@:-]+$/;
+
+function isValidDockerImage(value: string): boolean {
+  return value.length > 0 && value.length <= 255 && DOCKER_IMAGE_RE.test(value);
+}
+
+function isValidDockerContainer(value: string): boolean {
+  return value.length > 0 && value.length <= 255 && DOCKER_CONTAINER_RE.test(value);
+}
+
+function isValidSshTarget(value: string): boolean {
+  return value.length > 0 && value.length <= 255 && SSH_TARGET_RE.test(value);
+}
+
+// #70 / NemoClaw CVE-2026-32048 — required hardening flags for any docker
+// run/exec invocation. no-new-privileges blocks setuid escalation; cap-drop
+// ALL strips Linux capabilities (NET_ADMIN, SYS_ADMIN, etc.); --user pins a
+// non-root uid:gid (#71 — set uid/gid on copies into sandbox) so processes
+// crossing the host→container boundary cannot run as root inside the
+// container.
+const DOCKER_HARDENING_FLAGS = '--security-opt no-new-privileges --cap-drop ALL --user 1000:1000';
+
 function resolveTerminalCommandPlan(input: Record<string, unknown>): {
   ok: boolean;
   backend: TerminalBackendKind;
@@ -135,17 +167,29 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
     if (!container && !image) {
       return { ok: false, backend, command, output: 'Docker backend requires container or image.' };
     }
+    // #129 — validate before quoting. Reject any container/image that doesn't
+    // match the Docker reference grammar so attacker-controlled metadata
+    // cannot inject extra `docker` flags or shell tokens.
+    if (container && !isValidDockerContainer(container)) {
+      return { ok: false, backend, command, output: `Docker container name rejected: invalid characters or format (${container}).` };
+    }
+    if (image && !isValidDockerImage(image)) {
+      return { ok: false, backend, command, output: `Docker image name rejected: invalid characters or format (${image}).` };
+    }
     const wrappedCommand = cwd ? `cd ${quoteShell(cwd)} && ${command}` : command;
+    // quoteShell on container/image is defense-in-depth on top of the regex
+    // allowlist above. #70 — every docker invocation gets the hardening
+    // flags so a compromised agent cannot get a privileged shell.
     const resolvedCommand = container
-      ? `docker exec ${container} /bin/sh -lc ${quoteShell(wrappedCommand)}`
-      : `docker run --rm ${image} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
+      ? `docker exec --user 1000:1000 ${quoteShell(container)} /bin/sh -lc ${quoteShell(wrappedCommand)}`
+      : `docker run --rm ${DOCKER_HARDENING_FLAGS} ${quoteShell(image)} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
     return {
       ok: true,
       backend,
       command,
       cwd,
       resolvedCommand,
-      metadata: { backend, container: container || undefined, image: image || undefined, mode: 'wrapped', cwd }
+      metadata: { backend, container: container || undefined, image: image || undefined, mode: 'wrapped', cwd, hardened: true }
     };
   }
 
@@ -154,8 +198,12 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
     if (!target) {
       return { ok: false, backend, command, output: 'SSH backend requires target.' };
     }
+    // #129 — validate ssh target shape ([user@]host[:port]) before quoting.
+    if (!isValidSshTarget(target)) {
+      return { ok: false, backend, command, output: `SSH target rejected: invalid characters or format (${target}).` };
+    }
     const wrappedCommand = cwd ? `cd ${quoteShell(cwd)} && ${command}` : command;
-    const resolvedCommand = `ssh ${target} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
+    const resolvedCommand = `ssh ${quoteShell(target)} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
     return {
       ok: true,
       backend,
@@ -282,6 +330,62 @@ async function probeTerminalBackends(): Promise<TerminalBackendStatus[]> {
     });
   }
   return results;
+}
+
+// #138 — DNS-rebinding-aware SSRF guard. Falls back to regex-only validation
+// when `node:dns` is unavailable (Cloudflare Workers). On Node, uses
+// dns.lookup() so the IP that fetch() will see is the one we validated.
+let cachedDnsLookup: ((hostname: string) => Promise<string[]>) | null | undefined;
+async function loadDnsLookup(): Promise<((hostname: string) => Promise<string[]>) | null> {
+  if (cachedDnsLookup !== undefined) return cachedDnsLookup;
+  try {
+    const dns = (await import('node:dns')) as unknown as {
+      promises: { lookup(host: string, options: { all: true }): Promise<Array<{ address: string }>> };
+    };
+    cachedDnsLookup = async (host: string) => {
+      const records = await dns.promises.lookup(host, { all: true });
+      return records.map((r) => r.address);
+    };
+  } catch {
+    cachedDnsLookup = null;
+  }
+  return cachedDnsLookup;
+}
+
+/**
+ * Run validateFetchUrl + (when available) DNS-rebinding-aware re-validation.
+ * Callers should pair with `redirect: 'manual'` so the resolved IP can't be
+ * bypassed via a 30x to a private host.
+ */
+async function safeFetchPreflight(url: string): Promise<{ safe: boolean; reason?: string }> {
+  const lookup = await loadDnsLookup();
+  if (!lookup) {
+    return validateFetchUrl(url);
+  }
+  return resolveAndValidateUrl(url, lookup);
+}
+
+// #128 — Defensive in-tool approval gate. AgentLoop already checks
+// `requireApprovalForDangerousTools` before calling execute(), but tools may
+// also be invoked directly (e.g. ToolRegistry.execute() from a route handler
+// that didn't wire approval). To fail closed, terminal.exec/background
+// require *one* of the following to proceed:
+//
+//   - input.planOnly === true  (no execution, just returns the plan)
+//   - input.__approvalGranted === true  (explicit caller-set marker;
+//     AgentLoop or any wrapper that performs its own approval flow sets this)
+//   - context.env.crowclawApprovalGranted === true  (env-set marker)
+//   - context has an `approval` callback (future AgentLoop hook)
+//
+// Otherwise the tool returns a synthetic `approvalRequired: true` result so
+// the caller can prompt the operator instead of executing blind.
+function hasApprovalGate(input: Record<string, unknown>, context: ToolExecutionContext): boolean {
+  if (input.__approvalGranted === true) return true;
+  const env = context.env as Record<string, unknown> | undefined;
+  if (env && env.crowclawApprovalGranted === true) return true;
+  const approval = (context as unknown as { approval?: unknown }).approval;
+  if (typeof approval === 'function') return true;
+  return false;
 }
 
 function normalizeScope(input: Record<string, unknown>): 'session' | 'user' | 'workspace' | undefined {
@@ -426,12 +530,12 @@ export function createWebFetchTool(): ToolDefinition {
         };
       }
 
-      const urlCheck = validateFetchUrl(url);
+      const urlCheck = await safeFetchPreflight(url);
       if (!urlCheck.safe) {
         return { toolName: 'web.fetch', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
       }
 
-      const response = await fetch(url, { signal: context.signal });
+      const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
       const text = await response.text();
       return {
         toolName: 'web.fetch',
@@ -471,7 +575,7 @@ export function createTerminalExecTool(): ToolDefinition {
         required: ['command']
       }
     },
-    async execute(input) {
+    async execute(input, context) {
       const plan = resolveTerminalCommandPlan(input);
       if (!plan.ok || !plan.resolvedCommand) {
         return {
@@ -497,6 +601,23 @@ export function createTerminalExecTool(): ToolDefinition {
             ...plan.metadata,
             resolvedCommand: plan.resolvedCommand,
             planOnly: true
+          }
+        };
+      }
+      // #128 — Defensive in-tool approval gate. Returns synthetic
+      // approvalRequired:true if the caller hasn't proved an AgentLoop /
+      // wrapper has already gated the call.
+      if (!hasApprovalGate(input, context)) {
+        return {
+          toolName: 'terminal.exec',
+          runtime: 'worker',
+          ok: false,
+          output: 'Tool requires approval: terminal.exec executes shell commands and must be gated by AgentLoop or an explicit approval marker.',
+          metadata: {
+            ...plan.metadata,
+            approvalRequired: true,
+            resolvedCommand: plan.resolvedCommand,
+            backend: plan.backend
           }
         };
       }
@@ -554,7 +675,7 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         required: ['command']
       }
     },
-    async execute(input) {
+    async execute(input, context) {
       const plan = resolveTerminalCommandPlan(input);
       if (!plan.ok || !plan.resolvedCommand) {
         return {
@@ -580,6 +701,21 @@ export function createTerminalBackgroundTool(): ToolDefinition {
             ...plan.metadata,
             resolvedCommand: plan.resolvedCommand,
             planOnly: true
+          }
+        };
+      }
+      // #128 — Defensive in-tool approval gate.
+      if (!hasApprovalGate(input, context)) {
+        return {
+          toolName: 'terminal.background',
+          runtime: 'worker',
+          ok: false,
+          output: 'Tool requires approval: terminal.background spawns long-running shell processes and must be gated by AgentLoop or an explicit approval marker.',
+          metadata: {
+            ...plan.metadata,
+            approvalRequired: true,
+            resolvedCommand: plan.resolvedCommand,
+            backend: plan.backend
           }
         };
       }
@@ -870,12 +1006,12 @@ export function createWebExtractMetadataTool(): ToolDefinition {
         };
       }
 
-      const urlCheck = validateFetchUrl(url);
+      const urlCheck = await safeFetchPreflight(url);
       if (!urlCheck.safe) {
         return { toolName: 'web.extractMetadata', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
       }
 
-      const response = await fetch(url, { signal: context.signal });
+      const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
       const html = await response.text();
       const title = extractTag(html, /<title[^>]*>([^<]+)<\/title>/i)
         ?? extractTag(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i)
@@ -936,12 +1072,12 @@ export function createWebExtractLinksTool(): ToolDefinition {
         };
       }
 
-      const urlCheck = validateFetchUrl(url);
+      const urlCheck = await safeFetchPreflight(url);
       if (!urlCheck.safe) {
         return { toolName: 'web.extractLinks', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
       }
 
-      const response = await fetch(url, { signal: context.signal });
+      const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
       const html = await response.text();
       const hrefs = [...new Set(
         [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
@@ -983,12 +1119,12 @@ export function createWebExtractTextTool(): ToolDefinition {
         };
       }
 
-      const urlCheck = validateFetchUrl(url);
+      const urlCheck = await safeFetchPreflight(url);
       if (!urlCheck.safe) {
         return { toolName: 'web.extractText', runtime: 'worker', ok: false, output: `URL blocked: ${urlCheck.reason}` };
       }
 
-      const response = await fetch(url, { signal: context.signal });
+      const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
       const html = await response.text();
       const text = extractReadableText(html);
       return {
@@ -1032,14 +1168,17 @@ export function createWebSearchTool(): ToolDefinition {
 
       const searchUrl = new URL(providerBaseUrl);
       searchUrl.searchParams.set('q', query);
-      const searchUrlCheck = validateFetchUrl(searchUrl.toString());
+      const searchUrlCheck = await safeFetchPreflight(searchUrl.toString());
       if (!searchUrlCheck.safe) {
         return { toolName: 'web.search', runtime: 'worker', ok: false, output: `URL blocked: ${searchUrlCheck.reason}` };
       }
 
+      // #138 — `redirect: 'manual'` so a 30x to a private host can't bypass
+      // the SSRF preflight. The previous `redirect: 'follow'` was the SSRF
+      // hole the audit flagged.
       const response = await fetch(searchUrl, {
         signal: context.signal,
-        redirect: 'follow',
+        redirect: 'manual',
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CrowClaw/0.1; +https://github.com/subinium/CrowClaw)' },
       });
       if (!response.ok) {
@@ -1113,7 +1252,7 @@ export function createWebCrawlTool(): ToolDefinition {
         };
       }
 
-      const seedUrlCheck = validateFetchUrl(url);
+      const seedUrlCheck = await safeFetchPreflight(url);
       if (!seedUrlCheck.safe) {
         return { toolName: 'web.crawl', runtime: 'worker', ok: false, output: `URL blocked: ${seedUrlCheck.reason}` };
       }
@@ -1128,10 +1267,10 @@ export function createWebCrawlTool(): ToolDefinition {
         if (visited.has(current)) continue;
         visited.add(current);
 
-        const crawlUrlCheck = validateFetchUrl(current);
+        const crawlUrlCheck = await safeFetchPreflight(current);
         if (!crawlUrlCheck.safe) continue;
 
-        const response = await fetch(current, { signal: context.signal });
+        const response = await fetch(current, { signal: context.signal, redirect: 'manual' });
         const html = await response.text();
         const text = extractReadableText(html);
         const links = [...new Set(

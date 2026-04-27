@@ -65,8 +65,15 @@ export const api = async <T = unknown>(path: string, options?: ApiOptions): Prom
     let errorMessage = `HTTP ${response.status} ${response.statusText}`;
     try {
       const body = await response.json();
+      // Standard envelope is `{ error: { code, message } }`. Some legacy routes
+      // still emit `{ error: 'string' }`, so fall back to that. Reading the
+      // structured shape first avoids rendering '[object Object]' in the UI.
       if (body?.error) {
-        errorMessage = typeof body.error === 'string' ? body.error : body.error.message ?? errorMessage;
+        if (typeof body.error === 'object' && typeof body.error.message === 'string') {
+          errorMessage = body.error.message;
+        } else if (typeof body.error === 'string') {
+          errorMessage = body.error;
+        }
       }
     } catch {
       // Response is not JSON — use status text
