@@ -15,7 +15,16 @@ export type RuntimeEventType =
   | 'job:complete'
   | 'job:error'
   | 'session:created'
-  | 'session:updated';
+  | 'session:updated'
+  // #147: discriminated lifecycle events. Previously all session lifecycle
+  // changes were squashed into `session:updated` with an untyped `action`
+  // discriminant — the dashboard's `onEvent` handler couldn't dispatch on
+  // them and silently dropped every non-heartbeat frame. These let the UI
+  // refresh the session list / inject timeline markers in real time.
+  | 'session:steered'
+  | 'session:aborted'
+  | 'session:forked'
+  | 'session:compacted';
 
 export interface RuntimeEvent {
   type: RuntimeEventType;

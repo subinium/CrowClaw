@@ -89,7 +89,15 @@ export const routePaths = {
   sessions: {
     list: '/api/sessions',
     create: '/api/sessions',
-    stream: '/api/sessions/:id/stream'
+    stream: '/api/sessions/:id/stream',
+    // #146: action-based session ops live under the same `:id` mount with
+    // an `action` field on the body — these path strings exist for client
+    // route reflection / route-table tests.
+    abort: '/api/sessions/:id/abort',
+    stop: '/api/sessions/:id/stop',
+    steer: '/api/sessions/:id/steer',
+    fork: '/api/sessions/:id/fork',
+    compact: '/api/sessions/:id/compact'
   },
   personas: {
     list: '/api/personas',

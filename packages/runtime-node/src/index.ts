@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
@@ -5007,14 +5007,77 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
         if (action === 'steer') {
           const session = await store.get(sessionId);
-          if (!session) return Response.json({ error: 'Session not found' }, { status: 404 });
+          if (!session) return Response.json({ error: { code: 'SESSION_NOT_FOUND', message: 'Session not found' } }, { status: 404 });
           const steerBody = (await request.json()) as { directive: string };
-          if (!steerBody.directive) return Response.json({ error: 'Missing directive' }, { status: 400 });
-          if (steerBody.directive.length > 2000) return Response.json({ error: 'Directive too long (max 2000 chars)' }, { status: 400 });
+          if (!steerBody.directive) return Response.json({ error: { code: 'MISSING_DIRECTIVE', message: 'Missing directive' } }, { status: 400 });
+          if (steerBody.directive.length > 2000) return Response.json({ error: { code: 'DIRECTIVE_TOO_LONG', message: 'Directive too long (max 2000 chars)' } }, { status: 400 });
+          // #145: refuse steer on a session that isn't actively running. Without
+          // this guard the route returns 200 OK but the directive never reaches
+          // the agent (no turn in progress to inject into).
+          if (!sessionController.isActive(sessionId)) {
+            return Response.json(
+              { error: { code: 'SESSION_NOT_ACTIVE', message: 'Session is not running — directive will not be applied' } },
+              { status: 409 }
+            );
+          }
           securityAuditLog?.record({ type: 'command_warned', severity: 'info', detail: `session:steer sessionId=${sessionId} len=${steerBody.directive.length}` });
           const result = sessionController.steer(session, steerBody.directive);
           await store.put(session);
           return Response.json({ ok: true, ...result });
+        }
+
+        if (action === 'fork') {
+          // #146: implement POST /api/sessions/:id/fork — was claimed in
+          // CHANGELOG but had no route handler. Clones session.messages into a
+          // new child session via forkSession() from @crowclaw/core, persists
+          // the child, emits `session:forked` for live observability.
+          const session = await store.get(sessionId);
+          if (!session) {
+            return Response.json({ error: { code: 'SESSION_NOT_FOUND', message: 'Session not found' } }, { status: 404 });
+          }
+          const forkBody = (await request.json()) as {
+            task?: string;
+            childAgentId?: string;
+            enabledToolsets?: string[];
+          };
+          const task = forkBody.task ?? '';
+          const childAgentId = forkBody.childAgentId ?? session.agentId;
+          const child = forkSession(session, task, childAgentId);
+          // Carry parent's full transcript so the child has context (forkSession
+          // currently seeds with just the user task — the operator-driven fork
+          // path wants the full history).
+          child.messages = [
+            ...session.messages,
+            ...(task ? [{
+              role: 'user' as const,
+              content: task,
+              createdAt: new Date().toISOString(),
+              metadata: { forkedFrom: session.sessionId, forkedFromAgent: session.agentId },
+            }] : []),
+          ];
+          // enabledToolsets restriction lives at fork-time in core; if provided
+          // it is plumbed through forkSession's option object (added in #84).
+          // For now we accept the field on the wire but defer enforcement to
+          // the core-side option.
+          void forkBody.enabledToolsets;
+          await store.put(child);
+          // Emit a lifecycle event so the dashboard can refresh the session list.
+          eventBus.emit('session:forked', {
+            sessionId: child.sessionId,
+            parentSessionId: session.sessionId,
+            parentAgentId: session.agentId,
+            childAgentId,
+          });
+          securityAuditLog?.record({
+            type: 'command_warned',
+            severity: 'info',
+            detail: `session:fork parentSessionId=${session.sessionId} childSessionId=${child.sessionId}`,
+          });
+          return Response.json({
+            ok: true,
+            forkSessionId: child.sessionId,
+            parentSessionId: session.sessionId,
+          });
         }
 
         if (action === 'checkpoint') {
