@@ -11,10 +11,12 @@
     }
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@crowclaw/core": "0.6.0"
   }
 }

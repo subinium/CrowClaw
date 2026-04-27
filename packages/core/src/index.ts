@@ -1,4 +1,18 @@
-import { PluginManager } from '@crowclaw/plugins';
+import { PluginManager } from './plugins.js';
+export {
+  PluginManager,
+  MemoryCapturePlugin,
+} from './plugins.js';
+export type {
+  Plugin,
+  PluginContext,
+  PluginHookName,
+  PluginHookPayloads,
+  PluginInvocationName,
+  PluginInvocationPayloads,
+  PreToolCallVeto,
+  ToolResultTransform,
+} from './plugins.js';
 import { buildSystemPrompt, buildMemoryPrefix, type PromptBuilderInput } from './prompt-builder.js';
 import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
