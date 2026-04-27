@@ -254,7 +254,9 @@ describe('tool breadth extensions', () => {
     expect(localProbe.ok).toBe(true);
     expect(localProbe.output).toContain('local-ok');
 
-    const execResult = await registry.execute('terminal.exec', { command: 'printf "hello"' }, {
+    // #128 — direct registry.execute() lacks the AgentLoop approval gate, so
+    // tests that exercise actual execution must opt-in via __approvalGranted.
+    const execResult = await registry.execute('terminal.exec', { command: 'printf "hello"', __approvalGranted: true }, {
       agentId: 'crowclaw',
       sessionId: 'term-1'
     });
@@ -262,14 +264,14 @@ describe('tool breadth extensions', () => {
     expect(execResult.output).toContain('hello');
 
     const tempCwd = await mkdtemp(join(tmpdir(), 'crowclaw-terminal-tool-'));
-    const cwdResult = await registry.execute('terminal.exec', { command: 'pwd', cwd: tempCwd }, {
+    const cwdResult = await registry.execute('terminal.exec', { command: 'pwd', cwd: tempCwd, __approvalGranted: true }, {
       agentId: 'crowclaw',
       sessionId: 'term-cwd'
     });
     expect(cwdResult.ok).toBe(true);
     expect(cwdResult.output).toContain(tempCwd);
 
-    const timeoutResult = await registry.execute('terminal.exec', { command: 'sleep 1', timeoutMs: 10 }, {
+    const timeoutResult = await registry.execute('terminal.exec', { command: 'sleep 1', timeoutMs: 10, __approvalGranted: true }, {
       agentId: 'crowclaw',
       sessionId: 'term-timeout'
     });
@@ -281,16 +283,17 @@ describe('tool breadth extensions', () => {
       sessionId: 'term-1'
     });
     expect(dockerPlan.ok).toBe(true);
-    expect(dockerPlan.output).toContain('docker exec app');
+    // #129/#70/#71 — container quoted, --user pinned to non-root uid:gid.
+    expect(dockerPlan.output).toContain("docker exec --user 1000:1000 'app'");
 
     const sshPlan = await registry.execute('terminal.exec', { backend: 'ssh', target: 'demo@example.com', command: 'uname -a', planOnly: true }, {
       agentId: 'crowclaw',
       sessionId: 'term-1'
     });
     expect(sshPlan.ok).toBe(true);
-    expect(sshPlan.output).toContain('ssh demo@example.com');
+    expect(sshPlan.output).toContain("ssh 'demo@example.com'");
 
-    const background = await registry.execute('terminal.background', { command: 'sleep 5' }, {
+    const background = await registry.execute('terminal.background', { command: 'sleep 5', __approvalGranted: true }, {
       agentId: 'crowclaw',
       sessionId: 'term-2'
     });

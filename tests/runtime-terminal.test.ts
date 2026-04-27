@@ -53,10 +53,13 @@ describe('runtime terminal integration', () => {
     expect(probePayload.ok).toBe(true);
     expect(probePayload.output).toContain('local-ok');
 
+    // #128 — direct /api/terminal routes lack the AgentLoop approval gate, so
+    // tests that exercise actual execution must opt-in via __approvalGranted
+    // in the request body. Plan-only flows skip the gate by design.
     const tempCwd = await mkdtemp(join(tmpdir(), 'crowclaw-terminal-runtime-'));
     const cwdResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',
-      body: JSON.stringify({ command: 'pwd', cwd: tempCwd })
+      body: JSON.stringify({ command: 'pwd', cwd: tempCwd, __approvalGranted: true })
     }));
     const cwdPayload = await cwdResponse.json() as { ok: boolean; output: string };
     expect(cwdPayload.ok).toBe(true);
@@ -64,7 +67,7 @@ describe('runtime terminal integration', () => {
 
     const timeoutResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',
-      body: JSON.stringify({ command: 'sleep 1', timeoutMs: 10 })
+      body: JSON.stringify({ command: 'sleep 1', timeoutMs: 10, __approvalGranted: true })
     }));
     const timeoutPayload = await timeoutResponse.json() as { ok: boolean; metadata?: { timeoutMs?: number } };
     expect(timeoutPayload.ok).toBe(false);
@@ -72,7 +75,7 @@ describe('runtime terminal integration', () => {
 
     const execResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',
-      body: JSON.stringify({ command: 'printf "hello-terminal"' })
+      body: JSON.stringify({ command: 'printf "hello-terminal"', __approvalGranted: true })
     }));
     const execPayload = await execResponse.json() as { ok: boolean; output: string };
     expect(execPayload.ok).toBe(true);
@@ -84,11 +87,12 @@ describe('runtime terminal integration', () => {
     }));
     const dockerPlanPayload = await dockerPlanResponse.json() as { ok: boolean; output: string };
     expect(dockerPlanPayload.ok).toBe(true);
-    expect(dockerPlanPayload.output).toContain('docker exec demo-app');
+    // #129/#70/#71 — container quoted; --user pinned to non-root uid:gid.
+    expect(dockerPlanPayload.output).toContain("docker exec --user 1000:1000 'demo-app'");
 
     const backgroundResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.background), {
       method: 'POST',
-      body: JSON.stringify({ command: 'sleep 5' })
+      body: JSON.stringify({ command: 'sleep 5', __approvalGranted: true })
     }));
     const backgroundPayload = await backgroundResponse.json() as { ok: boolean; metadata: { pid: number } };
     expect(backgroundPayload.ok).toBe(true);

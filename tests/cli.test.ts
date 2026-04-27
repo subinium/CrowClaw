@@ -374,19 +374,22 @@ describe('cli package', () => {
     const terminalProbe = await runCliInputLine('/terminal-probe local', chat.state, { runtime });
     expect(terminalProbe.output).toContain('local-ok');
 
+    // #129/#70/#71 — docker container is shell-quoted and pinned to non-root --user.
     const terminalExecPlan = await runCliInputLine('/terminal-exec --backend docker --container demo --cwd /workspace --plan printf hello-terminal-cli', chat.state, { runtime });
-    expect(terminalExecPlan.output).toContain('docker exec demo');
+    expect(terminalExecPlan.output).toContain("docker exec --user 1000:1000 'demo'");
     expect(terminalExecPlan.output).toContain('/workspace');
 
+    // #128 — Without an explicit approval marker, terminal.exec / terminal.background
+    // return approvalRequired:true. Plan-only flows (above) skip the gate by design.
     const cliTempCwd = await mkdtemp(join(tmpdir(), 'crowclaw-cli-terminal-'));
     const terminalExecCwd = await runCliInputLine(`/terminal-exec --cwd ${cliTempCwd} pwd`, chat.state, { runtime });
-    expect(terminalExecCwd.output).toContain(cliTempCwd);
+    expect(terminalExecCwd.output).toContain('Tool requires approval');
 
     const terminalBackground = await runCliInputLine('/terminal-background sleep 5', chat.state, { runtime });
-    expect(terminalBackground.output).toContain('"pid"');
+    expect(terminalBackground.output).toContain('Tool requires approval');
 
     const terminalProcesses = await runCliInputLine('/terminal-processes', chat.state, { runtime });
-    expect(terminalProcesses.output).toContain('\\"backend\\": \\"local\\"');
+    expect(terminalProcesses.output).toContain('"count": 0');
   });
 
   it('tracks an interactive transcript with stream chunks', async () => {
