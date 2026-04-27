@@ -126,7 +126,13 @@ export class McpJsonRpcStdioTransport implements McpTransport {
         resolve();
       }, 5_000);
 
-      proc.on('close', () => {
+      // Use `once` instead of `on` (#126). The constructor at line 88 already
+      // attaches a global 'close' handler; using `on` here would leave a
+      // dangling listener that fires for every subsequent emission, growing
+      // the listener count past Node's MaxListenersExceededWarning threshold
+      // when transports are repeatedly created/destroyed (e.g. test runs,
+      // long-lived dashboards reconnecting).
+      proc.once('close', () => {
         clearTimeout(timer);
         resolve();
       });

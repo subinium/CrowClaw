@@ -104,9 +104,15 @@ export class ProcessTracker {
 
     this.processes.set(child.pid!, { process: child, info });
 
-    child.on('exit', (code) => {
+    // Use `once` so a re-emitted 'exit' (rare, but possible if a caller
+    // re-spawns into the same pid slot) cannot double-remove a different
+    // tracked entry. Mark exited and drop the map entry so long-running
+    // workers (Hermes-style cron loops, #114, #133) don't accumulate
+    // stale ChildProcess refs and leak file descriptors / EMFILE the host.
+    child.once('exit', (code) => {
       info.status = 'exited';
       info.exitCode = code ?? 1;
+      this.processes.delete(child.pid!);
     });
 
     return info;
