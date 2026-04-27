@@ -180,11 +180,61 @@ export interface ParsedCliCommand {
 export interface CliRuntimeLike {
   fetch(request: Request): Promise<Response>;
   tools?: { list(): Array<{ name: string; description?: string }> };
+  /**
+   * Optional cleanup hook. When `runServe` receives SIGINT/SIGTERM it awaits
+   * `close()` to stop background work owned by the runtime (e.g. websocket
+   * heartbeats, in-memory timers). See issue #150.
+   */
+  close?(): void | Promise<void>;
 }
 
 export interface CliRunOptions {
   runtime?: CliRuntimeLike;
   runtimeOptions?: NodeRuntimeOptions;
+}
+
+/**
+ * Distinct exit codes for the CLI process. Documented in `--help`.
+ * - 0: success (normal completion)
+ * - 1: internal error (default)
+ * - 2: user-cancel (Ctrl+C / SIGINT)
+ * - 3: timeout
+ *
+ * Issue #143.
+ */
+export const CLI_EXIT_CODE = {
+  SUCCESS: 0,
+  ERROR: 1,
+  USER_CANCEL: 2,
+  TIMEOUT: 3,
+} as const;
+
+export class CliUserCancelError extends Error {
+  readonly exitCode = CLI_EXIT_CODE.USER_CANCEL;
+  constructor(message = 'Cancelled by user') {
+    super(message);
+    this.name = 'CliUserCancelError';
+  }
+}
+
+export class CliTimeoutError extends Error {
+  readonly exitCode = CLI_EXIT_CODE.TIMEOUT;
+  constructor(message = 'Operation timed out') {
+    super(message);
+    this.name = 'CliTimeoutError';
+  }
+}
+
+/** Map an arbitrary error to a CLI exit code per issue #143. */
+export function exitCodeForError(error: unknown): number {
+  if (error instanceof CliUserCancelError) return CLI_EXIT_CODE.USER_CANCEL;
+  if (error instanceof CliTimeoutError) return CLI_EXIT_CODE.TIMEOUT;
+  if (error instanceof Error) {
+    // node's AbortError surfaces as `name === 'AbortError'`
+    if (error.name === 'AbortError') return CLI_EXIT_CODE.USER_CANCEL;
+    if (error.name === 'TimeoutError') return CLI_EXIT_CODE.TIMEOUT;
+  }
+  return CLI_EXIT_CODE.ERROR;
 }
 
 export interface ReplOptions extends CliRunOptions {
@@ -609,6 +659,20 @@ export function renderCliHelp(): string {
     '  -q "msg"            One-shot chat (alias for chat)',
     '  --no-onboarding     Skip first-run wizard',
     '  --port N            Server port (default: 3117)',
+    '',
+    'Session actions (REST):',
+    '  POST /api/sessions/<id>/stop      Abort an active session (200 stopped, 202 pending)',
+    '  POST /api/sessions/<id>/abort     Signal abort without waiting for drain',
+    '  POST /api/sessions/<id>/steer     Inject a directive into the running turn',
+    '  POST /api/sessions/<id>/compact   Compact session context to keep last N turns',
+    '  POST /api/sessions/<id>/fork      Reserved (not yet implemented; tracked in roadmap)',
+    '  REPL: /compact, /resume <id> map to the same flows from the interactive session.',
+    '',
+    'Exit codes:',
+    '  0  success',
+    '  1  internal error',
+    '  2  user-cancel (Ctrl+C / SIGINT)',
+    '  3  timeout',
     '',
     'REPL Slash Commands:',
     '  /help                          Show this help text',
@@ -2402,6 +2466,114 @@ function maskInput(rl: ReturnType<typeof createInterface>): Promise<string> {
   });
 }
 
+// --- Provider credential validation (#149) ---
+
+export interface ProviderValidationResult {
+  /** True iff credentials look accepted by the provider (any non-401 from the auth-aware endpoint). */
+  ok: boolean;
+  /** HTTP status returned by the provider. `0` indicates a network/transport error. */
+  status: number;
+  /** Provider-supplied error message when `ok === false`, or a human description of the transport failure. */
+  message?: string;
+}
+
+export interface ValidateProviderCredentialsArgs {
+  provider: string;
+  apiKey: string;
+  baseUrl: string;
+  /** Optional fetch override for tests. Defaults to globalThis.fetch. */
+  fetch?: typeof fetch;
+  /** Per-call timeout in ms. Default 8000. */
+  timeoutMs?: number;
+}
+
+/**
+ * Verify the supplied API key actually authenticates against the provider.
+ *
+ * Strategy per task spec: hit the provider's models / list endpoint with the
+ * configured credentials. We treat **only HTTP 401** as an auth failure —
+ * anything else (200, 403, 404, 5xx, network error) is reported with status
+ * but is *not* treated as "the key is wrong". This avoids false negatives on
+ * self-hosted endpoints and providers with quirky model-list ACLs.
+ *
+ * Issue #149.
+ */
+export async function validateProviderCredentials(
+  args: ValidateProviderCredentialsArgs
+): Promise<ProviderValidationResult> {
+  const { provider, apiKey, baseUrl } = args;
+  const fetchImpl = args.fetch ?? globalThis.fetch;
+  const timeoutMs = args.timeoutMs ?? 8000;
+
+  if (typeof fetchImpl !== 'function') {
+    return { ok: false, status: 0, message: 'fetch is not available in this runtime' };
+  }
+  if (!apiKey) {
+    return { ok: false, status: 401, message: 'API key is empty' };
+  }
+
+  // Build a provider-aware probe request.
+  // - Anthropic: GET {base}/v1/models with `x-api-key` + `anthropic-version`
+  // - OpenAI / OpenRouter / custom: GET {base}/models with Bearer auth
+  // baseUrl values from CLI_PROVIDERS already include `/v1` for OpenAI/OpenRouter.
+  const trimmedBase = baseUrl.replace(/\/+$/, '');
+  let url: string;
+  const headers: Record<string, string> = { accept: 'application/json' };
+
+  if (provider === 'anthropic') {
+    // Anthropic base url is `https://api.anthropic.com` (no /v1 suffix in CLI_PROVIDERS).
+    const path = trimmedBase.endsWith('/v1') ? '/models' : '/v1/models';
+    url = `${trimmedBase}${path}`;
+    headers['x-api-key'] = apiKey;
+    headers['anthropic-version'] = '2023-06-01';
+  } else {
+    // OpenAI / OpenRouter / custom — assume OpenAI-compatible /models endpoint.
+    url = `${trimmedBase}/models`;
+    headers.authorization = `Bearer ${apiKey}`;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(url, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+    if (response.status === 401) {
+      let message = 'HTTP 401: API key rejected by provider';
+      try {
+        const body = await response.text();
+        if (body) {
+          // Best-effort: extract a `.error.message` if present.
+          try {
+            const parsed = JSON.parse(body) as { error?: { message?: string } | string };
+            const inner = typeof parsed.error === 'object' && parsed.error
+              ? parsed.error.message
+              : typeof parsed.error === 'string' ? parsed.error : undefined;
+            if (inner) message = `HTTP 401: ${inner}`;
+          } catch {
+            message = `HTTP 401: ${body.slice(0, 200)}`;
+          }
+        }
+      } catch {
+        // Ignore body-read failures — we still know it's 401.
+      }
+      return { ok: false, status: 401, message };
+    }
+    // Per task spec: anything other than 401 means credentials are accepted.
+    return { ok: true, status: response.status };
+  } catch (error: unknown) {
+    const isAbort = error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+    const message = isAbort
+      ? `Request timed out after ${timeoutMs}ms`
+      : error instanceof Error ? error.message : String(error);
+    return { ok: false, status: 0, message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function runCliOnboarding(): Promise<CrowClawConfig | null> {
   const rl = createInterface({ input: stdin, output: stdout, terminal: true });
 
@@ -2416,28 +2588,72 @@ export async function runCliOnboarding(): Promise<CrowClawConfig | null> {
   const provider = CLI_PROVIDERS[provIdx >= 0 && provIdx < CLI_PROVIDERS.length ? provIdx : 2]!;
   stdout.write('\n');
 
-  // Step 2: API Key (masked)
-  stdout.write('? Enter your API key: ');
-  const apiKey = await maskInput(rl);
-  stdout.write('\n\n');
+  // Step 2 + 3: API key (masked) and base URL.
+  // #149: actually verify the credentials against the provider before printing
+  // "Connected!" or persisting config. Re-prompt on HTTP 401 (auth rejected),
+  // up to MAX_AUTH_ATTEMPTS times. Other failures (network, 5xx) emit a warning
+  // but proceed — the user may be on a self-hosted endpoint we can't reach.
+  const MAX_AUTH_ATTEMPTS = 3;
+  let apiKey = '';
+  let baseUrl = provider.url;
+  let baseUrlPrompted = false;
+  let validated = false;
 
-  if (!apiKey) {
-    stdout.write('\\x1b[31mNo API key provided. Skipping onboarding.\\x1b[0m\n');
+  for (let attempt = 1; attempt <= MAX_AUTH_ATTEMPTS; attempt++) {
+    stdout.write('? Enter your API key: ');
+    apiKey = await maskInput(rl);
+    stdout.write('\n\n');
+
+    if (!apiKey) {
+      stdout.write('\\x1b[31mNo API key provided. Skipping onboarding.\\x1b[0m\n');
+      rl.close();
+      return null;
+    }
+
+    // Prompt for custom base URL only on the first attempt.
+    if (!baseUrlPrompted && provider.key === 'custom') {
+      const customUrl = await rl.question('? Enter your base URL: ');
+      baseUrl = customUrl.trim() || 'http://localhost:11434/v1';
+      stdout.write('\n');
+      baseUrlPrompted = true;
+    }
+
+    stdout.write('Testing connection... ');
+    const result = await validateProviderCredentials({
+      provider: provider.key,
+      apiKey,
+      baseUrl,
+    });
+
+    if (result.ok) {
+      stdout.write('\\x1b[32m\\u2713 Connected!\\x1b[0m\n\n');
+      validated = true;
+      break;
+    }
+
+    if (result.status === 401) {
+      stdout.write(`\\x1b[31m\\u2717 ${result.message ?? 'HTTP 401: unauthorized'}\\x1b[0m\n`);
+      if (attempt < MAX_AUTH_ATTEMPTS) {
+        stdout.write(`Try again (${attempt}/${MAX_AUTH_ATTEMPTS} attempts used).\n\n`);
+        continue;
+      }
+      stdout.write('\\x1b[31mAuthentication failed after 3 attempts. Aborting onboarding.\\x1b[0m\n');
+      rl.close();
+      return null;
+    }
+
+    // Non-401 failure (network, 5xx, ...). Per task spec: accept the credentials
+    // but surface the warning so the user knows verification was inconclusive.
+    const detail = result.status > 0 ? `HTTP ${result.status}` : 'network error';
+    stdout.write(`\\x1b[33m! Could not verify (${detail}${result.message ? `: ${result.message}` : ''}). Continuing.\\x1b[0m\n\n`);
+    validated = true;
+    break;
+  }
+
+  if (!validated) {
     rl.close();
     return null;
   }
-
-  // Step 3: Base URL (if custom)
-  let baseUrl = provider.url;
-  if (provider.key === 'custom') {
-    const customUrl = await rl.question('? Enter your base URL: ');
-    baseUrl = customUrl.trim() || 'http://localhost:11434/v1';
-    stdout.write('\n');
-  }
-
-  stdout.write('Testing connection... ');
-  // Simple connection test
-  stdout.write('\\x1b[32m\\u2713 Connected!\\x1b[0m\n\n');
 
   // Step 4: Model
   const models = CLI_MODELS[provider.key] || CLI_MODELS.custom!;
@@ -2699,12 +2915,24 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
   await new Promise<void>((resolve) => {
     let shuttingDown = false;
 
-    const shutdown = (signal: string) => {
+    const shutdown = async (signal: string): Promise<void> => {
       if (shuttingDown) return;
       shuttingDown = true;
       stdout.write(`\n[shutdown] ${signal} received, draining ${inFlight} in-flight request(s)...\n`);
 
       void stopGatewayRunner();
+
+      // #150: stop runtime-owned background work (ws heartbeats, timers) so
+      // the process can actually exit instead of hanging on the event loop.
+      // Failures here are non-fatal — log and continue with server.close.
+      if (typeof runtime.close === 'function') {
+        try {
+          await runtime.close();
+        } catch (closeError: unknown) {
+          const msg = closeError instanceof Error ? closeError.message : String(closeError);
+          stdout.write(`[shutdown] runtime.close() failed: ${msg}\n`);
+        }
+      }
 
       server.close(() => {
         stdout.write('[shutdown] Server closed gracefully.\n');
@@ -2720,8 +2948,8 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
       forceTimer.unref();
     };
 
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => { void shutdown('SIGINT'); });
+    process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
   });
 }
 
@@ -2815,9 +3043,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 }
 
 // Auto-invoke when run directly
-main().catch((error) => {
+main().catch((error: unknown) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
+  // #143: distinct exit codes — 1 error / 2 user-cancel / 3 timeout.
+  process.exitCode = exitCodeForError(error);
 });
 
 export const cliPackage = {
