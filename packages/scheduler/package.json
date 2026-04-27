@@ -11,8 +11,7 @@
     }
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
   "devDependencies": {
     "@types/node": "^22.0.0"
