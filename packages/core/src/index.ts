@@ -2078,6 +2078,7 @@ export {
   containsSecrets,
   redactCredentials,
   redactToolOutput,
+  redactStructuredData,
   scanForEnhancedInjection,
   scanCommand,
   type InjectionScanResult,
