@@ -60,6 +60,7 @@ import {
   setTelegramWebhook,
   deleteTelegramWebhook,
   getTelegramWebhookInfo,
+  WsAuthRateLimiter,
 } from '@crowclaw/gateway';
 import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry, createLlmSkillExtractor } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
@@ -77,7 +78,7 @@ import { RuntimeConfigStore, FileConfigStore } from './config-store.js';
 import { pruneStaleBridgeSessions, type CodeBridgeSession } from './bridge-state.js';
 import { ensureBrowserSession, pruneStaleBrowserSessions, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
 import { handleCodeBridgeRoutes } from './bridge-routes.js';
-import type { BridgeProcessRecord } from './bridge-process.js';
+import { pruneDeadBridgeProcesses, type BridgeProcessRecord } from './bridge-process.js';
 import { routePaths } from './route-paths.js';
 import { resolveProviderFromConfig, resolveProvidersFromConfig, createProviderFromSlot } from './provider-factory.js';
 import { SessionController } from './session-controller.js';
@@ -160,6 +161,27 @@ export class GatewayDebouncer {
   /** Number of keys currently pending debounce */
   get pendingCount(): number {
     return this.pending.size;
+  }
+
+  /**
+   * #120: Drain all pending debounce timers. Called from `shutdown()` so
+   * pending timers and their resolve closures don't leak between runtime
+   * lifetimes. Each pending caller resolves with whatever messages were
+   * already accumulated (rather than rejecting) so awaiting code in the
+   * gateway routes returns deterministically and any partially-merged
+   * text still flows through downstream chat handling instead of being
+   * silently dropped.
+   *
+   * Returns the number of pending entries that were flushed.
+   */
+  flush(): number {
+    const drained = this.pending.size;
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+      try { entry.resolve(entry.messages.join('\n')); } catch { /* swallow */ }
+    }
+    this.pending.clear();
+    return drained;
   }
 }
 
@@ -801,9 +823,14 @@ function normalizeIp(ip: string): string {
  * O(N) copy on every check; this is O(expired) with no allocation in the
  * common steady-state path.
  */
-class RateLimiter {
+export class RateLimiter {
   private requests = new Map<string, number[]>();
   private readonly maxKeys: number;
+
+  /** Exposed for tests / observability — not part of the public hot path. */
+  get size(): number {
+    return this.requests.size;
+  }
 
   constructor(options?: { maxKeys?: number }) {
     this.maxKeys = options?.maxKeys ?? 50_000;
@@ -828,12 +855,142 @@ class RateLimiter {
       return false; // rate limited
     }
     timestamps.push(now); // monotonic — preserves sorted order
-    // Evict oldest entry if at capacity (prevents unbounded memory growth)
+    // Evict oldest entry if at capacity (prevents unbounded memory growth).
+    // #124: When the oldest key IS the current key (e.g. the inserted key
+    // is the only one, or it happens to be at the head of the insertion
+    // order), the previous guard `oldest !== key` skipped eviction entirely
+    // and the Map size grew to maxKeys + 1 — and would compound the further
+    // distinct keys arrived. Walk forward instead so we always free a slot
+    // when over capacity, and never evict the entry we just inserted.
     if (this.requests.size > this.maxKeys) {
-      const oldest = this.requests.keys().next().value;
-      if (oldest !== undefined && oldest !== key) this.requests.delete(oldest);
+      for (const candidate of this.requests.keys()) {
+        if (candidate !== key) {
+          this.requests.delete(candidate);
+          break;
+        }
+      }
     }
     return true; // allowed
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Body size cap (#128) — defends against memory-exhaustion via large POSTs
+// ---------------------------------------------------------------------------
+
+/** Max accepted JSON body, in bytes. 1 MiB matches typical reverse-proxy
+ *  defaults and is far above any legitimate dashboard / gateway payload —
+ *  the largest realistic body is a multi-thousand-token chat message which
+ *  fits comfortably in tens of kilobytes. Anything larger almost certainly
+ *  represents an abusive caller or a misconfigured client.
+ */
+export const MAX_REQUEST_BODY_BYTES = 1_048_576;
+
+/**
+ * Inspect `Content-Length` and reject oversized bodies before they're buffered
+ * in memory. Returns `null` when the request is acceptable, or a 413 Response
+ * when the declared length exceeds the cap. Callers should still read with
+ * `readJsonWithSizeCap` to defend against chunked / unknown-length bodies that
+ * omit the header.
+ */
+export function checkContentLengthCap(request: Request, max: number = MAX_REQUEST_BODY_BYTES): Response | null {
+  const raw = request.headers.get('content-length');
+  if (raw === null) return null;
+  const declared = Number(raw);
+  if (!Number.isFinite(declared) || declared < 0) {
+    // Malformed header — treat as suspicious. Reject rather than guessing.
+    return Response.json({ error: 'invalid content-length' }, { status: 400 });
+  }
+  if (declared > max) {
+    return Response.json(
+      { error: 'request body too large', maxBytes: max },
+      { status: 413, headers: { 'Connection': 'close' } },
+    );
+  }
+  return null;
+}
+
+/**
+ * Parse a JSON body with a hard size cap. Defensive about chunked transfers
+ * that omit `Content-Length`: streams the body through a manual byte counter
+ * and aborts as soon as the cap is exceeded. This avoids `request.json()`
+ * loading a 1 GB payload into memory before validation could possibly run.
+ *
+ * On success returns `{ ok: true, value }`. On overflow / malformed JSON
+ * returns `{ ok: false, response }` with the appropriate 413 / 400 response
+ * the caller can return directly.
+ */
+export async function readJsonWithSizeCap<T = unknown>(
+  request: Request,
+  max: number = MAX_REQUEST_BODY_BYTES,
+): Promise<{ ok: true; value: T } | { ok: false; response: Response }> {
+  // 1) Cheap header check first — rejects the obvious abuse without ever
+  //    touching the body stream.
+  const headerReject = checkContentLengthCap(request, max);
+  if (headerReject) return { ok: false, response: headerReject };
+
+  // 2) Stream body chunks through a size accumulator. We can't trust
+  //    Content-Length on chunked transfers, so this is the real gate.
+  const body = request.body;
+  if (!body) {
+    return { ok: true, value: {} as T };
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > max) {
+        // Cancel the upstream stream so we don't keep buffering a hostile
+        // sender's bytes after we've already decided to reject.
+        try { await reader.cancel('body too large'); } catch { /* best-effort */ }
+        return {
+          ok: false,
+          response: Response.json(
+            { error: 'request body too large', maxBytes: max },
+            { status: 413, headers: { 'Connection': 'close' } },
+          ),
+        };
+      }
+      chunks.push(value);
+    }
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      response: Response.json(
+        { error: 'failed to read request body', detail: err instanceof Error ? err.message : String(err) },
+        { status: 400 },
+      ),
+    };
+  }
+
+  if (total === 0) {
+    return { ok: true, value: {} as T };
+  }
+
+  // Reassemble chunks into a single Uint8Array, then decode + parse.
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  const text = new TextDecoder('utf-8').decode(merged);
+  try {
+    return { ok: true, value: JSON.parse(text) as T };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      response: Response.json(
+        { error: 'invalid JSON', detail: err instanceof Error ? err.message : String(err) },
+        { status: 400 },
+      ),
+    };
   }
 }
 
@@ -1238,6 +1395,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // Context engine: discover .crowclaw.md, AGENTS.md, CLAUDE.md from working dir
   let contextEngineResult: ContextEngineResult | null = null;
   let contextEngineReady: Promise<void> = Promise.resolve();
+  // #119: Hoist the refresh handle so `shutdown()` can clear it. Without this
+  // two consecutive `createNodeRuntime({ workingDirectory })` calls leave a
+  // stray 60s interval ticking against the previous engine's closure (each
+  // capture pins a ContextEngine instance + its workingDir state).
+  let contextRefresh: ReturnType<typeof setInterval> | null = null;
   // Context discovery: only when workingDirectory is explicitly provided in options
   // CLI/server sets this; tests and library consumers omit it
   const workingDir = (options as Record<string, unknown>).workingDirectory as string | undefined;
@@ -1248,13 +1410,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       contextEngineResult = result;
     }).catch(() => {});
     // Periodic refresh every 60 seconds (picks up .crowclaw.md changes)
-    const contextRefresh = setInterval(() => {
+    contextRefresh = setInterval(() => {
       engine.discover().then((result) => {
         contextEngineResult = result;
       }).catch(() => {});
     }, 60_000);
     // Unref so the interval doesn't prevent process exit in tests
-    if (typeof contextRefresh === 'object' && 'unref' in contextRefresh) {
+    if (typeof contextRefresh === 'object' && contextRefresh !== null && 'unref' in contextRefresh) {
       (contextRefresh as { unref(): void }).unref();
     }
   }
@@ -1263,11 +1425,21 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const securityAuditLog = new SecurityAuditLog(500);
   const rateLimiter = new RateLimiter();
   const authRateLimiter = new RateLimiter();
+  // Issue #69: per-IP WS auth rate limiter with exponential backoff bans.
+  // Lives in @crowclaw/gateway so the same primitive can be reused by other
+  // runtimes (CF Workers). Defaults: 5 failures / minute trigger a 5-minute
+  // ban; bans double on each escalation up to a 1-hour cap. A successful
+  // auth resets both the failure window and the escalation level for that IP.
+  const wsAuthRateLimiter = new WsAuthRateLimiter();
   const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
   let lastHeartbeatAt: string | null = null;
-  eventBus.subscribe((event) => {
+  // #118: Capture the unsubscribe so `shutdown()` can detach the listener.
+  // EventBus is per-runtime today, but listeners outliving their runtime would
+  // still pin closures (resolve fns, runtime locals) until GC, and any future
+  // refactor that hoists EventBus to a singleton would leak across runtimes.
+  const unsubscribeHeartbeatTracker = eventBus.subscribe((event) => {
     if (event.type === 'chat:complete' || event.type === 'session:updated') {
       lastHeartbeatAt = new Date().toISOString();
     }
@@ -2021,7 +2193,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
    * Idempotent and safe to call from a process.on('SIGTERM', ...) handler.
    * Returns a summary so the host CLI can log what was drained.
    */
-  async function shutdown(timeoutMs: number = 5_000): Promise<{ ssEClosed: number; learningAwaited: number; learningPending: number }> {
+  async function shutdown(timeoutMs: number = 5_000): Promise<{ ssEClosed: number; learningAwaited: number; learningPending: number; debouncerFlushed: number }> {
     // 1. Flush every open SSE subscriber. Close the controller, clear the
     //    heartbeat, and unsubscribe from the EventBus so we don't fire
     //    any further events into a closed stream.
@@ -2033,7 +2205,32 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     }
     sseSubscribers.clear();
 
-    // 2. Await in-flight learning.autoCapture with a hang cap so a stuck
+    // 2. #115: Tear down the WebSocket manager — clears its 15s heartbeat
+    //    interval, unsubscribes from the EventBus, and closes every open
+    //    socket with code 1001 (server going away). Without this the
+    //    heartbeat keeps firing into a runtime that's been replaced and
+    //    every back-to-back `createNodeRuntime()` accumulates intervals.
+    try { wsManager.stop(); } catch { /* best-effort */ }
+
+    // 3. #118: Detach the heartbeat-tracker EventBus listener so its
+    //    closure (which captures `lastHeartbeatAt`) doesn't pin the
+    //    runtime's locals after shutdown.
+    try { unsubscribeHeartbeatTracker(); } catch { /* best-effort */ }
+
+    // 4. #119: Stop the context-engine refresh interval. Two consecutive
+    //    `createNodeRuntime({ workingDirectory })` calls would otherwise
+    //    leave a 60s interval ticking against the previous engine.
+    if (contextRefresh) {
+      clearInterval(contextRefresh);
+      contextRefresh = null;
+    }
+
+    // 5. #120: Drain the gateway message debouncer. Each pending entry
+    //    holds a setTimeout handle plus a resolve closure; without an
+    //    explicit flush they survive past shutdown until the timer fires.
+    const debouncerFlushed = gatewayDebouncer.flush();
+
+    // 6. Await in-flight learning.autoCapture with a hang cap so a stuck
     //    extractor can't block shutdown indefinitely. Promises are wrapped
     //    in trackLearning() which swallows errors, so allSettled is safe.
     const pending = [...inFlightLearning];
@@ -2053,6 +2250,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       ssEClosed,
       learningAwaited,
       learningPending: inFlightLearning.size,
+      debouncerFlushed,
     };
   }
 
@@ -2124,6 +2322,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
       }
 
+      // #128: Body-size cap for state-changing methods. A declared
+      // Content-Length above 1 MiB is rejected before we ever touch the
+      // body stream — this is the cheap layer that stops a 1 GB JSON DoS
+      // from buffering through `request.json()` on the unauthenticated
+      // `/api/auth/verify` route or any other POST surface. Routes that
+      // need defense against missing/lying Content-Length (chunked
+      // transfers) additionally read with `readJsonWithSizeCap`.
+      if (request.method === 'POST' || request.method === 'PUT' || request.method === 'PATCH' || request.method === 'DELETE') {
+        const cap = checkContentLengthCap(request);
+        if (cap) {
+          log.warn('Request body exceeds size cap', {
+            component: 'security',
+            path: url.pathname,
+            method: request.method,
+            contentLength: request.headers.get('content-length'),
+            clientIp: getClientIp(request),
+          });
+          return cap;
+        }
+      }
+
       // Stricter rate limit for credential-checking endpoints only.
       // /api/auth/check is a passive cookie/bearer status read that the dashboard
       // hits on every page load — counting it as an "auth attempt" exhausts the
@@ -2161,7 +2380,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           }
           return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN is required when binding to non-localhost' }, { status: 500 });
         }
-        const body = (await request.json()) as { token?: string };
+        // #128: defensive read — caps the body even when Content-Length is
+        // absent or lying (chunked transfers). This is the unauthenticated
+        // surface, so it is the highest-value site to harden beyond the
+        // header precheck above.
+        const parsed = await readJsonWithSizeCap<{ token?: string }>(request);
+        if (!parsed.ok) return parsed.response;
+        const body = parsed.value;
         if (dashToken && timingSafeEqual(body.token ?? '', dashToken)) {
           const cookieValue = getDerivedCookieToken(dashToken);
           const secureSuffix = isLocalhost ? '' : '; Secure';
@@ -2425,8 +2650,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         //      reflect what the runtime would actually serve, not entries
         //      that have been idle for >1h with no chance of resumption.
         pruneStaleBridgeSessions(codeBridgeSessions);
+        // #116: Prune the BridgeProcessRecord Map alongside the session Map.
+        // Without this, entries marked dead but never explicitly terminated
+        // (e.g. child exited but `terminateBridgeProcess` was never called)
+        // accumulate forever and the dashboard counts grow unbounded.
+        pruneDeadBridgeProcesses(bridgeProcesses);
         pruneStaleBrowserSessions(browserSessions);
-        const dynamicMcpClient = mcpClient as unknown as { getStatus?: () => unknown };
         const bridgeProcessSummary = [...bridgeProcesses.values()].map((process) => ({
           sessionId: process.sessionId,
           protocolVersion: process.protocolVersion,
@@ -2481,9 +2710,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             // badge on the Overview panel. `getStatus()` exposes cache-level
             // state only; attach the server list from `getServerStatus()` so
             // the UI count tracks reality.
-            const status = dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null;
+            const status = mcpClient.getStatus();
             if (!status) return null;
-            const serverStatus = (dynamicMcpClient as unknown as { getServerStatus?: () => Record<string, unknown> }).getServerStatus?.() ?? {};
+            const serverStatus = (mcpClient as unknown as { getServerStatus?: () => Record<string, unknown> }).getServerStatus?.() ?? {};
             return { ...status, servers: Object.keys(serverStatus) };
           })(),
           gateway: {
@@ -2515,8 +2744,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           ? String((options.provider as unknown as Record<string, unknown>).model)
           : 'unknown';
         const isEcho = providerName.toLowerCase().includes('echo') || !options.provider;
-        const dynamicMcpCap = mcpClient as unknown as { getStatus?: () => unknown };
-        const mcpStatus = dynamicMcpCap.getStatus ? dynamicMcpCap.getStatus() : null;
+        const mcpStatus = mcpClient.getStatus();
         const hasMcp = Boolean(mcpStatus);
         const hasGateway = Boolean(options.slackSigningSecret);
         const toolCount = tools.list().length;
@@ -2547,8 +2775,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/preflight') {
-        const dynamicMcpClient = mcpClient as unknown as { getStatus?: () => { degraded?: boolean } | null };
-        const mcpStatus = dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null;
+        const mcpStatus = mcpClient.getStatus();
         return Response.json({
           ok: true,
           deployment: deploymentName,
@@ -2571,11 +2798,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // #35: prune-on-read here too — release-check is a heavy enumeration
         //      that's a natural place to flush stale entries.
         pruneStaleBridgeSessions(codeBridgeSessions);
+        // #116: Prune the BridgeProcessRecord Map alongside the session Map.
+        // Without this, entries marked dead but never explicitly terminated
+        // (e.g. child exited but `terminateBridgeProcess` was never called)
+        // accumulate forever and the dashboard counts grow unbounded.
+        pruneDeadBridgeProcesses(bridgeProcesses);
         pruneStaleBrowserSessions(browserSessions);
-        const dynamicMcpClient = mcpClient as unknown as {
-          getStatus?: () => unknown;
-          inspect?: (options?: { refresh?: boolean }) => Promise<unknown>;
-        };
         const bridgeProcessSummary = [...bridgeProcesses.values()].map((process) => ({
           sessionId: process.sessionId,
           pid: process.pid,
@@ -2607,20 +2835,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }));
         const defaultBridgeSession = codeBridgeSessions.get('cli-default');
         const defaultBridgeProcess = bridgeProcesses.get('cli-default');
-        const dynamicMcpStatus = dynamicMcpClient.getStatus ? dynamicMcpClient.getStatus() : null;
+        const dynamicMcpStatus = mcpClient.getStatus();
         let inspectedMcp: unknown;
-        if (dynamicMcpClient.inspect) {
-          try {
-            inspectedMcp = await dynamicMcpClient.inspect();
-          } catch {
-            inspectedMcp = {
-              status: dynamicMcpStatus,
-              tools: [],
-              resources: [],
-              prompts: []
-            };
-          }
-        } else {
+        try {
+          inspectedMcp = await mcpClient.inspect();
+        } catch {
           inspectedMcp = {
             status: dynamicMcpStatus,
             tools: [],
@@ -4543,13 +4762,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/mcp/resources') {
-        const dynamicClient = mcpClient as unknown as { listResources?: () => Promise<unknown[]> };
-        return Response.json(dynamicClient.listResources ? await dynamicClient.listResources() : []);
+        return Response.json(await mcpClient.listResources());
       }
 
       if (request.method === 'GET' && url.pathname === '/api/mcp/prompts') {
-        const dynamicClient = mcpClient as unknown as { listPrompts?: () => Promise<unknown[]> };
-        return Response.json(dynamicClient.listPrompts ? await dynamicClient.listPrompts() : []);
+        return Response.json(await mcpClient.listPrompts());
       }
 
       if (request.method === 'GET' && url.pathname === routePaths.mcp.serverTools) {
@@ -4634,8 +4851,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/mcp/status') {
-        const dynamicClient = mcpClient as unknown as { getStatus?: () => unknown };
-        return Response.json(dynamicClient.getStatus ? dynamicClient.getStatus() : null);
+        return Response.json(mcpClient.getStatus());
       }
 
       if (request.method === 'GET' && url.pathname === '/api/mcp/inspect') {
@@ -4675,11 +4891,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'POST' && url.pathname === '/api/mcp/verify') {
-        const dynamicClient = mcpClient as unknown as { verify?: (options?: { timeoutMs?: number }) => Promise<unknown> };
-        if (dynamicClient.verify) {
-          return Response.json(await dynamicClient.verify());
-        }
-        return Response.json({ ok: false, error: 'verify not supported on this client', latencyMs: 0 });
+        return Response.json(await mcpClient.verify());
       }
 
       if (request.method === 'GET' && url.pathname === '/api/mcp/presets/status') {
@@ -5883,6 +6095,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       // --- WebSocket upgrade (auth via HttpOnly cookie or Authorization header) ---
       if (request.method === 'GET' && url.pathname === '/ws') {
+        // Issue #69: rate-limit WS auth attempts before reading credentials.
+        // OpenClaw CVE-2026-32025 — without this, an attacker can brute-force
+        // the dashboard token at HTTP-handshake speed (the prior `/ws` path
+        // had no per-IP cap; only REST routes did). The limiter denies during
+        // the active ban window and emits Retry-After so well-behaved clients
+        // back off. Successful auth clears the ban-escalation level for the IP.
+        const wsClientIp = getClientIp(request);
+        const wsDecision = wsAuthRateLimiter.beforeAuth(wsClientIp);
+        if (!wsDecision.allowed) {
+          log.warn('WS auth rate limit triggered', {
+            component: 'security',
+            clientIp: wsClientIp,
+            reason: wsDecision.reason,
+            retryAfterSec: wsDecision.retryAfterSec,
+          });
+          return new Response('Too many WebSocket auth attempts', {
+            status: 429,
+            headers: { 'Retry-After': String(wsDecision.retryAfterSec ?? 300) },
+          });
+        }
+
         // Prefer the cookie the browser already holds from /api/auth/verify.
         // Bearer header stays supported for non-browser clients. We intentionally
         // do NOT accept `?token=...` query params: they leak into access logs,
@@ -5897,8 +6130,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const wsAuthenticated = cookieMatches || bearerMatches;
 
         if (dashToken && !wsAuthenticated) {
+          // Issue #69: count this as a failed auth attempt so repeated bad
+          // tokens trigger the exponential backoff ban.
+          wsAuthRateLimiter.recordFailure(wsClientIp);
           return new Response('Unauthorized — authenticated cookie or Authorization header required', { status: 401 });
         }
+        // Issue #69: clear the failure window + ban escalation for this IP
+        // so a legitimate user does not stay penalised after fixing their token.
+        wsAuthRateLimiter.recordSuccess(wsClientIp);
         // Only the owner-of-the-host (localhost + no token configured) gets
         // "authenticated" privileges (can send session:abort). Without this
         // tightening, any local process or malicious page could abort sessions

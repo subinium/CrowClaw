@@ -19,6 +19,23 @@ export interface McpJsonRpcStdioTransportOptions {
   onStderr?: (data: string) => void;
   onClose?: (code: number | null) => void;
   onError?: (error: Error) => void;
+  /**
+   * Issue #103: Auto-reconnect on unexpected close. When true (default), the
+   * transport will schedule `connect()` after the child process closes
+   * unexpectedly, with exponential backoff (1s / 2s / 4s) up to
+   * `reconnectMaxAttempts` (default 3). Disabled automatically once
+   * `disconnect()` is called explicitly.
+   */
+  autoReconnect?: boolean;
+  /** Issue #103: Max reconnect attempts (default 3). */
+  reconnectMaxAttempts?: number;
+  /** Issue #103: Initial backoff delay in ms (default 1000). Doubles each attempt. */
+  reconnectInitialDelayMs?: number;
+  /**
+   * Issue #103: Hook fired before each reconnect attempt. Useful for tests
+   * and operator metrics.
+   */
+  onReconnect?: (attempt: number, delayMs: number) => void;
 }
 
 interface JsonRpcRequest {
@@ -49,12 +66,29 @@ export class McpJsonRpcStdioTransport implements McpTransport {
   private readonly onClose?: (code: number | null) => void;
   private readonly onError?: (error: Error) => void;
 
+  // ---- Issue #103: auto-reconnect state ----
+  private readonly autoReconnect: boolean;
+  private readonly reconnectMaxAttempts: number;
+  private readonly reconnectInitialDelayMs: number;
+  private readonly onReconnect?: (attempt: number, delayMs: number) => void;
+  /** Number of reconnect attempts since the last successful connect. */
+  private reconnectAttempt = 0;
+  /** Pending reconnect timer (if any). */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set to true by `disconnect()` to suppress further reconnect attempts. */
+  private disconnectRequested = false;
+
   constructor(config: McpStdioServerConfig, options?: McpJsonRpcStdioTransportOptions) {
     this.config = config;
     this.requestTimeoutMs = options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.onStderr = options?.onStderr;
     this.onClose = options?.onClose;
     this.onError = options?.onError;
+    // Issue #103: default autoReconnect = true. Backoff: 1s / 2s / 4s. Max 3.
+    this.autoReconnect = options?.autoReconnect ?? true;
+    this.reconnectMaxAttempts = options?.reconnectMaxAttempts ?? 3;
+    this.reconnectInitialDelayMs = options?.reconnectInitialDelayMs ?? 1000;
+    this.onReconnect = options?.onReconnect;
   }
 
   async connect(): Promise<void> {
@@ -89,9 +123,14 @@ export class McpJsonRpcStdioTransport implements McpTransport {
       this.connected = false;
       this.onClose?.(code);
       this.rejectAllPending(new Error(`MCP server process exited with code ${code}`));
+      // Issue #103: schedule reconnect with exponential backoff unless an
+      // explicit disconnect() was requested. Bound to `reconnectMaxAttempts`.
+      this.maybeScheduleReconnect();
     });
 
     this.connected = true;
+    // Issue #103: reset reconnect state on successful connect.
+    this.reconnectAttempt = 0;
 
     // Send MCP initialize request
     await this.sendRequest('initialize', {
@@ -107,7 +146,47 @@ export class McpJsonRpcStdioTransport implements McpTransport {
     this.sendNotification('notifications/initialized', {});
   }
 
+  /**
+   * Issue #103: Schedule a reconnect attempt after unexpected close. No-op when
+   * autoReconnect is disabled, the consumer requested disconnect, or we have
+   * exhausted attempts. Backoff is `initialDelay * 2^attempt`.
+   */
+  private maybeScheduleReconnect(): void {
+    if (!this.autoReconnect) return;
+    if (this.disconnectRequested) return;
+    if (this.reconnectAttempt >= this.reconnectMaxAttempts) return;
+    if (this.reconnectTimer) return; // already scheduled
+
+    const attempt = this.reconnectAttempt + 1;
+    const delayMs = this.reconnectInitialDelayMs * Math.pow(2, this.reconnectAttempt);
+    this.reconnectAttempt = attempt;
+    this.onReconnect?.(attempt, delayMs);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      // The connect() call resets `reconnectAttempt` on success and the close
+      // handler will re-trigger this method on subsequent failures, capping at
+      // `reconnectMaxAttempts`.
+      void this.connect().catch((error: unknown) => {
+        this.onError?.(error instanceof Error ? error : new Error(String(error)));
+      });
+    }, delayMs);
+    // Issue #126 follow-on: don't keep the event loop alive solely to
+    // retry — agents may exit while a backoff is pending.
+    if (typeof this.reconnectTimer === 'object' && this.reconnectTimer !== null) {
+      (this.reconnectTimer as { unref?: () => void }).unref?.();
+    }
+  }
+
   async disconnect(): Promise<void> {
+    // Issue #103: mark explicit disconnect *first* so any in-flight close
+    // handler (race with SIGTERM) suppresses the reconnect schedule.
+    this.disconnectRequested = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     if (!this.connected || !this.childProcess) {
       return;
     }

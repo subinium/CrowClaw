@@ -12,12 +12,16 @@ export interface BridgeProcessRecord {
   exitedAt?: string;
   exitCode?: number | null;
   spawnError?: string;
+  // #123: `removeAllListeners` is called on the handle during termination so
+  //       the child process's event listeners (and their captured closures)
+  //       can be released.
   handle?: {
     pid?: number;
     kill(signal?: string): boolean;
     unref?: () => void;
     on?: (event: string, callback: (code: number | null) => void) => void;
-  };
+    removeAllListeners?: (event?: string) => void;
+  } | null;
 }
 
 export async function ensureBridgeProcess(
@@ -441,5 +445,65 @@ export function terminateBridgeProcess(
   record.alive = false;
   record.socketReady = false;
   record.exitedAt = new Date().toISOString();
+  // #123: Detach all event listeners we registered on the child handle and
+  //       null the handle itself. The 'exit' listener captures `record`,
+  //       which keeps the entry retained even after the child has exited.
+  //       Combined with the `processes.delete(sessionId)` below this lets
+  //       the GC reclaim both the handle and the closure.
+  if (record.handle?.removeAllListeners) {
+    try { record.handle.removeAllListeners(); } catch { /* best-effort */ }
+  }
+  record.handle = null;
+  // #116: Drop the Map entry. Long-running runtimes accumulate dead
+  //       BridgeProcessRecords (each holding a transcript + spawn metadata)
+  //       because previously terminate() only flipped `alive=false` and
+  //       `pruneStaleBridgeSessions` only operated on `codeBridgeSessions`.
+  processes.delete(sessionId);
   return record;
+}
+
+/**
+ * #116: Drop dead or stale bridge process records. Companion to
+ * `pruneStaleBridgeSessions` (in `bridge-state.ts`) which only handles the
+ * transcript-side `codeBridgeSessions` Map; this function targets the
+ * `bridgeProcesses` Map which holds the spawned-child metadata.
+ *
+ * Removes entries that are either:
+ *   - already marked `alive = false` (terminated but never deleted), OR
+ *   - older than `maxAgeMs` based on `startedAt`.
+ *
+ * Returns the number of entries removed.
+ */
+export function pruneDeadBridgeProcesses(
+  processes: Map<string, BridgeProcessRecord>,
+  maxAgeMs: number = 60 * 60 * 1000, // 1h, mirrors session prune default
+  now: number = Date.now(),
+): number {
+  let removed = 0;
+  for (const [key, record] of processes) {
+    // Only drop records that ACTUALLY ran and then exited (have `exitedAt`).
+    // Simulated / spawn-error records (alive=false from birth) stay visible
+    // to operators — they're the only signal that a bridge failed to spawn,
+    // and aggressively pruning them silently swallows the diagnostic.
+    if (!record.alive && record.exitedAt) {
+      processes.delete(key);
+      removed++;
+      continue;
+    }
+    const ts = new Date(record.startedAt).getTime();
+    if (!Number.isFinite(ts)) continue;
+    if (now - ts > maxAgeMs) {
+      // Best-effort terminate so we don't leave a zombie child handle.
+      if (record.handle?.kill) {
+        try { record.handle.kill('SIGTERM'); } catch { /* best-effort */ }
+      }
+      if (record.handle?.removeAllListeners) {
+        try { record.handle.removeAllListeners(); } catch { /* best-effort */ }
+      }
+      record.handle = null;
+      processes.delete(key);
+      removed++;
+    }
+  }
+  return removed;
 }

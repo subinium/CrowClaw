@@ -15,6 +15,212 @@ function validateFetchUrl(url: string): { safe: boolean; reason?: string } {
   } catch { return { safe: false, reason: 'Invalid URL' }; }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #134: Bot-token scrubbing for error messages and URLs.
+//
+// Telegram puts the bot token directly in the URL path (`/bot<TOKEN>/...`),
+// so any stack trace, fetch error, or proxy-debug log can leak it. Scrub
+// before storing in `status.error` (returned by /api/gateway/status) or
+// emitting to logs. The pattern matches Telegram bot tokens specifically:
+// digits, colon, then base64url-ish body. Other platforms with tokens-in-URL
+// (none today, but future-proof) can be added here.
+// ---------------------------------------------------------------------------
+
+const BOT_TOKEN_PATTERN = /bot\d+:[A-Za-z0-9_-]+/g;
+
+/**
+ * Replace any Telegram-style bot token (`bot<digits>:<base64url>`) with
+ * `bot[REDACTED]` so secrets never escape into status payloads or logs.
+ * Returns the input unchanged when it contains no token.
+ */
+export function scrubBotToken(text: string): string {
+  if (!text) return text;
+  return text.replace(BOT_TOKEN_PATTERN, 'bot[REDACTED]');
+}
+
+// ---------------------------------------------------------------------------
+// Issue #69: WebSocket auth rate limiter with exponential backoff bans.
+//
+// The runtime-node `/ws` upgrade path used to be unprotected: an attacker
+// could brute-force the dashboard token at HTTP-handshake speed. This
+// limiter is shared between gateway and runtime-node so the same per-IP
+// budget governs every WS auth attempt.
+//
+// Counts only *failed* auth attempts (the caller decides what counts as
+// failure). After `maxAttempts` failures inside `windowMs`, the IP is
+// banned for `baseBanMs * 2^N` (capped at `maxBanMs`), where N is the
+// number of consecutive ban escalations. A successful auth resets both
+// the failure window AND the ban escalation counter for that IP.
+// ---------------------------------------------------------------------------
+
+export interface WsAuthRateLimiterOptions {
+  /** Failed-attempt cap inside `windowMs` before the IP is banned. Default 5. */
+  maxAttempts?: number;
+  /** Sliding window for counting failures. Default 60_000 ms (1 minute). */
+  windowMs?: number;
+  /** Initial ban duration. Default 5 * 60_000 ms (5 minutes). */
+  baseBanMs?: number;
+  /** Hard cap on exponential ban duration. Default 60 * 60_000 ms (1 hour). */
+  maxBanMs?: number;
+  /** Soft cap on tracked IPs to bound memory. Default 10_000. */
+  maxKeys?: number;
+}
+
+export interface WsAuthRateLimiterDecision {
+  /** True if the upgrade should proceed to auth, false if it must be rejected. */
+  allowed: boolean;
+  /** Seconds until the ban lifts. Always present when `allowed` is false. */
+  retryAfterSec?: number;
+  /** Reason code for logging. */
+  reason?: 'rate-limited' | 'banned';
+}
+
+/**
+ * Per-IP WebSocket auth rate limiter with exponential backoff bans (issue #69).
+ *
+ * Usage:
+ *   const limiter = new WsAuthRateLimiter();
+ *   const decision = limiter.beforeAuth(clientIp);
+ *   if (!decision.allowed) return new Response('Too many attempts', { status: 429, headers: { 'Retry-After': String(decision.retryAfterSec) } });
+ *   const ok = await checkAuth(...);
+ *   if (ok) limiter.recordSuccess(clientIp); else limiter.recordFailure(clientIp);
+ */
+export class WsAuthRateLimiter {
+  private readonly maxAttempts: number;
+  private readonly windowMs: number;
+  private readonly baseBanMs: number;
+  private readonly maxBanMs: number;
+  private readonly maxKeys: number;
+
+  // Per-IP failure timestamps inside the sliding window.
+  private readonly failures = new Map<string, number[]>();
+  // Per-IP ban entry: { until: epoch ms when the ban lifts, level: # of escalations so far }.
+  private readonly bans = new Map<string, { until: number; level: number }>();
+
+  constructor(opts?: WsAuthRateLimiterOptions) {
+    this.maxAttempts = Math.max(1, opts?.maxAttempts ?? 5);
+    this.windowMs = Math.max(1_000, opts?.windowMs ?? 60_000);
+    this.baseBanMs = Math.max(1_000, opts?.baseBanMs ?? 5 * 60_000);
+    this.maxBanMs = Math.max(this.baseBanMs, opts?.maxBanMs ?? 60 * 60_000);
+    this.maxKeys = Math.max(100, opts?.maxKeys ?? 10_000);
+  }
+
+  /**
+   * Check whether `ip` may proceed to auth. Call this before reading or
+   * comparing the auth credential. Returns a decision; on `allowed: false`
+   * the caller must short-circuit with 429 and respect `retryAfterSec`.
+   */
+  beforeAuth(ip: string): WsAuthRateLimiterDecision {
+    const now = Date.now();
+    const ban = this.bans.get(ip);
+    if (ban && ban.until > now) {
+      return { allowed: false, retryAfterSec: Math.ceil((ban.until - now) / 1000), reason: 'banned' };
+    }
+    if (ban && ban.until <= now) {
+      // Ban window passed but escalation level is preserved so the next
+      // burst lands a longer ban. We only forget the ban entirely after a
+      // verified success (recordSuccess) — see resetEscalation below.
+      this.bans.delete(ip);
+      // Re-insert with `until = 0` so the level survives the prune scan.
+      this.bans.set(ip, { until: 0, level: ban.level });
+    }
+    // Even outside an active ban, if we already have N failures in the
+    // window we deny pre-emptively to avoid a thundering herd while the
+    // ban transition is being computed by recordFailure.
+    const recent = this.failures.get(ip);
+    if (recent) {
+      const cutoff = now - this.windowMs;
+      while (recent.length > 0 && recent[0]! <= cutoff) recent.shift();
+      if (recent.length >= this.maxAttempts) {
+        // Emit a fresh ban so the caller can include Retry-After.
+        const ban2 = this.bans.get(ip);
+        const level = (ban2?.level ?? 0) + 1;
+        const banMs = Math.min(this.maxBanMs, this.baseBanMs * Math.pow(2, Math.max(0, level - 1)));
+        const until = now + banMs;
+        this.bans.set(ip, { until, level });
+        // Clear failure window — replay protection now lives in the ban.
+        this.failures.delete(ip);
+        this.evictIfNeeded();
+        return { allowed: false, retryAfterSec: Math.ceil(banMs / 1000), reason: 'rate-limited' };
+      }
+    }
+    return { allowed: true };
+  }
+
+  /** Record a failed auth attempt. Triggers a ban once threshold is reached. */
+  recordFailure(ip: string): void {
+    const now = Date.now();
+    let arr = this.failures.get(ip);
+    if (!arr) {
+      arr = [];
+      this.failures.set(ip, arr);
+    }
+    const cutoff = now - this.windowMs;
+    while (arr.length > 0 && arr[0]! <= cutoff) arr.shift();
+    arr.push(now);
+    if (arr.length >= this.maxAttempts) {
+      const existing = this.bans.get(ip);
+      const level = (existing?.level ?? 0) + 1;
+      const banMs = Math.min(this.maxBanMs, this.baseBanMs * Math.pow(2, Math.max(0, level - 1)));
+      this.bans.set(ip, { until: now + banMs, level });
+      this.failures.delete(ip);
+    }
+    this.evictIfNeeded();
+  }
+
+  /** Record a successful auth. Clears failures and ban-escalation level. */
+  recordSuccess(ip: string): void {
+    this.failures.delete(ip);
+    this.bans.delete(ip);
+  }
+
+  /** Test hook — clear all state. */
+  reset(): void {
+    this.failures.clear();
+    this.bans.clear();
+  }
+
+  /** Test hook — peek at current ban for `ip`, or `null` if none. */
+  getBan(ip: string): { until: number; level: number } | null {
+    return this.bans.get(ip) ?? null;
+  }
+
+  /** Test hook — current failure count inside the active window. */
+  getFailureCount(ip: string): number {
+    const arr = this.failures.get(ip);
+    if (!arr) return 0;
+    const cutoff = Date.now() - this.windowMs;
+    let live = 0;
+    for (let i = arr.length - 1; i >= 0; i -= 1) {
+      if (arr[i]! > cutoff) live += 1;
+      else break;
+    }
+    return live;
+  }
+
+  /** Bound memory: drop oldest tracked IPs once we exceed maxKeys. */
+  private evictIfNeeded(): void {
+    if (this.failures.size > this.maxKeys) {
+      const overflow = this.failures.size - this.maxKeys;
+      let removed = 0;
+      for (const k of this.failures.keys()) {
+        if (removed >= overflow) break;
+        this.failures.delete(k);
+        removed += 1;
+      }
+    }
+    if (this.bans.size > this.maxKeys) {
+      const overflow = this.bans.size - this.maxKeys;
+      let removed = 0;
+      for (const k of this.bans.keys()) {
+        if (removed >= overflow) break;
+        this.bans.delete(k);
+        removed += 1;
+      }
+    }
+  }
+}
+
 export interface NormalizedInboundMessage {
   platform: GatewayPlatform;
   channelId: string;
@@ -524,19 +730,45 @@ export interface GatewayDeliveryPlan {
  * newly recorded and `false` when an unexpired entry already existed. The
  * legacy `mark` method remains for backcompat and internally delegates to
  * `markIfAbsent`.
+ *
+ * Issue #78: Once visible progress occurs (a tool side-effect ran or a token
+ * streamed to the user), call `poisonAfterProgress(key)`. After that, any
+ * subsequent claim attempt for the same key reports `'poisoned'` rather than
+ * silently re-running the side-effect. The runtime surfaces this as 409 to
+ * the platform so retried inbound deliveries fail loud instead of replaying.
  */
+export type GatewayIdempotencyClaim = 'fresh' | 'duplicate' | 'poisoned';
+
 export interface GatewayIdempotencyStore {
   /**
    * Atomically record `key` if it is not already present.
    * Returns `true` if the key was newly recorded, `false` if a still-valid
    * entry already existed. The optional `ttlMs` overrides the store default.
+   *
+   * Note: This boolean form is preserved for backcompat. New code should
+   * prefer `claim()` so the poisoned state is surfaced.
    */
   markIfAbsent(key: string, ttlMs?: number): Promise<boolean>;
+  /**
+   * Issue #78: Tri-state claim that distinguishes fresh / duplicate /
+   * poisoned. Implementations without poisoning support should return
+   * `'fresh' | 'duplicate'` only, matching `markIfAbsent` semantics.
+   */
+  claim?(key: string, ttlMs?: number): Promise<GatewayIdempotencyClaim>;
+  /**
+   * Issue #78: Mark `key` as poisoned because visible progress happened.
+   * Subsequent `claim` calls return `'poisoned'`; subsequent `markIfAbsent`
+   * calls return `false` (a poisoned entry counts as occupied).
+   * No-op if the key is unknown or expired.
+   */
+  poisonAfterProgress?(key: string, ttlMs?: number): Promise<void>;
   /** Remove `key`. Used when downstream processing fails and the caller
    * wants the next retry delivery to be considered fresh. */
   unmark(key: string): Promise<void>;
   /** Whether `key` has an unexpired entry. */
   has(key: string): Promise<boolean>;
+  /** Whether `key` is currently poisoned (issue #78). */
+  isPoisoned?(key: string): Promise<boolean>;
   /** Backcompat shim — equivalent to `markIfAbsent` but discards the result. */
   mark(key: string, ttlMs?: number): Promise<void>;
 }
@@ -558,6 +790,11 @@ export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore 
   // inserted earlier expire earlier, so the iteration order also doubles as
   // an "oldest expiresAt first" ordering for cap-based eviction.
   private readonly entries = new Map<string, number>(); // key -> expiresAt epoch ms
+  // Issue #78: poisoned keys map to the same expiresAt domain. A poisoned
+  // entry is still "present" for `markIfAbsent`/`has` (so dedupe still
+  // rejects), but `claim()` reports `'poisoned'` so the runtime can return
+  // 409 instead of silently re-running side-effects.
+  private readonly poisoned = new Map<string, number>(); // key -> expiresAt epoch ms
   private readonly defaultTtlMs: number;
   private readonly maxEntries: number;
 
@@ -582,6 +819,11 @@ export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore 
         //  because prune runs once per mutation, not per check.)
       }
     }
+    // Drop expired poison markers in the same sweep so they cannot grow
+    // unbounded. Poison TTL mirrors the entry TTL.
+    for (const [key, expiresAt] of this.poisoned) {
+      if (expiresAt <= now) this.poisoned.delete(key);
+    }
     // 2. Enforce cap by evicting oldest entries first.
     if (this.entries.size > this.maxEntries) {
       const overflow = this.entries.size - this.maxEntries;
@@ -589,6 +831,8 @@ export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore 
       for (const key of this.entries.keys()) {
         if (removed >= overflow) break;
         this.entries.delete(key);
+        // Drop matching poison marker so we don't keep stale poison forever.
+        this.poisoned.delete(key);
         removed++;
       }
     }
@@ -601,6 +845,12 @@ export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore 
     if (existing !== undefined && existing > now) {
       return false;
     }
+    // Issue #78: poisoned-without-entry can happen if the entry was unmarked
+    // after poisoning (operator-driven). Treat as occupied — never re-run.
+    const poisonedAt = this.poisoned.get(key);
+    if (poisonedAt !== undefined && poisonedAt > now) {
+      return false;
+    }
     // If the existing entry was expired, delete first so re-set lands at the
     // tail of insertion order (matching new-entry semantics for eviction).
     if (existing !== undefined) {
@@ -610,8 +860,61 @@ export class InMemoryGatewayIdempotencyStore implements GatewayIdempotencyStore 
     return true;
   }
 
+  /**
+   * Issue #78: tri-state claim. `'fresh'` = newly recorded, claim succeeded.
+   * `'duplicate'` = unexpired entry exists but no side-effects yet (caller
+   * may choose to wait/retry the *same* outbound). `'poisoned'` = visible
+   * progress already happened; the caller MUST NOT replay and should surface
+   * a 409 to the platform.
+   */
+  async claim(key: string, ttlMs: number = this.defaultTtlMs): Promise<GatewayIdempotencyClaim> {
+    const now = Date.now();
+    this.prune(now);
+    const poisonedAt = this.poisoned.get(key);
+    if (poisonedAt !== undefined && poisonedAt > now) {
+      return 'poisoned';
+    }
+    const existing = this.entries.get(key);
+    if (existing !== undefined && existing > now) {
+      return 'duplicate';
+    }
+    if (existing !== undefined) {
+      this.entries.delete(key);
+    }
+    this.entries.set(key, now + ttlMs);
+    return 'fresh';
+  }
+
+  /**
+   * Issue #78: mark `key` as poisoned because the inbound delivery has
+   * caused user-visible progress (tool side-effect, streamed token, etc).
+   * Subsequent claims return `'poisoned'`. Idempotent.
+   */
+  async poisonAfterProgress(key: string, ttlMs: number = this.defaultTtlMs): Promise<void> {
+    const now = Date.now();
+    this.poisoned.set(key, now + ttlMs);
+    // Refresh the entry's expiresAt too so `markIfAbsent` keeps treating the
+    // key as occupied for the same window. This avoids a race where the
+    // entry expires before the poison marker.
+    if (this.entries.has(key)) {
+      this.entries.set(key, now + ttlMs);
+    }
+  }
+
+  async isPoisoned(key: string): Promise<boolean> {
+    const expiresAt = this.poisoned.get(key);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= Date.now()) {
+      this.poisoned.delete(key);
+      return false;
+    }
+    return true;
+  }
+
   async unmark(key: string): Promise<void> {
     this.entries.delete(key);
+    // Note: do NOT drop the poison marker. If the operator unmarks a key
+    // that has produced visible progress, replays should still fail loud.
   }
 
   async has(key: string): Promise<boolean> {

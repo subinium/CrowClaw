@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/shared",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -11,8 +11,7 @@
     }
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
   "publishConfig": {
     "access": "public"

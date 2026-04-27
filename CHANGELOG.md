@@ -5,6 +5,60 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.1] — 2026-04-28 — 26-issue follow-up sweep: shutdown leaks, body cap, gateway poison + WS auth limit, layering fix
+
+Follow-up sweep on the v0.6.0 release. Triaged the 89 issues that v0.6.0 left open and processed every non-breaking item with another **8-way parallel agent execution** round. Of the 89 open: ~40 were closed retroactively (work was actually shipped in v0.6.0 but commit-message close keywords didn't match the GH issue numbers exactly), ~26 implemented in this release, ~23 remain (breaking changes / architectural scope deferred to v0.7).
+
+- **7 commits**, ~50 files changed, ~+5,500 / -340 lines
+- **2,532 / 2,532 tests passing** (up from 2,421 — **111 new tests**)
+- 6 new test files: `v06_1-runtime-node-shutdown` (27), `v06_1-gateway` (21), `v06_1-tools-memory` (16), `v06_1-mcp-providers-acp` (24), `v06_1-core-plugins-layering` (12), `do-idempotency-store` (12), plus glossary doc
+
+### Reliability (CRITICAL)
+- **Runtime-node shutdown closes all v0.6.0 leaks** (#115 #116 #118 #119 #120 #123 #124 #128 #156). v0.6.0 added the `WebSocketManager.stop()` API but no caller; v0.6.1 wires it into `shutdown()` alongside `pruneDeadBridgeProcesses` (only collects records with `exitedAt`; preserves spawn-error records for operator visibility), `unsubscribeHeartbeatTracker`, `clearInterval(contextRefresh)`, `GatewayDebouncer.flush()`, and child-handle `removeAllListeners + null`. RateLimiter eviction off-by-one fixed (forward-walk that always frees one slot and never evicts the just-inserted key). Vestigial `as unknown as` casts on `mcpClient` dropped at 7 of 9 sites. (`packages/runtime-node/src/index.ts`, `bridge-process.ts`.)
+- **1 MiB body size cap on POST/PUT/PATCH/DELETE** (#128). New `checkContentLengthCap` (header gate) + `readJsonWithSizeCap` (streaming + chunked-defense) helpers. Global precheck rejects oversized requests with HTTP 413 before buffering; unauthenticated `/api/auth/verify` reads with the streaming-safe parser. Logs every rejection with client IP for observability.
+- **WS auth rate-limit + exponential backoff bans** (#69). `WsAuthRateLimiter` from `@crowclaw/gateway`: per-IP attempt cap (5/min), failed-auth backoff bans starting at 5min, doubling, capped at 1h. Applied at `runtime-node` `/ws` upgrade before reading credentials. Successful auth clears the IP. (OpenClaw CVE-2026-32025 parity.)
+- **Gateway dedupe poisoning after visible progress** (#78). `GatewayIdempotencyStore` extended with `poisonAfterProgress(key)` and tri-state `claim()` returning `'fresh' | 'duplicate' | 'poisoned'`. After a tool side-effect or streamed token, retries return `409 poisoned` instead of silently re-running. (OpenClaw v2026.4.25 issues #69303 / #58549.)
+- **MemoryManager.shutdown passes session transcript** (#85). New `shutdown(sessionId, messages)` fans the live transcript out to every provider's optional `onSessionEnd`; previously call sites passed `[]`, silently disabling dream-memory live capture. Per-provider failures isolated via `SessionEndResult[]`. (Hermes PR #16571 parity.)
+- **Concurrent approval callback propagation** (#86). `ToolRegistry.execute` snapshots `context.approval` into a per-dispatch symbol slot before calling `tool.execute`. Concurrent `Promise.all` workers see a stable approval reference even when the parent context is mutated mid-flight. (Hermes PR #16574 parity.)
+- **read_file dedup-stub escalation** (#88). `workspace.read` tracks per-session per-path read counts; after `WORKSPACE_READ_DEDUP_LIMIT=3` repeats, returns BLOCKED with `metadata['tool:blocked_dedup']=true`. Adds `resetWorkspaceReadDedup` for host session-end hooks. (Hermes PR #16382 parity.)
+
+### Reliability / DX (WARNING)
+- **MCP idle session TTL + stdio auto-reconnect with backoff** (#80, #103). `McpClient.sessionIdleTtlMs` + `sweepIfIdle` / `dispose` / `isIdle` helpers; `MultiServerMcpManager.sweepIdle` / `disposeAll`. Stdio transport `autoReconnect: true` (default) with 1s/2s/4s backoff and max 3 attempts; `disconnect()` cancels pending timer.
+- **Telegram update batches concurrent with p-limit(3)** (#109). Per-update logic extracted to `handleTelegramUpdate`; 10-message burst now runs in ~4 waves instead of serially.
+- **Telegram bot tokens scrubbed from error paths** (#134). `bot<digits>:<token>` → `bot[REDACTED]` before storing in `GatewayStatus` or returning via `/api/gateway/status`. Applied to `telegramGetMe`, `telegramGetUpdates`, `startTelegram` error path, and the poll-loop status update.
+- **AcpServer `tools/list` connects to optional registry** (#148). Constructor accepts `tools?: () => AcpToolInfo[]` callback; returns `{ tools, available: true }` when wired, `{ tools: [], available: false, error? }` when unwired. Lets ACP clients probe capability before `prompt/execute`.
+- **Plugin manifest `modelCatalog` cold-read** (#81). `packages/providers/src/model-catalog.ts` exports `PluginManifestModelCatalog`, `hasPluginManifestModelCatalog`, `readPluginManifestModelCatalog`, `seedManifestCacheFromPlugin`. Defensive against unknown input shapes; works whether or not the plugins package eventually adds a typed `modelCatalog` field. (OpenClaw v2026.4.24.)
+- **Layering inversion fixed: `core` no longer depends on `plugins`** (#158). `Plugin` contract types + `PluginManager` moved into `packages/core/src/plugins.ts` and re-exported from `@crowclaw/core`. `@crowclaw/plugins` is now a re-export shim depending on core (correct direction). Identity check pins `CorePluginManager === ShimPluginManager` so all existing consumers keep working unchanged.
+- **DurableObjectIdempotencyStore unit suite** (#159). 12 dedicated tests covering concurrent same-key `markIfAbsent`, TTL expiry + eviction (fake timers), storage round-trip on hydrate (with expired-snapshot filtering, `unmark` persistence, storage.get failure fallback), and `maxEntries` cap eviction durability across hydrate cycles.
+
+### Repo hygiene
+- **Drop `'src'` from all 19 package `files` arrays** (#157). Halves install size for consumers; composite build verified clean. Per-package `types` still points to `src/index.ts` for workspace-internal type resolution — flipping to `dist/*.d.ts` for publishable artifacts is a v0.7 follow-up.
+- **Workspace name validation in postinstall** (#136). `link-workspaces.mjs` validates `@crowclaw/<segment>` against `/^[a-z0-9_-]+$/`; invalid names skipped with `console.warn`.
+- **Cross-cutting glossary** (#151). New `docs/glossary.md` maps `session`/`run`/`job`/`task`/`abort`/`stop` terminology across CLI/REST/EventBus/ACP/MCP, with explicit response-shape tables for the stop semantics (200 stopped / 202 pending / 404 not-active) and the v0.6.0 EventBus discriminated union. No code renames performed.
+
+### Cross-package contracts added / changed
+- `MemoryManager.shutdown(sessionId, messages): Promise<SessionEndResult[]>` + `MemoryProvider.onSessionEnd?(...)` — `@crowclaw/memory`
+- `WorkspaceReadDedup` exports — `@crowclaw/tools`
+- `WsAuthRateLimiter` + `GatewayIdempotencyClaim` + `claim()/poisonAfterProgress()/isPoisoned()` — `@crowclaw/gateway`
+- `McpClient.sessionIdleTtlMs` + lifecycle helpers — `@crowclaw/mcp`
+- `McpJsonRpcStdioTransport` `autoReconnect` / `reconnectMaxAttempts` / `reconnectInitialDelayMs` / `onReconnect` — `@crowclaw/mcp`
+- `PluginManifestModelCatalog` + `seedManifestCacheFromPlugin` — `@crowclaw/providers`
+- `AcpToolInfo` + `tools?:` callback — `@crowclaw/acp`
+- `pruneDeadBridgeProcesses(processes, maxAgeMs?)` — `@crowclaw/runtime-node/bridge-process`
+- `GatewayDebouncer.flush()` — `@crowclaw/runtime-node`
+- All `Plugin*` symbols now also exported from `@crowclaw/core` (canonical home) — `@crowclaw/plugins` becomes a shim
+
+### Verification
+- `npm run typecheck` — clean
+- `npm test` — 2,532 / 2,532 across 214 files (8.92s)
+- 111 new tests; full suite up from 2,421 → 2,532
+
+### Sources
+- Hermes (post-v0.11.0 catch-up): PRs #16569 (#84-class fork toolset wired), #16571 (#85), #16574 (#86), #16382 (#88).
+- OpenClaw v2026.4.25 + earlier: issue #69303/#58549 (#78 poison dedupe), v2026.4.24 (#80 sessionIdleTtl, #81 modelCatalog cold-read), CVE-2026-32025 (#69 WS auth limit).
+- Internal v0.6.0 audit follow-up: 14 audit items (#115-#128 #134 #136 #151 #157 #159).
+- Cross-cutting refactor: #156, #158.
+
 ## [0.6.0] — 2026-04-28 — 103-issue sweep: NemoClaw + post-v0.11.0 Hermes + OpenClaw v2026.4.25 parity, security hardening, leak fixes
 
 A single release closing **103 issues (#63–#165)** filed in an eight-agent triage round (security / reliability / perf / UX-flow / memory-retention / cross-cutting + external-pattern research against `NousResearch/hermes-agent` post-v0.11.0, `openclaw/openclaw` v2026.4.24+v2026.4.25, and `NVIDIA/NemoClaw` first 30 days). Implementation ran with 8-way parallel agent execution; 14 commits, ~57 files modified, 13 new files (5 helpers / 8 test files), +5,300 / -300 lines, **2,421 tests passing** (up from 2,187 — 234 new tests).

@@ -49,6 +49,18 @@ export interface AcpAgentManifest {
   features?: string[];
 }
 
+/**
+ * Issue #148: Tool descriptor surfaced via `tools/list`. Mirrors the MCP
+ * shape so callers can pipe straight from a registry without a translation
+ * layer. `inputSchema` is optional — registries that don't ship JSON Schema
+ * yet just omit it.
+ */
+export interface AcpToolInfo {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // Agent loop interface expected by the ACP server
 // ---------------------------------------------------------------------------
@@ -88,6 +100,16 @@ export class AcpServer {
       agentId?: string;
       displayName?: string;
       version?: string;
+      /**
+       * Issue #148: Optional registry callback that returns the live tool
+       * surface. When provided, `tools/list` returns `{ tools, available: true }`.
+       * When omitted, `tools/list` returns `{ tools: [], available: false }`
+       * to signal the bridge is wired but no registry is connected — clients
+       * can detect the difference and fall back to MCP. Errors thrown by the
+       * callback are caught and surface as `available: false` with an
+       * `error` field rather than failing the request.
+       */
+      tools?: () => AcpToolInfo[] | Promise<AcpToolInfo[]>;
     },
   ) {}
 
@@ -179,8 +201,20 @@ export class AcpServer {
           });
         }
 
-        case 'tools/list':
-          return this.respondOk(id, { tools: [] });
+        case 'tools/list': {
+          // Issue #148: surface the registry callback when wired; otherwise
+          // signal availability=false so clients can route through MCP.
+          if (!this.options?.tools) {
+            return this.respondOk(id, { tools: [], available: false });
+          }
+          try {
+            const tools = await this.options.tools();
+            return this.respondOk(id, { tools, available: true });
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            return this.respondOk(id, { tools: [], available: false, error: message });
+          }
+        }
 
         case 'shutdown':
           this.shutdownRequested = true;

@@ -219,10 +219,15 @@ export { UserModelService, type UserProfile } from './user-model.js';
 export {
   type MemoryRecord as ManagerMemoryRecord,
   type MemoryProvider,
+  type SessionTranscriptMessage,
   BuiltInMemoryProvider,
   EmbeddingMemoryProvider,
 } from './memory-provider.js';
-export { MemoryManager, SKIP_REDACTION_FLAG } from './memory-manager.js';
+export {
+  MemoryManager,
+  SKIP_REDACTION_FLAG,
+  type SessionEndResult,
+} from './memory-manager.js';
 export {
   FrozenMemory,
   InMemoryFrozenStore,
