@@ -245,10 +245,17 @@ export class GatewayRunner {
         if (!normalized) continue;
 
         if (this.config.onMessage) {
+          // Issue #102: Wrap the typing indicator in try/finally that spans
+          // BOTH onMessage AND the send path. Previously, `typing.stop()` was
+          // called immediately after onMessage resolved, leaving the indicator
+          // stopped while the send was still in flight (so the user saw
+          // "online, not typing" during a possibly-long retry). On the error
+          // path, the catch handler stopped it but did not protect the send
+          // call itself. The `finally` block guarantees the indicator is
+          // always stopped exactly once, regardless of where we exit.
           const typing = createTypingIndicator(poller.botToken, normalized.channelId);
           try {
             const reply = await this.config.onMessage(normalized);
-            typing.stop();
             if (reply) {
               // Per-platform rate limit check — delay instead of dropping
               if (!this.platformRateLimiter.check('telegram')) {
@@ -271,8 +278,10 @@ export class GatewayRunner {
               }
             }
           } catch {
+            // Silently handle callback or send errors to keep polling alive.
+            // The `finally` clause below stops the typing indicator either way.
+          } finally {
             typing.stop();
-            // Silently handle callback errors to keep polling alive
           }
         }
       }
