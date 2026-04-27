@@ -1743,6 +1743,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     return result;
   }
 
+  // #152: wire ownerToken from CROWCLAW_DASHBOARD_TOKEN so the embedded MCP
+  // server enforces ownerOnly tool gating. Without this, the bridge runs in
+  // "legacy mode" where every caller is treated as owner — any unauthenticated
+  // POST to /api/mcp/server/request could invoke `crowclaw.chat`.
+  const embeddedMcpOwnerToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
   const embeddedMcpServer = new CrowClawMcpServer({
     run: async ({ sessionId, userMessage }) => {
       const result = await runConfiguredAgent({
@@ -1755,6 +1760,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }, {
     name: options.agentId ?? 'crowclaw-mcp-server',
     version,
+    ownerToken: embeddedMcpOwnerToken,
   });
 
   const embeddedAcpServer = new AcpServer({
@@ -4547,22 +4553,33 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === routePaths.mcp.serverTools) {
+        // #154: filter ownerOnly tools out of the unauthenticated listing.
+        const auth = request.headers.get('authorization');
+        const callerToken = auth?.startsWith('Bearer ') ? auth.slice(7) : undefined;
         return Response.json({
           server: {
             name: options.agentId ?? 'crowclaw-mcp-server',
             version,
           },
-          tools: embeddedMcpServer.getToolDefinitions()
+          tools: embeddedMcpServer.getVisibleTools(callerToken)
         });
       }
 
       if (request.method === 'POST' && url.pathname === routePaths.mcp.serverRequest) {
+        // #152: extract bearer token and inject into _meta so the MCP server
+        // can enforce ownerOnly gating (without this every caller was owner).
+        const auth = request.headers.get('authorization');
+        const callerToken = auth?.startsWith('Bearer ') ? auth.slice(7) : undefined;
         const body = (await request.json()) as {
           jsonrpc: '2.0';
           id: number | string;
           method: string;
           params?: Record<string, unknown>;
+          _meta?: { token?: string; [key: string]: unknown };
         };
+        if (callerToken) {
+          body._meta = { ...(body._meta ?? {}), token: callerToken };
+        }
         return Response.json(await embeddedMcpServer.handleRequest(body));
       }
 
