@@ -9,14 +9,14 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#5-minute-quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#packages"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-2421%20passed-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-2532%20passed-brightgreen.svg" alt="Tests" />
     <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.5.0-blue.svg" alt="Changelog" /></a>
   </p>
 </p>
 
 ---
 
-> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2421 tests, five-agent cross-audit, 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
+> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2532 tests, five-agent cross-audit, 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
 
 CrowClaw gives you an agent loop, 50+ tools, skill learning, scheduled jobs, multi-channel webhooks, and a dashboard — without wiring the whole stack yourself.
 
@@ -204,7 +204,7 @@ Runtime adapters (`runtime-node`, `runtime-cloudflare`) wrap the runtime-agnosti
 
 | Area | Status |
 |---|---|
-| Agent loop (`@crowclaw/core`) | Beta — tested, five-agent cross-audit, 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep |
+| Agent loop (`@crowclaw/core`) | Beta — tested, five-agent cross-audit, 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep |
 | Node.js runtime | Beta — primary runtime |
 | Cloudflare Workers runtime | **Early adapter** — functional, narrower override surface than Node |
 | Provider routing (OpenAI-compat / Anthropic) | Partial — credential pooling, prompt caching, fallback chain |
@@ -457,7 +457,7 @@ npm test             # vitest run
 npm run preflight    # both
 ```
 
-Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2421 tests** as of v0.6.0.
+Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2532 tests** as of v0.6.1.
 
 ## Packages
 
