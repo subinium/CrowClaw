@@ -222,7 +222,7 @@ export {
   BuiltInMemoryProvider,
   EmbeddingMemoryProvider,
 } from './memory-provider.js';
-export { MemoryManager } from './memory-manager.js';
+export { MemoryManager, SKIP_REDACTION_FLAG } from './memory-manager.js';
 export {
   FrozenMemory,
   InMemoryFrozenStore,
