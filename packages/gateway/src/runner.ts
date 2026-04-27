@@ -13,10 +13,56 @@ import {
   buildGatewayRetryPolicy,
   createTypingIndicator,
   normalizeTelegramWebhook,
+  scrubBotToken,
   sendTelegramMessage,
 } from './index.js';
 import { executeWithRetry } from './retry.js';
 import { PlatformRateLimiter } from './platform-rate-limiter.js';
+
+// ---------------------------------------------------------------------------
+// Issue #109: Minimal p-limit-style concurrency gate.
+//
+// The Telegram polling loop used to await `onMessage` per update sequentially.
+// A burst of 10 messages serialized 10 LLM calls for users in different chats.
+// This gate runs up to `max` updates concurrently. Kept inline so the gateway
+// stays zero-dep (matching the comment at the top of `index.ts`).
+// ---------------------------------------------------------------------------
+function createConcurrencyLimiter(
+  max: number,
+): <T>(fn: () => Promise<T>) => Promise<T> {
+  const limit = Math.max(1, Math.floor(max));
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  const next = (): void => {
+    if (active >= limit) return;
+    const run = queue.shift();
+    if (run) run();
+  };
+
+  return <T>(fn: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const start = (): void => {
+        active += 1;
+        Promise.resolve()
+          .then(fn)
+          .then(
+            (value) => {
+              active -= 1;
+              resolve(value);
+              next();
+            },
+            (err: unknown) => {
+              active -= 1;
+              reject(err);
+              next();
+            },
+          );
+      };
+      if (active < limit) start();
+      else queue.push(start);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -65,7 +111,9 @@ async function telegramGetMe(botToken: string): Promise<{ ok: boolean; username?
     }
     return { ok: false, error: 'Invalid bot token' };
   } catch (error: unknown) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    // Issue #134: scrub bot token from any error message (URL or body) before
+    // it bubbles up to status payloads or logs.
+    return { ok: false, error: scrubBotToken(error instanceof Error ? error.message : String(error)) };
   }
 }
 
@@ -92,7 +140,8 @@ async function telegramGetUpdates(
     if (error instanceof Error && error.name === 'AbortError') {
       return { ok: false, updates: [], error: 'aborted' };
     }
-    return { ok: false, updates: [], error: error instanceof Error ? error.message : String(error) };
+    // Issue #134: scrub bot token from any error message before it surfaces.
+    return { ok: false, updates: [], error: scrubBotToken(error instanceof Error ? error.message : String(error)) };
   }
 }
 
@@ -106,6 +155,10 @@ export class GatewayRunner {
   private telegramPollers: Map<string, TelegramPollerState> = new Map();
   private running = false;
   private readonly platformRateLimiter = new PlatformRateLimiter();
+  // Issue #109: bound concurrent update handling so a 10-message burst does
+  // not serialize 10 LLM calls. 3 keeps Telegram from running out of typing
+  // indicators or hitting per-chat rate caps while still parallelising.
+  private readonly updateLimiter = createConcurrencyLimiter(3);
 
   constructor(config: GatewayRunnerConfig) {
     this.config = config;
@@ -181,7 +234,13 @@ export class GatewayRunner {
     const me = await telegramGetMe(botToken);
 
     if (!me.ok) {
-      const status: GatewayStatus = { platform: 'telegram', connected: false, error: me.error };
+      // Issue #134: scrub bot token from getMe error before storing in status —
+      // this string is returned by /api/gateway/status (a localhost-bypass route).
+      const status: GatewayStatus = {
+        platform: 'telegram',
+        connected: false,
+        error: me.error ? scrubBotToken(me.error) : me.error,
+      };
       this.statuses.set('telegram', status);
       return status;
     }
@@ -219,10 +278,12 @@ export class GatewayRunner {
       if (!poller.running || !this.running) break;
 
       if (!result.ok) {
-        // Update status with error but keep trying
+        // Update status with error but keep trying.
+        // Issue #134: scrub any leaked bot token from `result.error` before
+        // storing — this string is exposed by /api/gateway/status.
         const status = this.statuses.get('telegram');
         if (status && result.error !== 'aborted') {
-          status.error = result.error;
+          status.error = result.error ? scrubBotToken(result.error) : result.error;
         }
         // Back off on error
         await this.sleep(intervalMs * 3, poller.abortController.signal);
@@ -235,61 +296,83 @@ export class GatewayRunner {
         status.error = undefined;
       }
 
+      // Advance offset for every update synchronously so we don't re-fetch
+      // the same updates if a concurrent handler is still in flight when the
+      // next poll fires.
       for (const update of result.updates) {
-        // Advance offset past this update
         if (update.update_id !== undefined) {
           poller.offset = update.update_id + 1;
         }
-
-        const normalized = normalizeTelegramWebhook(update);
-        if (!normalized) continue;
-
-        if (this.config.onMessage) {
-          // Issue #102: Wrap the typing indicator in try/finally that spans
-          // BOTH onMessage AND the send path. Previously, `typing.stop()` was
-          // called immediately after onMessage resolved, leaving the indicator
-          // stopped while the send was still in flight (so the user saw
-          // "online, not typing" during a possibly-long retry). On the error
-          // path, the catch handler stopped it but did not protect the send
-          // call itself. The `finally` block guarantees the indicator is
-          // always stopped exactly once, regardless of where we exit.
-          const typing = createTypingIndicator(poller.botToken, normalized.channelId);
-          try {
-            const reply = await this.config.onMessage(normalized);
-            if (reply) {
-              // Per-platform rate limit check — delay instead of dropping
-              if (!this.platformRateLimiter.check('telegram')) {
-                const limit = this.platformRateLimiter.getLimit('telegram');
-                const delayMs = Math.ceil(60_000 / limit.maxPerMinute);
-                await this.sleep(delayMs, poller.abortController.signal);
-              }
-              // Retry with exponential backoff on send failure
-              const retryPolicy = buildGatewayRetryPolicy('telegram');
-              const result = await executeWithRetry(
-                () => sendTelegramMessage(poller.botToken, normalized.channelId, reply, { parseMode: 'Markdown' }),
-                retryPolicy,
-                poller.abortController.signal,
-              );
-              if (!result.ok) {
-                // Log retry exhaustion — reply is lost after all attempts failed
-                const errMsg = result.lastError ?? 'unknown';
-                try { await sendTelegramMessage(poller.botToken, normalized.channelId, 'Sorry, I encountered an error sending my response.', {}); } catch { /* best-effort fallback */ }
-                void errMsg; // Consumed by future structured logging integration
-              }
-            }
-          } catch {
-            // Silently handle callback or send errors to keep polling alive.
-            // The `finally` clause below stops the typing indicator either way.
-          } finally {
-            typing.stop();
-          }
-        }
       }
+
+      // Issue #109: handle the batch concurrently with bounded p-limit so a
+      // burst of 10 messages does not serialize 10 LLM calls. We still
+      // `await` the whole batch before returning to the polling cycle to
+      // preserve back-pressure against runaway provider failures.
+      await Promise.all(
+        result.updates.map((update) =>
+          this.updateLimiter(() => this.handleTelegramUpdate(poller, update)),
+        ),
+      );
 
       // Small interval between polls to avoid hammering
       if (result.updates.length === 0) {
         await this.sleep(intervalMs, poller.abortController.signal);
       }
+    }
+  }
+
+  /**
+   * Issue #109: per-update handler extracted so the polling loop can dispatch
+   * with `p-limit(3)`. Mirrors the previous inline body byte-for-byte (typing
+   * indicator semantics from #102 preserved).
+   */
+  private async handleTelegramUpdate(
+    poller: TelegramPollerState,
+    update: TelegramUpdate,
+  ): Promise<void> {
+    const normalized = normalizeTelegramWebhook(update);
+    if (!normalized) return;
+    if (!this.config.onMessage) return;
+
+    // Issue #102: Wrap the typing indicator in try/finally that spans
+    // BOTH onMessage AND the send path. Previously, `typing.stop()` was
+    // called immediately after onMessage resolved, leaving the indicator
+    // stopped while the send was still in flight (so the user saw
+    // "online, not typing" during a possibly-long retry). On the error
+    // path, the catch handler stopped it but did not protect the send
+    // call itself. The `finally` block guarantees the indicator is
+    // always stopped exactly once, regardless of where we exit.
+    const typing = createTypingIndicator(poller.botToken, normalized.channelId);
+    try {
+      const reply = await this.config.onMessage(normalized);
+      if (reply) {
+        // Per-platform rate limit check — delay instead of dropping
+        if (!this.platformRateLimiter.check('telegram')) {
+          const limit = this.platformRateLimiter.getLimit('telegram');
+          const delayMs = Math.ceil(60_000 / limit.maxPerMinute);
+          await this.sleep(delayMs, poller.abortController.signal);
+        }
+        // Retry with exponential backoff on send failure
+        const retryPolicy = buildGatewayRetryPolicy('telegram');
+        const sendResult = await executeWithRetry(
+          () => sendTelegramMessage(poller.botToken, normalized.channelId, reply, { parseMode: 'Markdown' }),
+          retryPolicy,
+          poller.abortController.signal,
+        );
+        if (!sendResult.ok) {
+          // Log retry exhaustion — reply is lost after all attempts failed.
+          // Issue #134: scrub any bot token that leaked into lastError.
+          const errMsg = scrubBotToken(sendResult.lastError ?? 'unknown');
+          try { await sendTelegramMessage(poller.botToken, normalized.channelId, 'Sorry, I encountered an error sending my response.', {}); } catch { /* best-effort fallback */ }
+          void errMsg; // Consumed by future structured logging integration
+        }
+      }
+    } catch {
+      // Silently handle callback or send errors to keep polling alive.
+      // The `finally` clause below stops the typing indicator either way.
+    } finally {
+      typing.stop();
     }
   }
 
