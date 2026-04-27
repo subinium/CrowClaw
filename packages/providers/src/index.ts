@@ -2347,6 +2347,14 @@ export type {
   ManifestCacheEntry,
 } from './model-catalog.js';
 
+// Issue #81: Plugin manifest cold-read for fast startup
+export {
+  hasPluginManifestModelCatalog,
+  readPluginManifestModelCatalog,
+  seedManifestCacheFromPlugin,
+} from './model-catalog.js';
+export type { PluginManifestModelCatalog } from './model-catalog.js';
+
 // Issue #61: Local embedding provider with tunable context size
 export { LocalEmbeddingProvider } from './local-embedding-provider.js';
 export type { LocalEmbeddingProviderConfig } from './local-embedding-provider.js';

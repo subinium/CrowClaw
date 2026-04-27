@@ -118,6 +118,20 @@ export interface McpClientOptions {
   toolPrefix?: string;
   allowTools?: string[];
   denyTools?: string[];
+  /**
+   * Issue #80: Idle TTL for one-shot agent sessions. If set, the client tracks
+   * `lastUsedAt` on every `callTool` / `listTools` / `listResources` /
+   * `listPrompts` call and marks the session evictable once it has been idle
+   * for longer than this. Callers (or `MultiServerMcpManager.sweepIdle`) drive
+   * the actual eviction by calling {@link McpClient.sweepIfIdle} on a tick.
+   *
+   * Set to `0` or omit to disable idle eviction (default).
+   */
+  sessionIdleTtlMs?: number;
+  /**
+   * Issue #80: Override clock source for tests. Defaults to `Date.now`.
+   */
+  now?: () => number;
 }
 
 export class McpHttpTransport implements McpTransport {
@@ -181,11 +195,19 @@ export class McpClient {
   private degraded = false;
   private lastError?: string;
   private lastRefreshAt?: string;
+  /** Issue #80: epoch ms of last successful activity. */
+  private lastUsedAt: number;
+  /** Issue #80: set when sweepIfIdle/dispose has evicted this session. */
+  private disposed = false;
+  private readonly now: () => number;
 
   constructor(
     private readonly transport: McpTransport,
     private readonly options: McpClientOptions = {}
-  ) {}
+  ) {
+    this.now = options.now ?? Date.now;
+    this.lastUsedAt = this.now();
+  }
 
   static fromStdio(
     config: McpStdioServerConfig,
@@ -219,6 +241,7 @@ export class McpClient {
   }
 
   async refreshTools(): Promise<RegisteredMcpToolDefinition[]> {
+    this.ensureNotDisposed();
     try {
       const discovered = await this.transport.listTools();
       const registered = discovered
@@ -228,6 +251,7 @@ export class McpClient {
       this.degraded = false;
       this.lastError = undefined;
       this.lastRefreshAt = new Date().toISOString();
+      this.touch();
       return registered;
     } catch (error) {
       this.degraded = true;
@@ -260,18 +284,96 @@ export class McpClient {
   }
 
   async callTool(name: string, arguments_: Record<string, unknown>): Promise<McpCallResult> {
+    this.ensureNotDisposed();
     const resolvedName = await this.resolveToolName(name);
-    return this.transport.callTool(resolvedName, arguments_);
+    const result = await this.transport.callTool(resolvedName, arguments_);
+    this.touch();
+    return result;
   }
 
   async listResources(): Promise<RegisteredMcpResourceDefinition[]> {
+    this.ensureNotDisposed();
     const resources = await this.transport.listResources?.() ?? [];
+    this.touch();
     return resources.map((resource) => ({ ...resource }));
   }
 
   async listPrompts(): Promise<RegisteredMcpPromptDefinition[]> {
+    this.ensureNotDisposed();
     const prompts = await this.transport.listPrompts?.() ?? [];
+    this.touch();
     return prompts.map((prompt) => ({ ...prompt }));
+  }
+
+  // ------- Issue #80: idle session eviction -------
+
+  /** Issue #80: Update last-used timestamp. Called after every successful op. */
+  private touch(): void {
+    this.lastUsedAt = this.now();
+  }
+
+  /** Issue #80: Reject calls after `dispose()` has been invoked. */
+  private ensureNotDisposed(): void {
+    if (this.disposed) {
+      throw new Error('McpClient has been disposed (idle TTL exceeded).');
+    }
+  }
+
+  /** Issue #80: epoch ms of last successful activity. Exposed for diagnostics. */
+  getLastUsedAt(): number {
+    return this.lastUsedAt;
+  }
+
+  /** Issue #80: ms since the last successful op. */
+  getIdleMs(now: number = this.now()): number {
+    return now - this.lastUsedAt;
+  }
+
+  /** Issue #80: True after `dispose()` has been invoked. */
+  isDisposed(): boolean {
+    return this.disposed;
+  }
+
+  /**
+   * Issue #80: Idle if `sessionIdleTtlMs` is set and `now - lastUsedAt`
+   * exceeds it. Sessions without a configured TTL are never idle.
+   */
+  isIdle(now: number = this.now()): boolean {
+    const ttl = this.options.sessionIdleTtlMs;
+    if (!ttl || ttl <= 0) return false;
+    return now - this.lastUsedAt > ttl;
+  }
+
+  /**
+   * Issue #80: If the session is idle (per `sessionIdleTtlMs`), dispose it and
+   * return true. Returns false otherwise. Drives eviction on a tick — call
+   * from a manager-level sweep loop.
+   */
+  async sweepIfIdle(now: number = this.now()): Promise<boolean> {
+    if (this.disposed) return false;
+    if (!this.isIdle(now)) return false;
+    await this.dispose();
+    return true;
+  }
+
+  /**
+   * Issue #80: Mark the client disposed and best-effort tear down the
+   * underlying transport. Idempotent. After dispose, all calls throw.
+   *
+   * Also invoked when a one-shot agent exits — see runtime wiring.
+   */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.cachedTools = null;
+    const transport = this.transport as { disconnect?: () => Promise<void> };
+    if (typeof transport.disconnect === 'function') {
+      try {
+        await transport.disconnect();
+      } catch {
+        // Disconnect failures are non-fatal during eviction.
+      }
+    }
   }
 
   getStatus(): McpServerStatus {
@@ -435,5 +537,30 @@ export class MultiServerMcpManager {
       })
     );
     return Object.fromEntries(entries);
+  }
+
+  /**
+   * Issue #80: Sweep all managed clients and dispose any whose idle TTL has
+   * expired. Returns the names of evicted servers. Servers without a
+   * configured `sessionIdleTtlMs` are never evicted.
+   *
+   * Wire this on a manager-level interval (default 30s in callers) or call
+   * once from a one-shot agent's exit path to release child processes.
+   */
+  async sweepIdle(now?: number): Promise<string[]> {
+    const evicted: string[] = [];
+    for (const [serverName, client] of Object.entries(this.servers)) {
+      const swept = await client.sweepIfIdle(now);
+      if (swept) evicted.push(serverName);
+    }
+    return evicted;
+  }
+
+  /**
+   * Issue #80: Dispose every managed client. Used by one-shot agent exit and
+   * test teardown. Idempotent.
+   */
+  async disposeAll(): Promise<void> {
+    await Promise.all(Object.values(this.servers).map((client) => client.dispose()));
   }
 }

@@ -243,3 +243,102 @@ export function resolveContextLengthFromManifest(
   const entry = findModelEntry(manifest, modelId);
   return entry?.contextLength ?? fallback;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #81: Plugin manifest cold-read
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue #81: Minimal shape of the `modelCatalog` block expected on a plugin
+ * manifest. Plugins (declared in `packages/plugins/src/contracts.ts`, owned by
+ * a sibling team) ship this so the runtime can hydrate context-length
+ * lookups *cold* — without paying the round-trip to the remote manifest URL
+ * during startup.
+ *
+ * The shape is intentionally a strict subset of {@link ModelManifest}: every
+ * model entry must include the same flags so cached lookups (vision/tools/
+ * streaming caps) work identically whether they came from cold-read or
+ * remote fetch.
+ */
+export interface PluginManifestModelCatalog {
+  /** ISO date string. Used as the manifest's updatedAt when seeded. */
+  updatedAt?: string;
+  models: ModelManifestEntry[];
+}
+
+/**
+ * Issue #81: Type guard for a plugin manifest carrying a `modelCatalog` block.
+ * Accepts unknown input so callers can pass raw JSON without pre-validation.
+ */
+export function hasPluginManifestModelCatalog(
+  manifest: unknown,
+): manifest is { modelCatalog: PluginManifestModelCatalog } {
+  if (!manifest || typeof manifest !== 'object') return false;
+  const candidate = (manifest as { modelCatalog?: unknown }).modelCatalog;
+  if (!candidate || typeof candidate !== 'object') return false;
+  const catalog = candidate as Partial<PluginManifestModelCatalog>;
+  return Array.isArray(catalog.models);
+}
+
+/**
+ * Issue #81: Convert a plugin manifest's `modelCatalog` block into the shared
+ * {@link ModelManifest} shape. Defensive — invalid entries are filtered out so
+ * a malformed plugin manifest cannot crash provider startup. Returns null when
+ * the plugin has no usable catalog.
+ */
+export function readPluginManifestModelCatalog(
+  manifest: unknown,
+): ModelManifest | null {
+  if (!hasPluginManifestModelCatalog(manifest)) return null;
+  const catalog = manifest.modelCatalog;
+  const models: ModelManifestEntry[] = [];
+  for (const raw of catalog.models) {
+    if (!raw || typeof raw !== 'object') continue;
+    const m = raw as Partial<ModelManifestEntry>;
+    if (typeof m.id !== 'string') continue;
+    if (typeof m.contextLength !== 'number' || !Number.isFinite(m.contextLength)) continue;
+    if (typeof m.supportsTools !== 'boolean') continue;
+    if (typeof m.supportsImages !== 'boolean') continue;
+    if (typeof m.supportsStreaming !== 'boolean') continue;
+    models.push({
+      id: m.id,
+      contextLength: m.contextLength,
+      supportsTools: m.supportsTools,
+      supportsImages: m.supportsImages,
+      supportsStreaming: m.supportsStreaming,
+    });
+  }
+  if (models.length === 0) return null;
+  return {
+    updatedAt: typeof catalog.updatedAt === 'string' ? catalog.updatedAt : new Date().toISOString().slice(0, 10),
+    models,
+  };
+}
+
+/**
+ * Issue #81: Seed the in-memory manifest cache from a plugin's `modelCatalog`
+ * for the given URL key (defaulting to {@link DEFAULT_MANIFEST_URL}). Use this
+ * during runtime startup so the *first* `loadManifest` call serves from cache
+ * with no network round-trip. Subsequent calls past the 24h TTL still
+ * revalidate against the remote URL.
+ *
+ * Returns true when a catalog was seeded, false when the manifest had no
+ * usable `modelCatalog` block.
+ */
+export function seedManifestCacheFromPlugin(
+  manifest: unknown,
+  options?: { url?: string; cache?: ManifestCache; now?: () => number },
+): boolean {
+  const seeded = readPluginManifestModelCatalog(manifest);
+  if (!seeded) return false;
+  const cache = options?.cache ?? defaultCache;
+  const url = options?.url ?? DEFAULT_MANIFEST_URL;
+  const now = options?.now ?? Date.now;
+  cache.set(url, {
+    manifest: seeded,
+    fetchedAt: now(),
+    // No etag — a remote 304 path won't trigger; next 24h-expiry refetch will
+    // populate one.
+  });
+  return true;
+}
