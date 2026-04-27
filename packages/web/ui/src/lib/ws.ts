@@ -10,12 +10,32 @@ export interface WsCallbacks {
   onOpen?: () => void;
   onClose?: () => void;
   onError?: (error: Event) => void;
+  /**
+   * Fired the moment the client gives up on WebSocket and switches to the
+   * SSE fallback. The dashboard uses this to surface a banner and to switch
+   * the chat-view from streaming to non-streaming mode (issue #141).
+   */
+  onFallback?: () => void;
+  /**
+   * Fired when the user manually triggers a WS reconnect via the banner
+   * button. The transport is reset to a clean state and `connect()` runs
+   * again from scratch.
+   */
+  onReconnect?: () => void;
 }
 
 export interface WsClient {
   send: (message: { type: string; [key: string]: unknown }) => void;
   close: () => void;
   isConnected: () => boolean;
+  /** Whether the client has fallen back to the SSE fire-and-forget channel. */
+  isFallback: () => boolean;
+  /**
+   * Force a clean reconnect attempt. Closes any active WS/SSE, resets
+   * the failure counter, and schedules an immediate connection. The
+   * `onReconnect` callback fires before the new connection starts.
+   */
+  reconnect: () => void;
 }
 
 const MAX_RECONNECT_DELAY = 30_000;
@@ -37,6 +57,7 @@ export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let consecutiveFailures = 0;
   let sseFallbackCleanup: (() => void) | null = null;
+  let fallbackActive = false;
 
   const clearReconnectTimer = () => {
     if (reconnectTimer !== null) {
@@ -47,12 +68,14 @@ export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {
 
   const fallbackToSse = () => {
     if (sseFallbackCleanup || closed) return;
+    fallbackActive = true;
     sseFallbackCleanup = connectEventStream({
       onOpen: () => callbacks.onOpen?.(),
       onHeartbeat: (data) => callbacks.onEvent({ type: 'heartbeat', data: data as Record<string, unknown> }),
       onStatus: (data) => callbacks.onEvent({ type: 'status', data: data as Record<string, unknown> }),
       onError: () => callbacks.onClose?.(),
     });
+    callbacks.onFallback?.();
   };
 
   const connect = () => {
@@ -74,6 +97,15 @@ export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {
     ws.onopen = () => {
       consecutiveFailures = 0;
       reconnectDelay = INITIAL_RECONNECT_DELAY;
+      // If we recovered from SSE fallback, mark the transport as healthy
+      // again so the UI can drop the banner.
+      if (fallbackActive) {
+        fallbackActive = false;
+        if (sseFallbackCleanup) {
+          sseFallbackCleanup();
+          sseFallbackCleanup = null;
+        }
+      }
       callbacks.onOpen?.();
 
       // Empty channels array = subscribe to all events (server treats non-array as "all")
@@ -143,13 +175,36 @@ export const connectWebSocket = (callbacks: WsCallbacks): WsClient => {
       sseFallbackCleanup();
       sseFallbackCleanup = null;
     }
+    fallbackActive = false;
   };
 
   const isConnected = (): boolean => {
     return ws !== null && ws.readyState === WebSocket.OPEN;
   };
 
+  const isFallback = (): boolean => fallbackActive;
+
+  const reconnect = (): void => {
+    if (closed) return;
+    callbacks.onReconnect?.();
+    clearReconnectTimer();
+    if (sseFallbackCleanup) {
+      sseFallbackCleanup();
+      sseFallbackCleanup = null;
+    }
+    if (ws) {
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.close();
+      ws = null;
+    }
+    fallbackActive = false;
+    consecutiveFailures = 0;
+    reconnectDelay = INITIAL_RECONNECT_DELAY;
+    connect();
+  };
+
   connect();
 
-  return { send, close, isConnected };
+  return { send, close, isConnected, isFallback, reconnect };
 };

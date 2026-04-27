@@ -41,6 +41,12 @@ interface ChatMessage {
   content: string;
   name?: string;
   createdAt?: string;
+  /**
+   * Sub-classifies `system` messages so the renderer can show distinct
+   * icons/colors for steers, compactions, restores, etc. without relying
+   * on string-matching the content.
+   */
+  kind?: 'steer' | 'compact' | 'restore' | 'checkpoint' | 'abort' | 'fork' | 'error' | 'info';
 }
 
 interface ToolStep {
@@ -561,6 +567,53 @@ export class ChatView extends LitElement {
 
       .msg.system .role-tag { color: var(--info); }
 
+      /* Steered messages — distinct yellow/warning accent so they stand
+         apart from generic system notices (compact summaries, restore
+         notices, etc.). Issue #144. */
+      .msg.steer {
+        background: rgba(255, 214, 10, 0.06);
+        border: 1px solid rgba(255, 214, 10, 0.25);
+        border-left: 3px solid var(--warning);
+        font-size: var(--text-sm);
+        color: var(--text-primary);
+        display: flex;
+        gap: var(--sp-2);
+        align-items: flex-start;
+      }
+      .msg.steer .kind-icon {
+        flex-shrink: 0;
+        color: var(--warning);
+        margin-top: 2px;
+      }
+      .msg.steer .role-tag { color: var(--warning); }
+
+      .msg.compact {
+        background: rgba(48, 209, 88, 0.04);
+        border: 1px solid rgba(48, 209, 88, 0.2);
+        border-left: 3px solid var(--success);
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+      }
+      .msg.compact .role-tag { color: var(--success); }
+
+      .msg.checkpoint {
+        background: rgba(100, 210, 255, 0.04);
+        border: 1px solid rgba(100, 210, 255, 0.2);
+        border-left: 3px solid var(--info);
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+      }
+      .msg.checkpoint .role-tag { color: var(--info); }
+
+      .msg.error {
+        background: rgba(255, 69, 58, 0.05);
+        border: 1px solid rgba(255, 69, 58, 0.2);
+        border-left: 3px solid var(--error);
+        font-size: var(--text-xs);
+        color: var(--text-primary);
+      }
+      .msg.error .role-tag { color: var(--error); }
+
       .msg.streaming { opacity: 0.9; }
       .msg.streaming .cursor-blink {
         display: inline-block;
@@ -1021,6 +1074,13 @@ export class ChatView extends LitElement {
   @state() private renameSessionId: string | null = null;
   @state() private showCheckpointLabel = false;
   @state() private thinking = false;
+  /**
+   * When true, the WS transport has fallen back to SSE-heartbeats-only.
+   * `_sendMessageWithText` then uses the synchronous REST endpoint
+   * (POST /api/sessions/:id) instead of the streaming endpoint, so the
+   * user still gets a reply rather than an apparently-frozen UI. Issue #141.
+   */
+  @state() private transportFallback = false;
 
   @query('#msgInput') private msgInput!: HTMLTextAreaElement;
   @query('.messages') private messagesEl!: HTMLElement;
@@ -1028,6 +1088,70 @@ export class ChatView extends LitElement {
   private _streamController?: AbortController;
   private _streamStart = 0;
   private _activePollingInterval?: ReturnType<typeof setInterval>;
+
+  private _transportFallbackHandler = (e: Event) => {
+    const detail = (e as CustomEvent<{ active: boolean }>).detail;
+    this.transportFallback = !!detail?.active;
+  };
+
+  /**
+   * Refresh on session lifecycle events emitted by the runtime EventBus
+   * (steered/aborted/forked/compacted). Each event triggers a session-list
+   * reload so message-counts and active-state stay accurate, and — when
+   * the event matches the open session — a timeline marker injects so the
+   * user sees what just happened in real-time. Issue #140.
+   */
+  private _sessionEventHandler = (e: Event) => {
+    const { type, data } = (e as CustomEvent<{ type: string; data: Record<string, unknown> }>).detail;
+    const sid = typeof data.sessionId === 'string' ? data.sessionId : '';
+    if (sid && sid === this.currentSessionId) {
+      switch (type) {
+        case 'session:steered': {
+          const directive = typeof data.directive === 'string' ? data.directive : '';
+          this.messages = [...this.messages, {
+            role: 'system',
+            kind: 'steer',
+            content: directive || 'Session steered',
+            createdAt: new Date().toISOString(),
+          }];
+          break;
+        }
+        case 'session:aborted':
+          this.messages = [...this.messages, {
+            role: 'system',
+            kind: 'abort',
+            content: 'Session aborted',
+            createdAt: new Date().toISOString(),
+          }];
+          break;
+        case 'session:forked': {
+          const newSessionId = typeof data.newSessionId === 'string' ? data.newSessionId : '';
+          this.messages = [...this.messages, {
+            role: 'system',
+            kind: 'fork',
+            content: newSessionId ? `Forked to session ${newSessionId.slice(0, 8)}` : 'Session forked',
+            createdAt: new Date().toISOString(),
+          }];
+          break;
+        }
+        case 'session:compacted': {
+          const before = typeof data.beforeMessageCount === 'number' ? data.beforeMessageCount : 0;
+          const after = typeof data.afterMessageCount === 'number' ? data.afterMessageCount : 0;
+          this.messages = [...this.messages, {
+            role: 'system',
+            kind: 'compact',
+            content: `Session compacted: ${before} -> ${after} messages`,
+            createdAt: new Date().toISOString(),
+          }];
+          // Also refresh history because message ids changed.
+          this._loadHistory();
+          break;
+        }
+      }
+    }
+    // Always refresh the session list so counts/last-updated are correct.
+    void this._loadSessions();
+  };
 
   connectedCallback() {
     super.connectedCallback();
@@ -1039,6 +1163,8 @@ export class ChatView extends LitElement {
     // Close context menu on outside click
     this._onDocClick = this._onDocClick.bind(this);
     document.addEventListener('click', this._onDocClick);
+    document.addEventListener('crowclaw:transport-fallback', this._transportFallbackHandler);
+    document.addEventListener('crowclaw:session-event', this._sessionEventHandler);
   }
 
   disconnectedCallback() {
@@ -1046,6 +1172,8 @@ export class ChatView extends LitElement {
     this._streamController?.abort();
     this._stopActivePolling();
     document.removeEventListener('click', this._onDocClick);
+    document.removeEventListener('crowclaw:transport-fallback', this._transportFallbackHandler);
+    document.removeEventListener('crowclaw:session-event', this._sessionEventHandler);
   }
 
   private _onDocClick() {
@@ -1190,7 +1318,7 @@ export class ChatView extends LitElement {
       this.streamText = '';
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Abort failed';
-      this.messages = [...this.messages, { role: 'system', content: `Abort error: ${msg}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Abort error: ${msg}` }];
     } finally {
       this.aborting = false;
     }
@@ -1201,7 +1329,7 @@ export class ChatView extends LitElement {
     this.showConfirmCompact = false;
     try {
       const data = await api<{ ok: boolean; originalMessageCount: number; compactedMessageCount: number; summary: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/compact`, { method: 'POST', body: JSON.stringify({}) });
-      this.messages = [...this.messages, { role: 'system', content: `Compacted: ${data.originalMessageCount} -> ${data.compactedMessageCount} messages. ${data.summary}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'compact', content: `Compacted: ${data.originalMessageCount} -> ${data.compactedMessageCount} messages. ${data.summary}` }];
       // Refresh session info
       const session = this.sessions.find((s) => s.id === this.currentSessionId);
       if (session) {
@@ -1211,7 +1339,7 @@ export class ChatView extends LitElement {
       this._loadHistory();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Compact failed';
-      this.messages = [...this.messages, { role: 'system', content: `Compact error: ${msg}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Compact error: ${msg}` }];
     }
   }
 
@@ -1220,11 +1348,11 @@ export class ChatView extends LitElement {
     this.showSteerInput = false;
     try {
       const data = await api<{ ok: boolean; injectedPrompt: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/steer`, { method: 'POST', body: JSON.stringify({ directive: directive.trim() }) });
-      this.messages = [...this.messages, { role: 'system', content: `Steered: ${data.injectedPrompt}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'steer', content: data.injectedPrompt }];
       this._scrollToBottom();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Steer failed';
-      this.messages = [...this.messages, { role: 'system', content: `Steer error: ${msg}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Steer error: ${msg}` }];
     }
   }
 
@@ -1233,11 +1361,11 @@ export class ChatView extends LitElement {
     this.showCheckpointLabel = false;
     try {
       await api<{ ok: boolean; checkpoint: unknown }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/checkpoint`, { method: 'POST', body: JSON.stringify({ label: label || undefined }) });
-      this.messages = [...this.messages, { role: 'system', content: `Checkpoint created${label ? `: ${label}` : ''}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'checkpoint', content: `Checkpoint created${label ? `: ${label}` : ''}` }];
       this._scrollToBottom();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Checkpoint failed';
-      this.messages = [...this.messages, { role: 'system', content: `Checkpoint error: ${msg}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Checkpoint error: ${msg}` }];
     }
   }
 
@@ -1261,7 +1389,7 @@ export class ChatView extends LitElement {
       this._loadHistory();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Restore failed';
-      this.messages = [...this.messages, { role: 'system', content: `Restore error: ${msg}` }];
+      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Restore error: ${msg}` }];
     }
   }
 
@@ -1399,18 +1527,66 @@ export class ChatView extends LitElement {
       onError: (error) => {
         if (error.includes('falling back')) {
           // Informational: stream continues with fallback provider
-          this.messages = [...this.messages, { role: 'system', content: error, createdAt: new Date().toISOString() }];
+          this.messages = [...this.messages, { role: 'system', kind: 'info', content: error, createdAt: new Date().toISOString() }];
           return;
         }
         this.thinking = false;
         this.streaming = false;
         this.aborting = false;
-        this.messages = [...this.messages, { role: 'system', content: `Error: ${error}`, createdAt: new Date().toISOString() }];
+        this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Error: ${error}`, createdAt: new Date().toISOString() }];
         this._scrollToBottom();
       },
     };
 
+    if (this.transportFallback) {
+      // SSE-fallback path (issue #141): the global event channel can't
+      // carry per-request stream chunks, so we use the synchronous REST
+      // endpoint and surface the final response as a single assistant
+      // message once it arrives. Tool steps and iteration markers are
+      // not visible in this mode — that's the explicit tradeoff.
+      this._sendNonStreaming(this.currentSessionId, text, callbacks);
+      return;
+    }
     this._streamController = streamMessage(this.currentSessionId, text, callbacks);
+  }
+
+  /**
+   * REST fallback for chat send when WebSocket has degraded to SSE-only.
+   * Uses `POST /api/sessions/:id` which runs `runConfiguredAgent` and
+   * returns the full final response in one shot. Mirrors `streamMessage`
+   * by replaying the result through the same callbacks so existing UI
+   * state machinery stays intact.
+   */
+  private async _sendNonStreaming(sessionId: string, text: string, callbacks: StreamCallbacks) {
+    const controller = new AbortController();
+    this._streamController = controller;
+    try {
+      const result = await api<{ session?: { messages?: Array<{ role: string; content?: string }> }; finalResponse?: string }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ userMessage: text }),
+          signal: controller.signal,
+        },
+      );
+      const finalResponse =
+        typeof result.finalResponse === 'string' && result.finalResponse.length > 0
+          ? result.finalResponse
+          : (() => {
+              const msgs = result.session?.messages ?? [];
+              for (let i = msgs.length - 1; i >= 0; i--) {
+                if (msgs[i].role === 'assistant' && typeof msgs[i].content === 'string') {
+                  return msgs[i].content as string;
+                }
+              }
+              return '';
+            })();
+      if (finalResponse) callbacks.onTextDelta(finalResponse);
+      callbacks.onDone();
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      callbacks.onError(err instanceof Error ? err.message : 'Request failed');
+    }
   }
 
   private _inputKeydown(e: KeyboardEvent) {
@@ -1816,14 +1992,44 @@ export class ChatView extends LitElement {
       `;
     }
 
-    const roleClass = msg.role === 'user' ? 'user' : msg.role === 'assistant' ? 'assistant' : 'system';
+    // Steered messages get a dedicated branch with an icon and a distinct
+    // tag so they're not confused with compactions, restores, or errors —
+    // all of which previously rendered as plain `system` rows. Issue #144.
+    if (msg.role === 'system' && msg.kind === 'steer') {
+      return html`
+        <div class="msg steer">
+          <svg class="kind-icon" width="14" height="14" viewBox="0 0 24 24"
+               fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M5 12h14"/>
+            <path d="m12 5 7 7-7 7"/>
+          </svg>
+          <div style="flex:1;min-width:0;">
+            <span class="role-tag">steer</span>
+            <div class="md">${unsafeHTML(renderMarkdown(msg.content))}</div>
+            ${msg.createdAt ? html`<div class="msg-time">${timeAgo(msg.createdAt)}</div>` : nothing}
+          </div>
+        </div>
+      `;
+    }
+
+    // Sub-classified system messages share the system base shape but pick
+    // up their own border/icon class (compact/checkpoint/error). Plain
+    // system messages still render with the legacy `.msg.system` styling.
+    const systemKindClass =
+      msg.role === 'system' && msg.kind && msg.kind !== 'info'
+        ? msg.kind
+        : '';
+    const baseRoleClass = msg.role === 'user' ? 'user' : msg.role === 'assistant' ? 'assistant' : 'system';
+    const roleClass = systemKindClass ? `${baseRoleClass} ${systemKindClass}` : baseRoleClass;
     const content = msg.role === 'user'
       ? escapeHtml(msg.content)
       : renderMarkdown(msg.content);
+    const tagLabel = msg.role === 'system' && msg.kind ? msg.kind : msg.role;
 
     return html`
       <div class="msg ${roleClass}">
-        <span class="role-tag">${msg.role}${msg.name ? ` / ${msg.name}` : ''}</span>
+        <span class="role-tag">${tagLabel}${msg.name ? ` / ${msg.name}` : ''}</span>
         ${msg.role === 'user'
           ? html`${msg.content}`
           : html`<div class="md">${unsafeHTML(content)}</div>`}

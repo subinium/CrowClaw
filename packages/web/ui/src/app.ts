@@ -580,6 +580,53 @@ export class CrowClawApp extends LitElement {
         border-radius: var(--radius-sm);
       }
 
+      /* Transport / status banners */
+      .banner-stack {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .banner {
+        padding: 8px var(--sp-4);
+        font-size: var(--text-xs);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--sp-3);
+        line-height: 1.4;
+      }
+
+      .banner.warn {
+        background: rgba(255, 214, 10, 0.08);
+        border-bottom: 1px solid rgba(255, 214, 10, 0.3);
+        color: var(--text-primary);
+      }
+
+      .banner.info {
+        background: rgba(100, 210, 255, 0.08);
+        border-bottom: 1px solid rgba(100, 210, 255, 0.3);
+        color: var(--text-primary);
+      }
+
+      .banner-msg { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+      .banner-msg svg { flex-shrink: 0; }
+
+      .banner-btn {
+        background: transparent;
+        border: 1px solid currentColor;
+        color: inherit;
+        padding: 2px 10px;
+        border-radius: var(--radius-sm);
+        font-size: var(--text-xs);
+        font-family: inherit;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .banner-btn:hover { background: rgba(255, 255, 255, 0.06); }
+
       @media (max-width: 768px) {
         .hamburger { display: block; }
         .sb { position: fixed; left: -240px; top: 0; bottom: 0; z-index: 100; transition: left 0.2s ease; }
@@ -605,6 +652,20 @@ export class CrowClawApp extends LitElement {
   @state() private activeSessions: ActiveSession[] = [];
   @state() private instanceVersion = '';
   @state() private instanceRuntime = '';
+  /**
+   * True once the WS transport has given up and the SSE fallback is
+   * carrying heartbeats only. Surfaces the persistent banner with a
+   * reconnect button (issue #141). Cleared on a successful WS open.
+   */
+  @state() private transportFallback = false;
+  /**
+   * Snapshot of the most recent `droppedSinceLast` count reported by the
+   * heartbeat. The banner shows for ~6s after a non-zero value lands so
+   * the user notices a transport issue without it being a permanent UI
+   * fixture (issue #145 / web side).
+   */
+  @state() private droppedFrames = 0;
+  private _droppedFramesTimer: ReturnType<typeof setTimeout> | null = null;
 
   private _wsClient: WsClient | null = null;
 
@@ -645,6 +706,10 @@ export class CrowClawApp extends LitElement {
     super.disconnectedCallback();
     this._wsClient?.close();
     this._wsClient = null;
+    if (this._droppedFramesTimer) {
+      clearTimeout(this._droppedFramesTimer);
+      this._droppedFramesTimer = null;
+    }
     document.removeEventListener('crowclaw:auth-required', this._authRequiredHandler);
     window.removeEventListener('hashchange', this._hashChangeHandler);
     window.removeEventListener('keydown', this._globalKeyHandler);
@@ -687,12 +752,49 @@ export class CrowClawApp extends LitElement {
           const data = event.data;
           if (typeof data.sessions === 'number') this.sessionCount = data.sessions;
           if (typeof data.subscribers === 'number') this.subscriberCount = data.subscribers;
+          // Issue #145 (web side): runtime emits droppedSinceLast on the
+          // heartbeat when its WS broadcast queue overflows. Surface the
+          // count via a transient banner — auto-dismissing keeps the UI
+          // calm during a single hiccup but still calls out persistent loss.
+          const dropped = typeof data.droppedSinceLast === 'number' ? data.droppedSinceLast : 0;
+          if (dropped > 0) {
+            this.droppedFrames = dropped;
+            if (this._droppedFramesTimer) clearTimeout(this._droppedFramesTimer);
+            this._droppedFramesTimer = setTimeout(() => {
+              this.droppedFrames = 0;
+              this._droppedFramesTimer = null;
+            }, 6000);
+          }
+          return;
+        }
+
+        // Issue #140 (web side): typed session lifecycle events. Each one
+        // dispatches a DOM event the chat-view picks up to refresh its
+        // session list / inject a timeline marker. Toast surfaces the
+        // event globally so the user sees it even when on another view.
+        if (
+          event.type === 'session:steered' ||
+          event.type === 'session:aborted' ||
+          event.type === 'session:forked' ||
+          event.type === 'session:compacted'
+        ) {
+          document.dispatchEvent(new CustomEvent('crowclaw:session-event', {
+            detail: { type: event.type, data: event.data },
+          }));
+          const verb = event.type.split(':')[1];
+          const sid = typeof event.data.sessionId === 'string' ? event.data.sessionId.slice(0, 8) : '';
+          showToast(`Session ${sid ? sid + ' ' : ''}${verb}`, 'info');
+          return;
         }
       },
       onOpen: () => {
         this.connectionStatus = 'connected';
         // Determine transport: if WsClient.isConnected(), it is WS; otherwise SSE fallback
         this.transportType = this._wsClient?.isConnected() ? 'WS' : 'SSE';
+        // A successful WS open clears the fallback banner.
+        if (this._wsClient?.isConnected()) {
+          this.transportFallback = false;
+        }
       },
       onClose: () => {
         this.connectionStatus = 'connecting';
@@ -700,7 +802,21 @@ export class CrowClawApp extends LitElement {
       onError: () => {
         this.connectionStatus = 'connecting';
       },
+      onFallback: () => {
+        this.transportType = 'SSE';
+        this.transportFallback = true;
+        // Tell chat-view to switch to non-streaming mode for new sends.
+        document.dispatchEvent(new CustomEvent('crowclaw:transport-fallback', { detail: { active: true } }));
+      },
+      onReconnect: () => {
+        this.transportFallback = false;
+        document.dispatchEvent(new CustomEvent('crowclaw:transport-fallback', { detail: { active: false } }));
+      },
     });
+  }
+
+  private _reconnectTransport() {
+    this._wsClient?.reconnect();
   }
 
   private async _initApp() {
@@ -888,6 +1004,38 @@ export class CrowClawApp extends LitElement {
         <main class="mn">
           ${this.authenticated
             ? html`
+                <div class="banner-stack">
+                  ${this.transportFallback ? html`
+                    <div class="banner warn" role="status" aria-live="polite">
+                      <span class="banner-msg">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                             stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                             stroke-linejoin="round" aria-hidden="true">
+                          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                          <line x1="12" y1="9" x2="12" y2="13"/>
+                          <line x1="12" y1="17" x2="12.01" y2="17"/>
+                        </svg>
+                        Live streaming unavailable — responses appear after completion.
+                      </span>
+                      <button class="banner-btn" @click=${this._reconnectTransport}
+                              aria-label="Attempt to reconnect WebSocket">Reconnect WS</button>
+                    </div>
+                  ` : nothing}
+                  ${this.droppedFrames > 0 ? html`
+                    <div class="banner info" role="status" aria-live="polite">
+                      <span class="banner-msg">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                             stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                             stroke-linejoin="round" aria-hidden="true">
+                          <circle cx="12" cy="12" r="10"/>
+                          <line x1="12" y1="8" x2="12" y2="12"/>
+                          <line x1="12" y1="16" x2="12.01" y2="16"/>
+                        </svg>
+                        ${this.droppedFrames} event${this.droppedFrames !== 1 ? 's' : ''} dropped from broadcast queue.
+                      </span>
+                    </div>
+                  ` : nothing}
+                </div>
                 <div class="vw ${this.currentView === 'chat' ? 'on' : ''}">
                   <crowclaw-chat-view></crowclaw-chat-view>
                 </div>
