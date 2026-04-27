@@ -11,10 +11,24 @@ export {
   describeCron,
 } from './cron-parser.js';
 
+export {
+  type SafeTimer,
+  TIMEOUT_MAX,
+  safeSetTimeout,
+  safeSetInterval,
+  clearSafeTimer,
+} from './safe-timer.js';
+
 import {
   parseCron,
   nextCronOccurrence,
 } from './cron-parser.js';
+
+import {
+  type SafeTimer,
+  safeSetInterval,
+  clearSafeTimer,
+} from './safe-timer.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,6 +52,14 @@ export const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60_000;
  * where activity heartbeats keep firing but the job is effectively wedged.
  */
 export const DEFAULT_MAX_RUN_DURATION_MS = 2 * 60 * 60_000;
+
+/**
+ * Default fan-out cap for `SchedulerExecutor.tick`. Issue #101 — the executor
+ * runs due jobs concurrently, but a runaway tick (e.g. 100 jobs all due
+ * because the host slept) should not stampede the agent runtime. Override
+ * via `SchedulerExecutorOptions.maxConcurrentJobs`.
+ */
+export const DEFAULT_MAX_CONCURRENT_JOBS = 5;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,6 +89,16 @@ export interface CronJobDefinition {
   // Agent execution fields
   skillSlugs?: string[];
   toolsetPreset?: string;
+  /**
+   * Per-job allowlist of toolset slugs to register on the agent for this run.
+   * When set, the host should construct the agent with ONLY these toolsets
+   * registered — caps token overhead for narrow jobs (e.g. a daily summariser
+   * that only needs `web.search`). Mirrors Hermes PR #14767.
+   *
+   * `undefined` keeps the host's default behaviour (all toolsets from the
+   * preset). An empty array means "no toolsets" — the agent runs with no tools.
+   */
+  enabledToolsets?: string[];
   agentPreset?: string;
   model?: string;
   deliverTo?: DeliveryTarget;
@@ -140,6 +172,11 @@ export interface AgentRunFn {
     skillSlugs?: string[];
     agentPreset?: string;
     toolsetPreset?: string;
+    /**
+     * Per-job toolset allowlist. Hosts must register only these toolsets on
+     * the agent for this run when set. See `CronJobDefinition.enabledToolsets`.
+     */
+    enabledToolsets?: string[];
     model?: string;
   }): Promise<{
     finalResponse: string;
@@ -411,6 +448,8 @@ export function createScheduledAgentJob(options: {
   task: string;
   skillSlugs?: string[];
   toolsetPreset?: string;
+  /** Per-job toolset allowlist; see `CronJobDefinition.enabledToolsets`. */
+  enabledToolsets?: string[];
   agentPreset?: string;
   model?: string;
   deliverTo?: DeliveryTarget;
@@ -441,6 +480,7 @@ export function createScheduledAgentJob(options: {
     nextRunAt,
     skillSlugs: options.skillSlugs,
     toolsetPreset: options.toolsetPreset,
+    enabledToolsets: options.enabledToolsets,
     agentPreset: options.agentPreset,
     model: options.model,
     deliverTo: options.deliverTo,
@@ -553,6 +593,13 @@ export interface SchedulerExecutorOptions {
    * `maxRunDurationMs`.
    */
   defaultMaxRunDurationMs?: number;
+  /**
+   * Maximum number of due jobs the executor runs concurrently per `tick()`.
+   * Defaults to `DEFAULT_MAX_CONCURRENT_JOBS` (5). Issue #101 — without a cap
+   * a saturated tick can stampede the agent runtime; without concurrency
+   * a single 2h job blocks every later one.
+   */
+  maxConcurrentJobs?: number;
 }
 
 export class SchedulerExecutor {
@@ -567,75 +614,96 @@ export class SchedulerExecutor {
     this.options = options;
   }
 
-  /** Execute all due jobs. Returns results for each executed job. */
+  /**
+   * Execute all due jobs. Returns results for each executed job.
+   *
+   * Issue #101 — runs jobs concurrently up to `maxConcurrentJobs` (default 5).
+   * Result order matches the order of due jobs returned by `collectDueJobs`,
+   * not completion order, so callers can correlate by index.
+   */
   async tick(now?: Date): Promise<SchedulerTickResult[]> {
     const dueJobs = await collectDueJobs(this.store, now);
-    const results: SchedulerTickResult[] = [];
+    const runnable = dueJobs.filter((entry) => entry.due);
+    if (runnable.length === 0) return [];
 
-    for (const { job, due } of dueJobs) {
-      if (!due) continue;
+    const limit = createConcurrencyLimiter(
+      this.options.maxConcurrentJobs ?? DEFAULT_MAX_CONCURRENT_JOBS,
+    );
 
-      const startedAt = new Date().toISOString();
-      const startMs = Date.now();
-      const result = await this.executeJob(job);
-      const durationMs = Date.now() - startMs;
-      results.push(result);
-
-      // Record run history (store-level)
-      const runRecord: JobRunRecord = {
-        jobId: job.id,
-        runId: result.sessionId,
-        startedAt,
-        completedAt: result.executedAt,
-        ok: result.ok,
-        response: result.response ?? '',
-        error: result.error,
-        durationMs,
-      };
-      await this.store.recordRun(runRecord);
-
-      // Build run archival entry
-      const jobRun: JobRun = {
-        runId: result.sessionId,
-        startedAt,
-        completedAt: result.executedAt,
-        success: result.ok,
-        response: result.response,
-        error: result.error,
-      };
-
-      // Keep last 10 runs
-      const existingRuns = [...(job.runs ?? [])];
-      existingRuns.push(jobRun);
-      const archivedRuns = existingRuns.slice(-10);
-
-      // Update job state
-      const updated: CronJobDefinition = {
-        ...job,
-        lastRunAt: new Date().toISOString(),
-        lastRunStatus: result.ok ? 'success' : 'error',
-        lastRunError: result.error,
-        lastRunResult: result.response?.slice(0, 500),
-        runCount: (job.runCount ?? 0) + 1,
-        runs: archivedRuns,
-        totalRuns: (job.totalRuns ?? 0) + 1,
-      };
-
-      // Auto-disable if max runs reached
-      if (job.maxRuns && updated.runCount! >= job.maxRuns) {
-        updated.enabled = false;
-      }
-
-      // One-shot completion: disable after successful execution
-      if (isOneShotSchedule(job.schedule) && result.ok) {
-        updated.enabled = false;
-        updated.completedAt = new Date().toISOString();
-      }
-
-      await markJobRun(this.store, updated, now);
-    }
+    const results = await Promise.all(
+      runnable.map((entry) => limit(() => this.runOne(entry.job, now))),
+    );
 
     return results;
+  }
+
+  /**
+   * Execute a single due job and persist its post-run state. Extracted so
+   * `tick()` can fan out across jobs while preserving the original
+   * sequencing of work *within* one job (execute → recordRun → markJobRun).
+   */
+  private async runOne(
+    job: CronJobDefinition,
+    now: Date | undefined,
+  ): Promise<SchedulerTickResult> {
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const result = await this.executeJob(job);
+    const durationMs = Date.now() - startMs;
+
+    // Record run history (store-level)
+    const runRecord: JobRunRecord = {
+      jobId: job.id,
+      runId: result.sessionId,
+      startedAt,
+      completedAt: result.executedAt,
+      ok: result.ok,
+      response: result.response ?? '',
+      error: result.error,
+      durationMs,
+    };
+    await this.store.recordRun(runRecord);
+
+    // Build run archival entry
+    const jobRun: JobRun = {
+      runId: result.sessionId,
+      startedAt,
+      completedAt: result.executedAt,
+      success: result.ok,
+      response: result.response,
+      error: result.error,
+    };
+
+    // Keep last 10 runs
+    const existingRuns = [...(job.runs ?? [])];
+    existingRuns.push(jobRun);
+    const archivedRuns = existingRuns.slice(-10);
+
+    // Update job state
+    const updated: CronJobDefinition = {
+      ...job,
+      lastRunAt: new Date().toISOString(),
+      lastRunStatus: result.ok ? 'success' : 'error',
+      lastRunError: result.error,
+      lastRunResult: result.response?.slice(0, 500),
+      runCount: (job.runCount ?? 0) + 1,
+      runs: archivedRuns,
+      totalRuns: (job.totalRuns ?? 0) + 1,
+    };
+
+    // Auto-disable if max runs reached
+    if (job.maxRuns && updated.runCount! >= job.maxRuns) {
+      updated.enabled = false;
+    }
+
+    // One-shot completion: disable after successful execution
+    if (isOneShotSchedule(job.schedule) && result.ok) {
+      updated.enabled = false;
+      updated.completedAt = new Date().toISOString();
+    }
+
+    await markJobRun(this.store, updated, now);
+    return result;
   }
 
   /** Pause a job by id. Returns the updated job or null if not found. */
@@ -707,7 +775,7 @@ export class SchedulerExecutor {
     // overrides this with `SessionState.lastToolActivityAt` from CORE.
     let lastActivityMs = startMs;
 
-    let watchdog: ReturnType<typeof setInterval> | null = null;
+    let watchdog: SafeTimer | null = null;
     try {
       const agentPromise = this.runAgent({
         sessionId,
@@ -716,14 +784,18 @@ export class SchedulerExecutor {
         skillSlugs: job.skillSlugs,
         agentPreset: job.agentPreset,
         toolsetPreset: job.toolsetPreset,
+        enabledToolsets: job.enabledToolsets,
         model: job.model,
       });
 
       const watchdogPromise = new Promise<never>((_resolve, reject) => {
         // Tick at half the inactivity window (capped at 30s) so we surface a
         // stall within ~1.5x the configured timeout in the worst case.
+        // `safeSetInterval` clamps user-supplied timeouts to TIMEOUT_MAX
+        // (issue #76) — passing a 100-day inactivity window would otherwise
+        // tight-loop at 1ms.
         const tickMs = Math.min(Math.max(inactivityTimeoutMs / 2, 1_000), 30_000);
-        watchdog = setInterval(() => {
+        watchdog = safeSetInterval(tickMs, () => {
           void this.refreshLastActivity(sessionId, lastActivityMs).then((next) => {
             lastActivityMs = next;
             const now = Date.now();
@@ -735,6 +807,12 @@ export class SchedulerExecutor {
                     : `Job exceeded max run duration (${maxRunDurationMs}ms)`,
                 ),
               );
+              // Issue #112 — stop the watchdog the moment we resolve the race.
+              // Without this, the interval keeps firing (and querying the
+              // activity probe) until the surrounding `finally` runs, which
+              // can be one full tick later for long-running probes.
+              clearSafeTimer(watchdog);
+              watchdog = null;
               return;
             }
             if (now - lastActivityMs > inactivityTimeoutMs) {
@@ -745,9 +823,11 @@ export class SchedulerExecutor {
                     : `Job stalled: no tool activity for ${inactivityTimeoutMs}ms`,
                 ),
               );
+              clearSafeTimer(watchdog);
+              watchdog = null;
             }
           });
-        }, tickMs);
+        });
       });
 
       const agentResult = await Promise.race([agentPromise, watchdogPromise]);
@@ -780,7 +860,7 @@ export class SchedulerExecutor {
         executedAt: new Date().toISOString(),
       };
     } finally {
-      if (watchdog !== null) clearInterval(watchdog);
+      if (watchdog !== null) clearSafeTimer(watchdog);
     }
   }
 
@@ -812,7 +892,7 @@ export class SchedulerExecutor {
 // ---------------------------------------------------------------------------
 
 export class AutonomousScheduler {
-  private intervalId: ReturnType<typeof setInterval> | null = null;
+  private intervalTimer: SafeTimer | null = null;
   private readonly intervalMs: number;
   private _lastTick: string | null = null;
   private _lastError: string | null = null;
@@ -825,32 +905,40 @@ export class AutonomousScheduler {
     this.intervalMs = intervalMs ?? 60_000;
   }
 
-  /** Start interval-based ticking. No-op if already running. */
+  /**
+   * Start interval-based ticking. No-op if already running.
+   *
+   * Issue #76 — uses `safeSetInterval` so a host that configures a
+   * multi-month tick interval cannot trigger Node's `TIMEOUT_MAX`
+   * tight-loop crash.
+   */
   start(): void {
-    if (this.intervalId !== null) return;
-    this.intervalId = setInterval(async () => {
-      try {
-        await this.executor.tick();
-        this._lastTick = new Date().toISOString();
-        this._consecutiveErrors = 0;
-        this._lastError = null;
-      } catch (err: unknown) {
-        this._consecutiveErrors += 1;
-        this._lastError = err instanceof Error ? err.message : String(err);
-      }
-    }, this.intervalMs);
+    if (this.intervalTimer !== null) return;
+    this.intervalTimer = safeSetInterval(this.intervalMs, () => {
+      void (async () => {
+        try {
+          await this.executor.tick();
+          this._lastTick = new Date().toISOString();
+          this._consecutiveErrors = 0;
+          this._lastError = null;
+        } catch (err: unknown) {
+          this._consecutiveErrors += 1;
+          this._lastError = err instanceof Error ? err.message : String(err);
+        }
+      })();
+    });
   }
 
   /** Stop the interval. No-op if not running. */
   stop(): void {
-    if (this.intervalId === null) return;
-    clearInterval(this.intervalId);
-    this.intervalId = null;
+    if (this.intervalTimer === null) return;
+    clearSafeTimer(this.intervalTimer);
+    this.intervalTimer = null;
   }
 
   /** Whether the autonomous scheduler is actively ticking. */
   isRunning(): boolean {
-    return this.intervalId !== null;
+    return this.intervalTimer !== null;
   }
 
   /** Current interval in milliseconds. */
@@ -893,6 +981,12 @@ export class FileSchedulerStore implements SchedulerStore {
    * inside separate handlers could interleave `writeFile` calls and corrupt the file.
    */
   private persistQueue: Promise<void> = Promise.resolve();
+  /**
+   * Issue #111 — `mkdir(..., { recursive: true })` ran on every persist even
+   * after the directory already existed. For a busy scheduler that's a syscall
+   * per write; track success once and skip on subsequent persists.
+   */
+  private dirEnsured = false;
 
   constructor(private readonly filePath: string) {}
 
@@ -1030,10 +1124,65 @@ export class FileSchedulerStore implements SchedulerStore {
     const body = JSON.stringify(data, null, 2);
     const tmpPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
     this.persistQueue = this.persistQueue.then(async () => {
-      await mkdir(dirname(this.filePath), { recursive: true });
+      // Issue #111 — only mkdir on the first persist (or after a prior mkdir
+      // failed). `mkdir(..., { recursive: true })` is idempotent but still a
+      // syscall per write; on a busy scheduler we'd issue thousands per hour.
+      if (!this.dirEnsured) {
+        await mkdir(dirname(this.filePath), { recursive: true });
+        this.dirEnsured = true;
+      }
       await writeFile(tmpPath, body, 'utf-8');
       await rename(tmpPath, this.filePath);
     });
     return this.persistQueue;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency limiter (no external deps)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal `p-limit`-style concurrency gate. Used by `SchedulerExecutor.tick`
+ * to bound how many due jobs run at once (issue #101). Kept inline so the
+ * scheduler stays dependency-free across runtimes (Node + CF Workers).
+ */
+function createConcurrencyLimiter(
+  max: number,
+): <T>(fn: () => Promise<T>) => Promise<T> {
+  const limit = Math.max(1, Math.floor(max));
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  const next = (): void => {
+    if (active >= limit) return;
+    const run = queue.shift();
+    if (run) run();
+  };
+
+  return <T>(fn: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const start = (): void => {
+        active += 1;
+        Promise.resolve()
+          .then(fn)
+          .then(
+            (value) => {
+              active -= 1;
+              resolve(value);
+              next();
+            },
+            (err: unknown) => {
+              active -= 1;
+              reject(err);
+              next();
+            },
+          );
+      };
+      if (active < limit) {
+        start();
+      } else {
+        queue.push(start);
+      }
+    });
 }
