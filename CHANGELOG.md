@@ -5,6 +5,97 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.0] — 2026-04-28 — 103-issue sweep: NemoClaw + post-v0.11.0 Hermes + OpenClaw v2026.4.25 parity, security hardening, leak fixes
+
+A single release closing **103 issues (#63–#165)** filed in an eight-agent triage round (security / reliability / perf / UX-flow / memory-retention / cross-cutting + external-pattern research against `NousResearch/hermes-agent` post-v0.11.0, `openclaw/openclaw` v2026.4.24+v2026.4.25, and `NVIDIA/NemoClaw` first 30 days). Implementation ran with 8-way parallel agent execution; 14 commits, ~57 files modified, 13 new files (5 helpers / 8 test files), +5,300 / -300 lines, **2,421 tests passing** (up from 2,187 — 234 new tests).
+
+### External-pattern coverage by source
+- **NemoClaw** (NVIDIA, first 30 days + March 2026 CVE flood): 3 BLOCKER fixes for OpenClaw CVE patterns (CVE-2026-22172 self-declared scope, CVE-2026-32051 operator-write owner escalation, CVE-2026-28460 shell line-continuation bypass), 5 CRITICAL ports (symlink + atomic-write hardening, unified secret redaction, no-new-privileges + cap-drop on docker, sandbox uid/gid, command-tampering guard via ApprovedCommand value object).
+- **Hermes** (NousResearch/hermes-agent, post-v0.11.0 + 5 missed v0.5→v0.11 items): reasoning-content scrub on provider switch, fork toolset restriction, transcript-on-shutdown hooks, vision routing, credential pool with 401-rotation, ordered fallback-providers chain, per-cron `enabledToolsets`, `pre_tool_call` veto + `transform_tool_result` middleware, configurable `maxRetries` + per-model `requestTimeoutMs`.
+- **OpenClaw** (v2026.4.24 + v2026.4.25): timer-clamp safety, `contextInjection: never`, persisted-transcript redaction, plugin manifest `modelCatalog` shape (provider exports), tool-result middleware contract.
+- **Internal audits** (53 findings): D1 storage reliability, memory-management retention, security surface, UX-flow cliffs, cross-cutting maintainability.
+
+### Security (BLOCKER / CRITICAL / WARNING)
+- **Hardline blocklist hardened against shell-encoding evasion** (#65 BLOCKER). New `normalizeForHardline()` strips line continuations, ANSI CSI, `$()`/backtick substitution, and `'\''` shell-quote escapes before regex match. New patterns cover `rm -rf /etc /usr /var /boot /sys /lib /opt`, `~/...`, and `$HOME/...`. Renamed-fork-bomb pattern catches `bomb(){bomb|bomb&};bomb`. `serializeToolCall` walks string values directly instead of `JSON.stringify`-ing so `\<newline>` stays matchable as raw bytes. (`packages/core/src/hardline-blocklist.ts`; OpenClaw CVE-2026-28460.)
+- **MCP server scope verification + ownerToken wiring** (#63 BLOCKER, #64 BLOCKER, #152 CRITICAL, #154 WARNING). `CrowClawMcpServer` is now instantiated with `ownerToken` from `CROWCLAW_DASHBOARD_TOKEN` instead of running in legacy mode. `GET /api/mcp/server/tools` filters via `getVisibleTools(callerToken)` so unauthenticated callers cannot enumerate `ownerOnly` tool names. `POST /api/mcp/server/request` extracts `Authorization: Bearer …` and injects as `_meta.token` for per-tool gating. (`packages/runtime-node/src/index.ts:1746-1761,4549-4577`; OpenClaw CVE-2026-22172/-32051 parity.)
+- **Workspace path safety: realpath + atomic-rename + post-validate** (#67 CRITICAL). `resolveSafeWithRealpath` walks the deepest existing ancestor when the target doesn't exist yet, then realpaths it. Writes go through `atomicWrite()` (tmp file + `rename` + post-rename realpath re-validation). Defends against in-root symlinks pointing outside `rootDir` and TOCTOU races between approval and write. (`packages/workspace/src/index.ts`; OpenClaw PR #72115 + NemoClaw 8866f34.)
+- **Centralized secret redaction at all log/event sinks** (#68 CRITICAL, #135 CRITICAL). New `redactStructuredData(input)` walker recursively masks values under sensitive-named keys (`token`, `secret`, `apiKey`, `authorization`, `cookie`, `password`, `privateKey`, …) and applies `redactCredentials()` to every other string value. Wired into `runtime-node/logger.emit()` so every structured log entry passes through it. Cycles handled via `WeakSet` → `[CIRCULAR]`. (`packages/core/src/security.ts:295-345`, `packages/runtime-node/src/logger.ts:46-60`; NemoClaw de97a00.)
+- **MemoryManager.store + session writes redacted** (#137 CRITICAL). Both `content` and `metadata` route through `redactStructuredData` before fanning out to providers. Opt-out via `metadata[SKIP_REDACTION_FLAG] = true` (flag stripped before reaching providers). (`packages/memory/src/memory-manager.ts`; OpenClaw issue #42982.)
+- **Tools security hardening: shell-quote + no-new-privs + cap-drop + uid/gid + in-tool gate + SSRF** (#70/#71/#128/#129/#138 CRITICAL). Strict regex allowlist for `image`/`container`/`target` before `quoteShell()`. `docker run` adds `--security-opt no-new-privileges --cap-drop ALL --user 1000:1000`. `terminal.exec` returns synthetic `approvalRequired:true` when no `ctx.approval` callback is present (defense-in-depth). All 7 `web.*` fetch sites switch from regex-only `validateFetchUrl` to DNS-rebinding-aware `resolveAndValidateUrl(url, dns.lookup)` and add `redirect: 'manual'`. (`packages/tools/src/index.ts`; NemoClaw CVE-2026-32048 + cc15689.)
+- **Per-provider API key schema validation** (#72 WARNING). `ProviderAdapter.validateKey(key)` per provider (Anthropic `^sk-ant-`, OpenAI `^sk-`, Gemini `^AIza`, NVIDIA `^nvapi-`, xAI `^xai-`). Onboarding and credential-pool both call the per-provider validator. (`packages/providers/src/index.ts`; NemoClaw 6f7f0c6.)
+
+### Reliability (CRITICAL / WARNING)
+- **D1MemoryStore upsert + atomic FTS update** (#99 CRITICAL, #100 CRITICAL). `INSERT INTO memories ON CONFLICT(id) DO UPDATE SET …` for dedup-merge re-writes. `D1SessionStore.indexSession` uses `db.batch([DELETE, INSERT])` so a process crash between the two leaves no half-deleted FTS row. (`packages/storage/src/index.ts:247-272,395-411`.)
+- **DurableObjectIdempotencyStore: maxEntries cap + concurrent hydrate race** (#117 CRITICAL, #153 CRITICAL). Mirrors Node-side 100k cap; oldest-insertion-order evicted when over. `hydrate()` now stores the in-flight Promise so two concurrent `markIfAbsent` callers share one `storage.get`. (`packages/runtime-cloudflare/src/agent-do.ts:55-150`.)
+- **Resource-leak fixes — ProcessTracker, dream-memory, mcp stdio, bridge processes** (#114, #122, #126, #133). `ProcessTracker.track()` deletes the entry on child `'exit'` (was: status flipped but reference retained — Hermes EMFILE class). `InMemoryDreamStore.longTerm` capped at MAX_LONG_TERM=500. `mcp/stdio-transport.disconnect()` uses `proc.once('close', ...)` to avoid duplicate listener firing alongside the constructor's global handler.
+- **Hardline + redaction wired through provider switch** (#83 CRITICAL). `stripReasoningContent(messages, fromProvider, toProvider)` scrubs `<think>` / `<reasoning>` / `metadata.reasoningContent` blocks when the active provider changes (fork / steer / fallback). New `AgentLoopOptions.providerName` + `fallbackProviderNames` track the active provider. (`packages/core/src/provider-switch.ts`; Hermes PR #16500.)
+- **forkSession enabledToolsets restriction** (#84 CRITICAL). `forkSession` now accepts `ForkSessionOptions { enabledToolsets, forkPurpose }` so background review forks can be locked to memory/skills only. New `getForkEnabledToolsets()` + `isToolAllowedForFork()` helpers (exact + namespace-prefix matching). Legacy bare-suffix arg still supported. (`packages/core/src/index.ts`; Hermes PR #16569.)
+- **Plugin pre_tool_call veto + transform_tool_result hooks** (#95 CRITICAL). `Plugin.preToolCall(toolCall, ctx)` returns `{ veto, reason }` (OR-aggregated; first veto wins, plugin-throw-resilient). `Plugin.transformToolResult(input, result)` chains in registration order, runs *after* core redaction so plugins cannot un-redact secrets. (`packages/plugins/src/index.ts`, `packages/core/src/index.ts:applyResultPipeline`; Hermes PRs #9377/#12972 + OpenClaw v2026.4.24 breaking change to tool-result middleware.)
+- **Scheduler safe-timer + concurrent tick + per-cron toolsets** (#76 CRITICAL, #94 + #101 + #111 + #112 WARNING). New `safe-timer.ts` (`safeSetTimeout` / `safeSetInterval` / `clearSafeTimer`) clamps delays to `[0, 2_147_483_647]` and chains sub-timers for longer durations — multi-month schedules no longer tight-loop at 1ms (OpenClaw v2026.4.24 #71414). `SchedulerExecutor.tick` runs due jobs concurrently with `DEFAULT_MAX_CONCURRENT_JOBS=5`. `FileSchedulerStore` tracks `dirEnsured` flag. Watchdog calls `clearSafeTimer` immediately after `reject()`. `CronJobDefinition.enabledToolsets?: string[]` plumbed through `AgentRunFn`. (`packages/scheduler/src/`.)
+- **wsManager.stop in shutdown** (#115 CRITICAL — covered as part of leak-fix cluster).
+- **bridgeProcesses Map cleanup on terminate** (#116 CRITICAL — covered).
+- **ApprovedCommand value object** (#66 CRITICAL — core side). `freezeCommand()` deep-clones argv+env, recursively freezes, computes SHA-256 over canonical JSON. `verifyCommand()` recomputes hash and throws `CommandTamperedError` on mismatch. `isApprovedCommand()` type guard. Web Crypto `subtle.digest` so it works in CF Workers. **Sandbox-executor integration deferred to follow-up PR.** (`packages/core/src/approved-command.ts`; NemoClaw CVE-2026-29607 parity.)
+
+### User flow (CRITICAL / WARNING)
+- **/steer guard on inactive session** (#145 CRITICAL). Returns `409 SESSION_NOT_ACTIVE` instead of silently dropping the directive (was 200 OK with the directive going to `session.messages` but never reaching an active turn). (`packages/runtime-node/src/index.ts:5008-5028`.)
+- **POST /api/sessions/:id/fork REST route implemented** (#146 CRITICAL). Was claimed in v0.5.0 CHANGELOG but the handler was missing. Clones parent transcript via `forkSession()` from `@crowclaw/core`, persists child, emits `session:forked` event. (`packages/runtime-node/src/index.ts`, `route-paths.ts`.)
+- **Discriminated session lifecycle EventBus types + dashboard handlers** (#147 CRITICAL). `RuntimeEventType` union now includes `session:steered | session:aborted | session:forked | session:compacted` instead of squashing all into `session:updated` with an untyped `action`. Dashboard `app.ts onEvent` dispatches per type; toasts + DOM events let `chat-view` inject timeline markers. (`packages/runtime-node/src/event-bus.ts`, `packages/web/ui/src/app.ts`.)
+- **SSE fallback shows banner + switches to non-streaming mode when WS down** (#144 CRITICAL). After 3 WS failures the dashboard shows a persistent `Live streaming unavailable …` banner with a Reconnect WS button. `_sendMessageWithText` routes through synchronous REST `POST /api/sessions/:id` so the UI doesn't appear frozen. (`packages/web/ui/src/lib/ws.ts`, `views/chat-view.ts`.)
+- **CLI onboarding actually verifies API key** (#149 CRITICAL). `validateProviderCredentials({ provider, apiKey, baseUrl })` hits the provider's `/models` endpoint (Anthropic `x-api-key` + `anthropic-version`, OpenAI/OpenRouter Bearer). HTTP 401 re-prompts up to 3 attempts; anything else proceeds. Config persisted only on success. (`packages/cli/src/index.ts`.)
+- **Steered messages get visual differentiation** (#142 WARNING). `ChatMessage.kind: 'steer' | 'compact' | 'checkpoint' | 'error' | …` with dedicated render branch (arrow icon + warning border). (`packages/web/ui/src/views/chat-view.ts`.)
+- **Standardized error envelope** (#143 WARNING). `{ error: { code, message } }` across runtime-node 4xx responses; dashboard `api()` reads `body.error.message` first with legacy `{ error: 'string' }` fallback.
+- **CLI exit codes + SIGINT cleanup** (#150 + #143 NIT). `0`/`1`/`2`/`3` distinct codes via `exitCodeForError()`. `runServe` SIGINT awaits `runtime.close?.()` before `server.close()` so ws heartbeats can drain. New `CliRuntimeLike.close?(): void | Promise<void>`.
+
+### Performance
+- **Embedding-store: cached vector magnitudes + early-exit on non-positive dot** (#104 WARNING). `EmbeddingIndex.search` precomputes `|q|` once and caches `|v|` per id (populated on `add`, dropped on FIFO eviction). Default `maxVectors` tightened from 10,000 → 2,000. hnswlib-node integration noted as follow-up. (`packages/memory/src/embedding-store.ts`.)
+- **InMemoryMemoryStore sorted-on-write + zero-copy read** (#105 WARNING). Buckets are now kept newest-first via O(log n) binary-search insertion; per-session `list`/`search` returns a defensive `slice()` instead of `[...records].sort()` per read.
+- **D1MemoryStore.getByIds chunked at 500 ids/query** (#107 WARNING). Splits `IN (?, …)` into chunks; preserves caller order across.
+- **D1SessionStore.indexSession message-count gate** (#110 WARNING). Per-instance `Map<sessionId, messageCount>` skips re-indexing when transcript hasn't grown.
+- **FileCheckpointStore O(1) lookup** (#112 WARNING). Flat `_index/{checkpointId}.json` pointer file; legacy directory scan retained as fallback.
+- **Concurrent due-job tick** (#101 WARNING). `Promise.all(...map(limit(...)))` with default cap 5 instead of serial loop — a 2h job no longer blocks every other due job.
+
+### Provider / gateway features (Hermes / OpenClaw / NemoClaw parity)
+- **Native multimodal vision routing** (#87 WARNING). `vision: boolean` on `ModelMetadata`, `modelSupportsVision()`, `requestContainsImage()` for image-block detection. (Hermes PR #16506.)
+- **Credential pool with 401-rotation and least_used picker** (#91 WARNING). New `packages/gateway/src/credential-pool.ts` — `ProviderKeyPool` (cursors `least_used` / `round_robin`, 401-rotation, masked-status snapshots) + `GatewayCredentialPool` multi-provider container. (Hermes v0.7.0.)
+- **Ordered fallback_providers chain** (#92 WARNING). `GatewayConfig.fallbackProviders` ordered via `executeWithProviderFallback()`; emits `gateway:fallback_used` per hop. (Hermes v0.6.0.)
+- **Per-provider per-model request timeout** (#98 NIT). `requestTimeoutMs` on `ModelMetadata`; `resolveRequestTimeoutMs()` precedence model → provider → global. (Hermes PR #12652.)
+- **api_max_retries config** (#97 NIT). `GatewayConfig.maxRetries` exposed. (Hermes PR #14730.)
+- **typing-indicator try/finally** (#102 WARNING). Indicator stays alive during retries and stops exactly once across the full send path. (`packages/gateway/src/runner.ts`.)
+
+### Cross-cutting / DX
+- **vitest testTimeout / hookTimeout / teardownTimeout** (#161 WARNING). 15s test / 10s hook caps so a single hung test cannot stall the 200+-file suite.
+- **`__CROWCLAW_VERSION__` in vitest config reads from package.json** (#164 NIT). No more manual edits per release.
+- **AgentLoopOptions.contextInjection 'auto' | 'never'** (#79 WARNING). External orchestrators owning the entire prompt lifecycle can suppress workspace bootstrap injection. (OpenClaw v2026.4.24 #65006.)
+
+### Cross-package contracts added / changed
+- `redactStructuredData<T>(input: T): T` — `@crowclaw/core` (new sink-side redactor)
+- `freezeCommand` / `verifyCommand` / `ApprovedCommand` / `CommandTamperedError` / `isApprovedCommand` — `@crowclaw/core`
+- `stripReasoningContent(messages, fromProvider, toProvider)` — `@crowclaw/core`
+- `getForkEnabledToolsets(session)` / `isToolAllowedForFork(toolName, allowed)` — `@crowclaw/core`
+- `Plugin.preToolCall` / `Plugin.transformToolResult` + `PluginManager.preToolCall` / `transformToolResult` — `@crowclaw/plugins`
+- `ProviderKeyPool` + `GatewayCredentialPool` — `@crowclaw/gateway/credential-pool`
+- `safeSetTimeout` / `safeSetInterval` / `clearSafeTimer` — `@crowclaw/scheduler/safe-timer`
+- `WorkspacePathEscapeError` + `resolveSafeWithRealpath` — `@crowclaw/workspace`
+- `RuntimeEventType` extended: `session:steered | session:aborted | session:forked | session:compacted` — `@crowclaw/runtime-node/event-bus`
+- `routePaths.sessions.{abort,stop,steer,fork,compact}` — `@crowclaw/runtime-node/route-paths`
+- `ProviderAdapter.validateKey(key)` — `@crowclaw/providers`
+- `ModelMetadata.vision` + `ModelMetadata.requestTimeoutMs` — `@crowclaw/providers`
+- `GatewayConfig.fallbackProviders` + `GatewayConfig.maxRetries` — `@crowclaw/gateway`
+- `CronJobDefinition.enabledToolsets` — `@crowclaw/scheduler`
+- `CliRuntimeLike.close?(): void | Promise<void>` + `CLI_EXIT_CODE` / `CliUserCancelError` / `CliTimeoutError` / `exitCodeForError` — `@crowclaw/cli`
+- `MemoryManager` opts metadata `[SKIP_REDACTION_FLAG]: true` — `@crowclaw/memory`
+
+### Verification
+- `npm run typecheck` — clean
+- `npm test` — 2,421 / 2,421 across 208 files (7.85s)
+- 234 new tests (28 hardline + 15 redaction + 4 mcp-route-auth + 15 workspace-path-safety + 7 leak-fixes + 15 storage-v06 + 16 memory-perf-redact + 17 scheduler-fixes + 19 cli-fixes + 36 providers-gateway + 28 core-features + 4 runtime-session-actions + 8 web-ui + 23 tools-security)
+
+### Sources
+- NousResearch/hermes-agent (post-v0.11.0 + missed window): PR #16500, #16569, #16571, #16574, #16506, #16382, #16598, #14767, #9377, #12972, #10501, #9934, #14730, #12652, plus v0.5.0 → v0.11.0 follow-ups (#4623, #4188, #3813, #14767).
+- openclaw/openclaw v2026.4.24 + v2026.4.25: issue #71414 (timer clamp), #71990 (gateway scope), #69303 / #58549 (poison dedupe), #42982 (transcript redaction), #65006 (contextInjection), PR #72115 (SKILL.md path safety).
+- NVIDIA/NemoClaw + OpenClaw CVE flood (March 2026): CVE-2026-22172, -32051, -28460, -29607, -32025, -32048, plus NemoClaw commits 6ba58a6, 8866f34, de97a00, cc15689, 6f7f0c6.
+- Internal audit: 7-agent triage (backend / memory-retention / security / UX-flow / cross-cutting + external research). 53 audit findings closed in this release.
+
 ## [0.5.0] — 2026-04-26 — 38-issue sweep: backend audit + Hermes/OpenClaw parity + perf
 
 A single release closing a 38-issue audit backlog. The issue list was generated from a five-agent triage (security/reliability/contract/perf + external-pattern research against the Apr-2026 month of NousResearch/hermes-agent and openclaw/openclaw activity). All 38 landed in this release; 26 source files modified, 5 new files, +2725 / -431 lines, **2187 tests passing** (up from 2161).
