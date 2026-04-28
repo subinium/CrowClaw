@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/tools",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,13 +17,13 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.6.6",
-    "@crowclaw/gateway": "0.6.6",
-    "@crowclaw/memory": "0.6.6",
-    "@crowclaw/mcp": "0.6.6",
-    "@crowclaw/scheduler": "0.6.6",
-    "@crowclaw/storage": "0.6.6",
-    "@crowclaw/workspace": "0.6.6"
+    "@crowclaw/core": "0.6.7",
+    "@crowclaw/gateway": "0.6.7",
+    "@crowclaw/memory": "0.6.7",
+    "@crowclaw/mcp": "0.6.7",
+    "@crowclaw/scheduler": "0.6.7",
+    "@crowclaw/storage": "0.6.7",
+    "@crowclaw/workspace": "0.6.7"
   },
   "repository": {
     "type": "git",

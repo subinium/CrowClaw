@@ -5,6 +5,18 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.7] — 2026-04-28 — extend localhost dev open-access to all GETs (dashboard init unblock, take 2)
+
+v0.6.6 only carved out a small list of dashboard-config routes (`/api/providers/config`, `/api/config/*`). The dashboard's init sequence also `GET`s several other dangerous-routed endpoints (`/api/mcp/servers`, `/api/scheduler/start` etc.) for read-only display, which still 401'd → the `crowclaw:auth-required` toast still fired ("Session expired. Please sign in again.") in dev mode. Test coverage missed it because the v0.6.6 tests targeted POST/PUT/PATCH/DELETE only.
+
+### Fixed
+- **`runtime-node` auth-middleware (line 2438-2462)**: extend the localhost dev-mode carve-out to allow `GET`/`HEAD` on **all** dangerous routes (read-only listings, status, config display). `POST`/`PUT`/`PATCH`/`DELETE` on execution routes (terminal exec, workspace mutate, MCP server CRUD, scheduler control) **stay locked** — the security-critical regression suite still passes. Read-only requests are the dashboard's bootstrap path; their 401s are what was forcing the login screen even after v0.6.6.
+
+### Verification
+- New regression test `GET on dangerous routes (read-only listings) is allowed on localhost no-token` covering `/api/mcp/servers`, `/api/scheduler/start`, `/api/providers/config`.
+- Existing test that POST/etc. on execution routes still 401 stays green.
+- Full suite: **2,541 / 2,541**.
+
 ## [0.6.6] — 2026-04-28 — localhost dev open-access for dashboard config + /healthz aliases
 
 Patch surfacing two real bugs found while running the dashboard locally:
