@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/workspace",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -18,5 +18,14 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subinium/CrowClaw.git",
+    "directory": "packages/workspace"
+  },
+  "homepage": "https://github.com/subinium/CrowClaw",
+  "bugs": {
+    "url": "https://github.com/subinium/CrowClaw/issues"
   }
 }

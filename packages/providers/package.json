@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/providers",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,6 +17,15 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.6.2"
+    "@crowclaw/core": "0.6.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subinium/CrowClaw.git",
+    "directory": "packages/providers"
+  },
+  "homepage": "https://github.com/subinium/CrowClaw",
+  "bugs": {
+    "url": "https://github.com/subinium/CrowClaw/issues"
   }
 }

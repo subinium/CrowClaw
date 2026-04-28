@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/sandbox-executor",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -18,7 +18,16 @@
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.8.9",
-    "@crowclaw/core": "0.6.2",
-    "@crowclaw/tools": "0.6.2"
+    "@crowclaw/core": "0.6.3",
+    "@crowclaw/tools": "0.6.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subinium/CrowClaw.git",
+    "directory": "packages/sandbox-executor"
+  },
+  "homepage": "https://github.com/subinium/CrowClaw",
+  "bugs": {
+    "url": "https://github.com/subinium/CrowClaw/issues"
   }
 }
