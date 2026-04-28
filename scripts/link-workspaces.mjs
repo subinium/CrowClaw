@@ -27,6 +27,30 @@ async function safeRemove(target) {
 const PACKAGE_NAME_RE = /^[a-z0-9_-]+$/;
 
 async function main() {
+  // No-op when running from a published tarball (consumer `npm install
+  // crowclaw`). The published `crowclaw` package only ships
+  // `packages/*/dist`, not the workspace `package.json` files — so there's
+  // nothing to symlink. Detect by looking for *any* in-repo workspace
+  // package.json. If none exist, exit cleanly so consumer installs don't
+  // fail with ENOENT on `node_modules/@crowclaw/`.
+  let hasWorkspaces = false;
+  try {
+    const probeEntries = await fs.readdir(packagesDir, { withFileTypes: true });
+    for (const entry of probeEntries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        await fs.access(path.join(packagesDir, entry.name, 'package.json'));
+        hasWorkspaces = true;
+        break;
+      } catch { /* keep scanning */ }
+    }
+  } catch {
+    // packages/ dir missing entirely — definitely a consumer install.
+  }
+  if (!hasWorkspaces) {
+    return;
+  }
+
   await ensureDir(nodeModulesDir);
   const scopeDir = path.join(nodeModulesDir, '@crowclaw');
   await ensureDir(scopeDir);
