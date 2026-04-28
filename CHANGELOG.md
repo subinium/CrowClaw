@@ -5,6 +5,17 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.5] — 2026-04-28 — first npm publish of `@crowclaw/*` workspaces
+
+The `@crowclaw` npm organization was registered ahead of this release (npm org creation is web-UI-only — not scriptable), unblocking the workspace publish step that has failed since v0.6.0.
+
+### Added
+- **All 19 workspace packages publish to npm**: `@crowclaw/{acp, cli, core, gateway, learning, mcp, mcp-server, memory, plugins, providers, runtime-cloudflare, runtime-node, sandbox-executor, scheduler, shared, storage, tools, web, workspace}@0.6.5`. Library consumers can now `npm install @crowclaw/core` and run the `import { AgentLoop } from '@crowclaw/core'` examples in the README without cloning the repo. Each tarball carries an npm provenance attestation linking back to the GitHub Actions build.
+- **`.github/workflows/publish.yml`** restored the workspace publish step (`npm publish --workspaces --access public --ignore-scripts --provenance`) before the umbrella `crowclaw` publish. `continue-on-error` removed — workspace publish failures will now fail the release.
+
+### Background
+v0.6.0 introduced the workspace publish step, but it failed on every release because the `@crowclaw` npm organization was never registered (`404 Scope not found` on every PUT). v0.6.4 dropped the step and shipped only the umbrella. v0.6.5 restores it now that the org exists.
+
 ## [0.6.4] — 2026-04-28 — fix `npm install crowclaw` postinstall + drop unscoped workspace publish
 
 Patch fixing two long-standing issues with the npm artifact:

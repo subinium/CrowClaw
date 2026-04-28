@@ -47,15 +47,21 @@ jobs:
       - name: Test
         run: npm test
 
-      # Publish the umbrella `crowclaw` package only. Workspace members
-      # (`@crowclaw/*`) are kept un-published — `crowclaw` ships every
-      # workspace's `dist/` via the root package's `files: ["packages/*/dist"]`
-      # so `npm install crowclaw` gets the entire runtime in one shot.
-      # Library consumers who want individual subpath imports can deep-import
-      # via `crowclaw/packages/<name>/dist/index.js` from the umbrella tarball.
-      # `--ignore-scripts` skips the workspace `link-workspaces.mjs` postinstall
-      # which expects a checkout layout, not a fresh tarball.
-      - name: Publish (crowclaw umbrella)
+      # Publish each `@crowclaw/*` workspace package independently so library
+      # users can `npm install @crowclaw/core` etc. The `@crowclaw` npm org
+      # was registered manually before this workflow first ran successfully —
+      # creating an npm org is a web-UI-only action and not scriptable.
+      # `--ignore-scripts` skips the workspace `link-workspaces.mjs`
+      # postinstall (it expects a checkout layout, not a fresh tarball).
+      - name: Publish workspaces (@crowclaw/*)
+        run: npm publish --workspaces --access public --ignore-scripts --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Publish the umbrella `crowclaw` package (CLI + bundled workspace dist
+      # via root `files: ["packages/*/dist", ...]`). Same `--ignore-scripts`
+      # rationale.
+      - name: Publish root (crowclaw)
         run: npm publish --access public --ignore-scripts --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
