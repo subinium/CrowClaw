@@ -49,6 +49,25 @@ describe('v0.6.6 localhost open-access', () => {
     expect(res.status).not.toBe(401);
   });
 
+  it('GET on dangerous routes (read-only listings) is allowed on localhost no-token', async () => {
+    const runtime = createNodeRuntime({
+      provider: new EchoProvider(),
+      agentId: 'crowclaw-localhost-readonly',
+      hostname: '127.0.0.1',
+    });
+    // Dashboard init fetches these — must NOT 401, otherwise the
+    // crowclaw:auth-required event fires and the user sees "Session expired".
+    const readOnlyDangerous = [
+      '/api/mcp/servers',
+      '/api/scheduler/start',  // GET on a typically-POST path: still no 401
+      '/api/providers/config',
+    ];
+    for (const p of readOnlyDangerous) {
+      const res = await runtime.fetch(new Request(localRoute(p))); // GET
+      expect(res.status, `GET ${p} should not 401`).not.toBe(401);
+    }
+  });
+
   it('execution routes (terminal/workspace-mutate/mcp-server CRUD) STAY locked on localhost no-token', async () => {
     const runtime = createNodeRuntime({
       provider: new EchoProvider(),

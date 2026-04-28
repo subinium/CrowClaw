@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/plugins",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,7 +17,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.6.6"
+    "@crowclaw/core": "0.6.7"
   },
   "repository": {
     "type": "git",

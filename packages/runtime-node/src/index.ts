@@ -2461,7 +2461,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // See `tests/security-critical.test.ts` for the binding contract.
         if (isDangerousRoute(url.pathname)) {
           if (!dashToken) {
-            const localDashOk = isLocalhost && isLocalDashConfigRoute(url.pathname);
+            // Dev-mode (no token) carve-out on localhost — see comment block
+            // above isLocalDashConfigRoute for rationale.
+            //   1) GET on any dangerous route is read-only (listings, status,
+            //      configuration display) — the dashboard fetches many of
+            //      these on init and would otherwise 401-storm.
+            //   2) The explicit dashboard-config endpoints (read+write) for
+            //      the setup wizard.
+            //   3) The historic gateway-mutation carve-out.
+            // POST/PUT/PATCH/DELETE on execution routes (terminal exec,
+            // workspace mutate, MCP CRUD, scheduler control) stay locked.
+            const isReadOnly = request.method === 'GET' || request.method === 'HEAD';
+            const localDashOk = isLocalhost && (isReadOnly || isLocalDashConfigRoute(url.pathname));
             if (!isGatewayMutationRoute(url.pathname) && !localDashOk) {
               return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
             }
