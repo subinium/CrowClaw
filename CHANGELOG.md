@@ -5,6 +5,23 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.4] — 2026-04-28 — fix `npm install crowclaw` postinstall + drop unscoped workspace publish
+
+Patch fixing two long-standing issues with the npm artifact:
+
+1. **`npm install crowclaw` failed with `MODULE_NOT_FOUND` on every consumer install since v0.5.0** — the `postinstall` script ran `node scripts/link-workspaces.mjs`, but the script file was never included in the published tarball (root `files: ["packages/*/dist"]` only). Verified with a fresh `npm install crowclaw` in a clean directory.
+2. **`@crowclaw/*` workspace publish step in CI was failing** — the `@crowclaw` npm scope was never registered, so every `--workspaces` publish hit `404 Scope not found`. Decision: keep `crowclaw` as the **only** published artifact (umbrella distribution); workspace `@crowclaw/*` packages stay un-published. Library consumers continue to use the cloned-repo dev workflow; CLI consumers `npm install -g crowclaw`.
+
+### Fixed
+- **`scripts/link-workspaces.mjs` ships in the published tarball** — added to root `files`. The script also now early-exits cleanly when run from a consumer install (probes for any `packages/<dir>/package.json`; absent → `return` before touching `node_modules/@crowclaw/`). This is what `link-workspaces` already implicitly handled via try/catch on each entry, but the early-return makes the consumer-install path explicit and fast (no empty `node_modules/@crowclaw/` directory created).
+- Verified: `npm pack` → 35.2 kB tarball with 5 files; `npm install <tarball>` in a clean directory → `added 5 packages, 0 vulnerabilities`, no postinstall errors.
+
+### Changed
+- **`.github/workflows/publish.yml`** drops the `npm publish --workspaces` step. Only the umbrella `crowclaw` package publishes. The `--ignore-scripts --provenance` flags stay; `id-token: write` permission stays.
+
+### Note for library consumers
+Programmatic imports like `import { AgentLoop } from '@crowclaw/core'` work in the cloned-repo dev workflow (where `link-workspaces.mjs` postinstall sets up symlinks). They do **not** resolve against `npm install crowclaw` because `@crowclaw/*` packages are not published to npm. If you need library use without cloning, open an issue — the maintainer can register the npm org if there's demand.
+
 ## [0.6.3] — 2026-04-28 — npm provenance unblock (repository field on every package)
 
 Patch on top of v0.6.2's publish-pipeline fix. The v0.6.2 publish workflow ran end-to-end but failed at every actual `npm publish` call with `E422 Unprocessable Entity — Failed to validate repository information: package.json: "repository.url" is "", expected to match "https://github.com/subinium/CrowClaw" from provenance`. npm's provenance verification requires `repository.url` on the published package.json — none of the workspace packages had it.
