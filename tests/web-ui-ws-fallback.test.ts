@@ -9,6 +9,25 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// `CloseEvent` is a browser DOM type that became a Node global in 22.4.0+,
+// but the GitHub Actions Linux runner sometimes ships an older Node 22.x
+// minor where it's still undefined. Polyfill to a minimal shim before the
+// mock instantiates one — vitest's environment is `node`, not `jsdom`.
+if (typeof (globalThis as { CloseEvent?: unknown }).CloseEvent === 'undefined') {
+  class PolyfillCloseEvent extends Event {
+    code: number;
+    reason: string;
+    wasClean: boolean;
+    constructor(type: string, init: { code?: number; reason?: string; wasClean?: boolean } = {}) {
+      super(type);
+      this.code = init.code ?? 1000;
+      this.reason = init.reason ?? '';
+      this.wasClean = init.wasClean ?? true;
+    }
+  }
+  (globalThis as { CloseEvent?: unknown }).CloseEvent = PolyfillCloseEvent;
+}
+
 // ---------------------------------------------------------------------------
 // Minimal Mock WebSocket — we control readyState transitions per-instance.
 // ---------------------------------------------------------------------------

@@ -3,9 +3,19 @@ name: publish
 on:
   release:
     types: [published]
+  # Manual re-trigger when a release was tagged but the publish run failed
+  # (e.g. transient CI test flake, npm registry blip). Pass the tag to
+  # republish via the `tag` input. Defaults to the latest release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (defaults to repo's latest release)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
+  id-token: write  # required for npm provenance
 
 jobs:
   publish:
@@ -13,6 +23,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # When manually re-triggered, check out the requested tag (or fall
+          # back to the default branch ref the workflow was kicked from).
+          ref: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -33,7 +48,20 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Publish
-        run: npm publish --access public
+      # Publish each `@crowclaw/*` workspace package independently so library
+      # users can `npm install @crowclaw/core` etc. The root `crowclaw`
+      # package is published separately below as the all-in-one CLI install.
+      # `--ignore-scripts` skips workspace postinstall hooks (link-workspaces)
+      # which expect a checkout layout, not a fresh tarball.
+      - name: Publish workspaces (@crowclaw/*)
+        run: npm publish --workspaces --access public --ignore-scripts --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        continue-on-error: true  # tolerate "already published" on re-runs
+
+      # Publish the umbrella `crowclaw` package (CLI + bundled workspace dist).
+      # Same `--ignore-scripts` rationale.
+      - name: Publish root (crowclaw)
+        run: npm publish --access public --ignore-scripts --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

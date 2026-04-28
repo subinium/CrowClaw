@@ -5,6 +5,24 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.2] — 2026-04-28 — npm publish unblock + workspace packages on registry
+
+Patch release that unblocks the broken publish pipeline (v0.6.0 and v0.6.1 GitHub releases were tagged but the `publish` workflow failed at the test step in CI, so neither version reached the npm registry — `crowclaw@0.5.0` had been the last published version on npm) and adds workspace-level publishing so library consumers can install `@crowclaw/*` packages independently.
+
+### Fixed
+- **`tests/web-ui-ws-fallback.test.ts` no longer fails on Node 22 minors that pre-date the global `CloseEvent`** — added a 12-line shim `class PolyfillCloseEvent extends Event` at the top of the test file (vitest runs in `node`, not `jsdom`, and `CloseEvent` only became a Node global in 22.4.0). The `npm test` step in `publish.yml` is what blocked the v0.6.0 and v0.6.1 release runs.
+
+### Changed
+- **`.github/workflows/publish.yml`** rewritten to:
+  - Add `workflow_dispatch` trigger with optional `tag` input so a failed publish run can be manually re-triggered against the same tag without cutting a new release.
+  - Publish each workspace package (`@crowclaw/*`) independently with `npm publish --workspaces --access public --ignore-scripts --provenance` before publishing the umbrella `crowclaw` root package. Library users can now `npm install @crowclaw/core` etc.
+  - Add `--ignore-scripts` so the workspace `link-workspaces.mjs` postinstall (which expects a checkout layout, not a fresh tarball) doesn't run during the publish step.
+  - Add `--provenance` flags + `id-token: write` permission so published tarballs carry npm's signed build attestation.
+  - The root publish step keeps its existing `files: ["packages/*/dist"]` umbrella behavior so `npm install crowclaw` continues to work as the all-in-one install path.
+
+### Verification
+- `npm test` — 2,532 / 2,532 passing locally; the previously CI-only `CloseEvent` reference error is gone.
+
 ## [0.6.1] — 2026-04-28 — 26-issue follow-up sweep: shutdown leaks, body cap, gateway poison + WS auth limit, layering fix
 
 Follow-up sweep on the v0.6.0 release. Triaged the 89 issues that v0.6.0 left open and processed every non-breaking item with another **8-way parallel agent execution** round. Of the 89 open: ~40 were closed retroactively (work was actually shipped in v0.6.0 but commit-message close keywords didn't match the GH issue numbers exactly), ~26 implemented in this release, ~23 remain (breaking changes / architectural scope deferred to v0.7).
