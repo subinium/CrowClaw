@@ -58,8 +58,8 @@ The v0.6.x cycle delivered a battle-tested backend; v0.7.0 turns the dashboard f
 
 ### Remaining v0.7 work (deferred to subsequent patches)
 v0.7.0 covers **Group 1 (UX live wave)**. Remaining 25 v0.7 issues split into:
-- **v0.7.1** — Memory + Skills 살리기 (#181 skill matching reasons, #184 memory edit/delete, #185 learning loop dashboard, #186 memory pinning, #188 skill preview, #196 multi-slot UI, #197 persona switcher)
-- **v0.7.2** — 인프라 + 폴리시 (#182 token usage breakdown, #183 audit log, #189 plugin catalog, #190 safer MCP install, #199 pairings UI, #200 platform setup wizard, #201 secret rotation, #202 sessionStore wiring, #203 ACP tools wiring, #204 Korean i18n, #205 theme system, #206 version footer, #207 export/import, #208 a11y)
+- **v0.7.1 — Memory + Skills polish**: #181 skill matching reasons, #184 memory edit/delete, #185 learning loop dashboard, #186 memory pinning, #188 skill preview, #196 multi-slot UI, #197 persona switcher
+- **v0.7.2 — Infrastructure + polish**: #182 token usage breakdown, #183 audit log, #189 plugin catalog, #190 safer MCP install, #199 pairings UI, #200 platform setup wizard, #201 secret rotation, #202 sessionStore wiring, #203 ACP tools wiring, #204 Korean i18n, #205 theme system, #206 version footer, #207 export/import, #208 a11y
 
 ## [0.6.7] — 2026-04-28 — extend localhost dev open-access to all GETs (dashboard init unblock, take 2)
 
