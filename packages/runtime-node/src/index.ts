@@ -1209,6 +1209,22 @@ function isGatewayMutationRoute(pathname: string): boolean {
   return /^\/api\/gateway\/[^/]+\/(config|policy)$/.test(pathname);
 }
 
+// v0.6.6: in dev mode (no dashToken set) on a localhost bind, the dashboard
+// needs to read a few config endpoints to render the setup wizard / provider
+// state. Whitelist them here so the UI doesn't 401 + toast "Session expired"
+// during open-access bootstrap. Execution routes (terminal/workspace mutate/
+// MCP CRUD/scheduler control) stay locked — see DANGEROUS_ROUTES.
+function isLocalDashConfigRoute(pathname: string): boolean {
+  return (
+    pathname === '/api/providers/config'
+    || pathname === '/api/config/provider'
+    || pathname === '/api/config/agent'
+    || pathname === '/api/config/validate'
+    || pathname === '/api/config/diff'
+    || pathname === '/api/config/remote-access'
+  );
+}
+
 const SESSION_DANGEROUS_ACTIONS = new Set(['abort', 'stop', 'compact', 'steer']);
 
 function isDangerousRoute(pathname: string): boolean {
@@ -2434,11 +2450,19 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const derivedCookie = getDerivedCookieToken(dashToken);
         const tokenMatch = dashToken ? ((bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) || (cookieToken !== null && timingSafeEqual(cookieToken, derivedCookie))) : false;
 
-        // Dangerous routes ALWAYS require auth, regardless of localhost
+        // Dangerous routes require auth, regardless of localhost — UNLESS we're
+        // in dev mode (no dashToken) AND the route is a dashboard-config
+        // read/write that the UI needs to bootstrap (config fetches,
+        // provider-config display). Execution routes (terminal exec, workspace
+        // mutations, MCP server CRUD, scheduler start/stop) stay locked even
+        // on localhost so a misconfigured dashboard token doesn't open a
+        // remote-code-execution surface for a malicious browser tab on the
+        // same host.
+        // See `tests/security-critical.test.ts` for the binding contract.
         if (isDangerousRoute(url.pathname)) {
           if (!dashToken) {
-            // Gateway config/policy routes are OK without token for dev ergonomics
-            if (!isGatewayMutationRoute(url.pathname)) {
+            const localDashOk = isLocalhost && isLocalDashConfigRoute(url.pathname);
+            if (!isGatewayMutationRoute(url.pathname) && !localDashOk) {
               return Response.json({ error: 'CROWCLAW_DASHBOARD_TOKEN must be set to access dangerous routes' }, { status: 401 });
             }
           } else if (!tokenMatch) {
@@ -2611,6 +2635,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/health') {
+        return Response.json({ ok: true, service: 'crowclaw', runtime: 'node', version });
+      }
+      // Kubernetes-style aliases. /healthz is liveness (always 200 if the
+      // process is up). /readyz is readiness — currently same shape as
+      // /health since the runtime has no async warm-up phase; wired now so
+      // probes don't 404.
+      if (request.method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/readyz')) {
         return Response.json({ ok: true, service: 'crowclaw', runtime: 'node', version });
       }
 

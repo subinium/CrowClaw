@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/runtime-node",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -33,19 +33,19 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/acp": "0.6.5",
-    "@crowclaw/core": "0.6.5",
-    "@crowclaw/gateway": "0.6.5",
-    "@crowclaw/learning": "0.6.5",
-    "@crowclaw/mcp": "0.6.5",
-    "@crowclaw/mcp-server": "0.6.5",
-    "@crowclaw/memory": "0.6.5",
-    "@crowclaw/plugins": "0.6.5",
-    "@crowclaw/providers": "0.6.5",
-    "@crowclaw/scheduler": "0.6.5",
-    "@crowclaw/storage": "0.6.5",
-    "@crowclaw/tools": "0.6.5",
-    "@crowclaw/workspace": "0.6.5"
+    "@crowclaw/acp": "0.6.6",
+    "@crowclaw/core": "0.6.6",
+    "@crowclaw/gateway": "0.6.6",
+    "@crowclaw/learning": "0.6.6",
+    "@crowclaw/mcp": "0.6.6",
+    "@crowclaw/mcp-server": "0.6.6",
+    "@crowclaw/memory": "0.6.6",
+    "@crowclaw/plugins": "0.6.6",
+    "@crowclaw/providers": "0.6.6",
+    "@crowclaw/scheduler": "0.6.6",
+    "@crowclaw/storage": "0.6.6",
+    "@crowclaw/tools": "0.6.6",
+    "@crowclaw/workspace": "0.6.6"
   },
   "repository": {
     "type": "git",
