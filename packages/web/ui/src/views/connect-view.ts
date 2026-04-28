@@ -1712,10 +1712,13 @@ export class ConnectView extends LitElement {
         <div class="section-header">MCP Servers</div>
         ${this.mcpServers.length === 0 && !this.showMcpForm
           ? html`
-              <div class="empty-state">
-                <div class="title">No MCP Servers</div>
-                <div class="subtitle">Add a custom server to get started</div>
-              </div>
+              <crowclaw-empty
+                icon="mcp"
+                title="No MCP servers"
+                description="Connect Model Context Protocol servers to extend your agent with new tools and resources."
+                cta-label="Browse marketplace"
+                cta-href="https://github.com/modelcontextprotocol/servers"
+              ></crowclaw-empty>
             `
           : html`
               <div class="mcp-list">
@@ -1884,10 +1887,13 @@ export class ConnectView extends LitElement {
         </div>
         ${this.platforms.length === 0
           ? html`
-              <div class="empty-state">
-                <div class="title">No Platforms</div>
-                <div class="subtitle">No gateway platforms available</div>
-              </div>
+              <crowclaw-empty
+                icon="pairing"
+                title="No paired platforms"
+                description="Pair Telegram, Slack, or Discord to chat with your agent from anywhere."
+                cta-label="Connect Telegram/Slack/Discord"
+                cta-href="https://github.com/subinium/CrowClaw/blob/main/docs/gateway.md"
+              ></crowclaw-empty>
             `
           : html`
               <div class="platform-grid">

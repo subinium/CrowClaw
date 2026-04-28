@@ -6,6 +6,12 @@ import { streamMessage, type StreamCallbacks } from '../lib/sse.js';
 import { renderMarkdown, highlightCodeBlocks, attachCopyHandlers } from '../lib/markdown.js';
 import { buttonStyles } from '../lib/shared-styles.js';
 import { showToast } from '../components/toast.js';
+// v0.7.0 #193/#194/#195 — register the new session-action components and
+// pull in their public types for typed props.
+import '../components/steer-composer.js';
+import '../components/fork-modal.js';
+import '../components/checkpoint-panel.js';
+import type { ForkParentInfo } from '../components/fork-modal.js';
 
 interface SessionInfo {
   id: string;
@@ -381,6 +387,44 @@ export class ChatView extends LitElement {
       }
 
       .steer-overlay input:focus { border-color: var(--info); }
+
+      /* v0.7.0 #193: sticky bottom-of-stream Steer affordance. The wrap
+         hugs the bottom of the messages list so the button + composer
+         track the chat content rather than pinning to the viewport. */
+      .steer-sticky-wrap {
+        padding: var(--sp-2) var(--sp-4);
+        border-top: 1px solid var(--glass-border);
+        background: var(--bg-secondary);
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-2);
+      }
+
+      .steer-sticky-btn {
+        align-self: flex-end;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border: 1px solid rgba(255, 214, 10, 0.3);
+        background: rgba(255, 214, 10, 0.08);
+        color: var(--warning);
+        font-size: var(--text-xs);
+        font-weight: 600;
+        font-family: inherit;
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+        transition: background var(--duration-fast);
+      }
+
+      .steer-sticky-btn:hover {
+        background: rgba(255, 214, 10, 0.14);
+      }
+
+      .steer-sticky-btn svg {
+        width: 12px;
+        height: 12px;
+      }
 
       /* Search overlay */
       .search-overlay {
@@ -1074,6 +1118,18 @@ export class ChatView extends LitElement {
   @state() private renameSessionId: string | null = null;
   @state() private showCheckpointLabel = false;
   @state() private thinking = false;
+
+  // v0.7.0 #193/#194/#195: state for the new session-action components.
+  // These flags are independent from the legacy inline overlays so the old
+  // ops-toolbar paths keep working — the new component-driven flows are
+  // additive triggers (sticky-bottom Steer button, 3-dot Fork item,
+  // header-level Checkpoints panel button).
+  @state() private showSteerComposer = false;
+  @state() private showForkModal = false;
+  @state() private forkParentInfo: ForkParentInfo | null = null;
+  @state() private forkAvailableToolsets: string[] = [];
+  @state() private showCheckpointPanel = false;
+  @state() private checkpointCount = 0;
   /**
    * When true, the WS transport has fallen back to SSE-heartbeats-only.
    * `_sendMessageWithText` then uses the synchronous REST endpoint
@@ -1145,6 +1201,13 @@ export class ChatView extends LitElement {
           }];
           // Also refresh history because message ids changed.
           this._loadHistory();
+          // Compaction rewrites message indices that older checkpoints
+          // reference — refresh the panel + count so stale rows clear.
+          void this._loadCheckpointCount();
+          const cpPanel = this.renderRoot?.querySelector?.('crowclaw-checkpoint-panel') as
+            | (HTMLElement & { refresh: () => Promise<void> })
+            | null;
+          void cpPanel?.refresh?.();
           break;
         }
       }
@@ -1158,6 +1221,9 @@ export class ChatView extends LitElement {
     this._loadSessions();
     if (this.currentSessionId) {
       this._loadHistory();
+      // Prime the checkpoint badge so the header button is labelled
+      // `Checkpoints (N)` from first paint.
+      void this._loadCheckpointCount();
     }
     this._startActivePolling();
     // Close context menu on outside click
@@ -1262,6 +1328,9 @@ export class ChatView extends LitElement {
     this.sessions = [...this.sessions];
     this._closeAllOverlays();
     this._loadHistory();
+    // Refresh the checkpoint badge for the new session so the header
+    // button label `Checkpoints (N)` is accurate without opening the panel.
+    void this._loadCheckpointCount();
   }
 
   private async _createSession() {
@@ -1426,6 +1495,151 @@ export class ChatView extends LitElement {
     this.showRenameInput = false;
     this.showCheckpointLabel = false;
     this.searchResults = [];
+    // The new session-action components are also overlay-style affordances —
+    // close them so swapping between Steer/Fork/Checkpoints is mutually
+    // exclusive and the screen never has two competing overlays open.
+    this.showSteerComposer = false;
+    this.showForkModal = false;
+    this.showCheckpointPanel = false;
+  }
+
+  // --- v0.7.0 #193/#194/#195: session-action component handlers ---
+
+  /**
+   * Called when the operator clicks the sticky 'Steer' button while the
+   * session is running. Toggles the slide-up composer; closing other
+   * overlays first prevents UI overlap.
+   */
+  private _toggleSteerComposer() {
+    if (!this.currentSessionId) return;
+    if (this.showSteerComposer) {
+      this.showSteerComposer = false;
+      return;
+    }
+    this._closeAllOverlays();
+    this.showSteerComposer = true;
+    requestAnimationFrame(() => {
+      const composer = this.renderRoot.querySelector('crowclaw-steer-composer') as
+        | (HTMLElement & { focusInput: () => void })
+        | null;
+      composer?.focusInput?.();
+    });
+  }
+
+  /**
+   * Steer composer success — drop a 'pending' marker into the chat
+   * stream. The marker style flips to 'applied' once the EventBus
+   * `session:steered` event arrives (see `_sessionEventHandler`).
+   */
+  private _onSteered(e: CustomEvent<{ directive: string; injectedPrompt: string }>) {
+    this.showSteerComposer = false;
+    this.messages = [...this.messages, {
+      role: 'system',
+      kind: 'steer',
+      content: e.detail.injectedPrompt || e.detail.directive,
+      createdAt: new Date().toISOString(),
+    }];
+    this._scrollToBottom();
+  }
+
+  /**
+   * Open the fork modal for the given session row. Pre-loads the toolset
+   * list from `/api/agent/identity` so the chip selector renders the
+   * right options. Lookup is best-effort — if the identity endpoint
+   * fails, the modal still works and just shows 'inherit parent'.
+   */
+  private async _openForkModal(sessionId: string) {
+    const session = this.sessions.find((s) => s.id === sessionId);
+    if (!session) return;
+    this.contextMenuSessionId = null;
+    this._closeAllOverlays();
+    this.forkParentInfo = {
+      sessionId: session.id,
+      title: session.title || undefined,
+      preview: session.preview || undefined,
+    };
+    // Best-effort toolset enumeration; empty list is a valid fallback.
+    try {
+      const data = await api<{ toolsets?: Array<{ name: string }> }>('/api/agent/identity');
+      this.forkAvailableToolsets = (data.toolsets ?? []).map((t) => t.name);
+    } catch {
+      this.forkAvailableToolsets = [];
+    }
+    this.showForkModal = true;
+  }
+
+  /**
+   * Fork modal success — navigate to the newly-created child session
+   * and refresh the session list so the new row appears immediately.
+   */
+  private _onForked(e: CustomEvent<{ parentSessionId: string; forkSessionId: string }>) {
+    this.showForkModal = false;
+    this.forkParentInfo = null;
+    void this._loadSessions();
+    // Switching session triggers history load + scroll-to-bottom.
+    this._selectSession(e.detail.forkSessionId);
+  }
+
+  /**
+   * Toggle the checkpoint side panel. Loading the count up front lets
+   * the header button label as `Checkpoints (N)` even while collapsed.
+   */
+  private _toggleCheckpointPanel() {
+    if (!this.currentSessionId) return;
+    if (this.showCheckpointPanel) {
+      this.showCheckpointPanel = false;
+      return;
+    }
+    this._closeAllOverlays();
+    this.showCheckpointPanel = true;
+  }
+
+  /**
+   * Checkpoint restored — reload history so the chat reflects the
+   * rewound state, and drop a system marker so the operator sees what
+   * happened.
+   */
+  private _onCheckpointRestored(e: CustomEvent<{ checkpointId: string; messageCount?: number; restoredIteration?: number }>) {
+    const target = e.detail.restoredIteration !== undefined
+      ? `iteration ${e.detail.restoredIteration}`
+      : `checkpoint ${e.detail.checkpointId.slice(0, 8)}`;
+    this.messages = [...this.messages, {
+      role: 'system',
+      kind: 'restore',
+      content: `Restored to ${target}${e.detail.messageCount !== undefined ? ` (${e.detail.messageCount} messages)` : ''}`,
+      createdAt: new Date().toISOString(),
+    }];
+    void this._loadHistory();
+  }
+
+  /**
+   * Replay opened — switch the dashboard to the new replay session so
+   * the operator can immediately interact with the cloned state.
+   */
+  private _onReplayOpened(e: CustomEvent<{ newSessionId: string; sourceCheckpointId: string }>) {
+    this.showCheckpointPanel = false;
+    void this._loadSessions();
+    this._selectSession(e.detail.newSessionId);
+  }
+
+  /**
+   * Track checkpoint count for the header button label. Called once on
+   * session change so the button reads `Checkpoints (N)` without
+   * forcing the panel open. Failures fall back to '0' silently.
+   */
+  private async _loadCheckpointCount() {
+    if (!this.currentSessionId) {
+      this.checkpointCount = 0;
+      return;
+    }
+    try {
+      const data = await api<{ checkpoints?: Array<unknown> }>(
+        `/api/sessions/${encodeURIComponent(this.currentSessionId)}/checkpoints`,
+      );
+      this.checkpointCount = (data.checkpoints ?? []).length;
+    } catch {
+      this.checkpointCount = 0;
+    }
   }
 
   // --- Messaging ---
@@ -1653,7 +1867,16 @@ export class ChatView extends LitElement {
             </div>
             <div class="sess-list">
               ${this._filteredSessions.length === 0
-                ? html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">${this.sessions.length ? 'No matching sessions' : 'No sessions yet'}</div></div>`
+                ? this.sessions.length === 0
+                  ? html`<crowclaw-empty
+                      icon="sessions"
+                      title="No active sessions"
+                      description="Start a new session to chat with your agent."
+                      cta-label="New session"
+                      cta-event="cc-empty-new-session"
+                      @cc-empty-new-session=${this._createSession}
+                    ></crowclaw-empty>`
+                  : html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">No matching sessions</div></div>`
                 : this._filteredSessions.map((s) => this._renderSessionCard(s))}
             </div>
           </div>
@@ -1692,6 +1915,34 @@ export class ChatView extends LitElement {
                   `}
           </div>
 
+          <!-- v0.7.0 #193: sticky bottom-of-stream Steer trigger + composer.
+               Only visible while a turn is running so the operator can
+               redirect the agent mid-flight. The composer slides up over
+               the chat input and POSTs to /api/sessions/:id/steer. -->
+          ${this.currentSessionId && (this.streaming || this._isSessionActive(this.currentSessionId)) ? html`
+            <div class="steer-sticky-wrap">
+              ${!this.showSteerComposer ? html`
+                <button class="steer-sticky-btn"
+                        @click=${this._toggleSteerComposer}
+                        aria-label="Steer the running agent"
+                        title="Send mid-run guidance">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5 12h14"/>
+                    <path d="m12 5 7 7-7 7"/>
+                  </svg>
+                  Steer
+                </button>
+              ` : nothing}
+              <crowclaw-steer-composer
+                ?open=${this.showSteerComposer}
+                .sessionId=${this.currentSessionId ?? ''}
+                @steered=${(e: CustomEvent) => this._onSteered(e as CustomEvent<{ directive: string; injectedPrompt: string }>)}
+                @cancel=${() => { this.showSteerComposer = false; }}
+              ></crowclaw-steer-composer>
+            </div>
+          ` : nothing}
+
           <!-- Chat Input -->
           <div class="chat-input">
             <textarea id="msgInput" placeholder="Send a message... (Shift+Enter for newline)"
@@ -1712,7 +1963,31 @@ export class ChatView extends LitElement {
           <!-- Trace Panel -->
           <button class="trace-toggle" @click=${() => { this.traceOpen = !this.traceOpen; }} aria-label="Toggle trace panel">T</button>
           ${this._renderTracePanel()}
+
+          <!-- v0.7.0 #195: checkpoint side panel. Mounted inside chat-content
+               so it slides in over the message list (z-index: 50 in the
+               component) without escaping to the dashboard root. -->
+          ${this.currentSessionId ? html`
+            <crowclaw-checkpoint-panel
+              ?open=${this.showCheckpointPanel}
+              .sessionId=${this.currentSessionId}
+              @close=${() => { this.showCheckpointPanel = false; }}
+              @saved=${() => { void this._loadCheckpointCount(); }}
+              @restored=${(e: CustomEvent) => this._onCheckpointRestored(e as CustomEvent<{ checkpointId: string; messageCount?: number; restoredIteration?: number }>)}
+              @replay-opened=${(e: CustomEvent) => this._onReplayOpened(e as CustomEvent<{ newSessionId: string; sourceCheckpointId: string }>)}
+            ></crowclaw-checkpoint-panel>
+          ` : nothing}
         </div>
+
+        <!-- v0.7.0 #194: fork modal lives at the chat-area root so the
+             overlay covers the full surface (sidebar + chat content). -->
+        <crowclaw-fork-modal
+          ?open=${this.showForkModal}
+          .parent=${this.forkParentInfo}
+          .availableToolsets=${this.forkAvailableToolsets}
+          @close=${() => { this.showForkModal = false; this.forkParentInfo = null; }}
+          @forked=${(e: CustomEvent) => this._onForked(e as CustomEvent<{ parentSessionId: string; forkSessionId: string }>)}
+        ></crowclaw-fork-modal>
       </div>
     `;
   }
@@ -1734,6 +2009,8 @@ export class ChatView extends LitElement {
           <div class="sess-ctx-menu" @click=${(e: Event) => e.stopPropagation()}>
             <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this.renameSessionId = s.id; this.showRenameInput = true; this._selectSession(s.id); }}>Rename</button>
             <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this._selectSession(s.id); this._checkpointSession(); }}>Checkpoint</button>
+            <!-- v0.7.0 #194: fork-trigger in the 3-dot actions menu. -->
+            <button @click=${(e: Event) => { e.stopPropagation(); void this._openForkModal(s.id); }}>Fork session...</button>
             <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this._selectSession(s.id); this.showConfirmCompact = true; }}>Compact</button>
             <button class="danger" @click=${(e: Event) => this._deleteSession(e, s.id)}>Delete</button>
           </div>
@@ -1792,6 +2069,15 @@ export class ChatView extends LitElement {
                 @click=${() => { this._closeAllOverlays(); this._loadCheckpoints(); }}
                 aria-label="View checkpoint history">
           History
+        </button>
+        <!-- v0.7.0 #195: header button for the new checkpoint side panel.
+             Label includes the count so operators can see at a glance how
+             many save points exist for the current session. -->
+        <button class="ops-btn"
+                @click=${this._toggleCheckpointPanel}
+                aria-label="Open checkpoints panel"
+                title="Manage checkpoints (save / restore / replay)">
+          Checkpoints (${this.checkpointCount})
         </button>
         <div class="ops-sep"></div>
         <button class="ops-btn"

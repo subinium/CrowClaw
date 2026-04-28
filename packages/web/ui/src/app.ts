@@ -4,8 +4,106 @@ import { checkAuth, verifyToken, api, clearAuthToken } from './lib/api.js';
 import { connectWebSocket, type WsClient } from './lib/ws.js';
 import { buttonStyles } from './lib/shared-styles.js';
 import { showToast } from './components/toast.js';
+// Pill action event names live with the component so a rename trips a
+// type/build error rather than a silent runtime drift between emitter
+// and listener (#177 agent A4).
+import { STATUS_PILL_ACTIONS } from './components/status-pill.js';
 
-export type ViewName = 'chat' | 'agent' | 'connect' | 'automate' | 'settings';
+/* ------------------------------------------------------------------ */
+/*  v0.7.0 component contracts (defensive)                             */
+/*                                                                     */
+/*  Each of these modules is authored by a sibling agent for the       */
+/*  v0.7.0 release. We resolve them at runtime via dynamic import in   */
+/*  `firstUpdated()` so this file stays type-safe and runtime-safe     */
+/*  whether or not the module has landed yet:                          */
+/*                                                                     */
+/*    - <crowclaw-status-pill>     — issue #177, agent A4              */
+/*        components/status-pill.ts                                    */
+/*    - <crowclaw-demo-badge>      — issue #175, agent A2 (LANDED)     */
+/*        components/demo-badge.ts                                     */
+/*    - <crowclaw-onboarding>      — issue #174, agent A1              */
+/*        views/onboarding-view.ts                                     */
+/*    - registerCommandPalette()   — issue #178, agent A5 (LANDED,     */
+/*        depends on components/command-palette.ts which is in flight) */
+/*        lib/keyboard.ts                                              */
+/*    - shouldShowOnboarding()     — agent A1                          */
+/*        views/onboarding-view.ts                                     */
+/*                                                                     */
+/*  Local fallbacks below let `tsc --noEmit` pass and degrade the      */
+/*  runtime gracefully (console.warn instead of throw) until every     */
+/*  module is on disk. The dynamic import will swap in real            */
+/*  implementations when available.                                    */
+/* ------------------------------------------------------------------ */
+
+/** System status payload returned by GET /api/system/status. */
+interface SystemStatus {
+  /** Provider slot name. 'echo' = demo provider, 'none' = unconfigured. */
+  provider?: string;
+  /** True iff a real (non-echo) provider is configured. Derived if absent. */
+  hasProvider?: boolean;
+  /** True iff a config preset is bound (agent A1 onboarding milestone). */
+  hasPreset?: boolean;
+  /** True iff the user has completed at least one chat (A1 milestone). */
+  firstChatComplete?: boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * Handle returned by `registerCommandPalette` — mirrors the contract from
+ * `lib/keyboard.ts` (agent A5, issue #178). Restated locally so this file
+ * compiles even when the keyboard module fails to load.
+ */
+interface CommandPaletteHandle {
+  open(): void;
+  close(): void;
+  dispose(): void;
+}
+
+/**
+ * Type of the dynamic-import payload from `lib/keyboard.js`. We narrow at
+ * call-site to avoid taking a hard dependency on the module shape until
+ * #178 ships.
+ */
+type RegisterCommandPaletteFn = (parent: HTMLElement) => CommandPaletteHandle;
+
+/**
+ * Default predicate: show the onboarding view when no real provider is
+ * configured. Agent A1 is expected to export a richer version from
+ * views/onboarding-view.ts; we re-declare the contract locally so this
+ * file compiles before A1 lands. Exported for test coverage.
+ */
+export function defaultShouldShowOnboarding(status: SystemStatus | null): boolean {
+  if (!status) return false;
+  if (typeof status.hasProvider === 'boolean') return !status.hasProvider;
+  // Derive from `provider` field: 'none' or missing means no provider.
+  const provider = (status.provider ?? '').toLowerCase();
+  return provider === '' || provider === 'none';
+}
+
+/**
+ * Last-resort Cmd+K registrar used when `lib/keyboard.js` (agent A5) fails
+ * to load. Dispatches `crowclaw:open-command-palette` so any later-loaded
+ * palette element can still react. Mirrors the real
+ * `CommandPaletteHandle` contract. Exported for test coverage.
+ */
+export function fallbackRegisterCommandPalette(_parent: HTMLElement): CommandPaletteHandle {
+  void _parent;
+  const handler = (e: KeyboardEvent) => {
+    const isCmdK = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k';
+    if (!isCmdK) return;
+    e.preventDefault();
+    e.stopPropagation();
+    document.dispatchEvent(new CustomEvent('crowclaw:open-command-palette'));
+  };
+  window.addEventListener('keydown', handler, { capture: true });
+  return {
+    open: () => document.dispatchEvent(new CustomEvent('crowclaw:open-command-palette')),
+    close: () => document.dispatchEvent(new CustomEvent('crowclaw:close-command-palette')),
+    dispose: () => window.removeEventListener('keydown', handler, { capture: true }),
+  };
+}
+
+export type ViewName = 'chat' | 'agent' | 'connect' | 'automate' | 'settings' | 'onboarding';
 
 interface PairingEntry {
   platform: string;
@@ -418,6 +516,25 @@ export class CrowClawApp extends LitElement {
       /* Main */
       .mn { display: flex; flex-direction: column; overflow: hidden; }
 
+      /* App header strip — v0.7.0 (status pill, demo badge, persona, theme) */
+      .app-header {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-4);
+        border-bottom: 1px solid var(--glass-border);
+        background: var(--bg-secondary);
+        flex-shrink: 0;
+        min-height: 40px;
+      }
+
+      .app-header-right {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+      }
+
       .mh {
         padding: var(--sp-5) var(--sp-8) 0;
         flex-shrink: 0;
@@ -652,6 +769,12 @@ export class CrowClawApp extends LitElement {
   @state() private activeSessions: ActiveSession[] = [];
   @state() private instanceVersion = '';
   @state() private instanceRuntime = '';
+  /** Latest snapshot from /api/system/status. Drives onboarding + demo badge. */
+  @state() private systemStatus: SystemStatus | null = null;
+  /** True when no real provider is configured — gates the onboarding view. */
+  @state() private showOnboarding = false;
+  /** True when the active provider is the demo "echo" — drives demo-badge. */
+  @state() private demoMode = false;
   /**
    * True once the WS transport has given up and the SSE fallback is
    * carrying heartbeats only. Surfaces the persistent banner with a
@@ -669,6 +792,11 @@ export class CrowClawApp extends LitElement {
 
   private _wsClient: WsClient | null = null;
 
+  /** Handle returned by registerCommandPalette(); set in firstUpdated. */
+  private _commandPaletteHandle: CommandPaletteHandle | null = null;
+  /** True after firstUpdated has run once — guards against double registration. */
+  private _commandPaletteRegistered = false;
+
   private _authRequiredHandler = () => {
     this.authenticated = false;
     showToast('Session expired. Please sign in again.', 'error');
@@ -676,7 +804,7 @@ export class CrowClawApp extends LitElement {
 
   private _hashChangeHandler = () => {
     const hash = location.hash.slice(1) as ViewName;
-    if (['chat', 'agent', 'connect', 'automate', 'settings'].includes(hash)) {
+    if (['chat', 'agent', 'connect', 'automate', 'settings', 'onboarding'].includes(hash)) {
       this.currentView = hash;
     }
   };
@@ -689,17 +817,126 @@ export class CrowClawApp extends LitElement {
     }
   };
 
+  /**
+   * Issue #177 (agent A4): the status pill emits these custom events when
+   * the user clicks its quick actions. Each one maps to a runtime API call
+   * plus a toast. We swallow API errors into the toast so a failed action
+   * never crashes the app shell.
+   */
+  private _reconnectWsHandler = () => {
+    this._reconnectTransport();
+    showToast('Reconnecting WebSocket…', 'info');
+  };
+
+  private _testProviderHandler = async () => {
+    try {
+      const res = await api<{ ok: boolean; error?: string }>('/api/providers/test', {
+        method: 'POST',
+        body: JSON.stringify({ slot: 'primary' }),
+      });
+      if (res.ok) {
+        showToast('Provider check passed.', 'success');
+      } else {
+        showToast(`Provider check failed: ${res.error ?? 'unknown error'}`, 'error');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Provider check failed';
+      showToast(msg, 'error');
+    }
+  };
+
+  private _resumeSchedulerHandler = async () => {
+    try {
+      await api('/api/scheduler/resume', { method: 'POST' });
+      showToast('Scheduler resumed.', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to resume scheduler';
+      showToast(msg, 'error');
+    }
+  };
+
+  /**
+   * #174: when the onboarding wizard reports completion we re-fetch system
+   * status (so the demo badge / hasProvider flags reflect the new key) and
+   * route to the chat view. We never re-enter onboarding from the same
+   * mount unless `/api/system/status` says we should.
+   */
+  private _onboardingCompleteHandler = async () => {
+    try {
+      const status = await api<SystemStatus>('/api/system/status');
+      this.systemStatus = status;
+      this.showOnboarding = defaultShouldShowOnboarding(status);
+      this.demoMode = (status.provider ?? '').toLowerCase() === 'echo';
+    } catch {
+      // If status refetch fails, optimistically clear onboarding so the
+      // user isn't stuck on the wizard. Next page load will reconcile.
+      this.showOnboarding = false;
+    }
+    if (!this.showOnboarding) {
+      this.currentView = 'chat';
+      location.hash = 'chat';
+      showToast('Setup complete — welcome to CrowClaw.', 'success');
+    }
+  };
+
   connectedCallback() {
     super.connectedCallback();
     // Restore view from hash
     const hash = location.hash.slice(1) as ViewName;
-    if (['chat', 'agent', 'connect', 'automate', 'settings'].includes(hash)) {
+    if (['chat', 'agent', 'connect', 'automate', 'settings', 'onboarding'].includes(hash)) {
       this.currentView = hash;
     }
     document.addEventListener('crowclaw:auth-required', this._authRequiredHandler);
     window.addEventListener('hashchange', this._hashChangeHandler);
     window.addEventListener('keydown', this._globalKeyHandler);
+    // v0.7.0 status-pill custom events (issue #177, agent A4). Names come
+    // from STATUS_PILL_ACTIONS so a rename in either file is caught at
+    // build time, not as silent dead UI in production.
+    document.addEventListener(STATUS_PILL_ACTIONS.reconnectWs, this._reconnectWsHandler);
+    document.addEventListener(STATUS_PILL_ACTIONS.testProvider, this._testProviderHandler);
+    document.addEventListener(STATUS_PILL_ACTIONS.resumeScheduler, this._resumeSchedulerHandler);
+    // #174 onboarding-view emits this when the user completes the wizard.
+    document.addEventListener('crowclaw:onboarding-complete', this._onboardingCompleteHandler);
     this._checkAuth();
+  }
+
+  /**
+   * Cmd+K registration runs exactly once after the element is in the DOM.
+   * `_commandPaletteRegistered` is flipped synchronously so any concurrent
+   * `firstUpdated` (Lit can re-run on attribute mutations during boot) is
+   * a no-op. We resolve the real `registerCommandPalette` via dynamic
+   * import; if `lib/keyboard.js` is missing or its dependency
+   * `command-palette.ts` is still in flight, we fall back to a minimal
+   * dispatch-only handler so the shortcut still feels alive.
+   */
+  firstUpdated() {
+    if (this._commandPaletteRegistered) return;
+    this._commandPaletteRegistered = true;
+
+    // Dynamic import keeps this file independent of agent A5's landing
+    // schedule. The keyboard module side-effect-imports
+    // `components/command-palette.js`, which currently doesn't exist —
+    // failing here is expected and falls through to the fallback.
+    import('./lib/keyboard.js')
+      .then((mod) => {
+        const register = (mod as { registerCommandPalette?: RegisterCommandPaletteFn })
+          .registerCommandPalette;
+        if (typeof register !== 'function') {
+          throw new Error('lib/keyboard.js is missing registerCommandPalette export');
+        }
+        // `parent` is the element the palette is appended to. Using
+        // `document.body` so the palette overlays on top of the app
+        // shell's shadow DOM without needing slot plumbing.
+        this._commandPaletteHandle = register(document.body);
+      })
+      .catch((err: unknown) => {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[crowclaw-app] registerCommandPalette unavailable, using fallback:',
+          err,
+        );
+        this._commandPaletteHandle = fallbackRegisterCommandPalette(document.body);
+      });
   }
 
   disconnectedCallback() {
@@ -713,6 +950,15 @@ export class CrowClawApp extends LitElement {
     document.removeEventListener('crowclaw:auth-required', this._authRequiredHandler);
     window.removeEventListener('hashchange', this._hashChangeHandler);
     window.removeEventListener('keydown', this._globalKeyHandler);
+    document.removeEventListener(STATUS_PILL_ACTIONS.reconnectWs, this._reconnectWsHandler);
+    document.removeEventListener(STATUS_PILL_ACTIONS.testProvider, this._testProviderHandler);
+    document.removeEventListener(STATUS_PILL_ACTIONS.resumeScheduler, this._resumeSchedulerHandler);
+    document.removeEventListener('crowclaw:onboarding-complete', this._onboardingCompleteHandler);
+    if (this._commandPaletteHandle) {
+      this._commandPaletteHandle.dispose();
+      this._commandPaletteHandle = null;
+    }
+    this._commandPaletteRegistered = false;
   }
 
   private async _checkAuth() {
@@ -784,7 +1030,23 @@ export class CrowClawApp extends LitElement {
           const verb = event.type.split(':')[1];
           const sid = typeof event.data.sessionId === 'string' ? event.data.sessionId.slice(0, 8) : '';
           showToast(`Session ${sid ? sid + ' ' : ''}${verb}`, 'info');
-          return;
+        }
+
+        // #177 (agent A4): bridge any session:*/gateway:*/job:* event into
+        // the window-scoped STATUS_PILL_EVENTBUS_BRIDGE_EVENT so the pill
+        // refreshes immediately instead of waiting for its 30s tick. We
+        // do this AFTER the toast so the user gets both the notification
+        // and the up-to-date pill colour at the same time.
+        if (
+          typeof event.type === 'string' &&
+          (event.type.startsWith('session:') ||
+            event.type.startsWith('gateway:') ||
+            event.type.startsWith('job:'))
+        ) {
+          window.dispatchEvent(new CustomEvent('crowclaw-event', {
+            detail: { type: event.type },
+          }));
+          if (event.type.startsWith('session:')) return; // already handled above
         }
       },
       onOpen: () => {
@@ -829,6 +1091,39 @@ export class CrowClawApp extends LitElement {
       const tools = await api<{ tools: unknown[] }>('/api/tools');
       this.toolCount = tools.tools?.length ?? 0;
     } catch { /* non-critical */ }
+
+    // v0.7.0: pull system status to decide onboarding + demo-mode flags. The
+    // /api/system/status endpoint returns `provider: 'echo'|name|'none'` —
+    // 'none' (or absent provider) routes the user to the onboarding view,
+    // 'echo' lights the demo badge in the header.
+    try {
+      const status = await api<SystemStatus>('/api/system/status');
+      this.systemStatus = status;
+
+      // Prefer agent A1's `shouldShowOnboarding` from views/onboarding-view.js
+      // when available; otherwise use the local default (provider==='none').
+      let predicate: (s: SystemStatus | null) => boolean = defaultShouldShowOnboarding;
+      try {
+        const mod = await import('./views/onboarding-view.js');
+        const fn = (mod as { shouldShowOnboarding?: (s: SystemStatus | null) => boolean })
+          .shouldShowOnboarding;
+        if (typeof fn === 'function') predicate = fn;
+      } catch {
+        // Module not ready — keep local default.
+      }
+
+      this.showOnboarding = predicate(status);
+      const provider = (status.provider ?? '').toLowerCase();
+      this.demoMode = provider === 'echo';
+      // If we have no provider, force the onboarding view as the landing
+      // route so the user lands on it regardless of any persisted hash.
+      if (this.showOnboarding) {
+        this.currentView = 'onboarding';
+      }
+    } catch {
+      // Non-critical: leave onboarding/demoMode at defaults. The header
+      // pills simply don't render until status resolves.
+    }
   }
 
   private async _authSubmit() {
@@ -1004,6 +1299,26 @@ export class CrowClawApp extends LitElement {
         <main class="mn">
           ${this.authenticated
             ? html`
+                <!-- v0.7.0 header strip: status pill, demo badge, persona, theme -->
+                <header class="app-header" role="banner">
+                  <div class="app-header-right">
+                    <!-- Issue #177 (agent A4) — pill self-polls /api/diagnostics
+                         and emits STATUS_PILL_ACTIONS.* CustomEvents which
+                         this shell listens for. No props needed; the pill
+                         owns its data fetching to keep the orchestrator
+                         from coupling to the diagnostics shape. -->
+                    <crowclaw-status-pill></crowclaw-status-pill>
+
+                    <!-- Issue #175 (agent A2) — demo-mode badge. Component
+                         renders nothing when .active is false, so we set
+                         the property and let it self-hide. -->
+                    <crowclaw-demo-badge .active=${this.demoMode}></crowclaw-demo-badge>
+
+                    <!-- TODO(persona/theme): existing persona pill + theme
+                         toggle slot in here once their components land. -->
+                  </div>
+                </header>
+
                 <div class="banner-stack">
                   ${this.transportFallback ? html`
                     <div class="banner warn" role="status" aria-live="polite">
@@ -1036,22 +1351,33 @@ export class CrowClawApp extends LitElement {
                     </div>
                   ` : nothing}
                 </div>
-                <div class="vw ${this.currentView === 'chat' ? 'on' : ''}">
-                  <crowclaw-chat-view></crowclaw-chat-view>
-                </div>
-                <div class="vw ${this.currentView === 'agent' ? 'on' : ''}">
-                  <crowclaw-agent-view></crowclaw-agent-view>
-                </div>
-                <div class="vw ${this.currentView === 'connect' ? 'on' : ''}">
-                  <div class="mh"><h2>Connect</h2><p>Providers, integrations, and service connections</p></div>
-                  <div class="mb"><crowclaw-connect-view></crowclaw-connect-view></div>
-                </div>
-                <div class="vw ${this.currentView === 'automate' ? 'on' : ''}">
-                  <crowclaw-automate-view></crowclaw-automate-view>
-                </div>
-                <div class="vw ${this.currentView === 'settings' ? 'on' : ''}">
-                  <crowclaw-settings-view></crowclaw-settings-view>
-                </div>
+
+                ${this.showOnboarding
+                  ? html`
+                      <!-- v0.7.0 onboarding (issue #174, agent A1). Shown when
+                           shouldShowOnboarding(systemStatus) is true. -->
+                      <div class="vw on">
+                        <crowclaw-onboarding></crowclaw-onboarding>
+                      </div>
+                    `
+                  : html`
+                      <div class="vw ${this.currentView === 'chat' ? 'on' : ''}">
+                        <crowclaw-chat-view></crowclaw-chat-view>
+                      </div>
+                      <div class="vw ${this.currentView === 'agent' ? 'on' : ''}">
+                        <crowclaw-agent-view></crowclaw-agent-view>
+                      </div>
+                      <div class="vw ${this.currentView === 'connect' ? 'on' : ''}">
+                        <div class="mh"><h2>Connect</h2><p>Providers, integrations, and service connections</p></div>
+                        <div class="mb"><crowclaw-connect-view></crowclaw-connect-view></div>
+                      </div>
+                      <div class="vw ${this.currentView === 'automate' ? 'on' : ''}">
+                        <crowclaw-automate-view></crowclaw-automate-view>
+                      </div>
+                      <div class="vw ${this.currentView === 'settings' ? 'on' : ''}">
+                        <crowclaw-settings-view></crowclaw-settings-view>
+                      </div>
+                    `}
               `
             : nothing}
         </main>

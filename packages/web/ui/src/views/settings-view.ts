@@ -906,6 +906,17 @@ export class SettingsView extends LitElement {
     }
   }
 
+  /**
+   * Issue #176: empty-state CTAs in this view (Memory / Usage) navigate to
+   * the chat tab so the user can produce data. Uses hash-based routing
+   * already wired in `app.ts`.
+   */
+  private _navigateToChat = () => {
+    if (typeof location !== 'undefined') {
+      location.hash = 'chat';
+    }
+  };
+
   private async _saveRemoteAccess() {
     this.remoteAccessSaving = true;
     try {
@@ -1457,9 +1468,14 @@ export class SettingsView extends LitElement {
                       </table>
                     </div>
                   `
-                : html`<div class="status-msg" style="color:var(--text-muted)">
-                    No usage entries recorded.
-                  </div>`}
+                : html`<crowclaw-empty
+                    icon="usage"
+                    title="No LLM calls yet"
+                    description="LLM usage and cost are tracked per call. Start a chat to populate this dashboard."
+                    cta-label="Start a chat"
+                    cta-event="cc-empty-go-chat"
+                    @cc-empty-go-chat=${this._navigateToChat}
+                  ></crowclaw-empty>`}
             `
           : html`<div class="status-msg">Loading usage data...</div>`}
       </div>
@@ -1722,9 +1738,18 @@ export class SettingsView extends LitElement {
                     No memories found for this session.
                   </div>`}
             `
-          : html`<div class="status-msg" style="color:var(--text-muted)">
-              Select a session to browse its memories.
-            </div>`}
+          : this.memorySessions.length === 0
+            ? html`<crowclaw-empty
+                icon="memory"
+                title="No memories yet"
+                description="Memories are captured automatically when you chat. Start a conversation to build agent recall."
+                cta-label="Start a chat"
+                cta-event="cc-empty-go-chat"
+                @cc-empty-go-chat=${this._navigateToChat}
+              ></crowclaw-empty>`
+            : html`<div class="status-msg" style="color:var(--text-muted)">
+                Select a session to browse its memories.
+              </div>`}
       </div>
     `;
   }
@@ -1854,9 +1879,11 @@ export class SettingsView extends LitElement {
                 </table>
               </div>
             `
-          : html`<div class="status-msg" style="color:var(--text-muted)">
-              No feedback entries recorded.
-            </div>`}
+          : html`<crowclaw-empty
+              icon="feedback"
+              title="No tool feedback yet"
+              description="Tool feedback is recorded automatically each time your agent calls a tool. Use the agent and entries appear here."
+            ></crowclaw-empty>`}
       </div>
     `;
   }

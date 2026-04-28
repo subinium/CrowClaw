@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem, type ToolCatalog, type ToolExecutor, type ToolExecutionContext, type ToolExecutionResult, type ToolManifest, type ToolDefinition } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
@@ -1526,6 +1526,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     void resolveProviderFromConfig().then((resolved) => {
       if (resolved.source !== 'echo') {
         provider = resolved.provider;
+      } else {
+        // Issue #175: No real provider key — switch to EchoProvider demo mode
+        // so onboarding (memory capture / skill matching / scheduler / plugin
+        // hooks) exercises the full pipeline against simulated streaming, and
+        // log a prominent banner so operators understand why responses look
+        // canned.
+        provider = new EchoProvider({ demoMode: true });
+        console.log(
+          '[crowclaw] DEMO MODE: EchoProvider active. Set OPENROUTER_API_KEY for real LLM. Memory + Skills + Scheduler still fully exercised.'
+        );
       }
       providerReady = true;
     }).catch(() => { providerReady = true; });
@@ -1746,6 +1756,72 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     return Promise.resolve(false);
   }
 
+  // v0.7 (#179) — wrap the configured tool registry so AgentLoop tool dispatches
+  // emit `tool:start` / `tool:complete` on the eventBus. Direct routes
+  // (/api/web/fetch, /api/terminal/exec, etc.) call `tools.execute(...)`
+  // directly with the unwrapped registry, so this wrapper only affects the
+  // agent-loop integration. We forward `list()`/`get()` so AgentLoop's
+  // budget/prompt-build paths see the same manifests as before, then emit
+  // around `execute(...)` with a per-call id, the (best-effort) sessionId
+  // from the context, the input args, the duration, and the ok flag.
+  function instrumentToolRegistry(registry: ToolCatalog & ToolExecutor): ToolCatalog & ToolExecutor {
+    return {
+      list(): ToolManifest[] {
+        return registry.list();
+      },
+      get(name: string): ToolDefinition | undefined {
+        return registry.get(name);
+      },
+      async execute(name: string, input: Record<string, unknown>, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+        const callId = (typeof crypto !== 'undefined' && typeof (crypto as { randomUUID?: () => string }).randomUUID === 'function')
+          ? (crypto as { randomUUID: () => string }).randomUUID()
+          : `call-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const sessionId = (context as { sessionId?: string }).sessionId;
+        const startedAt = performance.now();
+        eventBus.emit('tool:start', {
+          callId,
+          toolName: name,
+          sessionId,
+          // Args echoed back so the dashboard can render exactly what the
+          // worker received. Audit-redaction has already run in AgentLoop
+          // by the time we reach here, so this is safe to surface.
+          args: input,
+          startedAt: new Date().toISOString(),
+        });
+        try {
+          const result = await registry.execute(name, input, context);
+          const durationMs = Math.round(performance.now() - startedAt);
+          eventBus.emit('tool:complete', {
+            callId,
+            toolName: name,
+            sessionId,
+            ok: result.ok,
+            durationMs,
+            // Truncate at the wire so a runaway tool (e.g. a 50MB fetch)
+            // doesn't blow the event listener buffer. Full output is on
+            // disk via SecurityAuditLog and reachable via the audit drawer.
+            output: result.output.length > 4000 ? `${result.output.slice(0, 4000)}…[truncated]` : result.output,
+            outputLength: result.output.length,
+            metadata: result.metadata,
+          });
+          return result;
+        } catch (err) {
+          const durationMs = Math.round(performance.now() - startedAt);
+          eventBus.emit('tool:complete', {
+            callId,
+            toolName: name,
+            sessionId,
+            ok: false,
+            durationMs,
+            output: err instanceof Error ? err.message : String(err),
+            error: true,
+          });
+          throw err;
+        }
+      }
+    };
+  }
+
   function createConfiguredAgent(overrides?: ExecutionOverrides): AgentLoop {
     // Use persona registry's active prompt, falling back to the legacy personaPrompt
     const activePersonaPrompt = personaRegistry.getActive().prompt || personaPrompt;
@@ -1764,7 +1840,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
     }
 
-    return new AgentLoop(resolveProvider(overrides), buildConfiguredToolRegistry(overrides), store, {
+    return new AgentLoop(resolveProvider(overrides), instrumentToolRegistry(buildConfiguredToolRegistry(overrides)), store, {
       plugins,
       runtimeName: 'node',
       skills: buildConfiguredSkillManifests(overrides),
@@ -1802,6 +1878,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         memoryService.recall(input.sessionId, input.userMessage, 5),
         userModelService.getProfile(input.sessionId, input.userId ?? 'default-user'),
       ]);
+      // v0.7 (#180) — surface recall to the dashboard MemoryStream component.
+      // We only emit when at least one record came back; an empty recall is
+      // noise that would otherwise drown the live stream on every turn.
+      if (recalled.length > 0) {
+        eventBus.emit('memory:recalled', {
+          sessionId: input.sessionId,
+          query: input.userMessage,
+          hits: recalled.length,
+          ids: recalled.map((r) => r.id),
+          summaries: recalled.map((r) => r.summary.slice(0, 200)),
+        });
+      }
       memories = recalled.map(r => r.summary);
       // Inject user profile context if meaningful data exists
       if (profile.expertise.length > 0 || profile.preferences.length > 0) {
@@ -2730,6 +2818,23 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           ...summarizeSessionTranscript(codeBridgeSessions.get(process.sessionId))
         }));
         const bridgeSessionSummary = [...codeBridgeSessions.values()].map((session) => summarizeBridgeSessionRecord(session, bridgeProcesses.get(session.sessionId)));
+        // #174: First-run onboarding flags. Derived from existing state so we
+        // don't have to persist a parallel set of booleans that could drift
+        // out of sync with the underlying configStore / message log.
+        //   - hasProvider:       primary provider slot is configured
+        //   - hasPreset:         a config preset has been activated
+        //   - firstChatComplete: at least one user/assistant message has
+        //                        been persisted across any session. Empty
+        //                        needle on `searchAll` matches every stored
+        //                        message; a single hit is enough to know
+        //                        the user has finished their first chat.
+        const onboardingHasProvider = Boolean(configStore.getProviderConfig()?.primary);
+        const onboardingHasPreset = Boolean(configStore.getActiveConfigPresetName());
+        let onboardingFirstChatComplete = false;
+        try {
+          const probe = await messageStore.searchAll('', 1);
+          onboardingFirstChatComplete = probe.length > 0;
+        } catch { /* status route must never fail because of a probe */ }
         return Response.json({
           ok: true,
           deployment: deploymentName,
@@ -2744,6 +2849,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             browserSessions: browserSessions.size,
             schedulerJobs: (await schedulerStore.listJobs()).length
           },
+          // #174: top-level booleans the onboarding wizard reads to decide
+          // whether to render and which step to land on.
+          hasProvider: onboardingHasProvider,
+          hasPreset: onboardingHasPreset,
+          firstChatComplete: onboardingFirstChatComplete,
           bridgeSummary: summarizeBridgeSessionsAggregate(codeBridgeSessions, bridgeProcesses),
           bridgeSessions: bridgeSessionSummary,
           bridgeProcesses: bridgeProcessSummary,
@@ -5520,7 +5630,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
               try {
                 const updatedSession = await store.get(sessionId);
                 if (updatedSession) {
-                  await memoryService.captureSessionSummary(sessionId, updatedSession.messages);
+                  const captured = await memoryService.captureSessionSummary(sessionId, updatedSession.messages);
+                  // v0.7 (#180) — surface end-of-turn capture to the dashboard
+                  // MemoryStream. `captureSessionSummary` returns null when the
+                  // store is unconfigured or the transcript is empty; we only
+                  // emit on a real write so the stream stays signal-only.
+                  if (captured) {
+                    eventBus.emit('memory:captured', {
+                      sessionId,
+                      memoryId: captured.id,
+                      summary: captured.summary,
+                      scope: captured.scope,
+                      tags: captured.tags,
+                    });
+                  }
                   const toolMsgs = updatedSession.messages.filter(m => m.role === 'tool' || (m.role === 'assistant' && m.content?.includes('tool')));
                   if (toolMsgs.length > 0) {
                     // #42: track for SIGTERM drain so the autoCapture survives shutdown.
@@ -5563,7 +5686,19 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           workspaceId: body.workspaceId,
           systemPrompt: 'You are CrowClaw, an AI assistant with tool-use capabilities. You can search the web, read/write files, manage scheduled tasks and reminders, and more. Use your available tools proactively to fulfill user requests.'
         });
-        await memoryService.captureSessionSummary(sessionId, result.session.messages);
+        const capturedSync = await memoryService.captureSessionSummary(sessionId, result.session.messages);
+        // v0.7 (#180) — sync chat path mirrors the streaming path: emit the
+        // capture event so the MemoryStream component sees the same signal
+        // regardless of whether the user was streaming or doing a turn-style request.
+        if (capturedSync) {
+          eventBus.emit('memory:captured', {
+            sessionId,
+            memoryId: capturedSync.id,
+            summary: capturedSync.summary,
+            scope: capturedSync.scope,
+            tags: capturedSync.tags,
+          });
+        }
         // Auto-capture skills from completed conversations (Hermes self-improvement pattern)
         if (result.toolResults.length > 0) {
           // #42: track for SIGTERM drain so the autoCapture survives shutdown.
@@ -6283,7 +6418,58 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       // --- Diagnostics ---
+      // Issue #177: extend the response with aggregate sub-checks so the
+      // header `<crowclaw-status-pill>` can render a single red/yellow/green
+      // pill without making four separate calls. The pill aggregates:
+      //   transport.{ws,sse} – is the realtime channel up
+      //   provider.{configured,reachable,lastCallOk} – is the LLM provider OK
+      //   scheduler.{running,errored} – is the autonomous tick alive
+      //   mcp.{total,connected,degraded} – are all configured MCP servers OK
+      // Legacy fields (wsConnections, activeSessions, …) are preserved so
+      // existing tests and the older Overview panel keep working.
       if (request.method === 'GET' && url.pathname === '/api/diagnostics') {
+        // Provider sub-check. We can only inspect the slot the runtime was
+        // booted with — there's no per-call success tracker yet, so
+        // `lastCallOk` reports `null` (unknown) when no provider tracking is
+        // wired. `configured` is true when a non-echo provider is supplied;
+        // `reachable` mirrors `configured` until a live probe is added.
+        const providerOpt = options.provider;
+        const providerName = typeof providerOpt === 'object' && providerOpt && 'name' in providerOpt
+          ? String((providerOpt as Record<string, unknown>).name)
+          : '';
+        const providerIsEcho = !providerOpt || providerName.toLowerCase().includes('echo');
+        const providerConfigured = !providerIsEcho;
+
+        // MCP sub-check. Multi-server managers expose `getServerStatus()`;
+        // single-client setups expose `getStatus()` only. Treat a single
+        // client as `total: 1` so the pill never renders an empty MCP slot
+        // when one is wired.
+        const mcpAny = mcpClient as unknown as {
+          getServerStatus?: () => Record<string, { degraded?: boolean; lastError?: unknown }>;
+          getStatus?: () => { degraded?: boolean; lastError?: unknown } | null | undefined;
+        };
+        let mcpTotal = 0;
+        let mcpDegraded = 0;
+        const multi = mcpAny.getServerStatus?.();
+        if (multi && typeof multi === 'object') {
+          const entries = Object.values(multi);
+          mcpTotal = entries.length;
+          mcpDegraded = entries.filter((s) => s?.degraded === true).length;
+        } else {
+          const single = mcpAny.getStatus?.();
+          if (single) {
+            mcpTotal = 1;
+            mcpDegraded = single.degraded === true ? 1 : 0;
+          }
+        }
+        const mcpConnected = Math.max(0, mcpTotal - mcpDegraded);
+
+        // Scheduler sub-check. `consecutiveErrors > 0` means the most recent
+        // tick threw — operators should see yellow/red even if the timer is
+        // technically still running.
+        const schedRunning = autonomousScheduler.isRunning();
+        const schedErrored = autonomousScheduler.consecutiveErrors > 0;
+
         return Response.json({
           ok: true,
           runtime: 'node',
@@ -6294,6 +6480,29 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           eventBusSubscribers: eventBus.subscriberCount,
           uptime: typeof process !== 'undefined' ? Math.floor(process.uptime()) : 0,
           lastHeartbeat: lastHeartbeatAt,
+          // --- Issue #177 sub-checks ---
+          transport: {
+            ws: wsManager.connectionCount > 0,
+            // SSE endpoint (`/sse`) is always mounted by this runtime, so
+            // the channel is "available" even when no client is currently
+            // attached. The pill only flips this red if the runtime is
+            // shutting down (sseSubscribers cleared) — see #41.
+            sse: true,
+          },
+          provider: {
+            configured: providerConfigured,
+            reachable: providerConfigured,
+            lastCallOk: null as boolean | null,
+          },
+          scheduler: {
+            running: schedRunning,
+            errored: schedErrored,
+          },
+          mcp: {
+            total: mcpTotal,
+            connected: mcpConnected,
+            degraded: mcpDegraded,
+          },
         });
       }
 

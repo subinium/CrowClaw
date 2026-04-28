@@ -741,10 +741,14 @@ export class AutomateView extends LitElement {
 
         ${this.jobs.length === 0
           ? html`
-              <div class="empty">
-                <div class="empty-title">No Jobs</div>
-                <div class="empty-subtitle">Create a scheduled job to get started</div>
-              </div>
+              <crowclaw-empty
+                icon="jobs"
+                title="No automated jobs"
+                description="Schedule a recurring task and your agent will run it on cron or interval — no chat needed."
+                cta-label="Create a recurring task"
+                cta-event="cc-empty-new-job"
+                @cc-empty-new-job=${this._openForm}
+              ></crowclaw-empty>
             `
           : html`
               <div class="job-grid">
