@@ -77,6 +77,8 @@ export const routePaths = {
   },
   system: {
     health: '/health',
+    healthz: '/healthz',  // Kubernetes liveness alias (process up)
+    readyz: '/readyz',    // Kubernetes readiness alias (process up + warmed)
     version: '/api/system/version',
     status: '/api/system/status',
     preflight: '/api/system/preflight',

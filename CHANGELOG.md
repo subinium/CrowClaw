@@ -5,6 +5,25 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.6] — 2026-04-28 — localhost dev open-access for dashboard config + /healthz aliases
+
+Patch surfacing two real bugs found while running the dashboard locally:
+
+1. **`serve-local.mjs` printed "Dashboard token: NOT SET (open access)" but the dashboard hit "Session expired" toasts and bounced to a login screen.** Root cause: `runtime-node`'s auth middleware blocked every "dangerous" route (`/api/providers/config`, `/api/config/agent`, etc.) with HTTP 401 when `CROWCLAW_DASHBOARD_TOKEN` was unset, even on a localhost bind. The dashboard fetches those endpoints during init → 401 → the `crowclaw:auth-required` event fired → `authenticated=false` + "Session expired" toast → user pushed back to the login form even though the server claimed open access.
+2. **`/healthz` and `/readyz` were 404.** Issue #146 was closed in v0.6.0 as if shipped, but only `/health` was wired. Kubernetes-style probes 404'd.
+
+### Fixed
+- **`runtime-node`/auth-middleware (line 2438-2452)**: when `dashToken` is unset AND the runtime is bound to a localhost interface, dashboard-config read/write routes (`/api/providers/config`, `/api/config/provider`, `/api/config/agent`, `/api/config/validate`, `/api/config/diff`, `/api/config/remote-access`) bypass the 401. Implemented as a new `isLocalDashConfigRoute(pathname)` helper alongside the existing `isGatewayMutationRoute`. **Execution routes (`/api/terminal/*`, `/api/workspace/{write,delete,rename,patch*}`, `/api/scheduler/{start,stop}`, `/api/mcp/{connect,disconnect,servers}`, `/api/security/policy`) stay locked even on localhost** — `tests/security-critical.test.ts` is the binding contract. Public-bind fail-close (HTTP 500 with `CROWCLAW_DASHBOARD_TOKEN is required when binding to non-localhost`) is preserved at line 2315.
+- **`runtime-node`/index.ts:2613-2622**: added `/healthz` (Kubernetes liveness alias — process up) and `/readyz` (readiness alias — process up + warmed) returning the same payload as `/health`. Closes the v0.6.0 #146 close-as-shipped misclassification.
+- **`packages/runtime-node/src/route-paths.ts`**: `system.healthz` + `system.readyz` exposed in the route-paths table.
+
+### Verification
+- 7 new tests in `tests/v06_6-localhost-openaccess.test.ts` covering: config-route dev pass-through, execution-route stay-locked, public-bind fail-close, token-set normal flow, /healthz + /readyz alias shape.
+- Full suite: **2,540 / 2,540** (up from 2,532 — 8 new tests).
+
+### Why this matters
+After v0.6.5 finally fixed end-to-end npm publishing, this is the first patch that makes `node scripts/serve-local.mjs` → open `http://localhost:3333` actually deliver the "open access" experience the README and serve-local banner promise.
+
 ## [0.6.5] — 2026-04-28 — first npm publish of `@crowclaw/*` workspaces
 
 The `@crowclaw` npm organization was registered ahead of this release (npm org creation is web-UI-only — not scriptable), unblocking the workspace publish step that has failed since v0.6.0.

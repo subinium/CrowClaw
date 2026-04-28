@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/mcp",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,7 +17,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/sandbox-executor": "0.6.5"
+    "@crowclaw/sandbox-executor": "0.6.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"
