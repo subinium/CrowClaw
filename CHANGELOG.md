@@ -5,6 +5,13 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.6.3] — 2026-04-28 — npm provenance unblock (repository field on every package)
+
+Patch on top of v0.6.2's publish-pipeline fix. The v0.6.2 publish workflow ran end-to-end but failed at every actual `npm publish` call with `E422 Unprocessable Entity — Failed to validate repository information: package.json: "repository.url" is "", expected to match "https://github.com/subinium/CrowClaw" from provenance`. npm's provenance verification requires `repository.url` on the published package.json — none of the workspace packages had it.
+
+### Fixed
+- **`repository`, `homepage`, `bugs` fields added to all 20 package.json files** (root + 19 workspaces). `repository.directory` set per-workspace so the npm registry links to the correct subpath. This unblocks `--provenance` so v0.6.3 publishes both `crowclaw@0.6.3` and `@crowclaw/*@0.6.3` to npm.
+
 ## [0.6.2] — 2026-04-28 — npm publish unblock + workspace packages on registry
 
 Patch release that unblocks the broken publish pipeline (v0.6.0 and v0.6.1 GitHub releases were tagged but the `publish` workflow failed at the test step in CI, so neither version reached the npm registry — `crowclaw@0.5.0` had been the last published version on npm) and adds workspace-level publishing so library consumers can install `@crowclaw/*` packages independently.

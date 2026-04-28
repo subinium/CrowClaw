@@ -1,6 +1,6 @@
 {
   "name": "crowclaw",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "description": "A self-improving TypeScript agent framework that learns from every conversation.",
   "bin": {
@@ -37,5 +37,13 @@
     "typescript": "^6.0.2",
     "vitest": "^4.1.4",
     "wrangler": "^4.81.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subinium/CrowClaw.git"
+  },
+  "homepage": "https://github.com/subinium/CrowClaw",
+  "bugs": {
+    "url": "https://github.com/subinium/CrowClaw/issues"
   }
 }
