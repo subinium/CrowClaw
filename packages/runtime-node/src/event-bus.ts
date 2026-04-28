@@ -24,7 +24,22 @@ export type RuntimeEventType =
   | 'session:steered'
   | 'session:aborted'
   | 'session:forked'
-  | 'session:compacted';
+  | 'session:compacted'
+  // v0.7 (#179) — surface tool execution to the dashboard so operators can
+  // audit what the agent actually did. `tool:start` fires before the worker
+  // executes; `tool:complete` fires after with `durationMs` + `ok`. Emitted
+  // by the EventBus-observing wrapper around the configured ToolRegistry in
+  // `createConfiguredAgent` so direct routes (e.g. /api/web/fetch) stay
+  // untouched.
+  | 'tool:start'
+  | 'tool:complete'
+  // v0.7 (#180) — surface the memory pipeline. `memory:captured` fires after
+  // a session-summary write; `memory:recalled` fires after `MemoryService.recall`
+  // returns. Both are wired at the agent-loop integration site only, so the
+  // dashboard's MemoryStream component can show capture/recall in real time
+  // without modifying every gateway/scheduler dispatch handler.
+  | 'memory:captured'
+  | 'memory:recalled';
 
 export interface RuntimeEvent {
   type: RuntimeEventType;

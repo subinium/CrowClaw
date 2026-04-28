@@ -513,10 +513,76 @@ function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: stri
 // Providers
 // ---------------------------------------------------------------------------
 
+/**
+ * Issue #175: Demo-mode configuration for EchoProvider. When `demoMode` is on,
+ * `generateStream` emits 12 token-shaped chunks pacing across ~800ms with a
+ * `<thinking>...</thinking>` reasoning block and a fake `[TOOL CALL: web.fetch]`
+ * segment, so the chat UI exercises tool-call rendering and reasoning-scrub
+ * paths without a real provider key.
+ */
+export interface EchoProviderOptions {
+  /** Enable simulated streaming for the no-key onboarding demo path. */
+  demoMode?: boolean;
+  /** Total wall-clock pacing across the 12 demo chunks. Defaults to 800ms. */
+  demoStreamDurationMs?: number;
+  /** Override the chunk count (default: 12). Tests use 12; do not lower in prod. */
+  demoChunkCount?: number;
+  /**
+   * Sleep function — DI for tests so we can drive the stream without
+   * actually waiting 800ms. Defaults to `setTimeout`-backed promise.
+   */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const DEFAULT_DEMO_DURATION_MS = 800;
+const DEFAULT_DEMO_CHUNK_COUNT = 12;
+
+/**
+ * Issue #175: 12 token-shaped fragments. Includes a `<thinking>...</thinking>`
+ * reasoning block and a `[TOOL CALL: web.fetch] {url:'...'}` segment so the
+ * UI's tool-call rendering and reasoning-scrub paths get exercised against
+ * echo output. Total emitted text reads as a coherent assistant turn.
+ */
+const DEMO_STREAM_FRAGMENTS: readonly string[] = [
+  '<thinking>',
+  'User asked a question. ',
+  'I should answer concisely',
+  ' and demonstrate that streaming, tool calls, ',
+  'and reasoning blocks all wire through.',
+  '</thinking>',
+  '\n\nGreat question! Let me ',
+  'fetch a quick reference.',
+  '\n\n[TOOL CALL: web.fetch]',
+  " {url:'https://crowclaw.dev/docs'}",
+  '\n\nThis is **DEMO mode** (no real LLM). ',
+  'Set `OPENROUTER_API_KEY` for a real provider.',
+];
+
 export class EchoProvider implements ProviderAdapter, StreamingProviderAdapter {
+  private readonly demoMode: boolean;
+  private readonly demoStreamDurationMs: number;
+  private readonly demoChunkCount: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+
+  /**
+   * Issue #175: Optional options bag. Backwards compatible — `new EchoProvider()`
+   * still works exactly as before for unit tests and hermetic mode.
+   */
+  constructor(options: EchoProviderOptions = {}) {
+    this.demoMode = options.demoMode ?? false;
+    this.demoStreamDurationMs = options.demoStreamDurationMs ?? DEFAULT_DEMO_DURATION_MS;
+    this.demoChunkCount = options.demoChunkCount ?? DEFAULT_DEMO_CHUNK_COUNT;
+    this.sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  }
+
   /** Issue #72: Echo provider accepts any key (testing). */
   static validateKey(_key: string): KeyValidationResult {
     return { ok: true };
+  }
+
+  /** Issue #175: Surface demo-mode status to operators / system-status endpoints. */
+  isDemoMode(): boolean {
+    return this.demoMode;
   }
 
   /** Issue #56: Echo provider needs no nudging — testing only. */
@@ -547,6 +613,11 @@ export class EchoProvider implements ProviderAdapter, StreamingProviderAdapter {
   }
 
   async *generateStream(request: ProviderRequest): AsyncGenerator<StreamChunk> {
+    if (this.demoMode) {
+      yield* this.generateDemoStream();
+      return;
+    }
+
     const response = await this.generate(request);
     if (response.assistantMessage) {
       yield { type: 'text', text: response.assistantMessage };
@@ -558,6 +629,27 @@ export class EchoProvider implements ProviderAdapter, StreamingProviderAdapter {
         yield { type: 'tool_use_delta', toolInput: inputJson };
         yield { type: 'tool_use_end', toolName: tc.name, toolInput: inputJson };
       }
+    }
+    yield { type: 'done' };
+  }
+
+  /**
+   * Issue #175: Simulated streaming for the no-key onboarding path. Emits
+   * `demoChunkCount` (default 12) token-shaped fragments with even pacing
+   * across `demoStreamDurationMs` (default 800ms). Total wall time is
+   * approximately the configured duration regardless of chunk count.
+   */
+  private async *generateDemoStream(): AsyncGenerator<StreamChunk> {
+    const fragments = DEMO_STREAM_FRAGMENTS.slice(0, this.demoChunkCount);
+    const perChunkDelay = this.demoChunkCount > 0
+      ? Math.max(0, Math.floor(this.demoStreamDurationMs / this.demoChunkCount))
+      : 0;
+
+    for (const fragment of fragments) {
+      if (perChunkDelay > 0) {
+        await this.sleep(perChunkDelay);
+      }
+      yield { type: 'text', text: fragment };
     }
     yield { type: 'done' };
   }

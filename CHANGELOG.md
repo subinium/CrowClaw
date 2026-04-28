@@ -5,6 +5,62 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.7.0] — 2026-04-28 — UX live wave: 10-issue platform polish sweep (onboarding, demo mode, real-time observability, session controls UI)
+
+The v0.6.x cycle delivered a battle-tested backend; v0.7.0 turns the dashboard from "looks empty / amateurish" into a working product. Eight parallel agents implemented 10 spec'd issues against `release/v0.7.0` simultaneously with strict file ownership. The previous post-v0.6.7 audit found that 17/23 dashboard routes returned real data but the user couldn't see anything alive without an API key configured + setup completed; this release closes that perception gap.
+
+- **8 agent clusters**, ~75 files changed, ~+5,800 / -150 lines
+- **2,702 / 2,702 tests passing** (up from 2,541 — **161 new tests** across 9 v0.7 test files)
+- 12 new dashboard components
+
+### Onboarding (CRITICAL)
+- **First-run setup wizard** (#174). New `<crowclaw-onboarding>` view: 3-step horizontal stepper covering provider key (with per-provider validation from #72), tool preset, first chat. Skips when `/api/system/status.hasProvider === true`. Emits `crowclaw:onboarding-complete` so the app shell re-routes to the home view. Eliminates the "every tab is empty / what do I do" cliff.
+- **EchoProvider demo mode** (#175). When no provider key env is set, `runtime-node` auto-wires `EchoProvider` (extended with simulated streaming: 12 token-shaped chunks across 800ms with `<thinking>...</thinking>` and a fake `[TOOL CALL: web.fetch]` segment). Console banner makes the mode obvious. New `<crowclaw-demo-badge>` lights up in the header. **0-friction "try without keys"** path — `git clone` → `npm install` → `npm run dev` → working chat in <30s.
+
+### Real-time observability (CRITICAL / WARNING)
+- **Tool execution trace in chat** (#179). New `<crowclaw-tool-call-trace>` Lit component renders inline between assistant messages. Collapsed: `▶ web.fetch (1.2s) ✓`. Expanded: pretty-printed JSON args, 500-char-truncated output with "Show full" modal hook, "Copy as cURL" button for HTTP-shaped tools. Failed calls get a red border and "Why?" link to the audit log. Backed by new `tool:start`/`tool:complete` EventBus types + agent-loop instrumentation in `runtime-node`.
+- **Memory pipeline visualization** (#180). New `<crowclaw-memory-stream>` collapsible sidebar component. Live event stream with capture/recall pulse animation. Backed by new `memory:captured`/`memory:recalled` EventBus types + emission from `MemoryService.recall` and `captureSessionSummary`. Makes the "self-improving" claim visible.
+- **Connection status pill** (#177). New `<crowclaw-status-pill>` in the header. Aggregates 4 sub-checks (transport WS/SSE, provider configured/reachable, scheduler running/errored, MCP total/connected/degraded) into one color-coded pill. Click → popover with quick actions (`Reconnect WS`, `Test provider`, `Resume scheduler`). Polls `/api/diagnostics` every 30s + bridges WS EventBus events through a window-level `crowclaw-event` for live updates.
+
+### Session lifecycle UI (CRITICAL / WARNING)
+- **/steer mid-run UI** (#193). New `<crowclaw-steer-composer>`: slide-up textarea anchored to the bottom of the chat stream while `session.status === 'running'`. Submit → POST `/api/sessions/:id/steer` (v0.6.0 #145). Success → toast + steer marker injected at current stream position. 409 SESSION_NOT_ACTIVE handled with toast. Enter submits, Shift+Enter newline, Esc cancels. Subscribes to `session:steered` for live marker updates. Closes the "headline feature with no UI" gap.
+- **Fork session UI** (#194). New `<crowclaw-fork-modal>`: modal with parent preview + new task textarea + `enabledToolsets` chip multi-select (wires v0.6.0 #84 restriction option). 3-dot menu trigger in chat-view. POST → `/api/sessions/:id/fork` (#146) → navigate to child + refresh session list. Subscribes to `session:forked` for live updates.
+- **Checkpoint side panel** (#195). New `<crowclaw-checkpoint-panel>`: right-edge slide-in surface with checkpoint list (trigger badge, label, age, msg count). Manual save with optional label, two-step inline restore confirm with auto-revert, replay-to-new-session. `Checkpoints (N)` header button in chat-view. Refreshes on `session:compacted`.
+
+### Foundational UX (WARNING)
+- **Empty-state CTAs** (#176). New shared `<crowclaw-empty>` Lit component (icon + title + description + CTA). Wired into 8 distinct empty states across chat / agent / automate / connect / settings views. Each CTA either navigates via href or dispatches a custom event the host view listens for, so the component stays view-agnostic. Memory/Usage CTAs hash-navigate to chat to drive data generation.
+- **Cmd+K command palette** (#178). New `<crowclaw-command-palette>` Lit modal. Four indexed sources (sessions, memories, skills, hardcoded actions) with fuzzy ranking, recent-search persistence (max 20), Tab-cycling source filter, arrow-key navigation. Pure scoring logic (`fuzzyScore`, `aggregateResults`) lives in `lib/search.ts` for unit-testability. `lib/keyboard.ts:registerCommandPalette` wires the global Cmd+K / Ctrl+K binding.
+
+### App shell integration
+- **`packages/web/ui/src/app.ts`** updated to:
+  - Mount `<crowclaw-status-pill>` and `<crowclaw-demo-badge>` in the header strip.
+  - Register `Cmd+K` global shortcut at `firstUpdated` via dynamic import of `lib/keyboard.js`.
+  - Route to `<crowclaw-onboarding>` view when `shouldShowOnboarding(systemStatus)` returns true.
+  - Wire `STATUS_PILL_ACTIONS` constants for the 3 quick actions (reconnect-ws / test-provider / resume-scheduler).
+  - Bridge WS EventBus events to a window-level `crowclaw-event` so the status pill refreshes immediately instead of waiting for its 30s tick.
+- **EventBus** (`runtime-node/src/event-bus.ts`): `RuntimeEventType` union extended with 4 new types — `tool:start`, `tool:complete`, `memory:captured`, `memory:recalled`.
+- **`/api/diagnostics`** extended with sub-check booleans (transport / provider / scheduler / mcp) for the status pill.
+- **`/api/system/status`** extended with `hasProvider`, `hasPreset`, `firstChatComplete` for the onboarding wizard.
+
+### Cross-package contracts added
+- `<crowclaw-onboarding>` view + `shouldShowOnboarding` helper — `@crowclaw/web`
+- `<crowclaw-empty>`, `<crowclaw-demo-badge>`, `<crowclaw-status-pill>`, `<crowclaw-command-palette>`, `<crowclaw-tool-call-trace>`, `<crowclaw-memory-stream>`, `<crowclaw-steer-composer>`, `<crowclaw-fork-modal>`, `<crowclaw-checkpoint-panel>` — `@crowclaw/web/components`
+- `fuzzyScore` / `aggregateResults` / `loadRecent` — `@crowclaw/web/lib/search`
+- `registerCommandPalette(parent)` — `@crowclaw/web/lib/keyboard`
+- `STATUS_PILL_ACTIONS`, `STATUS_PILL_REFRESH_EVENT`, `STATUS_PILL_EVENTBUS_BRIDGE_EVENT` constants — `@crowclaw/web/components`
+- `EchoProviderOptions` (demoMode, demoStreamDurationMs, demoChunkCount) — `@crowclaw/providers`
+- `RuntimeEventType` union: `tool:start | tool:complete | memory:captured | memory:recalled` — `@crowclaw/runtime-node/event-bus`
+
+### Verification
+- `npm run typecheck` → clean
+- `npm test` → 2,702 / 2,702 across 224 files
+- 161 new tests across 9 v0.7 test files (`v07-onboarding`, `v07-echo-demo`, `v07-empty-states`, `v07-status-pill`, `v07-command-palette`, `v07-tool-trace`, `v07-memory-stream`, `v07-session-actions-ui`, `v07-app-integration`)
+
+### Remaining v0.7 work (deferred to subsequent patches)
+v0.7.0 covers **Group 1 (UX live wave)**. Remaining 25 v0.7 issues split into:
+- **v0.7.1** — Memory + Skills 살리기 (#181 skill matching reasons, #184 memory edit/delete, #185 learning loop dashboard, #186 memory pinning, #188 skill preview, #196 multi-slot UI, #197 persona switcher)
+- **v0.7.2** — 인프라 + 폴리시 (#182 token usage breakdown, #183 audit log, #189 plugin catalog, #190 safer MCP install, #199 pairings UI, #200 platform setup wizard, #201 secret rotation, #202 sessionStore wiring, #203 ACP tools wiring, #204 Korean i18n, #205 theme system, #206 version footer, #207 export/import, #208 a11y)
+
 ## [0.6.7] — 2026-04-28 — extend localhost dev open-access to all GETs (dashboard init unblock, take 2)
 
 v0.6.6 only carved out a small list of dashboard-config routes (`/api/providers/config`, `/api/config/*`). The dashboard's init sequence also `GET`s several other dangerous-routed endpoints (`/api/mcp/servers`, `/api/scheduler/start` etc.) for read-only display, which still 401'd → the `crowclaw:auth-required` toast still fired ("Session expired. Please sign in again.") in dev mode. Test coverage missed it because the v0.6.6 tests targeted POST/PUT/PATCH/DELETE only.

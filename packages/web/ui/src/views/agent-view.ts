@@ -732,10 +732,18 @@ export class AgentView extends LitElement {
         ${this.skillsLoading
           ? html`<div class="loading">Loading skills</div>`
           : this._filteredSkills.length === 0
-            ? html`<div class="empty">
-                <div class="empty-title">${this.skills.length ? 'No matching skills' : 'No skills'}</div>
-                <div class="empty-subtitle">${this.skills.length ? 'Try a different search term.' : 'Create a skill or import from SKILL.md.'}</div>
-              </div>`
+            ? this.skills.length === 0
+              ? html`<crowclaw-empty
+                  icon="skills"
+                  title="No skills loaded"
+                  description="Skills map trigger phrases to tool execution steps. Browse the OpenClaw catalog or drop SKILL.md files into .crowclaw/skills/."
+                  cta-label="Browse the catalog"
+                  cta-href="https://github.com/subinium/openclaw"
+                ></crowclaw-empty>`
+              : html`<div class="empty">
+                  <div class="empty-title">No matching skills</div>
+                  <div class="empty-subtitle">Try a different search term.</div>
+                </div>`
             : html`
                 <div class="grid">
                   ${this._filteredSkills.map((s) => this._renderSkillCard(s))}
