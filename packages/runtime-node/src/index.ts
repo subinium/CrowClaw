@@ -2387,6 +2387,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     eventBus,
     feedbackLedger,
     shutdown,
+    // v0.7.1: exposed so Node entry-points (serve-local.mjs) can wire an
+    // upgraded `ws` library WebSocket into the runtime's event broadcast
+    // pipeline. The fetch() path uses Workers-only WebSocketPair which is
+    // unavailable on Node, so this is the only route for live events on
+    // the Node host.
+    wsManager,
     async fetch(request: Request): Promise<Response> {
      try {
       const url = new URL(request.url);
