@@ -8,6 +8,13 @@ export { createImageGenerateTool, type ImageGenerationOptions } from './image-ge
 import { createImageGenerateTool as createImageGenerateToolImpl } from './image-gen.js';
 export { createTtsTool, createTranscriptionTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
+// v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
+// not registered by `registerCoreTools` and not in the default agent toolset.
+// Operators add the `code-pipeline` toolset preset (see TOOLSET_PRESETS) or
+// call `registerCodeExecuteTool` directly when wiring up their orchestrator.
+export { createCodeExecuteTool, type CodeExecuteToolDeps } from './code-execute.js';
+import { createCodeExecuteTool as createCodeExecuteToolImpl } from './code-execute.js';
+import type { CodeExecuteToolDeps as _CodeExecuteToolDeps } from './code-execute.js';
 import {
   buildDiscordSendPayload,
   buildSlackSendPayload,
@@ -3233,7 +3240,7 @@ export function createDefaultWorkerRegistry(options?: {
  * Toolset Presets — Named tool bundles inspired by Hermes Agent's toolset distributions.
  * Each preset defines which tool categories to include.
  */
-export type ToolsetPresetName = 'minimal' | 'web' | 'terminal' | 'workspace' | 'memory' | 'mcp' | 'full' | 'research' | 'devops' | 'creative';
+export type ToolsetPresetName = 'minimal' | 'web' | 'terminal' | 'workspace' | 'memory' | 'mcp' | 'full' | 'research' | 'devops' | 'creative' | 'code-pipeline';
 
 export interface ToolsetPreset {
   name: ToolsetPresetName;
@@ -3292,6 +3299,15 @@ export const TOOLSET_PRESETS: Record<ToolsetPresetName, ToolsetPreset> = {
     description: 'All available tools',
     toolNames: [], // Empty means "register everything"
   },
+  // v0.8.0 (#234) — `code.execute` pipeline. Curated subset that pairs the
+  // sandbox runner with deterministic read-mostly tools. Operators opt in via
+  // toolset config; this preset is NOT included in `registerCoreTools` and
+  // NOT in the default agent toolset.
+  'code-pipeline': {
+    name: 'code-pipeline',
+    description: 'Code-pipeline (#234) — sandboxed JS/TS runner that chains web/workspace/memory tools in one call',
+    toolNames: ['echo', 'time', 'tool.list', 'code.execute', 'web.fetch', 'web.search', 'workspace.read', 'memory.search'],
+  },
 };
 
 export function getToolsetPreset(name: ToolsetPresetName): ToolsetPreset {
@@ -3304,4 +3320,53 @@ export function listToolsetPresets(): ToolsetPreset[] {
 
 export function listToolsetPresetNames(): ToolsetPresetName[] {
   return Object.keys(TOOLSET_PRESETS) as ToolsetPresetName[];
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 (#238) — self-improvement loop tools (append-only registration)
+// ---------------------------------------------------------------------------
+export {
+  createLearningProposeSkillTool,
+  type LearningProposeSkillToolOptions,
+  type LearningProposeSkillEventBus,
+} from './learning-propose-skill.js';
+export {
+  createLearningReviseSkillTool,
+  type LearningReviseSkillToolOptions,
+  type LearningReviseSkillEventBus,
+} from './learning-revise-skill.js';
+import { createLearningProposeSkillTool as createLearningProposeSkillToolImpl, type LearningProposeSkillToolOptions } from './learning-propose-skill.js';
+import { createLearningReviseSkillTool as createLearningReviseSkillToolImpl, type LearningReviseSkillToolOptions } from './learning-revise-skill.js';
+
+/**
+ * Register the agent-authored skill tools (proposeSkill / reviseSkill).
+ * Both are idempotent and low-danger; safe to include in the default toolset.
+ */
+export function registerLearningSkillTools(
+  registry: ToolRegistry,
+  options: { propose?: LearningProposeSkillToolOptions; revise?: LearningReviseSkillToolOptions } = {},
+): ToolRegistry {
+  registry.register(createLearningProposeSkillToolImpl(options.propose));
+  registry.register(createLearningReviseSkillToolImpl(options.revise));
+  return registry;
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 (#234) — opt-in registration for the `code.execute` pipeline tool.
+//
+// Deliberately NOT folded into `registerCoreTools` and NOT in the default
+// agent toolset — operators who want sandboxed multi-tool pipelines must
+// call this explicitly when wiring their agent. The helper accepts the same
+// `executeTool` callback the agent loop uses (so plugins / hardline /
+// approval still apply inside the sandbox), an optional `eventBus` for
+// `code:start` / `code:tool_called` / `code:complete` events, and the
+// `securityAuditLog` so the call site emits a `tool.code-execute` audit
+// row before the sandbox runs.
+// ---------------------------------------------------------------------------
+export function registerCodeExecuteTool(
+  registry: ToolRegistry,
+  deps: Omit<_CodeExecuteToolDeps, 'toolRegistry'>,
+): ToolRegistry {
+  registry.register(createCodeExecuteToolImpl({ ...deps, toolRegistry: registry }));
+  return registry;
 }

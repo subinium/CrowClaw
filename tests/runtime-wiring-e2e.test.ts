@@ -66,8 +66,15 @@ describe('runtime wiring e2e', () => {
     });
 
     expect(provider.requests).toHaveLength(1);
-    expect(provider.requests[0]?.systemPrompt).toContain('<skill name="write-tests"');
-    expect(provider.requests[0]?.systemPrompt).toContain('Add a failing test');
+    // v0.8.0 (#230): skills inject as a user-role message, not into the
+    // system prompt — preserves prefix-cache hits across turns where matches
+    // change. Look for the envelope in the messages array.
+    const skillMsg = provider.requests[0]?.messages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<crowclaw-skills>'),
+    );
+    expect(skillMsg).toBeDefined();
+    expect(skillMsg?.content as string).toContain('<skill name="write-tests"');
+    expect(skillMsg?.content as string).toContain('Add a failing test');
   });
 
   it('runtime-node enforces pairing policy before agent execution and approves via gateway approvePairing', async () => {
@@ -157,7 +164,11 @@ describe('runtime wiring e2e', () => {
 
     expect(provider.requests).toHaveLength(1);
     expect(provider.requests[0]?.systemPrompt).toContain('Senior reviewer');
-    expect(provider.requests[0]?.systemPrompt).toContain('<skill name="write-tests"');
+    // v0.8.0 (#230): skills now inject as user-role messages.
+    const skillMsg1 = provider.requests[0]?.messages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<crowclaw-skills>'),
+    );
+    expect(skillMsg1?.content as string).toContain('<skill name="write-tests"');
     expect(provider.requests[0]?.availableTools.map((tool) => tool.name)).toEqual(['echo', 'time', 'tool.list']);
 
     await runtime.fetch(new Request('http://localhost/api/skills/write-tests/toggle', {
@@ -175,7 +186,12 @@ describe('runtime wiring e2e', () => {
 
     expect(provider.requests).toHaveLength(2);
     expect(provider.requests[1]?.systemPrompt).toContain('Senior reviewer');
-    expect(provider.requests[1]?.systemPrompt).not.toContain('<skill name="write-tests"');
+    const skillMsg2 = provider.requests[1]?.messages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<crowclaw-skills>'),
+    );
+    if (skillMsg2) {
+      expect(skillMsg2.content as string).not.toContain('<skill name="write-tests"');
+    }
     expect(provider.requests[1]?.availableTools.map((tool) => tool.name)).toEqual(['echo', 'time', 'tool.list']);
   });
 

@@ -66,3 +66,14 @@ import './tool-call-trace.js';
 export { CrowClawMemoryStream } from './memory-stream.js';
 export type { MemoryEventType, MemoryStreamEvent } from './memory-stream.js';
 import './memory-stream.js';
+
+/**
+ * v0.8.0 (#231) — `<crowclaw-reasoning-block>`. Renders Hermes-style
+ * `<plan>` / `<reasoning>` / `<reflection>` / `<thinking>` regions inline
+ * inside an assistant message. The chat-view orchestrator mounts one block
+ * per parsed `ReasoningBlock` and one live block during streaming (driven
+ * by the new `reasoning_start` / `reasoning_delta` / `reasoning_end` SSE
+ * events).
+ */
+export { CrowClawReasoningBlock } from './reasoning-block.js';
+import './reasoning-block.js';

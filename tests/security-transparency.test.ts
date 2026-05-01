@@ -117,7 +117,9 @@ describe('SecurityAuditLog integration with AgentLoop', () => {
         if (this.callCount === 1) {
           return {
             assistantMessage: 'Calling echo.',
-            toolCalls: [{ name: 'echo', input: { text: 'key=sk-ant-abc12345678901234567890' } }],
+            // v0.8.0 (#235): echo's schema requires `message` (validation
+          // gate now enforced pre-execution). Use the correct field.
+          toolCalls: [{ name: 'echo', input: { message: 'key=sk-ant-abc12345678901234567890' } }],
           };
         }
         return { assistantMessage: 'Done.' };

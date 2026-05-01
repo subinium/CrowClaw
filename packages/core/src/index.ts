@@ -128,6 +128,14 @@ export interface ProviderResponse {
   assistantMessage?: string;
   toolCalls?: ToolCall[];
   usage?: ProviderResponseUsage;
+  /**
+   * v0.8.0 (#231): when the response contains Hermes-style reasoning XML blocks
+   * (`<plan>`, `<reasoning>`, `<reflection>`, `<thinking>`, `<think>`, etc.) the
+   * provider parses them out and exposes them here. `assistantMessage` carries
+   * the stripped (non-reasoning) text so existing consumers keep their
+   * contract. Optional — providers that don't see any blocks omit this field.
+   */
+  reasoningBlocks?: import('./reasoning-blocks.js').ReasoningBlock[];
 }
 
 export interface ProviderAdapter {
@@ -138,6 +146,8 @@ export interface ProviderAdapter {
    *  Detected at runtime via `typeof provider.getToolUseGuidance === 'function'`
    *  so providers that don't implement it don't pay any cost. */
   getToolUseGuidance?(modelId: string): string | null;
+  /** #237 (v0.8.0 Hermes parity): optional JSON-schema-typed generation. */
+  generateStructured?<T = unknown>(req: import('./structured-output.js').StructuredOutputRequest<T>): Promise<import('./structured-output.js').StructuredOutputResponse<T>>;
 }
 
 export interface SessionLineage {
@@ -179,10 +189,36 @@ export interface AgentRunInput {
   memories?: string[];
 }
 
+/**
+ * #239 (v0.8.0 Hermes parity): why the agent loop exited.
+ *  - 'natural'                          — model produced a final response with no tool calls
+ *  - 'budget_exhausted_with_synthesis'  — iteration or token cap hit; loop ran one final no-tool synthesis turn
+ *  - 'tool_error_terminal'              — same (tool, error code) failed 3 iterations in a row (#235)
+ *  - 'aborted'                          — caller-provided AbortSignal fired
+ */
+export type AgentTerminationReason =
+  | 'natural'
+  | 'budget_exhausted_with_synthesis'
+  | 'tool_error_terminal'
+  | 'aborted';
+
 export interface AgentRunResult {
   session: SessionState;
   finalResponse: string;
   toolResults: ToolExecutionResult[];
+  /** #239: classification of why the loop exited. Always set on a successful return. */
+  terminationReason: AgentTerminationReason;
+}
+
+/**
+ * #239: companion type for the streaming variant. Surfaced via the final
+ * `done` event so downstream consumers can branch on the same exit reasons
+ * as the non-streaming `run()`.
+ */
+export interface AgentStreamResult {
+  response: string;
+  usage?: ProviderResponseUsage;
+  terminationReason: AgentTerminationReason;
 }
 
 export type AgentStreamEvent =
@@ -191,8 +227,18 @@ export type AgentStreamEvent =
   | { type: 'tool-end'; toolName: string; toolCallId: string; result: string; ok: boolean; durationMs?: number }
   | { type: 'iteration-start'; iteration: number }
   | { type: 'iteration-end'; iteration: number }
-  | { type: 'done'; response: string; usage?: ProviderResponseUsage }
+  | { type: 'done'; response: string; usage?: ProviderResponseUsage; terminationReason?: AgentTerminationReason }
   | { type: 'error'; error: string };
+
+/**
+ * #235 / #239 (v0.8.0): structural interface compatible with runtime-node's
+ * `EventBus`. Core does not import runtime-node (one-way dependency), so we
+ * accept any object with this shape. The orchestrator passes the live
+ * EventBus when constructing the AgentLoop; tests can pass a fake.
+ */
+export interface AgentEventEmitter {
+  emit(type: string, data: Record<string, unknown>): void;
+}
 
 export interface SecurityPolicy {
   /** Redact credentials and PII from tool output before adding to conversation. Default: true */
@@ -275,6 +321,15 @@ export interface AgentLoopOptions {
    *  When the loop trips into a fallback we use this to detect that the
    *  active provider has changed and trigger reasoning-content scrubbing. */
   fallbackProviderNames?: string[];
+  /** #235 / #239 (v0.8.0): runtime event emitter (structurally compatible with
+   *  the runtime-node EventBus) used for `tool:validation_failed`,
+   *  `tool:repeated_failure`, and `agent:terminated`. Optional — when absent,
+   *  the agent loop runs unchanged but the runtime cannot observe these
+   *  lifecycle moments. */
+  eventBus?: AgentEventEmitter;
+  /** #235 (v0.8.0): consecutive identical (toolName, errorCode) failures that
+   *  trigger a terminal exit. Default: 3 (Hermes pattern). */
+  toolFailureStreakLimit?: number;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -447,6 +502,72 @@ const dangerousInputPatterns = [
   /;\s*--/
 ];
 
+/**
+ * #235 (v0.8.0 Hermes parity): build a structured tool-error envelope.
+ * The agent loop injects this as the `content` of a `role:'tool'` message so
+ * the model sees a machine-readable failure payload (with explicit retry
+ * instructions) instead of a free-text "Tool failed:" string. Truncation is
+ * applied to the error message only — the envelope schema is fixed.
+ */
+export function buildToolErrorEnvelope(
+  toolName: string,
+  error: unknown,
+  inputSchema?: unknown,
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error instanceof Error ? error.constructor.name : 'UnknownError';
+  const truncated = message.length > 2000 ? message.slice(0, 2000) + '\n…[truncated]' : message;
+  const schemaHint = inputSchema ? `\nUse this schema: ${JSON.stringify(inputSchema)}` : '';
+  return JSON.stringify({
+    name: toolName,
+    ok: false,
+    error: { code, message: truncated },
+    retry_instruction: `Call ${toolName} again with corrected arguments.${schemaHint}`,
+  });
+}
+
+/**
+ * #235 (v0.8.0): tiny inline validator. Checks `required` keys exist and
+ * top-level types match. Sufficient for "did the model send the right shape"
+ * — we deliberately do not pull in Ajv. Only checks the top-level schema:
+ * nested object validation is the tool's job.
+ *
+ * Returns `null` when the input passes (or no schema is provided), or an
+ * Error with a description when validation fails.
+ */
+export function validateToolInputAgainstSchema(
+  input: Record<string, unknown>,
+  schema: Record<string, unknown> | undefined,
+): Error | null {
+  if (!schema || typeof schema !== 'object') return null;
+  const required = Array.isArray(schema.required) ? (schema.required as unknown[]) : [];
+  for (const key of required) {
+    if (typeof key !== 'string') continue;
+    if (!(key in input)) {
+      return new Error(`Missing required property: "${key}"`);
+    }
+  }
+  const properties = (schema.properties && typeof schema.properties === 'object')
+    ? schema.properties as Record<string, { type?: string }>
+    : null;
+  if (!properties) return null;
+  for (const [key, propSchema] of Object.entries(properties)) {
+    if (!(key in input)) continue;
+    const expectedType = propSchema?.type;
+    if (typeof expectedType !== 'string') continue;
+    const actual = input[key];
+    const actualType = Array.isArray(actual) ? 'array' : typeof actual;
+    // JSON Schema 'integer' is a refinement of 'number' — accept both as numbers.
+    const ok = expectedType === 'integer'
+      ? actualType === 'number' && Number.isInteger(actual as number)
+      : actualType === expectedType;
+    if (!ok) {
+      return new Error(`Property "${key}" expected type "${expectedType}" but got "${actualType}"`);
+    }
+  }
+  return null;
+}
+
 function collectDangerousInputSignals(input: Record<string, unknown>): string[] {
   const values = Object.values(input).flatMap((value) => {
     if (typeof value === 'string') return [value];
@@ -504,6 +625,10 @@ export class AgentLoop {
    *  switches in the fallback chain so we can scrub reasoning content. */
   private readonly providerName?: string;
   private readonly fallbackProviderNames: string[];
+  /** #235 / #239 (v0.8.0): structural emitter for harness-level lifecycle. */
+  private readonly eventBus?: AgentEventEmitter;
+  /** #235 (v0.8.0): consecutive identical (toolName, errorCode) cap. */
+  private readonly toolFailureStreakLimit: number;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -556,6 +681,8 @@ export class AgentLoop {
     this.contextInjection = options.contextInjection ?? 'auto';
     this.providerName = options.providerName;
     this.fallbackProviderNames = options.fallbackProviderNames ?? [];
+    this.eventBus = options.eventBus;
+    this.toolFailureStreakLimit = options.toolFailureStreakLimit ?? 3;
   }
 
   /**
@@ -1178,8 +1305,126 @@ export class AgentLoop {
     };
   }
 
+  /**
+   * #235 (v0.8.0): execute a single tool call, but FIRST validate its input
+   * against the tool's `inputSchema` (if declared). On validation failure,
+   * skip execution entirely, emit `tool:validation_failed`, and return a
+   * synthetic `!ok` ToolExecutionResult whose output is the structured error
+   * envelope. The agent loop appends this as a `role:'tool'` message so the
+   * model gets a clear retry instruction without a real tool ever running.
+   */
+  private async runToolCallWithValidation(
+    toolCall: ToolCall,
+    input: AgentRunInput,
+  ): Promise<ToolExecutionResult> {
+    const def = this.tools.get(toolCall.name);
+    const schema = def?.manifest.inputSchema;
+    if (schema) {
+      const err = validateToolInputAgainstSchema(toolCall.input, schema);
+      if (err) {
+        const envelope = buildToolErrorEnvelope(toolCall.name, err, schema);
+        this.eventBus?.emit('tool:validation_failed', {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          toolName: toolCall.name,
+          errorCode: err.constructor.name,
+          message: err.message,
+        });
+        return {
+          toolName: toolCall.name,
+          runtime: def?.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
+          ok: false,
+          output: envelope,
+          metadata: {
+            validationFailed: true,
+            errorCode: err.constructor.name,
+            envelope: true,
+          },
+        };
+      }
+    }
+    return this.executeToolCall(toolCall, input);
+  }
+
+  /**
+   * #235 (v0.8.0): rewrite a failing tool result so its `output` is the
+   * structured error envelope. Successful results are returned unchanged.
+   * This runs AFTER plugin transforms / redaction so plugins still see the
+   * raw error text and can override `ok` if needed before envelope wrapping.
+   * If a result is already enveloped (validation path) we keep it as-is.
+   */
+  private wrapFailureAsEnvelope(result: ToolExecutionResult): ToolExecutionResult {
+    if (result.ok) return result;
+    if (result.metadata?.envelope === true) return result;
+    const def = this.tools.get(result.toolName);
+    const schema = def?.manifest.inputSchema;
+    const errorCode = (result.metadata?.errorCode as string | undefined) ?? 'ToolError';
+    const message = result.output ?? 'Tool failed.';
+    const truncated = message.length > 2000 ? message.slice(0, 2000) + '\n…[truncated]' : message;
+    const schemaHint = schema ? `\nUse this schema: ${JSON.stringify(schema)}` : '';
+    const envelope = JSON.stringify({
+      name: result.toolName,
+      ok: false,
+      error: { code: errorCode, message: truncated },
+      retry_instruction: `Call ${result.toolName} again with corrected arguments.${schemaHint}`,
+    });
+    return {
+      ...result,
+      output: envelope,
+      metadata: { ...(result.metadata ?? {}), envelope: true, errorCode },
+    };
+  }
+
+  /**
+   * #230 (v0.8.0): build the synthetic user-role message that carries matched
+   * skills. Returns `undefined` when no skills are matched. The returned
+   * message is flagged ephemeral so persistence skips it (recordTurn filter).
+   */
+  private buildSkillInjectionMessage(matchedSkills?: MatchedSkill[]): ConversationMessage | undefined {
+    if (!matchedSkills || matchedSkills.length === 0) return undefined;
+    const inner = matchedSkills.map((s) => {
+      const tools = s.tools?.length ? s.tools.join(',') : '';
+      return `<skill name="${s.name}" tools="${tools}"><description>${s.description}</description><instructions>${s.instructions}</instructions></skill>`;
+    }).join('\n');
+    return {
+      role: 'user',
+      content: `<crowclaw-skills>${inner}</crowclaw-skills>`,
+      createdAt: nowIso(),
+      metadata: { ephemeral: true, kind: 'skill-injection' },
+    };
+  }
+
+  /**
+   * #239 (v0.8.0): single exit point for `agent:terminated` emission. Captures
+   * the duration relative to the run start so observability can compute
+   * tail latency.
+   */
+  private emitTerminated(
+    sessionId: string,
+    reason: AgentTerminationReason,
+    iterations: number,
+    runStartMs: number,
+  ): void {
+    this.eventBus?.emit('agent:terminated', {
+      reason,
+      sessionId,
+      iterations,
+      durationMs: Date.now() - runStartMs,
+    });
+  }
+
   async run(input: AgentRunInput): Promise<AgentRunResult> {
-    ensureNotAborted(input.signal);
+    // #239: capture run-start so `agent:terminated` carries an honest durationMs.
+    const runStartMs = Date.now();
+
+    // #239: AbortSignal handling for the 'aborted' termination reason.
+    // ensureNotAborted throws synchronously; wrap so we can emit before rethrow.
+    try {
+      ensureNotAborted(input.signal);
+    } catch (err) {
+      this.emitTerminated(input.sessionId, 'aborted', 0, runStartMs);
+      throw err;
+    }
 
     await this.plugins?.emit('agent:beforeRun', {
       input: input as unknown as { agentId: string; sessionId: string; [key: string]: unknown },
@@ -1214,11 +1459,18 @@ export class AgentLoop {
       (m) => !(m.role === 'system' && m.content?.startsWith('[session-meta]')),
     );
 
-    const nextMessages = [...cleanedSessionMessages, ...memoryMessages, {
-      role: 'user',
-      content: input.userMessage,
-      createdAt: nowIso()
-    } satisfies ConversationMessage];
+    // #230 (Hermes parity): the skill-injection user message is appended
+    // BELOW (after skill matching) via splice — we know the user-message
+    // index because the user message is the last entry inserted here.
+    const nextMessages: ConversationMessage[] = [
+      ...cleanedSessionMessages,
+      ...memoryMessages,
+      {
+        role: 'user',
+        content: input.userMessage,
+        createdAt: nowIso(),
+      } satisfies ConversationMessage,
+    ];
 
     // Security: scan user input for prompt injection
     let injectionWarning: string | undefined;
@@ -1273,6 +1525,18 @@ export class AgentLoop {
           }
         }
       }
+    }
+
+    // #230 (Hermes parity): inject the matched skills as a synthetic
+    // ephemeral user-role message immediately BEFORE the actual user message.
+    // The system prompt no longer carries skill content (see prompt-builder),
+    // so the prefix-cache key for the system prompt stays stable across turns
+    // even when skill matches change. Persistence will skip this message.
+    const skillInjectionMsg = this.buildSkillInjectionMessage(matchedSkills);
+    if (skillInjectionMsg) {
+      // Insert just before the latest user message (which we appended last).
+      const userIdx = nextMessages.length - 1;
+      nextMessages.splice(userIdx, 0, skillInjectionMsg);
     }
 
     // Security: build base system prompt, then append injection warning if present
@@ -1357,9 +1621,26 @@ export class AgentLoop {
 
     let errorReflectionCount = 0;
     let iterationsCompleted = 0;
+    // #235: per-(toolName, errorCode) consecutive-failure counter. Hitting
+    // toolFailureStreakLimit (default 3) emits `tool:repeated_failure` and
+    // sets terminationReason to 'tool_error_terminal'.
+    const toolFailureStreak = new Map<string, number>();
+    // #239: classify why we exit the loop. Defaults to 'natural' (model
+    // produced final text without further tool calls). Mutated below.
+    let terminationReason: AgentTerminationReason = 'natural';
+    // #235/#239: signal a hard exit from the iteration loop (e.g. repeated
+    // tool failures). The for-loop checks this and breaks before the next
+    // provider round-trip.
+    let toolErrorTerminal = false;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
-      ensureNotAborted(input.signal);
+      try {
+        ensureNotAborted(input.signal);
+      } catch (err) {
+        terminationReason = 'aborted';
+        this.emitTerminated(input.sessionId, terminationReason, iterationsCompleted, runStartMs);
+        throw err;
+      }
 
       // #54: Drain pending /steer guidance — operator submitted via control
       // channel since the last iteration. Inject as a one-shot system
@@ -1411,12 +1692,15 @@ export class AgentLoop {
       }
 
       let iterationResults: ToolExecutionResult[];
+      // #235: route ALL tool calls through runToolCallWithValidation so the
+      // input-schema gate runs before any work. The wrapper short-circuits
+      // with an enveloped failure result on schema violations.
       if (this.concurrentToolCalls && currentResponse.toolCalls.length > 1) {
         const safetyPartition = this.partitionToolCallsBySafety(currentResponse.toolCalls);
         if (safetyPartition) {
           // Safety-aware execution: parallel first, then destructive sequentially
           const parallelResults = safetyPartition.parallel.length > 0
-            ? await Promise.allSettled(safetyPartition.parallel.map((toolCall) => this.executeToolCall(toolCall, input)))
+            ? await Promise.allSettled(safetyPartition.parallel.map((toolCall) => this.runToolCallWithValidation(toolCall, input)))
                 .then((settled) => settled.map((s, i) =>
                   s.status === 'fulfilled'
                     ? s.value
@@ -1425,18 +1709,19 @@ export class AgentLoop {
                         runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
                         ok: false,
                         output: s.reason instanceof Error ? s.reason.message : String(s.reason),
+                        metadata: { errorCode: s.reason instanceof Error ? s.reason.constructor.name : 'UnknownError' },
                       }
                 ))
             : [];
           const destructiveResults: ToolExecutionResult[] = [];
           for (const toolCall of safetyPartition.destructive) {
-            const result = await this.executeToolCall(toolCall, input);
+            const result = await this.runToolCallWithValidation(toolCall, input);
             destructiveResults.push(result);
           }
           iterationResults = [...parallelResults, ...destructiveResults];
         } else {
           // No safety annotations: fall back to all-parallel
-          iterationResults = await Promise.allSettled(currentResponse.toolCalls.map((toolCall) => this.executeToolCall(toolCall, input)))
+          iterationResults = await Promise.allSettled(currentResponse.toolCalls.map((toolCall) => this.runToolCallWithValidation(toolCall, input)))
             .then((settled) => settled.map((s, i) =>
               s.status === 'fulfilled'
                 ? s.value
@@ -1445,17 +1730,38 @@ export class AgentLoop {
                     runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
                     ok: false,
                     output: s.reason instanceof Error ? s.reason.message : String(s.reason),
+                    metadata: { errorCode: s.reason instanceof Error ? s.reason.constructor.name : 'UnknownError' },
                   }
             ));
         }
       } else {
         iterationResults = await currentResponse.toolCalls.reduce<Promise<ToolExecutionResult[]>>(async (accPromise, toolCall) => {
             const acc = await accPromise;
-            const result = await this.executeToolCall(toolCall, input);
-            acc.push(result);
+            // #235: catch tool throws here too (mirrors the Promise.allSettled
+            // paths above). The original sequential reduce let exceptions
+            // propagate, which masked retryable tool failures as catastrophic
+            // run failures. With the structured envelope contract, every
+            // tool failure is now observable as a `role:'tool'` message.
+            try {
+              const result = await this.runToolCallWithValidation(toolCall, input);
+              acc.push(result);
+            } catch (err) {
+              acc.push({
+                toolName: toolCall.name,
+                runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
+                ok: false,
+                output: err instanceof Error ? err.message : String(err),
+                metadata: { errorCode: err instanceof Error ? err.constructor.name : 'UnknownError' },
+              });
+            }
             return acc;
           }, Promise.resolve([]));
       }
+
+      // #235: rewrite every failing result so its `output` carries the
+      // structured Hermes-style envelope. Validation failures already arrive
+      // enveloped (metadata.envelope === true) and are passed through.
+      iterationResults = iterationResults.map((r) => this.wrapFailureAsEnvelope(r));
 
       const encounteredToolError = iterationResults.some((result) => !result.ok);
 
@@ -1502,6 +1808,50 @@ export class AgentLoop {
           sessionId: input.sessionId,
           agentId: input.agentId,
         });
+      }
+
+      // #235: update per-(toolName, errorCode) consecutive-failure counters.
+      // A successful run for the same tool resets the streak for that tool.
+      // When ANY (tool, errorCode) hits toolFailureStreakLimit, we emit
+      // `tool:repeated_failure` and break the loop with a terminal exit.
+      const successfulToolNamesThisIter = new Set<string>();
+      for (const r of iterationResults) {
+        if (r.ok) {
+          successfulToolNamesThisIter.add(r.toolName);
+          continue;
+        }
+        const errorCode = (r.metadata?.errorCode as string | undefined) ?? 'ToolError';
+        const key = `${r.toolName}|${errorCode}`;
+        const next = (toolFailureStreak.get(key) ?? 0) + 1;
+        toolFailureStreak.set(key, next);
+        if (next >= this.toolFailureStreakLimit) {
+          this.eventBus?.emit('tool:repeated_failure', {
+            sessionId: input.sessionId,
+            agentId: input.agentId,
+            toolName: r.toolName,
+            errorCode,
+            consecutiveFailures: next,
+          });
+          toolErrorTerminal = true;
+        }
+      }
+      // Reset streak for any tool that succeeded in this iteration. This is
+      // intentional per-tool: a different tool failing keeps its own streak.
+      for (const k of Array.from(toolFailureStreak.keys())) {
+        const [toolName] = k.split('|');
+        if (successfulToolNamesThisIter.has(toolName)) {
+          toolFailureStreak.delete(k);
+        }
+      }
+
+      if (toolErrorTerminal) {
+        terminationReason = 'tool_error_terminal';
+        finalResponse = 'Stopped after tool failure (3 consecutive identical errors).';
+        // #239: include the iteration in which the streak hit its limit so
+        // observers can correlate `agent:terminated` durationMs with the
+        // failed iteration, not the previous one.
+        iterationsCompleted = iteration + 1;
+        break;
       }
 
       if (encounteredToolError) {
@@ -1566,10 +1916,31 @@ export class AgentLoop {
       iterationsCompleted = iteration + 1;
     }
 
-    if (!tokenBudgetExceeded && currentResponse.toolCalls && currentResponse.toolCalls.length > 0 && iterationsCompleted >= this.maxToolIterations) {
+    // #239 (Hermes parity): graceful soft-landing on budget exhaustion. The
+    // synthesis turn now begins with an explicit `<budget_exhausted>` system
+    // envelope so the model knows WHY it is being asked to wrap up. Both
+    // iteration-cap and token-budget paths converge here. When
+    // synthesizeOnExhaustion is false we fall back to the legacy "Reached
+    // maximum tool iterations." string for backward compatibility.
+    const iterationCapHit = !tokenBudgetExceeded
+      && !!currentResponse.toolCalls
+      && currentResponse.toolCalls.length > 0
+      && iterationsCompleted >= this.maxToolIterations;
+    if (iterationCapHit || tokenBudgetExceeded) {
       if (this.synthesizeOnExhaustion) {
-        // Exhaustion synthesis: one final call with no tools to force a text answer
-        nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
+        const reason = tokenBudgetExceeded ? 'token_budget' : 'iteration_cap';
+        const envelopeAttr = tokenBudgetExceeded
+          ? `tokens="${totalTokensConsumed}"`
+          : `iterations="${iterationsCompleted}"`;
+        // Ephemeral system envelope — flagged so persistence skips it. The
+        // same envelope is recognised downstream by both human and tooling
+        // observers as "harness-asked-for-wrap-up".
+        nextMessages.push({
+          role: 'system',
+          content: `<budget_exhausted reason="${reason}" ${envelopeAttr} />`,
+          createdAt: nowIso(),
+          metadata: { ephemeral: true, kind: 'budget-exhausted', reason },
+        });
         const synthesisResponse = await this.generateWithFallbacks({
           systemPrompt: this.buildSystemPromptForRequest({
             basePrompt: input.systemPrompt, runtimeName: this.runtimeName,
@@ -1578,9 +1949,10 @@ export class AgentLoop {
           }),
           messages: nextMessages,
           availableTools: [], // No tools — force text response
-          signal: input.signal
+          signal: input.signal,
         }, { sessionId: input.sessionId, agentId: input.agentId });
         finalResponse = synthesisResponse.assistantMessage ?? finalResponse ?? 'Reached maximum tool iterations.';
+        terminationReason = 'budget_exhausted_with_synthesis';
       } else {
         finalResponse = finalResponse
           ? `${finalResponse}\nReached maximum tool iterations.`
@@ -1601,10 +1973,16 @@ export class AgentLoop {
       metadata: toolResults.length > 0 ? { toolCount: toolResults.length } : undefined
     });
 
-    // Strip transient memory prefix messages before persisting session
-    // (they are re-injected fresh each turn from the memory service)
+    // Strip transient messages before persisting session.
+    //  - Memory-prefix system messages: re-injected fresh each turn from the
+    //    memory service.
+    //  - #230: ephemeral skill-injection user messages — they are re-derived
+    //    every turn from the live skill catalog.
+    //  - #239: ephemeral `<budget_exhausted>` envelopes — only meaningful for
+    //    the synthesis turn that produced them.
     const persistMessages = nextMessages.filter(m =>
       !(m.role === 'system' && m.content.includes('<recalled-context'))
+      && m.metadata?.ephemeral !== true
     );
 
     // Track 2.2: Use LLM compression if provider is available, else heuristic
@@ -1642,7 +2020,7 @@ export class AgentLoop {
       await this.checkpointStore.save(createCheckpoint(nextSession, toolResults, this.maxToolIterations, 'completion'));
     }
 
-    const result: AgentRunResult = { session: nextSession, finalResponse, toolResults };
+    const result: AgentRunResult = { session: nextSession, finalResponse, toolResults, terminationReason };
     await this.plugins?.emit('agent:afterRun', {
       input: input as unknown as { agentId: string; sessionId: string; [key: string]: unknown },
       result: result as unknown as { finalResponse: string; toolResults: Array<{ toolName: string; ok: boolean }> },
@@ -1651,6 +2029,10 @@ export class AgentLoop {
       sessionId: input.sessionId,
       agentId: input.agentId,
     });
+
+    // #239: emit `agent:terminated` once at every successful exit. Aborts
+    // and the per-iteration AbortSignal path emit before throwing.
+    this.emitTerminated(input.sessionId, terminationReason, iterationsCompleted, runStartMs);
 
     return result;
   }
@@ -1662,6 +2044,8 @@ export class AgentLoop {
     signal?: AbortSignal;
   }): AsyncGenerator<AgentStreamEvent> {
     const { userMessage, sessionState: session, signal } = input;
+    // #239: capture run-start so `agent:terminated` carries an honest durationMs.
+    const streamStartMs = Date.now();
 
     const streamingProvider = this.provider as Partial<StreamingProviderAdapter>;
     if (!streamingProvider.generateStream) {
@@ -1674,7 +2058,7 @@ export class AgentLoop {
       };
       try {
         const result = await this.run(runInput);
-        yield { type: 'done', response: result.finalResponse };
+        yield { type: 'done', response: result.finalResponse, terminationReason: result.terminationReason };
       } catch (error: unknown) {
         yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
       }
@@ -1744,6 +2128,16 @@ export class AgentLoop {
       }
     }
 
+    // #230 (Hermes parity, streaming): mirror run() — inject the matched
+    // skills as a synthetic ephemeral user-role message right BEFORE the
+    // active user message. The system prompt no longer carries skill
+    // content, preserving its prefix-cache key across turns.
+    const streamSkillInjectionMsg = this.buildSkillInjectionMessage(matchedSkills);
+    if (streamSkillInjectionMsg) {
+      const userIdx = nextMessages.length - 1;
+      nextMessages.splice(userIdx, 0, streamSkillInjectionMsg);
+    }
+
     // #56 (provider contract): apply tool-use guidance for streaming path too.
     let streamBasePrompt: string | undefined = streamInjectionWarning;
     const streamProviderWithGuidance = this.provider as { getToolUseGuidance?: (modelId: string) => string | null };
@@ -1769,6 +2163,11 @@ export class AgentLoop {
     let streamErrorReflectionCount = 0;
     let streamIterationsCompleted = 0;
     let lastStreamHadToolCalls = false;
+    // #235 / #239 (streaming): mirrors run()'s tracking.
+    const streamToolFailureStreak = new Map<string, number>();
+    let streamTerminationReason: AgentTerminationReason = 'natural';
+    let streamToolErrorTerminal = false;
+    let streamTokenBudgetExceeded = false;
 
     try {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
@@ -1878,6 +2277,8 @@ export class AgentLoop {
         const totalTokens = this.usageTracker?.getSummary().totalTokens ?? 0;
         const budgetCheck = this.checkTokenBudget(totalTokens);
         if (budgetCheck.exceeded) {
+          // #239: surface token-budget exhaustion to the soft-landing path.
+          streamTokenBudgetExceeded = true;
           yield { type: 'iteration-end', iteration };
           break;
         }
@@ -1924,15 +2325,23 @@ export class AgentLoop {
             }
             if (safetyPartition.parallel.length > 0) {
               const settled = await Promise.allSettled(
-                safetyPartition.parallel.map((tc) => this.executeToolCall(tc, runInput))
+                // #235: validation gate before each parallel tool call.
+                safetyPartition.parallel.map((tc) => this.runToolCallWithValidation(tc, runInput))
               );
               for (let i = 0; i < settled.length; i++) {
                 const tc = safetyPartition.parallel[i];
                 const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
                 const s = settled[i];
-                const result: ToolExecutionResult = s.status === 'fulfilled'
+                const rawResult: ToolExecutionResult = s.status === 'fulfilled'
                   ? s.value
-                  : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
+                  : {
+                      toolName: tc.name,
+                      runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
+                      ok: false,
+                      output: s.reason instanceof Error ? s.reason.message : String(s.reason),
+                      metadata: { errorCode: s.reason instanceof Error ? s.reason.constructor.name : 'UnknownError' },
+                    };
+                const result = this.wrapFailureAsEnvelope(rawResult);
                 toolResults.push(result);
                 iterationToolResults.push(result);
                 nextMessages.push(toolMessage(result, this.maxToolResultLength));
@@ -1945,7 +2354,8 @@ export class AgentLoop {
               const toolCallId = (tc as ToolCall & { id?: string }).id ?? `tc-${Date.now().toString(36)}-${tc.name}`;
               const toolStartTime = Date.now();
               yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
-              const result = await this.executeToolCall(tc, runInput);
+              const rawResult = await this.runToolCallWithValidation(tc, runInput);
+              const result = this.wrapFailureAsEnvelope(rawResult);
               toolResults.push(result);
               iterationToolResults.push(result);
               nextMessages.push(toolMessage(result, this.maxToolResultLength));
@@ -1962,15 +2372,23 @@ export class AgentLoop {
               yield { type: 'tool-start' as const, toolName: tc.name, toolCallId, input: tc.input };
             }
             const settled = await Promise.allSettled(
-              streamToolCalls.map((tc) => this.executeToolCall(tc, runInput))
+              // #235: validation gate before each tool call.
+              streamToolCalls.map((tc) => this.runToolCallWithValidation(tc, runInput))
             );
             for (let i = 0; i < settled.length; i++) {
               const tc = streamToolCalls[i];
               const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
               const s = settled[i];
-              const result: ToolExecutionResult = s.status === 'fulfilled'
+              const rawResult: ToolExecutionResult = s.status === 'fulfilled'
                 ? s.value
-                : { toolName: tc.name, runtime: 'worker' as Exclude<ToolRuntime, 'either'>, ok: false, output: s.reason instanceof Error ? s.reason.message : String(s.reason) };
+                : {
+                    toolName: tc.name,
+                    runtime: 'worker' as Exclude<ToolRuntime, 'either'>,
+                    ok: false,
+                    output: s.reason instanceof Error ? s.reason.message : String(s.reason),
+                    metadata: { errorCode: s.reason instanceof Error ? s.reason.constructor.name : 'UnknownError' },
+                  };
+              const result = this.wrapFailureAsEnvelope(rawResult);
               toolResults.push(result);
               iterationToolResults.push(result);
               nextMessages.push(toolMessage(result, this.maxToolResultLength));
@@ -2060,6 +2478,35 @@ export class AgentLoop {
               }
             }
 
+            // #235: validate args against the tool's input schema before
+            // executing. On failure we skip execution entirely and emit
+            // `tool:validation_failed`.
+            const validationError = def?.manifest.inputSchema
+              ? validateToolInputAgainstSchema(tc.input, def.manifest.inputSchema)
+              : null;
+            if (validationError) {
+              this.eventBus?.emit('tool:validation_failed', {
+                sessionId: session.sessionId,
+                agentId: session.agentId,
+                toolName: tc.name,
+                errorCode: validationError.constructor.name,
+                message: validationError.message,
+              });
+              const validationResult: ToolExecutionResult = this.wrapFailureAsEnvelope({
+                toolName: tc.name,
+                runtime: def?.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
+                ok: false,
+                output: validationError.message,
+                metadata: { validationFailed: true, errorCode: validationError.constructor.name },
+              });
+              toolResults.push(validationResult);
+              iterationToolResults.push(validationResult);
+              nextMessages.push(toolMessage(validationResult, this.maxToolResultLength));
+              yield { type: 'tool-end', toolName: tc.name, toolCallId, result: validationResult.output, ok: false, durationMs: Date.now() - toolStartTime };
+              encounteredToolError = true;
+              continue;
+            }
+
             const context: ToolExecutionContext = {
               agentId: session.agentId,
               sessionId: session.sessionId,
@@ -2075,6 +2522,9 @@ export class AgentLoop {
             // Security: redact tool output in streaming path
             toolResult = this.redactToolResult(toolResult);
 
+            // #235: structured envelope on failure.
+            toolResult = this.wrapFailureAsEnvelope(toolResult);
+
             toolResults.push(toolResult);
             iterationToolResults.push(toolResult);
             nextMessages.push(toolMessage(toolResult, this.maxToolResultLength));
@@ -2087,7 +2537,9 @@ export class AgentLoop {
               } else if (this.stopOnToolError) {
                 finalResponse = 'Stopped after tool failure.';
                 yield { type: 'iteration-end', iteration };
-                yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+                streamTerminationReason = 'tool_error_terminal';
+                this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
+                yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
                 return;
               }
             }
@@ -2098,6 +2550,46 @@ export class AgentLoop {
         // session whenever any tool ran in this iteration.
         if (iterationToolResults.length > 0) {
           session.lastToolActivityAt = Date.now();
+        }
+
+        // #235 (streaming): per-(toolName, errorCode) consecutive-failure
+        // counter. On hitting the limit we emit `tool:repeated_failure` and
+        // exit the iteration loop with `tool_error_terminal`.
+        const successfulStreamToolNames = new Set<string>();
+        for (const r of iterationToolResults) {
+          if (r.ok) {
+            successfulStreamToolNames.add(r.toolName);
+            continue;
+          }
+          const errorCode = (r.metadata?.errorCode as string | undefined) ?? 'ToolError';
+          const key = `${r.toolName}|${errorCode}`;
+          const next = (streamToolFailureStreak.get(key) ?? 0) + 1;
+          streamToolFailureStreak.set(key, next);
+          if (next >= this.toolFailureStreakLimit) {
+            this.eventBus?.emit('tool:repeated_failure', {
+              sessionId: session.sessionId,
+              agentId: session.agentId,
+              toolName: r.toolName,
+              errorCode,
+              consecutiveFailures: next,
+            });
+            streamToolErrorTerminal = true;
+          }
+        }
+        for (const k of Array.from(streamToolFailureStreak.keys())) {
+          const [toolName] = k.split('|');
+          if (successfulStreamToolNames.has(toolName)) {
+            streamToolFailureStreak.delete(k);
+          }
+        }
+
+        if (streamToolErrorTerminal) {
+          streamTerminationReason = 'tool_error_terminal';
+          finalResponse = 'Stopped after tool failure (3 consecutive identical errors).';
+          yield { type: 'iteration-end', iteration };
+          this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
+          yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
+          return;
         }
 
         if (encounteredToolError) {
@@ -2116,7 +2608,9 @@ export class AgentLoop {
           } else if (this.stopOnToolError) {
             finalResponse = 'Stopped after tool failure.';
             yield { type: 'iteration-end', iteration };
-            yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+            streamTerminationReason = 'tool_error_terminal';
+            this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
+            yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
             return;
           }
         }
@@ -2130,11 +2624,25 @@ export class AgentLoop {
         yield { type: 'iteration-end', iteration };
       }
 
-      // Synthesize on exhaustion (mirrors run() behavior).
-      // Synthesis runs once with no tools available — must rebuild the system
-      // prompt because availableTools differs from the cached version.
-      if (lastStreamHadToolCalls && streamIterationsCompleted >= this.maxToolIterations && this.synthesizeOnExhaustion) {
-        nextMessages.push({ role: 'system', content: 'You have used all available tool iterations. Based on all the information gathered so far, provide the best possible answer to the user\'s question. Synthesize your findings clearly and concisely.', createdAt: nowIso() });
+      // #239 (streaming, Hermes parity): graceful soft-landing on budget
+      // exhaustion. Mirrors run(): inject `<budget_exhausted>` envelope and
+      // mark terminationReason. Both iteration-cap and token-budget paths
+      // converge here.
+      const streamIterationCapHit = lastStreamHadToolCalls
+        && streamIterationsCompleted >= this.maxToolIterations
+        && !streamTokenBudgetExceeded;
+      if ((streamIterationCapHit || streamTokenBudgetExceeded) && this.synthesizeOnExhaustion) {
+        const reason = streamTokenBudgetExceeded ? 'token_budget' : 'iteration_cap';
+        const totalTokensSnapshot = this.usageTracker?.getSummary().totalTokens ?? 0;
+        const envelopeAttr = streamTokenBudgetExceeded
+          ? `tokens="${totalTokensSnapshot}"`
+          : `iterations="${streamIterationsCompleted}"`;
+        nextMessages.push({
+          role: 'system',
+          content: `<budget_exhausted reason="${reason}" ${envelopeAttr} />`,
+          createdAt: nowIso(),
+          metadata: { ephemeral: true, kind: 'budget-exhausted', reason },
+        });
         const synthesisRequest: ProviderRequest = {
           systemPrompt: this.buildSystemPromptForRequest({
             basePrompt: userMessage,
@@ -2157,6 +2665,7 @@ export class AgentLoop {
           }
           if (synthesisText) finalResponse = synthesisText;
         }
+        streamTerminationReason = 'budget_exhausted_with_synthesis';
       }
 
       // Save completion checkpoint
@@ -2165,8 +2674,16 @@ export class AgentLoop {
           createCheckpoint({ ...session, messages: nextMessages }, toolResults, this.maxToolIterations, 'completion')
         );
       }
-      yield { type: 'done', response: finalResponse, usage: accumulatedUsage };
+      this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
+      yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
     } catch (error: unknown) {
+      // #239: classify abort distinctly from a stream-internal error so the
+      // dashboard can show "user cancelled" vs "provider blew up".
+      const isAbort = (error instanceof Error && error.message === 'Agent run aborted.')
+        || (signal?.aborted ?? false);
+      if (isAbort) {
+        this.emitTerminated(session.sessionId, 'aborted', streamIterationsCompleted, streamStartMs);
+      }
       yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -2329,13 +2846,19 @@ export {
   type SecurityEvent,
   type SecurityEventType,
   type SecurityEventSeverity,
+  // v0.8.0 (#234) — code.execute audit hook. The helper appends a
+  // `tool.code-execute` entry tagged with the truncated source + allowed-tool
+  // list. Called from packages/tools/src/code-execute.ts at the call site so
+  // a runaway sandbox can't suppress its own audit row.
+  recordCodeExecuteAudit,
+  type CodeExecuteAuditPayload,
 } from './security.js';
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';
 export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usage-tracker.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
-export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry } from './skill-manifest.js';
+export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';
 
 export { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames, type AgentPreset } from './agent-presets.js';
 
@@ -2390,3 +2913,6 @@ export {
   type ApprovedCommand,
   type ApprovedCommandShape,
 } from './approved-command.js';
+
+// #237 (v0.8.0 Hermes parity): generateStructured contract types.
+export type { StructuredOutputRequest, StructuredOutputResponse } from './structured-output.js';

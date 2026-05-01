@@ -546,7 +546,13 @@ export type SecurityEventType =
   | 'pii_redacted'
   | 'ssrf_blocked'
   | 'approval_required'
-  | 'approval_denied';
+  | 'approval_denied'
+  // v0.8.0 (#234) — `code.execute` pipeline tool. Recorded at the call site
+  // (packages/tools/src/code-execute.ts) BEFORE the sandbox runs so a
+  // runaway sandbox can't suppress its own audit row. The detail string is
+  // the truncated source + allowed-tool list; the severity is `info` for
+  // benign runs and `warning` when the call requested any destructive tool.
+  | 'tool.code-execute';
 
 export type SecurityEventSeverity = 'info' | 'warning' | 'critical';
 
@@ -605,4 +611,59 @@ export class SecurityAuditLog {
   clear(): void {
     this.events = [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 (#234) — code.execute audit helper
+//
+// Append a `tool.code-execute` entry to the SecurityAuditLog. Called from
+// packages/tools/src/code-execute.ts at the start of every sandbox run, so
+// the audit log captures: which session ran the sandbox, what language, what
+// the source was (capped to `codeLimit` bytes — default 4 KB), and the
+// allowed-tool list the sandbox was permitted to invoke.
+//
+// The detail field is plain text rather than a structured JSON payload so it
+// renders correctly in existing audit drawers (dashboard, /api/security/audit
+// log). Truncation marker lives inline so callers reading the field don't
+// have to special-case truncation.
+// ---------------------------------------------------------------------------
+
+export interface CodeExecuteAuditPayload {
+  sessionId: string;
+  language: 'js' | 'ts' | 'python';
+  code: string;
+  /** Bytes of `code` to keep in the audit row before truncation. Defaults to 4 KB. */
+  codeLimit?: number;
+  allowedTools: ReadonlyArray<string>;
+}
+
+const DEFAULT_AUDIT_CODE_LIMIT = 4 * 1024;
+
+export function recordCodeExecuteAudit(
+  log: SecurityAuditLog,
+  payload: CodeExecuteAuditPayload,
+): void {
+  const limit = payload.codeLimit ?? DEFAULT_AUDIT_CODE_LIMIT;
+  const truncated =
+    payload.code.length > limit
+      ? `${payload.code.slice(0, limit)}\n[truncated: ${payload.code.length - limit} more bytes]`
+      : payload.code;
+  const allowedList =
+    payload.allowedTools.length > 0
+      ? payload.allowedTools.join(', ')
+      : '(none)';
+  // Severity escalates if the caller requested any tool whose name suggests a
+  // destructive class. The host bridge separately enforces the actual gate;
+  // this is purely an audit-side classification so reviewers can filter for
+  // higher-risk runs.
+  const dangerousLooking = payload.allowedTools.some((name) =>
+    /(?:exec|delete|write|kill|patch|terminal|workspace\.delete|workspace\.write|file\.delete|file\.write)/i.test(name),
+  );
+  const severity: SecurityEventSeverity = dangerousLooking ? 'warning' : 'info';
+  log.record({
+    type: 'tool.code-execute',
+    severity,
+    sessionId: payload.sessionId,
+    detail: `code.execute language=${payload.language} allowedTools=[${allowedList}]\n----- source -----\n${truncated}\n----- end source -----`,
+  });
 }

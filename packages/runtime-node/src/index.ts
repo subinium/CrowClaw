@@ -65,7 +65,7 @@ import {
 import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry, createLlmSkillExtractor } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { CrowClawMcpServer } from '@crowclaw/mcp-server';
-import { MemoryService, EmbeddingMemoryStore, type EmbeddingProvider } from '@crowclaw/memory';
+import { MemoryService, EmbeddingMemoryStore, InMemoryMemoryProvider, type EmbeddingProvider, type MemoryProvider } from '@crowclaw/memory';
 import { UserModelService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, ProviderChain, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
@@ -303,6 +303,13 @@ export interface NodeRuntimeOptions {
   tools?: ToolRegistry;
   sessionStore?: InMemorySessionStore;
   memoryStore?: InMemoryMemoryStore;
+  /**
+   * v0.8.0 Hermes parity (#233) — pluggable memory backend. Defaults to a
+   * fresh `InMemoryMemoryProvider` wrapping `memoryStore`. Adapters
+   * (D1, Postgres, vector DB) implement `MemoryProvider` and slot in here
+   * without touching the runtime.
+   */
+  memoryProvider?: MemoryProvider;
   workspaceStore?: WorkspaceStore;
   /** If provided, use FileWorkspaceStore backed by this directory. Ignored if workspaceStore is set. */
   workspaceDir?: string;
@@ -1500,7 +1507,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   const learning = new LearningPipeline(skillStore, { extractionProvider: llmSkillExtractor });
   learning.setRegistry(skillRegistry);
-  const memoryService = new MemoryService(memoryStore);
+  // v0.8.0 Hermes parity (#233): construct (or accept) a pluggable provider.
+  // The MemoryService facade still drives the v0.7 call sites, but it now
+  // delegates the v0.8 surface (prefetch / sync_turn / shutdown) to this
+  // provider so adapters can intercept those hooks without rewriting the
+  // facade's twenty-plus call sites.
+  const memoryProvider: MemoryProvider = options.memoryProvider ?? new InMemoryMemoryProvider(memoryStore);
+  const memoryService = new MemoryService(memoryStore, undefined, memoryProvider);
   const userModelService = new UserModelService(memoryStore);
   const mcpClient = options.mcpClient ?? new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
   const plugins = options.plugins ?? new PluginManager().register(new MemoryCapturePlugin());
@@ -1914,8 +1927,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     await frozenMemoryReady;
 
     try {
+      // v0.8.0 Hermes parity (#233): prefer the provider's `prefetch` hook when
+      // defined (adapters may pre-warm caches / batch-read here) and fall back
+      // to plain `recall` for adapters that don't override. The 5-record cap
+      // is preserved per the issue contract.
+      const recallPromise = memoryProvider.prefetch
+        ? memoryProvider.prefetch(input.sessionId, input.userMessage, 5)
+        : memoryProvider.recall(input.sessionId, input.userMessage, 5);
       const [recalled, profile] = await Promise.all([
-        memoryService.recall(input.sessionId, input.userMessage, 5),
+        recallPromise,
         userModelService.getProfile(input.sessionId, input.userId ?? 'default-user'),
       ]);
       // v0.7 (#180) — surface recall to the dashboard MemoryStream component.
@@ -2390,6 +2410,15 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         timeout,
       ]);
     }
+
+    // 7. v0.8.0 Hermes parity (#233): drain the MemoryProvider's in-flight
+    //    `sync_turn` promises with the documented 10s cap. Adapters that
+    //    do real post-turn work (embeddings, external sync) need this
+    //    window to flush before the process exits; the default in-memory
+    //    provider tracks no-op promises so this is cheap.
+    if (memoryProvider.shutdown) {
+      try { await memoryProvider.shutdown(); } catch { /* best-effort */ }
+    }
     return {
       ssEClosed,
       learningAwaited,
@@ -2402,6 +2431,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     tools,
     store,
     memoryStore,
+    memoryProvider,
     workspaceStore,
     schedulerStore,
     skillStore,
@@ -5171,6 +5201,76 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json(stored);
       }
 
+      // v0.8.0 (#238) — Drafts tab pending list. Returns drafts that haven't
+      // been promoted to published skills yet so the dashboard can render the
+      // Skill Drafts section.
+      if (request.method === 'GET' && url.pathname === '/api/learning/drafts/pending') {
+        const all = await learning.listDrafts();
+        const pending = all
+          .filter((d) => d.status === 'draft')
+          .map((d) => ({
+            id: d.id,
+            slug: d.slug,
+            title: d.title,
+            summary: d.summary,
+            triggerPhrases: d.triggerPhrases,
+            recurrenceCount: d.sourceMessages,
+            // We don't currently persist source provenance; use 'auto-capture'
+            // as the conservative default. Agent-proposed drafts that arrive
+            // via SKILL.md on disk are surfaced through the skills API, not
+            // this endpoint.
+            source: 'auto-capture' as const,
+            createdAt: d.createdAt,
+            updatedAt: d.updatedAt,
+          }));
+        return Response.json({ drafts: pending });
+      }
+
+      // v0.8.0 (#238) — Promote a draft to a published skill. Mirrors the
+      // existing `:id/publish` action but uses the explicit `/promote`
+      // pathname the dashboard's Drafts tab calls. Must be matched before
+      // the generic `startsWith('/api/learning/drafts/')` block below so the
+      // action discriminator there doesn't intercept it.
+      if (request.method === 'POST' && /^\/api\/learning\/drafts\/[^/]+\/promote$/.test(url.pathname)) {
+        const segments = url.pathname.split('/').filter(Boolean);
+        const id = segments[3] ?? '';
+        try {
+          const result = await learning.publishDraft(id);
+          await skillRegistry.refreshLearned();
+          eventBus.emit('learning:draft_promoted', { draftId: id, skillSlug: result.slug, source: 'manual' });
+          return Response.json({ ok: true, slug: result.slug, draft: result });
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: false, error: msg }, { status: 404 });
+        }
+      }
+
+      // v0.8.0 (#238) — Reject a draft. Today this means unpublish (revert to
+      // draft status) and emit a rejection event the dashboard listens for.
+      // Hard-delete is intentionally not exposed — operators can edit instead.
+      if (request.method === 'POST' && /^\/api\/learning\/drafts\/[^/]+\/reject$/.test(url.pathname)) {
+        const segments = url.pathname.split('/').filter(Boolean);
+        const id = segments[3] ?? '';
+        try {
+          // Mark as draft (no-op if already draft) so the pending list can be
+          // refreshed; the dashboard hides rejected rows by id client-side
+          // until the next promote attempt.
+          const existing = await learning.listDrafts();
+          const found = existing.find((d) => d.id === id);
+          if (!found) {
+            return Response.json({ ok: false, error: `Draft not found: ${id}` }, { status: 404 });
+          }
+          if (found.status === 'published') {
+            await learning.unpublishDraft(id);
+            await skillRegistry.refreshLearned();
+          }
+          return Response.json({ ok: true });
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: false, error: msg }, { status: 500 });
+        }
+      }
+
       if (request.method === 'POST' && url.pathname.startsWith('/api/learning/drafts/')) {
         const segments = url.pathname.split('/').filter(Boolean);
         const id = segments[3] ?? '';
@@ -6321,6 +6421,91 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({ ok: true, skill: stored });
       }
 
+      // v0.8.0 Hermes parity (#240): agentskills.io install endpoint.
+      // Mirrors the `crowclaw skill install` CLI command. Body: { source: string }
+      // where `source` is an http(s) URL, an `agentskills:` slug, or a local path.
+      // Install logic is inlined (not delegated to @crowclaw/cli) because the
+      // CLI package depends on runtime-node — pulling it in here would create
+      // a workspace cycle.
+      if (request.method === 'POST' && url.pathname === '/api/skills/install') {
+        try {
+          const body = (await request.json()) as { source?: unknown };
+          if (typeof body.source !== 'string' || !body.source) {
+            return Response.json({ ok: false, error: 'source (string) is required' }, { status: 400 });
+          }
+          const { parseSkillFile, validateSkillManifest } = await import('@crowclaw/core');
+          const { readFile, writeFile, mkdir } = await import('node:fs/promises');
+          const { existsSync } = await import('node:fs');
+          const { join: joinP, isAbsolute } = await import('node:path');
+
+          // Resolve source → raw text
+          const fetchSource = async (src: string): Promise<string> => {
+            if (src.startsWith('http://') || src.startsWith('https://')) {
+              const r = await fetch(src);
+              if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} for ${src}`);
+              return await r.text();
+            }
+            if (src.startsWith('agentskills:')) {
+              const slug = src.slice('agentskills:'.length).trim();
+              if (!slug) throw new Error('agentskills: source missing slug');
+              const u = `https://agentskills.io/api/skills/${encodeURI(slug)}/raw`;
+              const r = await fetch(u);
+              if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} for ${u}`);
+              return await r.text();
+            }
+            const p = isAbsolute(src) ? src : joinP(process.cwd(), src);
+            if (!existsSync(p)) throw new Error(`Local path does not exist: ${p}`);
+            return await readFile(p, 'utf-8');
+          };
+
+          let raw: string;
+          try {
+            raw = await fetchSource(body.source);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return Response.json({ ok: false, error: `Failed to fetch source: ${msg}` }, { status: 400 });
+          }
+
+          // Some registries wrap the body in JSON `{ markdown: "..." }`.
+          let markdown = raw;
+          const t = raw.trim();
+          if (t.startsWith('{')) {
+            try {
+              const j = JSON.parse(t) as { markdown?: unknown; body?: unknown };
+              if (typeof j.markdown === 'string') markdown = j.markdown;
+              else if (typeof j.body === 'string') markdown = j.body;
+            } catch { /* keep raw */ }
+          }
+
+          const parsed = parseSkillFile(markdown);
+          if (!parsed) {
+            return Response.json({ ok: false, error: 'Source does not look like a SKILL.md (missing YAML frontmatter)' }, { status: 400 });
+          }
+          const validation = validateSkillManifest(parsed.manifest);
+          if (!validation.valid) {
+            return Response.json({ ok: false, error: `Invalid skill manifest: ${validation.errors.join('; ')}` }, { status: 400 });
+          }
+
+          const destDir = joinPath(homedir(), '.crowclaw', 'skills', 'installed');
+          const destPath = joinP(destDir, `${parsed.manifest.name}.md`);
+          try {
+            await mkdir(destDir, { recursive: true });
+            await writeFile(destPath, markdown, 'utf-8');
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return Response.json({ ok: false, error: `Failed to write file: ${msg}` }, { status: 500 });
+          }
+
+          // Refresh registry so the newly-installed skill becomes visible
+          // without a full runtime restart. Failure here is non-fatal.
+          try { await skillRegistry.refreshLearned(); } catch { /* non-fatal */ }
+          return Response.json({ ok: true, slug: parsed.manifest.name, destinationPath: destPath });
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: false, error: msg }, { status: 500 });
+        }
+      }
+
       {
         const skillDetailMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
         if (request.method === 'GET' && skillDetailMatch) {
@@ -6462,6 +6647,37 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           serverUrl: newPublicUrl ?? `http://localhost:${(options as Record<string, unknown>).port ?? 3000}`,
           trustProxy: newTrustProxy,
         });
+      }
+
+      // --- Structured output (#237 v0.8.0 Hermes parity) ---
+      // Wraps `provider.generateStructured` so the dashboard / external
+      // callers can request a JSON-schema-typed completion. Returns the
+      // typed envelope directly (`ok: true|false` + details). When the
+      // configured provider doesn't implement the optional method, falls
+      // back to 501 Not Implemented so callers can degrade gracefully.
+      if (request.method === 'POST' && url.pathname === '/api/structured-output') {
+        const body = (await request.json().catch(() => null)) as
+          | { messages?: unknown; schema?: unknown; schemaDescription?: unknown }
+          | null;
+        if (!body || !Array.isArray(body.messages) || !body.schema || typeof body.schema !== 'object') {
+          return Response.json(
+            { ok: false, error: 'parse', details: 'Body must include `messages: ConversationMessage[]` and `schema: object`' },
+            { status: 400 },
+          );
+        }
+        const generateStructured = (provider as { generateStructured?: (req: unknown) => Promise<unknown> }).generateStructured?.bind(provider);
+        if (typeof generateStructured !== 'function') {
+          return Response.json(
+            { ok: false, error: 'provider', details: 'Configured provider does not implement generateStructured' },
+            { status: 501 },
+          );
+        }
+        const result = await generateStructured({
+          messages: body.messages as never,
+          schema: body.schema as object,
+          ...(typeof body.schemaDescription === 'string' ? { schemaDescription: body.schemaDescription } : {}),
+        });
+        return Response.json(result);
       }
 
       // --- Frozen memory API ---

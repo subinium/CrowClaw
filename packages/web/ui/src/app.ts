@@ -1041,7 +1041,11 @@ export class CrowClawApp extends LitElement {
           typeof event.type === 'string' &&
           (event.type.startsWith('session:') ||
             event.type.startsWith('gateway:') ||
-            event.type.startsWith('job:'))
+            event.type.startsWith('job:') ||
+            // v0.8.0 (#238) — self-improvement loop. Drafts tab listens to
+            // `crowclaw-event` for `learning:*` to live-refresh its pending
+            // drafts list without waiting for the polling tick.
+            event.type.startsWith('learning:'))
         ) {
           window.dispatchEvent(new CustomEvent('crowclaw-event', {
             detail: { type: event.type },

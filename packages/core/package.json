@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/core",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -12,6 +12,10 @@
     "./streaming": {
       "types": "./src/streaming.ts",
       "import": "./dist/streaming.js"
+    },
+    "./reasoning-blocks": {
+      "types": "./src/reasoning-blocks.ts",
+      "import": "./dist/reasoning-blocks.js"
     }
   },
   "files": [

@@ -231,11 +231,11 @@ describe('Memory utilization', () => {
 // ---------------------------------------------------------------------------
 
 describe('Skill matching', () => {
-  it('includes matched skill instructions in system prompt', async () => {
-    let capturedSystemPrompt = '';
+  it('includes matched skill instructions in user-role envelope', async () => {
+    let capturedMessages: ConversationMessage[] = [];
     const provider: ProviderAdapter = {
       generate(request: ProviderRequest) {
-        capturedSystemPrompt = request.systemPrompt ?? '';
+        capturedMessages = request.messages;
         return Promise.resolve({ assistantMessage: 'Done.' });
       },
       getModel() { return 'skill-test'; },
@@ -261,9 +261,15 @@ describe('Skill matching', () => {
       systemPrompt: 'You are helpful.',
     });
 
-    // Skill instructions should be in the prompt (name appears in <skill> tag)
-    expect(capturedSystemPrompt).toContain('code-review');
-    expect(capturedSystemPrompt).toContain('Check for bugs');
+    // v0.8.0 (#230): skills inject as a user-role message instead of into
+    // the system prompt — keeps the system prompt byte-stable for prefix
+    // caching. The skill content lives in a `<crowclaw-skills>` envelope.
+    const skillMsg = capturedMessages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<crowclaw-skills>'),
+    );
+    expect(skillMsg).toBeDefined();
+    expect(skillMsg?.content as string).toContain('code-review');
+    expect(skillMsg?.content as string).toContain('Check for bugs');
   });
 });
 
