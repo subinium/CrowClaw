@@ -825,7 +825,7 @@ export class CrowClawOnboarding extends LitElement {
           <crowclaw-empty
             icon="memory"
             title="Skip persona setup"
-            description="You can create personas later from the Agent tab."
+            description="You can create personas later from Settings → Agent."
             cta-label="Skip"
             cta-event="crowclaw:onboarding-skip-persona"
             @crowclaw:onboarding-skip-persona=${this._skipPersonaStep}

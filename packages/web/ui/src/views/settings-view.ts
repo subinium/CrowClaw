@@ -5,6 +5,7 @@ import {
   cardStyles,
   tagStyles,
   formStyles,
+  tabStyles,
   sectionStyles,
   searchStyles,
   gridStyles,
@@ -12,6 +13,7 @@ import {
 } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
 import { showToast } from '../components/toast.js';
+import '../components/toggle-switch.js';
 
 /* ------------------------------------------------------------------ */
 /*  Interfaces                                                        */
@@ -137,31 +139,103 @@ interface FeedbackEntry {
   sessionId: string;
 }
 
+/* ---- v0.8.1 (#246): merged from the deleted agent-view.ts ------------ */
+
+interface Preset {
+  id: string;
+  name: string;
+  description: string;
+  type: 'persona' | 'toolset' | 'config';
+  active?: boolean;
+}
+
+interface PresetsResponse {
+  agents: Array<{ name: string; role?: string; goal?: string; backstory?: string }>;
+  toolsets: Array<{ name: string; description?: string; toolNames?: string[] }>;
+  activeAgent?: string | null;
+  activeToolset?: string | null;
+}
+
+interface PersonasResponse {
+  personas: Array<{ name: string; active: boolean }>;
+}
+
+interface ToolEntry {
+  name: string;
+  description: string;
+  disabled: boolean;
+}
+
+interface ToolsResponse {
+  tools: ToolEntry[];
+  count?: number;
+}
+
+interface ConfigPresetsResponse {
+  presets: Array<{ name: string; description?: string }>;
+  active: string | null;
+}
+
+interface BackendSkill {
+  slug: string;
+  title: string;
+  summary: string;
+  triggerPhrases: string[];
+  steps: string[];
+  requiredTools: string[];
+}
+
+interface Skill {
+  slug: string;
+  title: string;
+  summary: string;
+  triggers: string[];
+  steps: string[];
+  tools: string[];
+}
+
+interface SkillsResponse {
+  skills: BackendSkill[];
+}
+
+type IdentityTab = 'personas' | 'toolsets';
+
+/**
+ * v0.8.1 (#246): the standalone Agent view was merged here. The four primary
+ * tabs are Agent (config + identity), Observability (usage/memory/feedback),
+ * System, and Plugins (skills + config presets). Security stays under
+ * Advanced as a fifth tab.
+ */
 type SettingsTab =
   | 'agent'
-  | 'security'
-  | 'usage'
+  | 'observability'
   | 'system'
-  | 'memory'
-  | 'feedback';
+  | 'plugins'
+  | 'security';
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * v0.8.1 (#246) primary tabs. Order is intentional: Agent first (highest-
+ * frequency edit surface), Observability second (read-mostly dashboards),
+ * System third (config snapshot + remote-access), Plugins last (skills /
+ * MCP / config presets — extension point, less common).
+ */
 const PRIMARY_TABS: { key: SettingsTab; label: string }[] = [
-  { key: 'agent', label: 'Agent Config' },
-  { key: 'usage', label: 'Usage' },
+  { key: 'agent', label: 'Agent' },
+  { key: 'observability', label: 'Observability' },
   { key: 'system', label: 'System' },
-  { key: 'memory', label: 'Memory' },
-  { key: 'feedback', label: 'Feedback' },
+  { key: 'plugins', label: 'Plugins' },
 ];
 
 const ADVANCED_TABS: { key: SettingsTab; label: string }[] = [
   { key: 'security', label: 'Security' },
 ];
 
-const SCOPES = ['All', 'Session', 'User', 'Workspace'] as const;
+const MEMORY_SCOPES = ['All', 'Session', 'User', 'Workspace'] as const;
+
 
 const gradeColor = (grade: string): string => {
   switch (grade.toUpperCase()) {
@@ -219,6 +293,7 @@ export class SettingsView extends LitElement {
     cardStyles,
     tagStyles,
     formStyles,
+    tabStyles,
     sectionStyles,
     searchStyles,
     gridStyles,
@@ -705,10 +780,37 @@ export class SettingsView extends LitElement {
 
   @state() private activeTab: SettingsTab = 'agent';
 
+  // #246: sub-tab inside Agent (Identity → Personas / Toolsets) absorbed
+  // from the deleted agent-view.
+  @state() private identityTab: IdentityTab = 'personas';
+
   // Agent config
   @state() private agentConfig: AgentConfig | null = null;
   @state() private agentSaving = false;
   @state() private agentStatus: { msg: string; ok: boolean } | null = null;
+
+  // Personas / Toolsets / Tools / Skills / Config presets (merged from
+  // agent-view in #246).
+  @state() private personas: Preset[] = [];
+  @state() private personasLoading = true;
+  @state() private presetToolsets: Preset[] = [];
+  @state() private presetsLoading = true;
+  @state() private tools: ToolEntry[] = [];
+  @state() private toolsLoading = true;
+  @state() private skills: Skill[] = [];
+  @state() private skillsLoading = true;
+  @state() private skillSearch = '';
+  @state() private showSkillForm = false;
+  @state() private showImportForm = false;
+  @state() private editingSkillSlug: string | null = null;
+  @state() private formTitle = '';
+  @state() private formSummary = '';
+  @state() private formTriggers = '';
+  @state() private formSteps = '';
+  @state() private formTools = '';
+  @state() private importText = '';
+  @state() private configPresets: Preset[] = [];
+  @state() private configPresetsLoading = true;
 
   // Providers config (read-only here; canonical source is Connect → Providers)
   @state() private providersConfig: ProvidersConfig | null = null;
@@ -762,29 +864,38 @@ export class SettingsView extends LitElement {
   /*  Data loading                                                    */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * v0.8.1 (#246): each tab loads only its own data. Agent now also fetches
+   * personas + toolsets + tools (merged from agent-view). Plugins owns
+   * skills + config presets. Observability batches usage + memory sessions
+   * + feedback because the tab renders them as stacked sub-sections.
+   */
   private _loadTabData() {
     switch (this.activeTab) {
       case 'agent':
         this._loadAgentConfig();
         this._loadProvidersConfig();
+        this._fetchPresets();
+        this._fetchPersonas();
+        this._fetchTools();
         break;
       case 'security':
         this._loadSecurityStatus();
         this._loadSecurityEvents();
         break;
-      case 'usage':
+      case 'observability':
         this._loadUsage();
+        this._loadMemorySessions();
+        this._loadFeedback();
         break;
       case 'system':
         this._loadSystem();
         this._loadRemoteAccess();
         this._loadDiagnostics();
         break;
-      case 'memory':
-        this._loadMemorySessions();
-        break;
-      case 'feedback':
-        this._loadFeedback();
+      case 'plugins':
+        this._fetchSkills();
+        this._fetchPresets();
         break;
     }
   }
@@ -961,6 +1072,284 @@ export class SettingsView extends LitElement {
     }
   }
 
+  /* ---- #246 fetchers absorbed from agent-view ---- */
+
+  private async _fetchPresets() {
+    this.presetsLoading = true;
+    this.configPresetsLoading = true;
+    try {
+      const [data, configData] = await Promise.all([
+        api<PresetsResponse>('/api/presets'),
+        api<ConfigPresetsResponse>('/api/config-presets').catch(() => ({ presets: [], active: null } as ConfigPresetsResponse)),
+      ]);
+      const activeToolset = data.activeToolset ?? null;
+
+      this.presetToolsets = (data.toolsets ?? []).map((t) => ({
+        id: t.name,
+        name: t.name,
+        description: t.description ?? `${t.toolNames?.length ?? 0} tools`,
+        type: 'toolset',
+        active: t.name === activeToolset,
+      }));
+
+      this.configPresets = (configData.presets ?? []).map((p) => ({
+        id: p.name,
+        name: p.name,
+        description: p.description ?? 'Bundled configuration',
+        type: 'config',
+        active: p.name === configData.active,
+      }));
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to fetch presets', 'error');
+    } finally {
+      this.presetsLoading = false;
+      this.configPresetsLoading = false;
+    }
+  }
+
+  /** #217: file-backed PersonaRegistry (the legacy hardcoded list is gone). */
+  private async _fetchPersonas() {
+    this.personasLoading = true;
+    try {
+      const data = await api<PersonasResponse>('/api/personas');
+      this.personas = (data.personas ?? []).map((p) => ({
+        id: p.name,
+        name: p.name,
+        description: p.active ? 'Currently active persona' : 'Registered persona',
+        type: 'persona',
+        active: p.active,
+      }));
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to fetch personas', 'error');
+    } finally {
+      this.personasLoading = false;
+    }
+  }
+
+  /** #218: per-tool override list. */
+  private async _fetchTools() {
+    this.toolsLoading = true;
+    try {
+      const data = await api<ToolsResponse>('/api/tools');
+      this.tools = (data.tools ?? []).map((t) => ({
+        name: t.name,
+        description: t.description ?? '',
+        disabled: Boolean(t.disabled),
+      }));
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to fetch tools', 'error');
+    } finally {
+      this.toolsLoading = false;
+    }
+  }
+
+  private async _toggleTool(tool: ToolEntry, nextDisabled: boolean) {
+    try {
+      await api(`/api/tools/${encodeURIComponent(tool.name)}/toggle`, {
+        method: 'POST',
+        body: JSON.stringify({ disabled: nextDisabled }),
+      });
+      await this._fetchTools();
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast(`Failed to toggle ${tool.name}`, 'error');
+    }
+  }
+
+  private async _fetchSkills() {
+    this.skillsLoading = true;
+    try {
+      const data = await api<SkillsResponse>('/api/skills');
+      this.skills = (data.skills ?? []).map((s) => ({
+        slug: s.slug,
+        title: s.title,
+        summary: s.summary,
+        triggers: s.triggerPhrases ?? [],
+        steps: s.steps ?? [],
+        tools: s.requiredTools ?? [],
+      }));
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to fetch skills', 'error');
+    } finally {
+      this.skillsLoading = false;
+    }
+  }
+
+  private async _createSkill() {
+    const title = this.formTitle.trim();
+    const summary = this.formSummary.trim();
+    if (!title) return;
+    const triggers = this._splitLines(this.formTriggers);
+    const steps = this._splitLines(this.formSteps);
+    const tools = this._splitLines(this.formTools);
+    try {
+      await api('/api/skills', {
+        method: 'POST',
+        body: JSON.stringify({ title, summary, triggerPhrases: triggers, steps, requiredTools: tools }),
+      });
+      this._resetSkillForm();
+      await this._fetchSkills();
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to create skill', 'error');
+    }
+  }
+
+  private async _updateSkill(slug: string) {
+    const title = this.formTitle.trim();
+    const summary = this.formSummary.trim();
+    if (!title) return;
+    const triggers = this._splitLines(this.formTriggers);
+    const steps = this._splitLines(this.formSteps);
+    const tools = this._splitLines(this.formTools);
+    try {
+      await api(`/api/skills/${slug}`, {
+        method: 'PUT',
+        body: JSON.stringify({ title, summary, triggerPhrases: triggers, steps, requiredTools: tools }),
+      });
+      this._resetSkillForm();
+      await this._fetchSkills();
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to update skill', 'error');
+    }
+  }
+
+  private async _deleteSkill(slug: string) {
+    try {
+      await api(`/api/skills/${slug}`, { method: 'DELETE' });
+      this.skills = this.skills.filter((s) => s.slug !== slug);
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to delete skill', 'error');
+    }
+  }
+
+  private _editSkill(skill: Skill) {
+    this.editingSkillSlug = skill.slug;
+    this.formTitle = skill.title;
+    this.formSummary = skill.summary;
+    this.formTriggers = skill.triggers.join('\n');
+    this.formSteps = skill.steps.join('\n');
+    this.formTools = skill.tools.join('\n');
+    this.showSkillForm = true;
+    this.showImportForm = false;
+  }
+
+  private async _importSkillMd() {
+    const text = this.importText.trim();
+    if (!text) return;
+    const parsed = this._parseSkillMd(text);
+    if (!parsed.title) return;
+    try {
+      await api('/api/skills', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: parsed.title,
+          summary: parsed.summary,
+          triggerPhrases: parsed.triggers,
+          steps: parsed.steps,
+          requiredTools: parsed.tools,
+        }),
+      });
+      this.importText = '';
+      this.showImportForm = false;
+      await this._fetchSkills();
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to import skill', 'error');
+    }
+  }
+
+  private async _activatePreset(preset: Preset) {
+    const endpointMap: Partial<Record<Preset['type'], string>> = {
+      persona: '/api/persona/switch',
+      toolset: '/api/toolset/select',
+      config: '/api/config-presets/switch',
+    };
+    const endpoint = endpointMap[preset.type];
+    if (!endpoint) {
+      showToast(`Activation not supported for ${preset.type} presets`, 'error');
+      return;
+    }
+    try {
+      await api(endpoint, {
+        method: 'POST',
+        body: JSON.stringify({ name: preset.name }),
+      });
+      await Promise.all([this._fetchPresets(), this._fetchPersonas()]);
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to activate preset', 'error');
+    }
+  }
+
+  private _splitLines(text: string): string[] {
+    return text.split('\n').map((l) => l.trim()).filter(Boolean);
+  }
+
+  private _parseSkillMd(md: string): { title: string; summary: string; triggers: string[]; steps: string[]; tools: string[] } {
+    const result = { title: '', summary: '', triggers: [] as string[], steps: [] as string[], tools: [] as string[] };
+    const titleMatch = md.match(/^#\s+(.+)$/m);
+    if (titleMatch) result.title = titleMatch[1].trim();
+
+    const sections = new Map<string, string>();
+    const sectionRegex = /^##\s+(.+)$/gm;
+    let match: RegExpExecArray | null;
+    const headings: { name: string; index: number }[] = [];
+    while ((match = sectionRegex.exec(md)) !== null) {
+      headings.push({ name: match[1].trim().toLowerCase(), index: match.index + match[0].length });
+    }
+    for (let i = 0; i < headings.length; i++) {
+      const start = headings[i].index;
+      const end = i + 1 < headings.length ? headings[i + 1].index - headings[i + 1].name.length - 3 : md.length;
+      sections.set(headings[i].name, md.slice(start, end).trim());
+    }
+
+    if (!titleMatch) {
+      result.summary = md.slice(0, 100);
+    } else {
+      const afterTitle = md.slice((titleMatch.index ?? 0) + titleMatch[0].length);
+      const nextHeading = afterTitle.indexOf('\n##');
+      const summaryBlock = nextHeading > -1 ? afterTitle.slice(0, nextHeading) : afterTitle.slice(0, 200);
+      result.summary = summaryBlock.trim().split('\n')[0] ?? '';
+    }
+
+    const extractListItems = (text: string): string[] =>
+      text
+        .split('\n')
+        .filter((l) => l.match(/^[-*]\s/))
+        .map((l) => l.replace(/^[-*]\s+/, '').trim())
+        .filter(Boolean);
+
+    for (const [name, content] of sections) {
+      if (name.includes('trigger')) result.triggers = extractListItems(content);
+      else if (name.includes('step')) result.steps = extractListItems(content);
+      else if (name.includes('tool')) result.tools = extractListItems(content);
+    }
+
+    return result;
+  }
+
+  private _resetSkillForm() {
+    this.formTitle = '';
+    this.formSummary = '';
+    this.formTriggers = '';
+    this.formSteps = '';
+    this.formTools = '';
+    this.showSkillForm = false;
+    this.editingSkillSlug = null;
+  }
+
+  private get _filteredSkills(): Skill[] {
+    const q = this.skillSearch.toLowerCase();
+    if (!q) return this.skills;
+    return this.skills.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.summary.toLowerCase().includes(q) ||
+        s.triggers.some((t) => t.toLowerCase().includes(q)),
+    );
+  }
+
+  private get _identityLoading(): boolean {
+    return this.identityTab === 'personas' ? this.personasLoading : this.presetsLoading;
+  }
+
   /* ---------------------------------------------------------------- */
   /*  Actions                                                         */
   /* ---------------------------------------------------------------- */
@@ -1133,17 +1522,38 @@ export class SettingsView extends LitElement {
         return this._renderAgent();
       case 'security':
         return this._renderSecurity();
-      case 'usage':
-        return this._renderUsage();
+      case 'observability':
+        return this._renderObservability();
       case 'system':
         return this._renderSystem();
-      case 'memory':
-        return this._renderMemory();
-      case 'feedback':
-        return this._renderFeedback();
+      case 'plugins':
+        return this._renderPlugins();
       default:
         return nothing;
     }
+  }
+
+  /* ---- v0.8.1 (#246) Observability tab — usage / memory / feedback stacked ---- */
+
+  private _renderObservability() {
+    return html`
+      ${this._renderUsage()}
+      ${this._renderMemory()}
+      ${this._renderFeedback()}
+    `;
+  }
+
+  /* ---- v0.8.1 (#246) Plugins tab — Skills + Config Presets + MCP hint ---- */
+
+  private _renderPlugins() {
+    return html`
+      ${this._renderSkillsSection()}
+      ${this._renderConfigPresetsSection()}
+      <div class="section-block">
+        <div class="section-header">MCP Servers</div>
+        <p class="hint">MCP servers are managed in <a href="#connect">Connect → MCP Servers</a>.</p>
+      </div>
+    `;
   }
 
   /* ---- Agent Config ---- */
@@ -1355,6 +1765,304 @@ export class SettingsView extends LitElement {
             ${this.agentSaving ? 'Saving...' : 'Save Configuration'}
           </button>
         </div>
+      </div>
+
+      ${this._renderIdentitySection()}
+    `;
+  }
+
+  /* ---- #246: Identity sub-section absorbed from agent-view ---- */
+
+  private _renderIdentitySection() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Identity</div>
+        <p class="hint">Manage agent personas and toolset overrides. MCP servers in <a href="#connect">Connect</a>.</p>
+        <div class="tabs" role="tablist" aria-label="Identity tabs">
+          <div class="tab ${this.identityTab === 'personas' ? 'active' : ''}"
+               role="tab"
+               aria-selected=${this.identityTab === 'personas'}
+               @click=${() => { this.identityTab = 'personas'; }}>Personas</div>
+          <div class="tab ${this.identityTab === 'toolsets' ? 'active' : ''}"
+               role="tab"
+               aria-selected=${this.identityTab === 'toolsets'}
+               @click=${() => { this.identityTab = 'toolsets'; }}>Toolsets</div>
+        </div>
+        ${this._renderIdentityTabContent()}
+      </div>
+    `;
+  }
+
+  private _renderIdentityTabContent() {
+    if (this._identityLoading) {
+      return html`<div class="status-msg">Loading ${this.identityTab}…</div>`;
+    }
+    if (this.identityTab === 'personas') {
+      return this._renderPersonasPanel();
+    }
+    return this._renderToolsetsPanel();
+  }
+
+  private _renderPersonasPanel() {
+    if (this.personas.length === 0) {
+      return html`<crowclaw-empty
+        icon="memory"
+        title="No personas yet"
+        description="Create a persona file under your config directory to get started."
+        cta-label="View documentation"
+        cta-href="https://github.com/subinium/CrowClaw#personas"
+      ></crowclaw-empty>`;
+    }
+    return html`
+      <div class="grid">
+        ${this.personas.map((p) => this._renderPresetCard(p))}
+      </div>
+    `;
+  }
+
+  private _renderToolsetsPanel() {
+    return html`
+      ${this.presetToolsets.length === 0
+        ? html`<crowclaw-empty
+            icon="skills"
+            title="No toolsets configured"
+            description="Toolsets are bundles of tools you can switch between. Configure them in your runtime config file."
+          ></crowclaw-empty>`
+        : html`
+            <div class="grid">
+              ${this.presetToolsets.map((p) => this._renderPresetCard(p))}
+            </div>
+          `}
+      ${this._renderToolOverrides()}
+    `;
+  }
+
+  private _renderToolOverrides() {
+    return html`
+      <div class="sec-h" style="margin-top:var(--sp-5)">Individual tool overrides</div>
+      ${this.toolsLoading
+        ? html`<div class="status-msg">Loading tools…</div>`
+        : this.tools.length === 0
+          ? html`<crowclaw-empty
+              icon="skills"
+              title="No tools registered"
+              description="Activate a toolset or config preset to populate the tool registry."
+            ></crowclaw-empty>`
+          : html`
+              <div class="grid">
+                ${this.tools.map((tool) => this._renderToolRow(tool))}
+              </div>
+            `}
+    `;
+  }
+
+  private _renderToolRow(tool: ToolEntry) {
+    const enabled = !tool.disabled;
+    return html`
+      <div class="card">
+        <div class="card-name" style="font-size:var(--text-sm);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-1);display:flex;align-items:center;gap:var(--sp-2)">
+          ${tool.name}
+          ${enabled ? nothing : html`<span class="tag">Disabled</span>`}
+        </div>
+        <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${tool.description || 'No description'}</div>
+        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--glass-border)">
+          <crowclaw-toggle
+            .checked=${enabled}
+            aria-label="Toggle tool ${tool.name}"
+            @change=${(e: CustomEvent<boolean>) => this._toggleTool(tool, !e.detail)}
+          ></crowclaw-toggle>
+        </div>
+      </div>
+    `;
+  }
+
+  private _renderPresetCard(preset: Preset) {
+    return html`
+      <div class="card">
+        <div class="card-name" style="font-size:var(--text-sm);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-1);display:flex;align-items:center;gap:var(--sp-2)">
+          ${preset.name}
+          ${preset.active ? html`<span class="tag" style="color:var(--success)">Active</span>` : nothing}
+        </div>
+        <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${preset.description || 'No description'}</div>
+        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--glass-border)">
+          ${preset.active
+            ? html`<span class="tag ok">Activated</span>`
+            : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
+        </div>
+      </div>
+    `;
+  }
+
+  /* ---- #246: Skills + Config Presets sections (Plugins tab) ---- */
+
+  private _renderSkillsSection() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Skills</div>
+        <p class="hint">Reusable skill definitions that map trigger phrases to tool execution steps.</p>
+
+        <div class="filter-row">
+          <input class="srch"
+                 type="text"
+                 placeholder="Search skills..."
+                 aria-label="Search skills"
+                 .value=${this.skillSearch}
+                 @input=${(e: InputEvent) => { this.skillSearch = (e.target as HTMLInputElement).value; }}>
+          <button class="btn btn-p"
+                  aria-label="Create skill"
+                  @click=${() => { this._resetSkillForm(); this.showSkillForm = true; this.showImportForm = false; }}>
+            Create Skill
+          </button>
+          <button class="btn"
+                  aria-label="Import skill from markdown"
+                  @click=${() => { this.showImportForm = !this.showImportForm; this.showSkillForm = false; this._resetSkillForm(); }}>
+            Import SKILL.md
+          </button>
+        </div>
+
+        ${this.showImportForm ? this._renderImportForm() : nothing}
+        ${this.showSkillForm ? this._renderSkillForm() : nothing}
+
+        ${this.skillsLoading
+          ? html`<div class="status-msg">Loading skills…</div>`
+          : this._filteredSkills.length === 0
+            ? this.skills.length === 0
+              ? html`<crowclaw-empty
+                  icon="skills"
+                  title="No skills loaded"
+                  description="Skills map trigger phrases to tool execution steps. Browse the OpenClaw catalog or drop SKILL.md files into .crowclaw/skills/."
+                  cta-label="Browse the catalog"
+                  cta-href="https://github.com/subinium/openclaw"
+                ></crowclaw-empty>`
+              : html`<crowclaw-empty
+                  icon="skills"
+                  title="No matching skills"
+                  description="Try a different search term."
+                ></crowclaw-empty>`
+            : html`
+                <div class="grid">
+                  ${this._filteredSkills.map((s) => this._renderSkillCard(s))}
+                </div>
+              `}
+      </div>
+    `;
+  }
+
+  private _renderSkillCard(skill: Skill) {
+    return html`
+      <div class="card ${this.editingSkillSlug === skill.slug ? 'editing' : ''}">
+        <div class="card-name" style="font-size:var(--text-sm);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-1)">${skill.title}</div>
+        <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${skill.summary || 'No summary'}</div>
+        ${skill.triggers.length > 0
+          ? html`
+              <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:var(--sp-2)">
+                ${skill.triggers.map((t) => html`<span class="tag">${t}</span>`)}
+              </div>
+            `
+          : nothing}
+        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);border-top:1px solid var(--glass-border);padding-top:var(--sp-3)">
+          <button class="btn" aria-label="Edit skill" @click=${() => this._editSkill(skill)}>Edit</button>
+          <button class="btn btn-danger" aria-label="Delete skill" @click=${() => this._deleteSkill(skill.slug)}>Delete</button>
+        </div>
+      </div>
+    `;
+  }
+
+  private _renderSkillForm() {
+    const isEdit = this.editingSkillSlug !== null;
+    return html`
+      <div class="sub-card" style="padding:var(--sp-5);margin-bottom:var(--sp-5)">
+        <div style="font-size:var(--text-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-4)">${isEdit ? 'Edit Skill' : 'Create Skill'}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-4)">
+          <div class="form-group">
+            <label class="form-label">Title</label>
+            <input class="form-input"
+                   type="text"
+                   placeholder="e.g. Web Search"
+                   .value=${this.formTitle}
+                   @input=${(e: InputEvent) => { this.formTitle = (e.target as HTMLInputElement).value; }}>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Summary</label>
+            <input class="form-input"
+                   type="text"
+                   placeholder="Brief description of the skill"
+                   .value=${this.formSummary}
+                   @input=${(e: InputEvent) => { this.formSummary = (e.target as HTMLInputElement).value; }}>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Trigger Phrases</label>
+          <textarea class="form-input"
+                    placeholder="One trigger phrase per line"
+                    .value=${this.formTriggers}
+                    @input=${(e: InputEvent) => { this.formTriggers = (e.target as HTMLTextAreaElement).value; }}></textarea>
+          <div class="form-hint">One phrase per line. These are used to match user intent.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Steps</label>
+          <textarea class="form-input"
+                    placeholder="One step per line"
+                    .value=${this.formSteps}
+                    @input=${(e: InputEvent) => { this.formSteps = (e.target as HTMLTextAreaElement).value; }}></textarea>
+          <div class="form-hint">Ordered execution steps for this skill.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Tools</label>
+          <input class="form-input"
+                 type="text"
+                 placeholder="Tool names, one per line or comma-separated"
+                 .value=${this.formTools}
+                 @input=${(e: InputEvent) => { this.formTools = (e.target as HTMLInputElement).value; }}>
+          <div class="form-hint">Tools required by this skill (e.g. web.search, fs.read).</div>
+        </div>
+        <div class="form-actions">
+          <button class="btn" @click=${() => this._resetSkillForm()}>Cancel</button>
+          ${isEdit
+            ? html`<button class="btn btn-p" @click=${() => this._updateSkill(this.editingSkillSlug!)}>Save Changes</button>`
+            : html`<button class="btn btn-p" @click=${this._createSkill}>Create</button>`}
+        </div>
+      </div>
+    `;
+  }
+
+  private _renderImportForm() {
+    return html`
+      <div class="sub-card" style="padding:var(--sp-5);margin-bottom:var(--sp-5)">
+        <div style="font-size:var(--text-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--sp-3)">Import SKILL.md</div>
+        <div class="form-group">
+          <textarea class="form-input"
+                    rows="10"
+                    placeholder="Paste the contents of a SKILL.md file here..."
+                    .value=${this.importText}
+                    @input=${(e: InputEvent) => { this.importText = (e.target as HTMLTextAreaElement).value; }}></textarea>
+        </div>
+        <div class="form-actions">
+          <button class="btn" @click=${() => { this.showImportForm = false; this.importText = ''; }}>Cancel</button>
+          <button class="btn btn-p" @click=${this._importSkillMd}>Import</button>
+        </div>
+      </div>
+    `;
+  }
+
+  private _renderConfigPresetsSection() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Config Presets</div>
+        <p class="hint">Bundled configurations that combine MCP servers, skills, and tools into a single activatable preset.</p>
+        ${this.configPresetsLoading
+          ? html`<div class="status-msg">Loading config presets…</div>`
+          : this.configPresets.length === 0
+            ? html`<crowclaw-empty
+                icon="skills"
+                title="No config presets"
+                description="Config presets bundle MCP servers, skills, and tools together so you can switch the agent's whole environment in one click."
+              ></crowclaw-empty>`
+            : html`
+                <div class="grid">
+                  ${this.configPresets.map((p) => this._renderPresetCard(p))}
+                </div>
+              `}
       </div>
     `;
   }
@@ -1842,7 +2550,7 @@ export class SettingsView extends LitElement {
               />
 
               <div class="scope-row">
-                ${SCOPES.map(
+                ${MEMORY_SCOPES.map(
                   (s) => html`
                     <button
                       class="scope-btn ${this.memoryScope === s ? 'active' : ''}"

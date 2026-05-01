@@ -77,3 +77,42 @@ import './memory-stream.js';
  */
 export { CrowClawReasoningBlock } from './reasoning-block.js';
 import './reasoning-block.js';
+
+/**
+ * v0.8.1 (#246, #247, #248) — UX live wave component foundation.
+ *
+ * Six new primitives that the view-migration agents consume in parallel:
+ *   - <crowclaw-button>          — variants/sizes/loading
+ *   - <crowclaw-status-dot>      — running/ok/warn/error/idle/paused
+ *   - <crowclaw-icon>            — inline SVG icon set
+ *   - <crowclaw-skeleton-line / -card / -list> — shimmer placeholders
+ *   - <crowclaw-inspector-rail>  — right-side rail with three tabbed slots
+ *   - <crowclaw-shortcut-help>   — searchable shortcut modal (data from A7)
+ *
+ * Side-effect imports register the custom elements; named exports give the
+ * orchestrator typed handles and let public types travel with the tag.
+ */
+export { CrowClawButton } from './button.js';
+export type { ButtonVariant, ButtonSize } from './button.js';
+import './button.js';
+
+export { CrowClawStatusDot } from './status-dot.js';
+export type { StatusDotStatus, StatusDotSize } from './status-dot.js';
+import './status-dot.js';
+
+export { CrowClawIcon } from './icon.js';
+import './icon.js';
+
+export {
+  CrowClawSkeletonLine,
+  CrowClawSkeletonCard,
+  CrowClawSkeletonList,
+} from './skeleton.js';
+import './skeleton.js';
+
+export { CrowClawInspectorRail } from './inspector-rail.js';
+import './inspector-rail.js';
+
+export { CrowClawShortcutHelp } from './shortcut-help.js';
+export type { ShortcutBinding } from './shortcut-help.js';
+import './shortcut-help.js';

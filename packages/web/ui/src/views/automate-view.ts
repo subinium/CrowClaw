@@ -1,8 +1,15 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
-import { buttonStyles, cardStyles, tagStyles, formStyles, sectionStyles } from '../lib/shared-styles.js';
+import { cardStyles, tagStyles, formStyles, sectionStyles } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
 import { showToast } from '../components/toast.js';
+// v0.8.1 #244 #246 — primitive component library: register custom elements
+// so the templates below can use the tags directly.
+import '../components/button.js';
+import '../components/status-dot.js';
+import '../components/icon.js';
+import '../components/empty.js';
+import '../components/skeleton.js';
 
 /** Maps to CronJobDefinition from @crowclaw/scheduler */
 interface SchedulerJob {
@@ -82,7 +89,6 @@ const formatDuration = (ms: number): string => {
 @customElement('crowclaw-automate-view')
 export class AutomateView extends LitElement {
   static styles = [
-    buttonStyles,
     cardStyles,
     tagStyles,
     formStyles,
@@ -141,22 +147,6 @@ export class AutomateView extends LitElement {
         font-weight: 500;
       }
 
-      .sched-led {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        flex-shrink: 0;
-      }
-
-      .sched-led.running {
-        background: var(--success);
-        box-shadow: 0 0 8px rgba(48, 209, 88, 0.4);
-      }
-
-      .sched-led.stopped {
-        background: var(--text-muted);
-      }
-
       .sched-bar-actions {
         margin-left: auto;
         display: flex;
@@ -205,29 +195,6 @@ export class AutomateView extends LitElement {
         display: flex;
         gap: var(--sp-1);
         flex-shrink: 0;
-      }
-
-      .icon-btn {
-        background: none;
-        border: 1px solid transparent;
-        color: var(--text-muted);
-        cursor: pointer;
-        font-size: 13px;
-        padding: 3px 6px;
-        border-radius: var(--radius-sm);
-        transition: color var(--duration-fast), background-color var(--duration-fast), border-color var(--duration-fast);
-      }
-
-      .icon-btn:hover {
-        color: var(--text-primary);
-        background: var(--glass-bg);
-        border-color: var(--glass-border);
-      }
-
-      .icon-btn.danger:hover {
-        color: var(--error);
-        border-color: var(--error);
-        background: rgba(255, 69, 58, 0.08);
       }
 
       .job-meta {
@@ -432,36 +399,16 @@ export class AutomateView extends LitElement {
         display: block;
       }
 
-      /* Empty state */
-      .empty {
+      /* Loading skeleton stack — used in the initial loading state */
+      .skeleton-stack {
         display: flex;
         flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        padding: var(--sp-12) 0;
-        gap: var(--sp-2);
-        opacity: 0.5;
+        gap: var(--sp-3);
+        padding: var(--sp-4) 0;
       }
 
-      .empty-title {
-        font-size: var(--text-base);
-        font-weight: 600;
-        color: #c8cdd6;
-      }
-
-      .empty-subtitle {
-        font-size: var(--text-xs);
-        color: var(--text-muted);
-      }
-
-      /* Loading */
-      .loading {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: var(--sp-8);
-        color: var(--text-muted);
-        font-size: var(--text-sm);
+      .drafts-section {
+        margin-top: var(--sp-6);
       }
 
       /* Dormant scheduler warning banner */
@@ -481,6 +428,51 @@ export class AutomateView extends LitElement {
         font-size: var(--text-sm);
         color: var(--text-primary);
         font-weight: 500;
+      }
+
+      /* Right-aligned action row inside a card (used by draft cards) */
+      .actions-end {
+        display: flex;
+        gap: var(--sp-2);
+        margin-top: var(--sp-3);
+        justify-content: flex-end;
+      }
+
+      .history-frame {
+        margin-top: var(--sp-3);
+        border-top: 1px solid var(--glass-border);
+        padding-top: var(--sp-3);
+      }
+
+      .history-empty {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        padding: var(--sp-2) 0;
+      }
+
+      .meta-summary,
+      .meta-trigger {
+        font-family: var(--font-sans);
+        font-size: var(--text-xs);
+        text-align: right;
+        max-width: 65%;
+        line-height: 1.4;
+      }
+
+      .meta-trigger {
+        max-width: 60%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .summary-row {
+        align-items: flex-start;
+      }
+
+      .history-cell-duration {
+        font-family: var(--font-mono);
+        font-size: var(--text-xs);
       }
 
       /* Inline form badges (e.g., gateway "token configured") */
@@ -924,7 +916,13 @@ export class AutomateView extends LitElement {
       </div>
       <div class="view-body">
         ${this.loading
-          ? html`<div class="loading">Loading scheduler data...</div>`
+          ? html`
+              <div class="skeleton-stack" role="status" aria-live="polite" aria-busy="true">
+                <crowclaw-skeleton-card lines="3"></crowclaw-skeleton-card>
+                <crowclaw-skeleton-card lines="4"></crowclaw-skeleton-card>
+                <crowclaw-skeleton-list rows="3"></crowclaw-skeleton-list>
+              </div>
+            `
           : html`
               ${this._renderSchedulerSection()}
               ${this._renderDraftsSection()}
@@ -942,18 +940,17 @@ export class AutomateView extends LitElement {
   private _renderDraftsSection() {
     const drafts = this.pendingDrafts;
     return html`
-      <div class="section-block" style="margin-top: var(--sp-6)">
+      <div class="section-block drafts-section">
         <div class="section-header">Skill Drafts</div>
         ${this.draftsLoading && drafts.length === 0
-          ? html`<div class="loading">Loading drafts...</div>`
+          ? html`<crowclaw-skeleton-list rows="3" aria-label="Loading drafts"></crowclaw-skeleton-list>`
           : drafts.length === 0
             ? html`
-                <div class="empty">
-                  <div class="empty-title">No pending drafts</div>
-                  <div class="empty-subtitle">
-                    Drafts appear here when the agent proposes a new skill or auto-capture finds a recurring pattern.
-                  </div>
-                </div>
+                <crowclaw-empty
+                  icon="skills"
+                  title="No pending drafts"
+                  description="Drafts appear here when the agent proposes a new skill or auto-capture finds a recurring pattern."
+                ></crowclaw-empty>
               `
             : html`
                 <div class="job-grid">
@@ -989,35 +986,39 @@ export class AutomateView extends LitElement {
           ${triggerPreview ? html`
             <div class="job-meta-row">
               <span class="job-meta-label">Triggers</span>
-              <span class="job-meta-value" style="font-family:var(--font-sans);font-size:var(--text-xs);text-align:right;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=${(draft.triggerPhrases ?? []).join(', ')}>${triggerPreview}</span>
+              <span class="job-meta-value meta-trigger" title=${(draft.triggerPhrases ?? []).join(', ')}>${triggerPreview}</span>
             </div>
           ` : nothing}
           ${draft.summary ? html`
-            <div class="job-meta-row" style="align-items:flex-start">
+            <div class="job-meta-row summary-row">
               <span class="job-meta-label">Summary</span>
-              <span class="job-meta-value" style="font-family:var(--font-sans);font-size:var(--text-xs);text-align:right;max-width:65%;line-height:1.4">${draft.summary.slice(0, 160)}</span>
+              <span class="job-meta-value meta-summary">${draft.summary.slice(0, 160)}</span>
             </div>
           ` : nothing}
         </div>
-        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);justify-content:flex-end">
-          <button
-            class="btn"
+        <div class="actions-end">
+          <crowclaw-button
+            variant="ghost"
+            size="sm"
             aria-label="Edit draft skill"
             @click=${() => this._editDraft(draft)}
             ?disabled=${inFlight}
-          >Edit</button>
-          <button
-            class="btn"
+          >Edit</crowclaw-button>
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
             aria-label="Reject draft skill"
             @click=${() => this._rejectDraft(draft)}
             ?disabled=${inFlight}
-          >Reject</button>
-          <button
-            class="btn btn-p"
+          >Reject</crowclaw-button>
+          <crowclaw-button
+            variant="primary"
+            size="sm"
             aria-label="Promote draft skill"
-            @click=${() => this._promoteDraft(draft)}
+            ?loading=${inFlight}
             ?disabled=${inFlight}
-          >${inFlight ? 'Working...' : 'Promote'}</button>
+            @click=${() => this._promoteDraft(draft)}
+          >${inFlight ? 'Working' : 'Promote'}</crowclaw-button>
         </div>
       </div>
     `;
@@ -1030,31 +1031,47 @@ export class AutomateView extends LitElement {
         <div class="section-header">Scheduler</div>
 
         ${showDormantBanner ? html`
-          <div class="dormant-banner" role="status">
+          <div class="dormant-banner" role="status" aria-live="polite">
             <span class="dormant-banner-text">
               Scheduler is stopped — ${this.jobs.length} ${this.jobs.length === 1 ? 'job is' : 'jobs are'} dormant.
             </span>
-            <button class="btn btn-p" aria-label="Start scheduler" @click=${this._startSchedulerFromBanner}>
-              Start scheduler
-            </button>
+            <crowclaw-button
+              variant="primary"
+              size="sm"
+              aria-label="Start scheduler"
+              @click=${this._startSchedulerFromBanner}
+            >Start scheduler</crowclaw-button>
           </div>
         ` : nothing}
 
         <div class="sched-bar">
-          <div class="sched-status">
-            <div class="sched-led ${this.schedulerRunning ? 'running' : 'stopped'}"></div>
+          <div class="sched-status" aria-live="polite">
+            <crowclaw-status-dot
+              status=${this.schedulerRunning ? 'running' : 'idle'}
+              ?pulse=${this.schedulerRunning}
+            ></crowclaw-status-dot>
             <span>${this.schedulerRunning ? 'Running' : 'Stopped'}</span>
           </div>
           <div class="sched-bar-actions">
-            <button class="btn" aria-label="${this.schedulerRunning ? 'Stop scheduler' : 'Start scheduler'}" @click=${this._toggleScheduler}>
-              ${this.schedulerRunning ? 'Stop' : 'Start'}
-            </button>
-            <button class="btn" aria-label="Run scheduler tick now" @click=${this._tickNow} ?disabled=${!this.schedulerRunning}>
-              Tick Now
-            </button>
-            <button class="btn btn-p" aria-label="Create new job" @click=${this._openForm}>
-              New Job
-            </button>
+            <crowclaw-button
+              variant="secondary"
+              size="sm"
+              aria-label="${this.schedulerRunning ? 'Stop scheduler' : 'Start scheduler'}"
+              @click=${this._toggleScheduler}
+            >${this.schedulerRunning ? 'Stop' : 'Start'}</crowclaw-button>
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
+              aria-label="Run scheduler tick now"
+              ?disabled=${!this.schedulerRunning}
+              @click=${this._tickNow}
+            >Tick Now</crowclaw-button>
+            <crowclaw-button
+              variant="primary"
+              size="sm"
+              aria-label="Create new job"
+              @click=${this._openForm}
+            >New Job</crowclaw-button>
           </div>
         </div>
 
@@ -1082,38 +1099,71 @@ export class AutomateView extends LitElement {
     const expanded = this.expandedJobIds.has(job.id);
     const history = this.jobHistory.get(job.id) ?? [];
     const loadingHistory = this.loadingHistoryFor.has(job.id);
+    // Map job state to a status-dot kind:
+    //   - last run errored      → 'error'
+    //   - paused                → 'paused'
+    //   - active + last success → 'ok'
+    //   - active, no run yet    → 'idle'
+    const dotStatus: 'error' | 'paused' | 'ok' | 'idle' =
+      job.lastRunStatus === 'error' || job.lastRunStatus === 'timeout'
+        ? 'error'
+        : !job.enabled
+          ? 'paused'
+          : job.lastRunStatus === 'success'
+            ? 'ok'
+            : 'idle';
     return html`
       <div class="job-card">
         <div class="job-card-header">
+          <crowclaw-status-dot
+            status=${dotStatus}
+            aria-live="polite"
+          ></crowclaw-status-dot>
           <span class="job-name" title=${job.id}>${job.id}</span>
           <span class="tag ${job.enabled ? 'ok' : 'wn'}">
             ${job.enabled ? 'active' : 'paused'}
           </span>
           <div class="job-card-actions">
-            <button
-              class="icon-btn"
-              @click=${() => this._dryRunJob(job)}
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
               title="Dry Run"
               aria-label="Test run job without side effects"
-            >&#x25B7;</button>
-            <button
-              class="icon-btn"
-              @click=${() => this._toggleJobExpand(job.id)}
+              @click=${() => this._dryRunJob(job)}
+            >
+              <crowclaw-icon slot="icon" name="play" size="14"></crowclaw-icon>
+            </crowclaw-button>
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
               title="History"
               aria-label="Show run history"
-            >&#x1F4CB;</button>
-            <button
-              class="icon-btn"
-              @click=${() => this._toggleJob(job)}
+              @click=${() => this._toggleJobExpand(job.id)}
+            >
+              <crowclaw-icon slot="icon" name="activity" size="14"></crowclaw-icon>
+            </crowclaw-button>
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
               title="${job.enabled ? 'Pause' : 'Resume'}"
               aria-label="${job.enabled ? 'Pause job' : 'Resume job'}"
-            >${job.enabled ? '&#x23F8;' : '&#x25B6;'}</button>
-            <button
-              class="icon-btn danger"
-              @click=${() => this._deleteJob(job)}
+              @click=${() => this._toggleJob(job)}
+            >
+              <crowclaw-icon
+                slot="icon"
+                name=${job.enabled ? 'pause' : 'play'}
+                size="14"
+              ></crowclaw-icon>
+            </crowclaw-button>
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
               title="Delete"
               aria-label="Delete job"
-            >&#x2715;</button>
+              @click=${() => this._deleteJob(job)}
+            >
+              <crowclaw-icon slot="icon" name="x" size="14"></crowclaw-icon>
+            </crowclaw-button>
           </div>
         </div>
         <div class="job-meta">
@@ -1137,11 +1187,11 @@ export class AutomateView extends LitElement {
           ` : nothing}
         </div>
         ${expanded ? html`
-          <div style="margin-top:var(--sp-3);border-top:1px solid var(--glass-border);padding-top:var(--sp-3)">
+          <div class="history-frame">
             ${loadingHistory
-              ? html`<div class="loading" style="padding:var(--sp-2)">Loading history...</div>`
+              ? html`<crowclaw-skeleton-list rows="3" aria-label="Loading job history"></crowclaw-skeleton-list>`
               : history.length === 0
-                ? html`<div style="font-size:var(--text-xs);color:var(--text-muted)">No run history</div>`
+                ? html`<div class="history-empty">No run history</div>`
                 : html`
                     <table class="history-table">
                       <thead>
@@ -1156,7 +1206,7 @@ export class AutomateView extends LitElement {
                         ${history.map((entry) => html`
                           <tr class="history-row">
                             <td>${timeAgo(entry.startedAt)}</td>
-                            <td style="font-family:var(--font-mono);font-size:var(--text-xs)">${formatDuration(entry.durationMs)}</td>
+                            <td class="history-cell-duration">${formatDuration(entry.durationMs)}</td>
                             <td>
                               <span class="tag ${entry.ok ? 'ok' : 'er'}">${entry.ok ? 'success' : 'error'}</span>
                             </td>
@@ -1201,8 +1251,9 @@ export class AutomateView extends LitElement {
     return html`
       <div class="form-row">
         <div class="form-group">
-          <label class="form-label">Delivery Platform</label>
+          <label class="form-label" for="delivery-platform">Delivery Platform</label>
           <select
+            id="delivery-platform"
             class="form-select"
             .value=${this.formDeliveryPlatform}
             @change=${(e: Event) => { this.formDeliveryPlatform = (e.target as HTMLSelectElement).value; }}
@@ -1219,15 +1270,16 @@ export class AutomateView extends LitElement {
           </select>
         </div>
         <div class="form-group">
-          <label class="form-label">Channel / Target</label>
+          <label class="form-label" for="delivery-channel">Channel / Target</label>
           <input
+            id="delivery-channel"
             class="form-input"
             type="text"
             placeholder="#channel or @user"
             .value=${this.formDeliveryChannel}
             @input=${(e: InputEvent) => { this.formDeliveryChannel = (e.target as HTMLInputElement).value; }}
           >
-          ${selectedConfigured ? html`<span class="badge ok">token configured</span>` : nothing}
+          ${selectedConfigured ? html`<span class="badge ok" role="status" aria-live="polite">token configured</span>` : nothing}
         </div>
       </div>
     `;
@@ -1236,12 +1288,13 @@ export class AutomateView extends LitElement {
   private _renderForm() {
     return html`
       <div class="form-overlay" @click=${(e: Event) => { if (e.target === e.currentTarget) this._closeForm(); }}>
-        <div class="form-panel">
-          <div class="form-title">New Scheduled Job</div>
+        <div class="form-panel" role="dialog" aria-labelledby="new-job-title" aria-modal="true">
+          <div class="form-title" id="new-job-title">New Scheduled Job</div>
 
           <div class="form-group">
-            <label class="form-label">Job Name</label>
+            <label class="form-label" for="job-form-name">Job Name</label>
             <input
+              id="job-form-name"
               class="form-input"
               type="text"
               placeholder="e.g., Daily news digest"
@@ -1251,8 +1304,9 @@ export class AutomateView extends LitElement {
           </div>
 
           <div class="form-group">
-            <label class="form-label">Task / Prompt</label>
+            <label class="form-label" for="job-form-prompt">Task / Prompt</label>
             <textarea
+              id="job-form-prompt"
               class="form-input"
               placeholder="Describe what this job should do..."
               .value=${this.formPrompt}
@@ -1287,8 +1341,9 @@ export class AutomateView extends LitElement {
               </div>
             </div>
             <div class="form-group">
-              <label class="form-label">Schedule Value</label>
+              <label class="form-label" for="job-form-schedule">Schedule Value</label>
               <input
+                id="job-form-schedule"
                 class="form-input"
                 type="text"
                 placeholder=${this.formScheduleType === 'interval' ? 'e.g., 30m, 1h, 6h' : 'e.g., 0 9 * * *'}
@@ -1304,8 +1359,9 @@ export class AutomateView extends LitElement {
           </div>
 
           <div class="form-group">
-            <label class="form-label">Model Override</label>
+            <label class="form-label" for="job-form-model">Model Override</label>
             <select
+              id="job-form-model"
               class="form-select"
               .value=${this.formModel}
               @change=${(e: Event) => { this.formModel = (e.target as HTMLSelectElement).value; }}
@@ -1340,13 +1396,20 @@ export class AutomateView extends LitElement {
           ${this._renderDeliveryRow()}
 
           <div class="form-actions">
-            <button class="btn" aria-label="Cancel job creation" @click=${this._closeForm}>Cancel</button>
-            <button
-              class="btn btn-p"
+            <crowclaw-button
+              variant="secondary"
+              size="sm"
+              aria-label="Cancel job creation"
+              @click=${this._closeForm}
+            >Cancel</crowclaw-button>
+            <crowclaw-button
+              variant="primary"
+              size="sm"
               aria-label="Create scheduled job"
-              @click=${this._submitJob}
+              ?loading=${this.formSubmitting}
               ?disabled=${this.formSubmitting || !this.formName.trim() || !this.formPrompt.trim() || !this.formScheduleValue.trim()}
-            >${this.formSubmitting ? 'Creating...' : 'Create Job'}</button>
+              @click=${this._submitJob}
+            >${this.formSubmitting ? 'Creating' : 'Create Job'}</crowclaw-button>
           </div>
         </div>
       </div>

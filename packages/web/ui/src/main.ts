@@ -20,8 +20,10 @@ import './components/command-palette.js'; // #178 agent A5 (palette element)
 import './components/reasoning-block.js';
 
 // Views
+// #246 Phase A (v0.8.1): `agent-view.js` was deleted; its content was merged
+// into `settings-view.js` under the Agent tab. Bookmarks at `#agent` redirect
+// to `#settings` via the hash router in app.ts.
 import './views/chat-view.js';
-import './views/agent-view.js';
 import './views/connect-view.js';
 import './views/automate-view.js';
 import './views/settings-view.js';

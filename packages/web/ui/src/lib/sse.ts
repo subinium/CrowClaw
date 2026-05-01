@@ -8,6 +8,14 @@ export interface StreamEvent {
     | 'text-delta'
     | 'tool-start'
     | 'tool-end'
+    // v0.8.1 (#242): runtime EventBus tool lifecycle bridged into the
+    // per-session SSE stream. `tool-start` (extended below with `args` /
+    // `startedAt`) fires when the instrumented ToolRegistry begins a call;
+    // `tool-complete` fires when it returns. Distinct from `tool-end` which
+    // is emitted by core's runStreaming() — both flow through this stream so
+    // clients can pick whichever fits their UI (tool-end is per-step in the
+    // model loop, tool-complete is per-execution from the worker).
+    | 'tool-complete'
     | 'iteration-start'
     // v0.8.0 (#231): Hermes-style reasoning lifecycle. Emitted by the runtime
     // SSE bridge once the orchestrator forwards `reasoning_*` chunks from the
@@ -29,6 +37,14 @@ export interface StreamEvent {
   error?: string;
   /** v0.8.0 (#231): tag name for `reasoning-start` / `reasoning-end`. */
   reasoningTag?: string;
+  /** v0.8.1 (#242): args echoed by the ToolRegistry wrapper on `tool-start`. */
+  args?: unknown;
+  /** v0.8.1 (#242): ISO timestamp captured when the worker began the call. */
+  startedAt?: string;
+  /** v0.8.1 (#242): truncated tool output on `tool-complete`. */
+  output?: string;
+  /** v0.8.1 (#242): security-audit log id correlated with the tool call. */
+  auditId?: string;
 }
 
 export interface StreamCallbacks {
@@ -46,6 +62,15 @@ export interface StreamCallbacks {
   onReasoningStart?: (tag: string) => void;
   onReasoningDelta?: (content: string) => void;
   onReasoningEnd?: (tag: string) => void;
+  /**
+   * v0.8.1 (#242): runtime tool-execution lifecycle bridged from the EventBus.
+   * Optional — existing clients that only consume core's `tool-start` /
+   * `tool-end` events keep working unchanged. `onToolStart` is invoked for
+   * BOTH the core `tool-start` (with `input`) and the runtime `tool-start`
+   * (with `args` echoed back from the worker); `onToolComplete` is the
+   * runtime-side counterpart and carries the durationMs, audit id, etc.
+   */
+  onToolComplete?: (toolCallId: string, ok: boolean, output?: string, durationMs?: number, auditId?: string, error?: string) => void;
 }
 
 /**
@@ -132,7 +157,10 @@ const dispatchEvent = (event: StreamEvent, callbacks: StreamCallbacks): void => 
       callbacks.onToolStart(
         event.toolName ?? 'unknown',
         event.toolCallId ?? '',
-        event.input,
+        // v0.8.1 (#242): runtime EventBus emits `args`; core runStreaming
+        // emits `input`. Forward whichever is populated so callers see the
+        // tool input regardless of which pipeline produced the event.
+        event.input ?? (event.args as Record<string, unknown> | undefined),
       );
       break;
     case 'tool-end':
@@ -140,6 +168,16 @@ const dispatchEvent = (event: StreamEvent, callbacks: StreamCallbacks): void => 
         event.toolCallId ?? '',
         event.result ?? '',
         event.ok ?? true,
+      );
+      break;
+    case 'tool-complete':
+      callbacks.onToolComplete?.(
+        event.toolCallId ?? '',
+        event.ok ?? true,
+        event.output,
+        event.durationMs,
+        event.auditId,
+        event.error,
       );
       break;
     case 'iteration-start':

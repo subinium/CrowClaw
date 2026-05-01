@@ -5,6 +5,94 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.8.1] — 2026-05-?? — Dashboard overhaul: 10-issue sweep against the v0.7.1 audit findings
+
+The v0.7.1 release closed 18 wiring/correctness gaps in the dashboard. The
+audit that followed (#241–#250) flagged that the *quality* of the dashboard
+still felt amateur — bubbles in chat, glass effects, gradient-text headings,
+9 distinct button styles, dormant components shipping in the bundle but
+never rendering. This release closes those gaps via 8 parallel sub-agents
+with strict file ownership.
+
+### Critical
+- **#241** Chat surface overhauled. Drop bubbles → full-width assistant
+  blocks with subtle role indicator on hover. Smart auto-scroll
+  (IntersectionObserver — no more yanks while scrolling up). Per-message
+  hover actions (Copy / Retry / Branch / Edit). New `POST /api/sessions/:id/edit-from`
+  endpoint for the user-message Edit flow.
+- **#242** Dormant `<crowclaw-tool-call-trace>` and `<crowclaw-memory-stream>`
+  components are now rendered: tool-call data flows through new
+  `tool:start` / `tool:complete` SSE events; memory stream subscribes to
+  the WS event bridge. Skeleton loaders replace every `Loading...` string.
+- **#243** Hand-rolled regex markdown renderer replaced with `marked` +
+  `dompurify`. GFM tables, task lists, autolink, footnotes — all work.
+  `highlight.js` is now lazy-loaded (only when the first code block renders).
+- **#244** Component library: `<crowclaw-button>` (4 variants × 3 sizes),
+  `<crowclaw-status-dot>`, `<crowclaw-icon>`, `<crowclaw-skeleton-*>`.
+  All views migrated; ~9 distinct button styles consolidated.
+
+### Wiring + structure
+- **#246** Top-nav from 5 → 4 items (Chat / Connect / Automate / Settings).
+  Agent view merged into Settings → Agent. Settings tab strip restructured
+  to 4 tabs (Agent / Observability / System / Plugins). Inline `aside.sb`
+  markup deleted; `<crowclaw-sidebar>` mounted as the canonical sidebar.
+  Empty states across all views unified via `<crowclaw-empty>`.
+- **#247** Inspector rail — replaces the two floating Trace / Memory toggle
+  buttons with a single right-side rail (3 tabs: Trace / Memory / Checkpoints).
+  Lock-open state persists in localStorage.
+
+### Polish
+- **#245** Visual system reset. `backdrop-filter: blur` removed from cards
+  (kept on modal overlays only). Gradient-text headings replaced with solid
+  `--text` color. Accent moved from warning-red `#e05545` to muted blue
+  `#5b8def` (the old red is `--brand-surface` for logo-only use). Radius
+  scale fixed (no more duplicate `--radius` and `--radius-sm` at 6px).
+  Heading hierarchy raised — section headings 22px, page headings 28px.
+  Print stylesheet added.
+- **#248** Keyboard system. Cmd+K palette actions wired (the 6 hardcoded
+  actions previously emitted dead events). New `?` shortcut help dialog.
+  Core shortcuts: Cmd+N new chat, Cmd+. abort, Cmd+F search, Cmd+B
+  sidebar, Cmd+I inspector, Cmd+, settings. vim-style `g c/o/a/s` chord
+  navigation. Session list keyboard nav (`j/k`).
+- **#249** A11y baseline. `--text-muted` bumped from #48484a (3.5:1) to
+  #7a7a82 (>=4.5:1). Streaming assistant text wrapped in
+  `aria-live="polite"`. Skip-to-content link. Lang attribute on `<html>`.
+  Icon-only button label audit. Axe-core test infra in
+  `tests/a11y.test.ts` (Playwright integration in a follow-up — see
+  `docs/a11y-plan.md`).
+- **#250** Performance. `lit-virtualizer` on session list / memory list /
+  feedback log. Stream delta batching (single rAF flush). `highlight.js`
+  lazy-loaded. Status-pill polling dropped (now event-driven via
+  `system:status_changed` + on-popover-open refresh). Idle network
+  requests reduced. Budget documented in `docs/perf-budget.md`.
+
+### Verification
+- `npm run typecheck` — clean
+- `npm test` — 2,856 / 2,857
+- Live smoke: chat surface renders without bubbles, inspector rail
+  populates, palette actions work, skeleton loaders show.
+
+### Cross-package contracts added
+- `<crowclaw-button>` / `<crowclaw-status-dot>` / `<crowclaw-icon>` /
+  `<crowclaw-skeleton-*>` / `<crowclaw-inspector-rail>` /
+  `<crowclaw-shortcut-help>` — `@crowclaw/web/components`
+- `SHORTCUTS` constant + `registerShortcuts()` — `@crowclaw/web/lib/keyboard`
+- `tool-start` / `tool-complete` / `reasoning-*` SSE event types — `@crowclaw/web/lib/sse`
+- `POST /api/sessions/:id/edit-from` — `@crowclaw/runtime-node`
+- `system:status_changed` event-bus type (consumed by `<crowclaw-status-pill>`)
+
+### New dependencies
+- `@lit-labs/virtualizer` (runtime) — long-list virtualization.
+- `@axe-core/playwright` (dev) — a11y test harness, Playwright wiring lands in a follow-up.
+
+### Caveats
+- Agent view is removed; bookmarks pointing at `#agent` are auto-redirected
+  to `#settings/agent`.
+- Component library lives in `@crowclaw/web/components`; consumers using
+  the old `.btn`/`.btn-p` CSS classes need to migrate to `<crowclaw-button>`.
+- Mobile UX explicitly out of scope; the dashboard is desktop-first by
+  design (a follow-up could revisit).
+
 ## [0.8.0] — 2026-05-?? — Hermes parity sweep: 11 issues closing the harness gap
 
 CrowClaw's harness now matches Hermes' design choices on the eleven items the
