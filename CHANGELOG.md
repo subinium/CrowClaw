@@ -5,6 +5,51 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.7.1] — 2026-05-01 — ChatGPT (Codex) OAuth provider: sign in with `codex login`, no API key needed
+
+CrowClaw can now use a ChatGPT subscription via the `codex` CLI's existing OAuth login. Users who already ran `codex login` don't have to paste an API key — the runtime detects `~/.codex/auth.json` and routes through the same Codex backend the official CLI uses. EchoProvider demo mode stays as the no-credentials fallback.
+
+This follows the same path taken by opencode (sst), Cline, and Roo Code. The Codex backend at `chatgpt.com/backend-api/codex/responses` is undocumented and may break — see "Caveats" below.
+
+### Added
+- **`@crowclaw/runtime-node/codex-auth`**: `CodexAuthStore` reads `~/.codex/auth.json`, decodes the access-token JWT to know when to refresh, and refreshes via `https://auth.openai.com/oauth/token` with the stored `refresh_token`. Concurrent refreshes are serialised through a single in-flight promise. The refreshed file is rewritten atomically (mode 0o600); rewrite failures are non-fatal so read-only filesystems don't crash the runtime.
+- **`@crowclaw/runtime-node/openai-chatgpt-provider`**: `createOpenAIChatGPTProvider(store, options)` factory + `tryCreateOpenAIChatGPTProvider()` convenience that returns a configured `OpenAICompatibleProvider` ready to call the Codex backend. Default model `gpt-5.5` (override with `CROWCLAW_CODEX_MODEL`); base URL `https://chatgpt.com/backend-api/codex` with `endpointPath: '/responses'`.
+- **`@crowclaw/providers/OpenAICompatibleConfig` hooks (6 new fields)**:
+  - `tokenProvider?: () => Promise<string>` — async bearer source; takes precedence over `apiKey` and `credentialPool` so refreshed tokens are always used.
+  - `extraHeaders?: Record<string, string>` — request-header overlay, used for `chatgpt-account-id`, `originator: codex_cli_rs`, and `OpenAI-Beta: responses=experimental`.
+  - `extraBodyFields?: Record<string, unknown>` — JSON body overlay for backend-required fields (`store: false` for Codex).
+  - `systemPromptAsInstructions?: boolean` — when on, the Responses API request routes the system prompt to top-level `instructions` instead of injecting a `developer` message into `input`. Codex backend rejects the in-array form.
+  - `requireStream?: boolean` — when on, `generate()` collects from `generateStream()` instead of issuing a non-streaming POST. Codex backend rejects `stream: false` outright.
+  - `onAuthFailure?: () => Promise<boolean>` — called on 401, returns `true` to retry once after the caller refreshes credentials.
+- **`buildResponsesApiTools()`** in `@crowclaw/providers`: emits the flat `{type, name, description, parameters}` tool shape the Responses API requires, instead of the nested `{type, function: {...}}` form used by `/chat/completions`. Switching is automatic when `endpointPath: '/responses'` resolves.
+
+### Wired
+- **`provider-factory.resolveProviderFromConfig()`**: new step `3b. ChatGPT (Codex CLI) OAuth` runs after explicit API keys but before the onboarding `~/.crowclaw/config.json`. Skipped when callers pass an explicit `env` override (preserves test hermeticity) or set `CROWCLAW_DISABLE_CODEX_AUTH=1`. Returns `source: 'env'` so the runtime treats it like a real provider, not the EchoProvider demo fallback.
+- **`runtime-node/src/index.ts` startup banner**: prints `[crowclaw] Using ChatGPT subscription via Codex CLI (model=gpt-5.5). Run \`codex login\` if auth fails.` when the resolved provider is the Codex-backed OpenAICompatibleProvider, so operators know the runtime is talking to the undocumented `chatgpt.com` backend instead of `api.openai.com`.
+
+### Errors / debuggability
+- The 4xx/5xx error message from `OpenAICompatibleProvider.generate()` and the streaming `error` chunk now include the first 200 chars of the response body, not just the status text. Surfaces issues like `"Stream must be set to true"`, `"Instructions are required"`, `"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account"` — silent before this release.
+
+### Codex backend requirements (verified by direct probe 2026-05-01)
+- Endpoint: `POST https://chatgpt.com/backend-api/codex/responses`
+- Allowed models with ChatGPT-account auth: `gpt-5.5`, `gpt-5.4`. **Rejected**: `gpt-5-codex`, `gpt-5-codex-latest`, `gpt-5`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `o3`, `o4-mini`, `chatgpt-4o-latest`, `codex-1`, `codex-mini-latest`. The `OPENAI_API_KEY` flow exposes a different set; this list is **subscription-only**.
+- Required headers: `Authorization`, `chatgpt-account-id`, `originator: codex_cli_rs`, `OpenAI-Beta: responses=experimental`.
+- Required body: `instructions` (top-level), `store: false`, `stream: true`. Tools must use the flat Responses API shape.
+
+### Verification
+- `npm run typecheck` → clean.
+- `npm test` → **2,709 / 2,709** (up from 2,702 — 7 new tests in `tests/codex-auth.test.ts` covering missing-file, non-chatgpt mode, unexpired-token cache hit, proactive-refresh window, refresh persistence, concurrent-refresh serialisation, and factory-built header/body shape).
+- End-to-end probe via `node scripts/serve-local.mjs` → `POST /api/sessions/:id/message` returned `{"finalResponse":"PONG"}` against `gpt-5.5`. Streaming via `POST /api/sessions/:id/stream` produced ordered `text-delta` chunks for a counting prompt.
+
+### Caveats
+- **Undocumented endpoint**. `chatgpt.com/backend-api/codex/responses` is what the official Codex CLI uses but it is not part of the public OpenAI API surface. OpenAI may change request/response shapes, headers, or model entitlements without notice.
+- **ToS gray area**. The ChatGPT Terms of Service prohibit "automated or programmatic" access, and as of May 2026 OpenAI has not opened a third-party OAuth program for ChatGPT subscriptions. opencode (sst), Cline, and Roo Code have shipped equivalent integrations since January 2026 with no public takedown, but this remains the user's risk.
+- **Not a replacement for `OPENAI_API_KEY`**. The Codex backend rejects most OpenAI models and runs against subscription quota, not the metered API. For production-grade integrations, prefer a real API key.
+
+### Environment knobs
+- `CROWCLAW_DISABLE_CODEX_AUTH=1` — skip the auto-detection.
+- `CROWCLAW_CODEX_MODEL=gpt-5.4` — override the default `gpt-5.5`.
+
 ## [0.7.0] — 2026-04-28 — UX live wave: 10-issue platform polish sweep (onboarding, demo mode, real-time observability, session controls UI)
 
 The v0.6.x cycle delivered a battle-tested backend; v0.7.0 turns the dashboard from "looks empty / amateurish" into a working product. Eight parallel agents implemented 10 spec'd issues against `release/v0.7.0` simultaneously with strict file ownership. The previous post-v0.6.7 audit found that 17/23 dashboard routes returned real data but the user couldn't see anything alive without an API key configured + setup completed; this release closes that perception gap.

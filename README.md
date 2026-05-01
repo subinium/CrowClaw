@@ -16,7 +16,7 @@
 
 ---
 
-> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2532 tests, five-agent cross-audit, 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
+> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2709 tests, five-agent cross-audit, 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
 
 CrowClaw gives you an agent loop, 50+ tools, skill learning, scheduled jobs, multi-channel webhooks, and a dashboard — without wiring the whole stack yourself.
 
@@ -457,7 +457,7 @@ npm test             # vitest run
 npm run preflight    # both
 ```
 
-Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2532 tests** as of v0.6.1.
+Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2709 tests** as of v0.7.1.
 
 ## Packages
 

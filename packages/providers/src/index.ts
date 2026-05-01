@@ -19,6 +19,39 @@ export interface OpenAICompatibleConfig {
   manifestUrl?: string;
   /** Issue #60: Optional manifest cache (in-memory map keyed by URL). */
   manifestCache?: ManifestCache;
+  /**
+   * v0.7.2: OAuth bearer-token hook used by the ChatGPT (Codex) backend.
+   * When set, takes precedence over credentialPool / static apiKey. Called
+   * before every request so a refreshed token is always used.
+   */
+  tokenProvider?: () => Promise<string>;
+  /**
+   * v0.7.2: Extra request headers (e.g., chatgpt-account-id, originator,
+   * OpenAI-Beta). Merged into both /chat/completions and /responses calls.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * v0.7.2: Called when the upstream returns 401. Should refresh credentials
+   * and resolve `true` to signal the provider to retry the request once.
+   */
+  onAuthFailure?: () => Promise<boolean>;
+  /**
+   * v0.7.2: Extra fields to merge into the JSON request body. Used by the
+   * ChatGPT (Codex) backend, which requires `store: false` on every call.
+   */
+  extraBodyFields?: Record<string, unknown>;
+  /**
+   * v0.7.2: When the Responses API is in use, route the system prompt to the
+   * top-level `instructions` field instead of injecting a `developer` message
+   * into the `input` array. Required by the ChatGPT (Codex) backend.
+   */
+  systemPromptAsInstructions?: boolean;
+  /**
+   * v0.7.2: When set, `generate()` collects from `generateStream()` instead of
+   * issuing a non-streaming POST. Required by the ChatGPT (Codex) backend,
+   * which rejects `stream: false` calls.
+   */
+  requireStream?: boolean;
 }
 
 export interface AnthropicConfig {
@@ -200,6 +233,25 @@ function buildOpenAITools(availableTools: ToolManifest[]): ChatCompletionsReques
         properties: {}
       }
     }
+  }));
+}
+
+/**
+ * v0.7.2: Responses API uses a flat tool shape
+ * `{type: 'function', name, description, parameters}` rather than the nested
+ * `{type: 'function', function: {...}}` of /chat/completions. Mismatching the
+ * shape returns 400 with `Missing required parameter: 'tools[0].name'`.
+ */
+function buildResponsesApiTools(availableTools: ToolManifest[]): Array<Record<string, unknown>> {
+  return availableTools.map((tool) => ({
+    type: 'function',
+    name: sanitizeToolName(tool.name),
+    description: tool.description,
+    parameters: (tool.inputSchema as ChatCompletionsRequestTool['function']['parameters']) ?? {
+      type: 'object',
+      additionalProperties: true,
+      properties: {},
+    },
   }));
 }
 
@@ -723,8 +775,17 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
   }
 
   async generate(request: ProviderRequest): Promise<ProviderResponse> {
+    if (this.config.requireStream) {
+      return collectStream(this.generateStream(request));
+    }
+
     const pool = this.config.credentialPool;
-    const apiKey = pool ? pool.getKey() : this.config.apiKey;
+    const tokenProvider = this.config.tokenProvider;
+    let apiKey = tokenProvider
+      ? await tokenProvider()
+      : pool
+      ? pool.getKey()
+      : this.config.apiKey;
 
     if (!apiKey) {
       return new EchoProvider().generate(request);
@@ -749,14 +810,20 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
 
     const body: Record<string, unknown> = {
       model: this.config.model,
+      ...(this.config.extraBodyFields ?? {}),
     };
 
     if (isResponsesApi) {
-      // Responses API: use `input` instead of `messages`, `developer` instead of `system`
-      body.input = [
-        ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
-        ...mappedMessages,
-      ];
+      const useInstructions = !!this.config.systemPromptAsInstructions;
+      if (useInstructions && request.systemPrompt) {
+        body.instructions = request.systemPrompt;
+        body.input = [...mappedMessages];
+      } else {
+        body.input = [
+          ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
+          ...mappedMessages,
+        ];
+      }
     } else {
       body.messages = [
         ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
@@ -765,25 +832,40 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     if (request.availableTools.length > 0) {
-      body.tools = buildOpenAITools(request.availableTools);
+      body.tools = isResponsesApi
+        ? buildResponsesApiTools(request.availableTools)
+        : buildOpenAITools(request.availableTools);
       body.tool_choice = 'auto';
     }
 
-    const response = await fetch(this.getEndpointUrl(), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      signal: request.signal
-    });
+    const performFetch = async (bearer: string) =>
+      fetch(this.getEndpointUrl(), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          'content-type': 'application/json',
+          ...(this.config.extraHeaders ?? {}),
+        },
+        body: JSON.stringify(body),
+        signal: request.signal,
+      });
+
+    let response = await performFetch(apiKey);
+
+    if (response.status === 401 && this.config.onAuthFailure) {
+      const refreshed = await this.config.onAuthFailure();
+      if (refreshed && tokenProvider) {
+        apiKey = await tokenProvider();
+        response = await performFetch(apiKey);
+      }
+    }
 
     if (!response.ok) {
       if (pool) {
         pool.reportFailure(apiKey, response.status);
       }
-      throw new Error(`Provider request failed: ${response.status} ${response.statusText}`);
+      const errBody = await response.text().catch(() => '');
+      throw new Error(`Provider request failed: ${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}`);
     }
 
     if (pool) {
@@ -848,7 +930,12 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
 
   async *generateStream(request: ProviderRequest): AsyncGenerator<StreamChunk> {
     const pool = this.config.credentialPool;
-    const apiKey = pool ? pool.getKey() : this.config.apiKey;
+    const tokenProvider = this.config.tokenProvider;
+    let apiKey = tokenProvider
+      ? await tokenProvider()
+      : pool
+      ? pool.getKey()
+      : this.config.apiKey;
 
     if (!apiKey) {
       const echo = new EchoProvider();
@@ -875,14 +962,20 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     const body: Record<string, unknown> = {
       model: this.config.model,
       stream: true,
+      ...(this.config.extraBodyFields ?? {}),
     };
 
     if (isResponsesApi) {
-      // Responses API: use `input` instead of `messages`, `developer` instead of `system`
-      body.input = [
-        ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
-        ...mappedMessages,
-      ];
+      const useInstructions = !!this.config.systemPromptAsInstructions;
+      if (useInstructions && request.systemPrompt) {
+        body.instructions = request.systemPrompt;
+        body.input = [...mappedMessages];
+      } else {
+        body.input = [
+          ...(request.systemPrompt ? [{ role: 'developer', content: request.systemPrompt }] : []),
+          ...mappedMessages,
+        ];
+      }
     } else {
       body.messages = [
         ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
@@ -891,25 +984,40 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     if (request.availableTools.length > 0) {
-      body.tools = buildOpenAITools(request.availableTools);
+      body.tools = isResponsesApi
+        ? buildResponsesApiTools(request.availableTools)
+        : buildOpenAITools(request.availableTools);
       body.tool_choice = 'auto';
     }
 
-    const response = await fetch(this.getEndpointUrl(), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      signal: request.signal
-    });
+    const performFetch = async (bearer: string) =>
+      fetch(this.getEndpointUrl(), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          'content-type': 'application/json',
+          ...(this.config.extraHeaders ?? {}),
+        },
+        body: JSON.stringify(body),
+        signal: request.signal,
+      });
+
+    let response = await performFetch(apiKey);
+
+    if (response.status === 401 && this.config.onAuthFailure) {
+      const refreshed = await this.config.onAuthFailure();
+      if (refreshed && tokenProvider) {
+        apiKey = await tokenProvider();
+        response = await performFetch(apiKey);
+      }
+    }
 
     if (!response.ok) {
       if (pool) {
         pool.reportFailure(apiKey, response.status);
       }
-      yield { type: 'error', error: `Provider request failed: ${response.status} ${response.statusText}` };
+      const errBody = await response.text().catch(() => '');
+      yield { type: 'error', error: `Provider request failed: ${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}` };
       return;
     }
 

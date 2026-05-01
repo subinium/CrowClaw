@@ -1526,6 +1526,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     void resolveProviderFromConfig().then((resolved) => {
       if (resolved.source !== 'echo') {
         provider = resolved.provider;
+        // v0.7.2: surface the Codex/ChatGPT route specifically so operators
+        // know the runtime is talking to the undocumented chatgpt.com backend
+        // instead of api.openai.com.
+        const ctorName = (resolved.provider as unknown as { constructor?: { name?: string } })?.constructor?.name;
+        const maybeGetModel = (resolved.provider as unknown as { getModel?: () => string }).getModel;
+        const model = typeof maybeGetModel === 'function' ? maybeGetModel.call(resolved.provider) : '';
+        if (ctorName === 'OpenAICompatibleProvider' && /^gpt-5\.\d/.test(model)) {
+          console.log(
+            `[crowclaw] Using ChatGPT subscription via Codex CLI (model=${model}). Run \`codex login\` if auth fails.`
+          );
+        }
       } else {
         // Issue #175: No real provider key — switch to EchoProvider demo mode
         // so onboarding (memory capture / skill matching / scheduler / plugin
