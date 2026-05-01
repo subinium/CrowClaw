@@ -1,70 +1,34 @@
 /**
  * Shared Lit CSS styles for CrowClaw components.
  * Import and spread into `static styles` arrays.
+ *
+ * NOTE (v0.8.1): Button styles (.btn / .btn-p / .btn-danger) and form-input
+ * styles have been removed in favour of <crowclaw-button> and <crowclaw-input>.
+ * Migrate any remaining call sites to those components.
  */
 import { css } from 'lit';
 
-/** Button styles — .btn, .btn-p, .btn-danger */
-export const buttonStyles = css`
-  .btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--sp-1);
-    padding: var(--sp-2) var(--sp-4);
-    border: 1px solid var(--glass-border);
-    background: var(--glass-bg);
-    color: #c8cdd6;
-    font-size: var(--text-sm);
-    font-weight: 500;
-    font-family: 'Inter', 'Noto Sans KR', var(--font-sans);
-    cursor: pointer;
-    transition: all var(--duration-fast) var(--ease-spring);
-    outline: none;
-    border-radius: var(--radius-sm);
-  }
-  .btn:hover {
-    background: var(--bg-card-hover);
-    border-color: rgba(255, 255, 255, 0.15);
-  }
-  .btn:active {
-    opacity: 0.85;
-    transform: scale(0.98);
-  }
-  .btn-p {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-  .btn-p:hover {
-    background: var(--accent-hover);
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(224, 85, 69, 0.3);
-  }
-  .btn-danger {
-    background: rgba(255, 69, 58, 0.08);
-    border-color: var(--error);
-    color: var(--error);
-  }
-  .btn-danger:hover {
-    background: rgba(255, 69, 58, 0.15);
-  }
-`;
+/**
+ * v0.8.1: empty back-compat stub. The real `.btn`/`.btn-p`/`.btn-danger` rules
+ * were dropped in favour of `<crowclaw-button>`. Files that still spread
+ * `buttonStyles` into `static styles` keep working — they just contribute an
+ * empty CSS block until they finish migrating to the component. Slated for
+ * removal in v0.9.
+ */
+export const buttonStyles = css``;
 
 /** Card styles */
 export const cardStyles = css`
   .card {
-    background: var(--glass-bg);
-    border: 1px solid var(--glass-border);
-    backdrop-filter: blur(var(--glass-blur));
-    -webkit-backdrop-filter: blur(var(--glass-blur));
+    background: var(--surface-1);
+    border: 1px solid var(--border);
     padding: var(--sp-4) var(--sp-5);
     transition: all var(--duration-normal) var(--ease-spring);
     border-radius: var(--radius-md);
   }
   .card:hover {
-    border-color: rgba(255, 255, 255, 0.14);
-    background: var(--bg-card-hover);
+    border-color: var(--border-strong);
+    background: var(--surface-2);
     transform: translateY(-1px);
     box-shadow: var(--shadow-md);
   }
@@ -75,22 +39,22 @@ export const tagStyles = css`
   .tag {
     display: inline-block;
     padding: 2px var(--sp-1);
-    background: var(--glass-bg);
-    border: 1px solid var(--glass-border);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
     font-size: 9px;
     font-weight: 500;
     font-family: var(--font-mono);
-    color: var(--text-secondary);
+    color: var(--text-muted);
     letter-spacing: 0.2px;
     border-radius: var(--radius-sm);
   }
   .tag.ok { color: var(--success); background: rgba(48,209,88,.08); border-color: rgba(48,209,88,.2); }
   .tag.er { color: var(--error); background: rgba(255,69,58,.08); border-color: rgba(255,69,58,.2); }
-  .tag.wn { color: var(--warning); background: rgba(255,214,10,.08); border-color: rgba(255,214,10,.2); }
-  .tag.ac { color: var(--accent); background: var(--accent-soft); border-color: rgba(224,85,69,.2); }
+  .tag.wn { color: var(--warn); background: rgba(255,204,0,.08); border-color: rgba(255,204,0,.2); }
+  .tag.ac { color: var(--accent); background: var(--accent-soft); border-color: rgba(91,141,239,.2); }
 `;
 
-/** Form input styles */
+/** Form layout helpers (form-input itself is now <crowclaw-input>). */
 export const formStyles = css`
   .form-group {
     margin-bottom: var(--sp-4);
@@ -99,39 +63,15 @@ export const formStyles = css`
     display: block;
     font-size: var(--text-xs);
     font-weight: 600;
-    color: var(--text-secondary);
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.8px;
     margin-bottom: var(--sp-2);
-  }
-  .form-input {
-    width: 100%;
-    padding: var(--sp-2) var(--sp-3);
-    border: 1px solid var(--glass-border);
-    background: var(--bg-input);
-    color: var(--text-primary);
-    font-size: var(--text-sm);
-    font-family: 'Inter', 'Noto Sans KR', var(--font-sans);
-    outline: none;
-    border-radius: var(--radius-sm);
-    transition: border-color var(--duration-fast) var(--ease-spring);
-  }
-  .form-input:focus {
-    border-color: var(--accent);
-    background: rgba(255, 255, 255, 0.08);
-  }
-  .form-input::placeholder {
-    color: var(--text-muted);
   }
   .form-hint {
     font-size: var(--text-xs);
     color: var(--text-muted);
     margin-top: var(--sp-1);
-  }
-  textarea.form-input {
-    min-height: 80px;
-    resize: vertical;
-    line-height: 1.5;
   }
 `;
 
@@ -149,7 +89,7 @@ export const emptyStyles = css`
   .empty-title {
     font-size: var(--text-base);
     font-weight: 600;
-    color: #c8cdd6;
+    color: var(--text);
   }
   .empty-subtitle {
     font-size: var(--text-xs);
@@ -169,14 +109,14 @@ export const gridStyles = css`
 /** Section styles */
 export const sectionStyles = css`
   .section-block {
-    margin-bottom: var(--sp-8);
+    margin-bottom: var(--sp-6);
   }
   .section-header {
-    font-size: var(--text-lg);
+    font-size: var(--text-xl);
     font-weight: 600;
-    color: var(--text-primary);
+    color: var(--text);
     padding: var(--sp-4) 0 var(--sp-3);
-    border-bottom: 1px solid var(--glass-border);
+    border-bottom: 1px solid var(--border);
     margin-bottom: var(--sp-4);
   }
   .sec-h {
@@ -194,7 +134,7 @@ export const tabStyles = css`
   .tabs {
     display: flex;
     gap: 0;
-    border-bottom: 1px solid var(--glass-border);
+    border-bottom: 1px solid var(--border);
     margin-bottom: var(--sp-4);
   }
   .tab {
@@ -207,7 +147,7 @@ export const tabStyles = css`
     transition: all var(--duration-fast) var(--ease-spring);
   }
   .tab:hover {
-    color: var(--text-secondary);
+    color: var(--text);
   }
   .tab.active {
     color: var(--accent);
@@ -223,11 +163,11 @@ export const kvStyles = css`
     align-items: center;
     padding: var(--sp-2) var(--sp-4);
     font-size: var(--text-sm);
-    border-bottom: 1px solid var(--glass-border);
+    border-bottom: 1px solid var(--border);
   }
   .kv:last-child { border-bottom: none; }
-  .kv-k { color: var(--text-secondary); font-weight: 500; }
-  .kv-v { color: var(--text-primary); font-family: var(--font-mono); font-size: var(--text-xs); }
+  .kv-k { color: var(--text-muted); font-weight: 500; }
+  .kv-v { color: var(--text); font-family: var(--font-mono); font-size: var(--text-xs); }
 `;
 
 /** Search input */
@@ -235,9 +175,9 @@ export const searchStyles = css`
   .srch {
     width: 100%;
     padding: var(--sp-2) var(--sp-3);
-    border: 1px solid var(--glass-border);
-    background: var(--bg-input);
-    color: var(--text-primary);
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--text);
     font-size: var(--text-sm);
     font-family: 'Inter', 'Noto Sans KR', var(--font-sans);
     outline: none;
@@ -245,6 +185,6 @@ export const searchStyles = css`
     border-radius: var(--radius-sm);
     transition: border-color var(--duration-fast) var(--ease-spring);
   }
-  .srch:focus { border-color: var(--accent); background: rgba(255,255,255,0.08); }
+  .srch:focus { border-color: var(--accent); background: var(--surface-2); }
   .srch::placeholder { color: var(--text-muted); }
 `;

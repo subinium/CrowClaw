@@ -5516,8 +5516,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           // Auth is already checked by the main auth gate; this is a safety net
         }
 
-        // Acquire per-session mutex for message/stream/compact/steer to prevent race conditions
-        const needsMutex = action === 'message' || action === 'stream' || action === 'compact' || action === 'steer';
+        // Acquire per-session mutex for message/stream/compact/steer/edit-from to prevent race conditions
+        const needsMutex = action === 'message' || action === 'stream' || action === 'compact' || action === 'steer' || action === 'edit-from';
         const releaseMutex = needsMutex ? await sessionMutex.acquire(sessionId) : undefined;
         let releaseHandledByStream = false;
         try {
@@ -5774,6 +5774,75 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return Response.json({ ok: true, source: 'session', results });
         }
 
+        if (action === 'edit-from') {
+          // #241: rewind a session to a prior user turn, replace that user message
+          // with edited content, and re-run the agent from there. The semantics
+          // mirror "branch from message N" — messages 0..N-1 are kept, the message
+          // at index N is replaced with the new user content, and any messages
+          // that came after (assistant/tool turns + later user turns) are dropped
+          // before the agent loop is re-entered. Without this rewind, the prior
+          // assistant reply would still be in the transcript and the model would
+          // happily extend it instead of regenerating.
+          const editBody = (await request.json()) as {
+            messageIndex?: number;
+            newContent?: string;
+            userId?: string;
+            workspaceId?: string;
+          };
+          if (typeof editBody.messageIndex !== 'number' || !Number.isInteger(editBody.messageIndex) || editBody.messageIndex < 0) {
+            return Response.json({ error: { code: 'INVALID_MESSAGE_INDEX', message: 'messageIndex must be a non-negative integer' } }, { status: 400 });
+          }
+          if (typeof editBody.newContent !== 'string' || editBody.newContent.length === 0) {
+            return Response.json({ error: { code: 'MISSING_NEW_CONTENT', message: 'newContent is required' } }, { status: 400 });
+          }
+          const session = await store.get(sessionId);
+          if (!session) {
+            return Response.json({ error: { code: 'SESSION_NOT_FOUND', message: 'Session not found' } }, { status: 404 });
+          }
+          if (editBody.messageIndex >= session.messages.length) {
+            return Response.json({ error: { code: 'MESSAGE_INDEX_OUT_OF_RANGE', message: `messageIndex ${editBody.messageIndex} is out of range (length=${session.messages.length})` } }, { status: 400 });
+          }
+          const target = session.messages[editBody.messageIndex];
+          if (!target || target.role !== 'user') {
+            return Response.json({ error: { code: 'MESSAGE_NOT_USER', message: 'edit-from can only target a user message' } }, { status: 400 });
+          }
+          // Truncate to messages 0..N-1 (drop the original at N and everything after).
+          // The new user message is then handed to runConfiguredAgent which appends
+          // it to the transcript via the standard run path — keeping the createdAt
+          // timestamp and metadata flow identical to a fresh /message turn.
+          session.messages = session.messages.slice(0, editBody.messageIndex);
+          session.updatedAt = new Date().toISOString();
+          await store.put(session);
+          eventBus.emit('chat:message', { sessionId, userMessage: editBody.newContent, editedFrom: editBody.messageIndex });
+          const result = await runConfiguredAgent({
+            sessionId,
+            userMessage: editBody.newContent,
+            userId: editBody.userId,
+            workspaceId: editBody.workspaceId,
+            systemPrompt: 'You are CrowClaw, an AI assistant with tool-use capabilities. You can search the web, read/write files, manage scheduled tasks and reminders, and more. Use your available tools proactively to fulfill user requests.'
+          });
+          // Mirror the post-run housekeeping from the regular /message path so
+          // memory capture, learning auto-capture, and lifecycle events fire
+          // identically — otherwise an edit-from rewind would silently skip
+          // these and the dashboard would miss the turn.
+          const capturedEdit = await memoryService.captureSessionSummary(sessionId, result.session.messages);
+          if (capturedEdit) {
+            eventBus.emit('memory:captured', {
+              sessionId,
+              memoryId: capturedEdit.id,
+              summary: capturedEdit.summary,
+              scope: capturedEdit.scope,
+              tags: capturedEdit.tags,
+            });
+          }
+          if (result.toolResults.length > 0) {
+            trackLearning(learning.autoCapture(result.session.messages, sessionId));
+          }
+          eventBus.emit('chat:complete', { sessionId, toolCount: result.toolResults.length });
+          eventBus.emit('session:updated', { sessionId, messageCount: result.session.messages.length });
+          return Response.json(result);
+        }
+
         if (action === 'stream') {
           const body = (await request.json()) as { message: string; userId?: string; workspaceId?: string };
           if (!body.message) return Response.json({ error: 'Missing message' }, { status: 400 });
@@ -5784,8 +5853,48 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const streamRelease = releaseMutex;
           const streamAbort = sessionController.registerSession(sessionId);
           const encoder = new TextEncoder();
+          // #242: bridge runtime EventBus tool lifecycle events into the SSE
+          // stream. The ToolRegistry wrapper at line ~1820 emits tool:start /
+          // tool:complete for every agent-loop tool call, but those signals
+          // never reached SSE subscribers — clients had to listen on the WS
+          // bus separately. We subscribe here and forward only events whose
+          // `sessionId` matches the active session so cross-session noise
+          // doesn't leak into one client's stream. The subscription is torn
+          // down in `finally` below alongside the session-controller cleanup.
+          let unsubscribeToolEvents: (() => void) | undefined;
           const stream = new ReadableStream({
             async start(controller) {
+              unsubscribeToolEvents = eventBus.subscribe((event) => {
+                if (event.type !== 'tool:start' && event.type !== 'tool:complete') return;
+                if ((event.data as { sessionId?: string }).sessionId !== sessionId) return;
+                try {
+                  if (event.type === 'tool:start') {
+                    const d = event.data as { callId?: string; toolName?: string; args?: unknown; startedAt?: string };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'tool-start',
+                      toolName: d.toolName,
+                      toolCallId: d.callId,
+                      args: d.args,
+                      startedAt: d.startedAt,
+                    })}\n\n`));
+                  } else {
+                    const d = event.data as { callId?: string; ok?: boolean; output?: string; durationMs?: number; auditId?: string; error?: boolean };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'tool-complete',
+                      toolCallId: d.callId,
+                      ok: d.ok,
+                      output: d.output,
+                      durationMs: d.durationMs,
+                      auditId: d.auditId,
+                      ...(d.error ? { error: d.output } : {}),
+                    })}\n\n`));
+                  }
+                } catch {
+                  // Controller may be closed if the client disconnected mid-turn;
+                  // swallow the enqueue error so a broken pipe doesn't crash the
+                  // listener for other (still-live) subscribers.
+                }
+              });
               try {
                 const loop = createConfiguredAgent();
                 const existingSession = await store.get(sessionId);
@@ -5852,6 +5961,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', error: msg })}\n\n`));
               } finally {
                 sessionController.unregisterSession(sessionId);
+                // #242: detach the tool-event forwarder before releasing the
+                // mutex so a late tool:complete (e.g. from a still-draining
+                // worker) doesn't try to enqueue into a closed controller.
+                unsubscribeToolEvents?.();
                 streamRelease?.();
               }
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));

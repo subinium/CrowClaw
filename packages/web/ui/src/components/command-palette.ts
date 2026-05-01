@@ -33,6 +33,12 @@ import {
   type SkillLike,
   type ActionLike,
 } from '../lib/search.js';
+// v0.8.1 (#248): single source of truth for action ids. The palette and the
+// global keyboard registry agree on the same `crowclaw:cmdk-action` action
+// strings; without this import they were free to drift. SHORTCUTS-derived
+// actions appear in the Actions tab with their key combo as a hint, so
+// users can learn the shortcut from the palette UI itself.
+import { SHORTCUTS } from '../lib/keyboard.js';
 
 interface SessionsResp {
   sessions?: Array<{ sessionId: string; title?: string; preview?: string }>;
@@ -45,13 +51,60 @@ interface SkillsResp {
   skills?: Array<{ slug: string; title: string; summary?: string; triggerPhrases?: string[] }>;
 }
 
-const HARDCODED_ACTIONS: ActionLike[] = [
-  { id: 'new-chat',         label: 'New chat',          hint: 'Start a fresh session' },
-  { id: 'open-settings',    label: 'Open settings',     hint: 'Tokens, providers, presets' },
+// v0.8.1 (#248): Display key combos in the palette so users learn the
+// shortcut while browsing actions. `cmd+,` etc. are kept as the source-of-
+// truth shape (lowercase, no Unicode); the formatter prettifies them into
+// the standard `⌘ ,` glyphs used elsewhere in the UI.
+const PLATFORM_IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || '');
+
+const formatKeyHint = (key: string): string => {
+  // Chords like "g c" render as a sequence; otherwise split on `+`.
+  if (key.includes(' ')) {
+    return key.split(' ').map((k) => k.toUpperCase()).join(' then ');
+  }
+  return key
+    .split('+')
+    .map((part) => {
+      const p = part.toLowerCase();
+      if (p === 'cmd' || p === 'meta') return PLATFORM_IS_MAC ? '⌘' : 'Ctrl';
+      if (p === 'ctrl') return 'Ctrl';
+      if (p === 'shift') return PLATFORM_IS_MAC ? '⇧' : 'Shift';
+      if (p === 'alt' || p === 'option') return PLATFORM_IS_MAC ? '⌥' : 'Alt';
+      return part.length === 1 ? part.toUpperCase() : part;
+    })
+    .join(PLATFORM_IS_MAC ? ' ' : '+');
+};
+
+// Actions surfaced in the palette but NOT covered by the global SHORTCUTS
+// table. These are kept as a manual list so the palette can offer entry
+// points for things that don't deserve a dedicated keybinding.
+const PALETTE_ONLY_ACTIONS: ActionLike[] = [
   { id: 'reconnect-ws',     label: 'Reconnect WS',      hint: 'Drop and re-establish transport' },
   { id: 'toggle-scheduler', label: 'Toggle scheduler',  hint: 'Pause or resume background jobs' },
   { id: 'switch-persona',   label: 'Switch persona',    hint: 'Pick a different agent persona' },
   { id: 'switch-preset',    label: 'Switch preset',     hint: 'Apply a config preset' },
+];
+
+// Lazy getter so the SHORTCUTS import is dereferenced AFTER both modules have
+// finished loading. lib/keyboard.ts side-effect-imports this file (so the
+// custom-element decorator runs before `registerCommandPalette` calls
+// `createElement`), and this file imports SHORTCUTS from lib/keyboard.ts —
+// a top-level spread of SHORTCUTS would observe an undefined binding during
+// the cycle's evaluation phase. Reading inside a function defers access to
+// runtime, by which time the cycle is fully initialised.
+const buildHardcodedActions = (): ActionLike[] => [
+  // SHORTCUTS-derived actions: the action `id` is the same string the keyboard
+  // registry dispatches via `crowclaw:cmdk-action`, so a palette click and a
+  // shortcut press hit the exact same listener in app.ts. `open-palette` is
+  // skipped because the palette is already open when the user sees this list.
+  ...SHORTCUTS
+    .filter((s) => s.action !== 'open-palette')
+    .map((s): ActionLike => ({
+      id: s.action,
+      label: s.description,
+      hint: formatKeyHint(s.key),
+    })),
+  ...PALETTE_ONLY_ACTIONS,
 ];
 
 const SOURCES: readonly CommandSource[] = ['sessions', 'memories', 'skills', 'actions'] as const;
@@ -333,7 +386,7 @@ export class CrowClawCommandPalette extends LitElement {
       sessions: this._sessions,
       memories: this._memories,
       skills: this._skills,
-      actions: HARDCODED_ACTIONS,
+      actions: buildHardcodedActions(),
       perSource: 50,
     });
   }
@@ -392,11 +445,20 @@ export class CrowClawCommandPalette extends LitElement {
 
   private _fire(result: CommandResult, newTab: boolean): void {
     if (this._query.trim()) this._recent = saveRecent(this._query);
+    // v0.8.1 (#248): include a top-level `action` field when the result is an
+    // action so app.ts (Agent A5) can use the same listener path it uses for
+    // shortcut-triggered events (`detail: { action }`). For session/memory/
+    // skill rows, `action` is omitted and the listener reads `detail.result`
+    // as before — this keeps the existing palette UI shape intact.
+    const detail: { result: CommandResult; newTab: boolean; action?: string } = { result, newTab };
+    if (result.source === 'actions') {
+      detail.action = result.id;
+    }
     this.dispatchEvent(
       new CustomEvent('crowclaw:cmdk-action', {
         bubbles: true,
         composed: true,
-        detail: { result, newTab },
+        detail,
       }),
     );
     this.hide();

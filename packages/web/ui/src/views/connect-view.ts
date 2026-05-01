@@ -1,7 +1,6 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
-  buttonStyles,
   cardStyles,
   tagStyles,
   formStyles,
@@ -13,6 +12,13 @@ import {
 import { api } from '../lib/api.js';
 import { showToast } from '../components/toast.js';
 import '../components/toggle-switch.js';
+// v0.8.1 #244 #246 — primitive component library: register custom elements
+// so the templates below can use the tags directly.
+import '../components/button.js';
+import '../components/status-dot.js';
+import '../components/icon.js';
+import '../components/empty.js';
+import '../components/skeleton.js';
 
 /* ------------------------------------------------------------------ */
 /*  Type definitions                                                  */
@@ -156,7 +162,6 @@ interface SystemStatus {
 @customElement('crowclaw-connect-view')
 export class ConnectView extends LitElement {
   static styles = [
-    buttonStyles,
     cardStyles,
     tagStyles,
     formStyles,
@@ -207,28 +212,6 @@ export class ConnectView extends LitElement {
         font-family: var(--font-mono);
         font-size: var(--text-xs);
         color: var(--text-muted);
-      }
-
-      /* Status dots */
-      .dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        flex-shrink: 0;
-      }
-
-      .dot.live {
-        background: var(--success);
-        box-shadow: 0 0 8px rgba(48, 209, 88, 0.35);
-      }
-
-      .dot.disc {
-        background: var(--text-muted);
-      }
-
-      .dot.sim {
-        background: var(--warning);
-        box-shadow: 0 0 8px rgba(255, 214, 10, 0.25);
       }
 
       /* Provider cards */
@@ -387,30 +370,6 @@ export class ConnectView extends LitElement {
 
       .env-row input { flex: 1; }
 
-      .env-row .remove-env {
-        background: none;
-        border: none;
-        color: var(--text-muted);
-        cursor: pointer;
-        font-size: 14px;
-        padding: 2px 6px;
-        border-radius: var(--radius-sm);
-      }
-
-      .env-row .remove-env:hover { color: var(--error); }
-
-      .add-env-btn {
-        font-size: var(--text-xs);
-        color: var(--accent);
-        cursor: pointer;
-        background: none;
-        border: none;
-        padding: var(--sp-1) 0;
-        font-family: inherit;
-      }
-
-      .add-env-btn:hover { color: var(--accent-hover); }
-
       .platform-card {
         background: var(--glass-bg);
         border: 1px solid var(--glass-border);
@@ -551,6 +510,10 @@ export class ConnectView extends LitElement {
         font-size: var(--text-xs);
         color: var(--text-muted);
         font-family: var(--font-mono);
+      }
+
+      .platform-probe-info .probe-error {
+        color: var(--error);
       }
 
       .platform-actions {
@@ -764,21 +727,21 @@ export class ConnectView extends LitElement {
         white-space: nowrap;
       }
 
-      .copy-btn {
-        background: none;
-        border: 1px solid var(--glass-border);
-        color: var(--text-muted);
-        cursor: pointer;
-        font-size: 10px;
-        padding: 2px 8px;
-        border-radius: var(--radius-sm);
-        font-family: inherit;
-        transition: color var(--duration-fast), border-color var(--duration-fast);
+      .remote-row .remote-flex {
+        flex: 1;
       }
 
-      .copy-btn:hover {
-        color: var(--accent);
-        border-color: var(--accent);
+      /* Telegram webhook block — column layout */
+      .remote-row.column {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .remote-row .webhook-row-head {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-3);
+        margin-bottom: var(--sp-2);
       }
 
       .webhook-info {
@@ -826,35 +789,12 @@ export class ConnectView extends LitElement {
         gap: var(--sp-3);
       }
 
-      /* Loading / empty states */
-      .loading {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: var(--sp-8) 0;
-        color: var(--text-muted);
-        font-size: var(--text-sm);
-      }
-
-      .empty-state {
+      /* Loading skeleton stack — used in the initial loading state */
+      .skeleton-stack {
         display: flex;
         flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        padding: var(--sp-8) 0;
-        gap: var(--sp-2);
-        opacity: 0.5;
-      }
-
-      .empty-state .title {
-        font-size: var(--text-base);
-        font-weight: 600;
-        color: #c8cdd6;
-      }
-
-      .empty-state .subtitle {
-        font-size: var(--text-xs);
-        color: var(--text-muted);
+        gap: var(--sp-4);
+        padding: var(--sp-4) 0;
       }
 
       /* Error message */
@@ -863,6 +803,19 @@ export class ConnectView extends LitElement {
         font-size: var(--text-xs);
         margin-top: var(--sp-2);
         min-height: 16px;
+      }
+
+      /* Inline action row: places a `<crowclaw-button>` row aligned right */
+      .actions-row {
+        display: flex;
+        gap: var(--sp-2);
+        align-items: center;
+      }
+      .actions-row.end {
+        justify-content: flex-end;
+      }
+      .row-spacer {
+        margin-top: var(--sp-3);
       }
     `,
   ];
@@ -1586,17 +1539,29 @@ export class ConnectView extends LitElement {
     return 'Disconnected';
   }
 
-  private _statusDotClass(status: string): string {
-    if (status === 'live' || status === 'connected' || status === 'ok') return 'live';
-    if (status === 'sim' || status === 'simulated') return 'sim';
-    return 'disc';
+  /**
+   * Map a domain-level status string to a `<crowclaw-status-dot>` status prop.
+   * - live/connected/ok → 'ok'
+   * - sim/simulated      → 'warn'
+   * - everything else    → 'idle'
+   */
+  private _statusDotKind(status: string): 'ok' | 'warn' | 'idle' {
+    if (status === 'live' || status === 'connected' || status === 'ok') return 'ok';
+    if (status === 'sim' || status === 'simulated') return 'warn';
+    return 'idle';
   }
 
   /* ---- render ---- */
 
   render() {
     if (this.loading) {
-      return html`<div class="loading">Loading connections...</div>`;
+      return html`
+        <div class="skeleton-stack" role="status" aria-live="polite" aria-busy="true">
+          <crowclaw-skeleton-card lines="3"></crowclaw-skeleton-card>
+          <crowclaw-skeleton-card lines="3"></crowclaw-skeleton-card>
+          <crowclaw-skeleton-list rows="4"></crowclaw-skeleton-list>
+        </div>
+      `;
     }
 
     return html`
@@ -1621,10 +1586,14 @@ export class ConnectView extends LitElement {
         <div class="section-header">Providers</div>
         ${this.providers.length === 0 && missing.length === 0
           ? html`
-              <div class="empty-state">
-                <div class="title">No Providers</div>
-                <div class="subtitle">No provider configurations found</div>
-              </div>
+              <crowclaw-empty
+                icon="skills"
+                title="No providers configured"
+                description="Connect an LLM provider (OpenAI, Anthropic, OpenRouter, ...) to start chatting."
+                cta-label="Add primary provider"
+                cta-event="cc-empty-add-provider"
+                @cc-empty-add-provider=${() => this._openAddSlot('primary')}
+              ></crowclaw-empty>
             `
           : html`
               <div class="provider-grid">
@@ -1641,18 +1610,17 @@ export class ConnectView extends LitElement {
     return html`
       <div class="provider-card">
         <div class="provider-hdr">
-          <span class="dot disc"></span>
+          <crowclaw-status-dot status="idle" aria-live="polite"></crowclaw-status-dot>
           <span class="provider-name">Add ${slotName} slot</span>
         </div>
         <div class="provider-url">No ${slotName} slot configured</div>
         <div class="provider-actions">
-          <button
-            class="btn ${isConfiguring ? 'btn-p' : ''}"
+          <crowclaw-button
+            variant=${isConfiguring ? 'primary' : 'secondary'}
+            size="sm"
             aria-label="Add ${slotName} slot"
             @click=${() => this._openAddSlot(slotName)}
-          >
-            ${isConfiguring ? 'Close' : 'Add'}
-          </button>
+          >${isConfiguring ? 'Close' : 'Add'}</crowclaw-button>
         </div>
         ${isConfiguring ? this._renderProviderForm() : nothing}
       </div>
@@ -1662,37 +1630,37 @@ export class ConnectView extends LitElement {
   private _renderProviderCard(provider: ProviderDisplay) {
     const isConfiguring = this.configuringProvider === provider.slot;
     const canRemove = provider.slot !== 'primary';
+    const dotStatus = provider.hasKey ? 'ok' : 'idle';
     return html`
       <div class="provider-card">
         <div class="provider-hdr">
-          <span class="dot ${provider.hasKey ? 'live' : 'disc'}"></span>
+          <crowclaw-status-dot status=${dotStatus} aria-live="polite"></crowclaw-status-dot>
           <span class="provider-name">${provider.name} (${provider.slot})</span>
         </div>
         <div class="provider-url">${provider.baseUrl || provider.provider} / ${provider.model}</div>
         <div class="provider-actions">
-          <button
-            class="btn"
+          <crowclaw-button
+            variant="ghost"
+            size="sm"
             aria-label="Test ${provider.name} provider"
+            ?loading=${this.testingProvider === provider.slot}
             ?disabled=${this.testingProvider === provider.slot}
             @click=${() => this._testProvider(provider)}
-          >
-            ${this.testingProvider === provider.slot ? 'Testing...' : 'Test'}
-          </button>
-          <button
-            class="btn ${isConfiguring ? 'btn-p' : ''}"
+          >${this.testingProvider === provider.slot ? 'Testing' : 'Test'}</crowclaw-button>
+          <crowclaw-button
+            variant=${isConfiguring ? 'primary' : 'ghost'}
+            size="sm"
+            aria-label="Configure ${provider.name} provider"
             @click=${() => this._openProviderConfig(provider)}
-          >
-            ${isConfiguring ? 'Close' : 'Configure'}
-          </button>
+          >${isConfiguring ? 'Close' : 'Configure'}</crowclaw-button>
           ${canRemove
             ? html`
-                <button
-                  class="btn btn-danger"
+                <crowclaw-button
+                  variant="danger"
+                  size="sm"
                   aria-label="Remove ${provider.slot} slot"
                   @click=${() => this._removeProviderSlot(provider.slot)}
-                >
-                  Remove
-                </button>
+                >Remove</crowclaw-button>
               `
             : nothing}
         </div>
@@ -1705,8 +1673,9 @@ export class ConnectView extends LitElement {
     return html`
       <div class="provider-form">
         <div class="form-group">
-          <label class="form-label">Name</label>
+          <label class="form-label" for="provider-form-name">Name</label>
           <input
+            id="provider-form-name"
             class="form-input"
             .value=${this.providerForm.name}
             @input=${(e: InputEvent) => {
@@ -1718,8 +1687,9 @@ export class ConnectView extends LitElement {
           />
         </div>
         <div class="form-group">
-          <label class="form-label">Provider</label>
+          <label class="form-label" for="provider-form-provider">Provider</label>
           <input
+            id="provider-form-provider"
             class="form-input"
             placeholder="openai, anthropic, openrouter, ..."
             .value=${this.providerForm.provider}
@@ -1732,8 +1702,9 @@ export class ConnectView extends LitElement {
           />
         </div>
         <div class="form-group">
-          <label class="form-label">Model</label>
+          <label class="form-label" for="provider-form-model">Model</label>
           <input
+            id="provider-form-model"
             class="form-input"
             placeholder="gpt-4o, claude-sonnet-4-20250514, ..."
             .value=${this.providerForm.model}
@@ -1746,8 +1717,9 @@ export class ConnectView extends LitElement {
           />
         </div>
         <div class="form-group">
-          <label class="form-label">Base URL</label>
+          <label class="form-label" for="provider-form-base-url">Base URL</label>
           <input
+            id="provider-form-base-url"
             class="form-input"
             placeholder="https://api.openai.com/v1"
             .value=${this.providerForm.baseUrl}
@@ -1760,8 +1732,9 @@ export class ConnectView extends LitElement {
           />
         </div>
         <div class="form-group">
-          <label class="form-label">API Key</label>
+          <label class="form-label" for="provider-form-api-key">API Key</label>
           <input
+            id="provider-form-api-key"
             class="form-input"
             type="password"
             placeholder="sk-..."
@@ -1776,8 +1749,18 @@ export class ConnectView extends LitElement {
           <div class="form-hint">Leave blank to keep the existing key</div>
         </div>
         <div class="form-actions">
-          <button class="btn" @click=${this._closeProviderConfig}>Cancel</button>
-          <button class="btn btn-p" @click=${this._saveProviderConfig}>Save</button>
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
+            aria-label="Cancel provider configuration"
+            @click=${this._closeProviderConfig}
+          >Cancel</crowclaw-button>
+          <crowclaw-button
+            variant="primary"
+            size="sm"
+            aria-label="Save provider configuration"
+            @click=${this._saveProviderConfig}
+          >Save</crowclaw-button>
         </div>
       </div>
     `;
@@ -1805,13 +1788,13 @@ export class ConnectView extends LitElement {
               </div>
             `}
         ${this.showMcpForm ? this._renderMcpAddForm() : nothing}
-        <div style="margin-top: var(--sp-3)">
-          <button
-            class="btn ${this.showMcpForm ? '' : 'btn-p'}"
+        <div class="row-spacer">
+          <crowclaw-button
+            variant=${this.showMcpForm ? 'secondary' : 'primary'}
+            size="sm"
+            aria-label="${this.showMcpForm ? 'Cancel add MCP server' : 'Add custom MCP server'}"
             @click=${this._toggleMcpForm}
-          >
-            ${this.showMcpForm ? 'Cancel' : 'Add Custom Server'}
-          </button>
+          >${this.showMcpForm ? 'Cancel' : 'Add Custom Server'}</crowclaw-button>
         </div>
       </div>
     `;
@@ -1820,7 +1803,7 @@ export class ConnectView extends LitElement {
   private _renderMcpItem(server: McpServer) {
     return html`
       <div class="mcp-item">
-        <span class="dot live"></span>
+        <crowclaw-status-dot status="ok" aria-live="polite"></crowclaw-status-dot>
         <div class="mcp-info">
           <div class="mcp-name">${server.name}</div>
           <div class="mcp-cmd">${server.command}${server.args?.length ? ` ${server.args.join(' ')}` : ''}</div>
@@ -1828,22 +1811,22 @@ export class ConnectView extends LitElement {
             ? html`<div class="mcp-desc">${server.description}</div>`
             : nothing}
         </div>
-        <button
-          class="btn"
+        <crowclaw-button
+          variant="ghost"
+          size="sm"
           aria-label="Reconnect ${server.name}"
+          ?loading=${this.reconnectingMcp === server.name}
           ?disabled=${this.reconnectingMcp === server.name}
           @click=${() => this._reconnectMcpServer(server.name)}
-        >
-          ${this.reconnectingMcp === server.name ? 'Reconnecting...' : 'Reconnect'}
-        </button>
+        >${this.reconnectingMcp === server.name ? 'Reconnecting' : 'Reconnect'}</crowclaw-button>
         ${server.custom !== false
           ? html`
-              <button
-                class="btn btn-danger"
+              <crowclaw-button
+                variant="danger"
+                size="sm"
+                aria-label="Remove ${server.name}"
                 @click=${() => this._removeMcpServer(server.name)}
-              >
-                Remove
-              </button>
+              >Remove</crowclaw-button>
             `
           : nothing}
       </div>
@@ -1856,8 +1839,9 @@ export class ConnectView extends LitElement {
         <div class="add-form-title">Add Custom Server</div>
         <div class="row">
           <div class="form-group">
-            <label class="form-label">Name</label>
+            <label class="form-label" for="mcp-form-name">Name</label>
             <input
+              id="mcp-form-name"
               class="form-input"
               placeholder="my-server"
               .value=${this.mcpForm.name}
@@ -1870,8 +1854,9 @@ export class ConnectView extends LitElement {
             />
           </div>
           <div class="form-group">
-            <label class="form-label">Command</label>
+            <label class="form-label" for="mcp-form-command">Command</label>
             <input
+              id="mcp-form-command"
               class="form-input"
               placeholder="npx @modelcontextprotocol/server-x"
               .value=${this.mcpForm.command}
@@ -1886,8 +1871,9 @@ export class ConnectView extends LitElement {
         </div>
         <div class="row">
           <div class="form-group">
-            <label class="form-label">Args (comma-separated)</label>
+            <label class="form-label" for="mcp-form-args">Args (comma-separated)</label>
             <input
+              id="mcp-form-args"
               class="form-input"
               placeholder="--port, 3000"
               .value=${this.mcpForm.args}
@@ -1900,8 +1886,9 @@ export class ConnectView extends LitElement {
             />
           </div>
           <div class="form-group">
-            <label class="form-label">Description</label>
+            <label class="form-label" for="mcp-form-description">Description</label>
             <input
+              id="mcp-form-description"
               class="form-input"
               placeholder="Optional description"
               .value=${this.mcpForm.description}
@@ -1923,6 +1910,7 @@ export class ConnectView extends LitElement {
                   <input
                     class="form-input"
                     placeholder="KEY"
+                    aria-label="Environment variable key"
                     .value=${ev.key}
                     @input=${(e: InputEvent) =>
                       this._updateEnvVar(i, 'key', (e.target as HTMLInputElement).value)}
@@ -1930,21 +1918,44 @@ export class ConnectView extends LitElement {
                   <input
                     class="form-input"
                     placeholder="value"
+                    aria-label="Environment variable value"
                     .value=${ev.value}
                     @input=${(e: InputEvent) =>
                       this._updateEnvVar(i, 'value', (e.target as HTMLInputElement).value)}
                   />
-                  <button class="remove-env" @click=${() => this._removeEnvVar(i)}>x</button>
+                  <crowclaw-button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Remove environment variable"
+                    @click=${() => this._removeEnvVar(i)}
+                  >
+                    <crowclaw-icon slot="icon" name="x" size="14"></crowclaw-icon>
+                  </crowclaw-button>
                 </div>
               `,
             )}
           </div>
-          <button class="add-env-btn" @click=${this._addEnvVar}>+ Add variable</button>
+          <crowclaw-button
+            variant="ghost"
+            size="sm"
+            aria-label="Add environment variable"
+            @click=${this._addEnvVar}
+          >+ Add variable</crowclaw-button>
         </div>
-        <div class="err-msg">${this.mcpFormError}</div>
+        <div class="err-msg" role="alert" aria-live="polite">${this.mcpFormError}</div>
         <div class="form-actions">
-          <button class="btn" @click=${this._toggleMcpForm}>Cancel</button>
-          <button class="btn btn-p" @click=${this._addMcpServer}>Add Server</button>
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
+            aria-label="Cancel adding MCP server"
+            @click=${this._toggleMcpForm}
+          >Cancel</crowclaw-button>
+          <crowclaw-button
+            variant="primary"
+            size="sm"
+            aria-label="Add MCP server"
+            @click=${this._addMcpServer}
+          >Add Server</crowclaw-button>
         </div>
       </div>
     `;
@@ -1999,7 +2010,10 @@ export class ConnectView extends LitElement {
         <!-- Header row: status + name + toggle -->
         <div class="platform-card-header">
           <div class="platform-info">
-            <span class="dot ${this._statusDotClass(modeStatus)}"></span>
+            <crowclaw-status-dot
+              status=${this._statusDotKind(modeStatus)}
+              aria-live="polite"
+            ></crowclaw-status-dot>
             <span class="platform-name">${platform.name}</span>
             ${hasPairingPolicy && pendingPairings.length > 0
               ? html`<span class="badge" title="${pendingPairings.length} pending pairings">${pendingPairings.length}</span>`
@@ -2021,7 +2035,7 @@ export class ConnectView extends LitElement {
                       ${probe.botUsername ? html`<span>Bot: @${probe.botUsername}</span>` : nothing}
                       ${probe.webhookUrl ? html`<span>Webhook: ${probe.webhookActive ? 'active' : 'inactive'}</span>` : nothing}
                     `
-                  : html`<span style="color: var(--error)">Probe failed: ${probe.error ?? 'unknown'}</span>`}
+                  : html`<span class="probe-error">Probe failed: ${probe.error ?? 'unknown'}</span>`}
               </div>
             `
           : nothing}
@@ -2038,30 +2052,28 @@ export class ConnectView extends LitElement {
 
         <!-- Actions -->
         <div class="platform-actions">
-          <button
-            class="btn"
+          <crowclaw-button
+            variant="ghost"
+            size="sm"
             aria-label="Probe ${platform.name} connectivity"
+            ?loading=${isProbing}
             ?disabled=${isProbing}
             @click=${() => this._probePlatform(platform)}
-          >
-            ${isProbing ? 'Probing...' : 'Probe'}
-          </button>
-          <button
-            class="btn ${isExpanded ? 'btn-p' : ''}"
+          >${isProbing ? 'Probing' : 'Probe'}</crowclaw-button>
+          <crowclaw-button
+            variant=${isExpanded ? 'primary' : 'ghost'}
+            size="sm"
             aria-label="${isExpanded ? 'Close' : 'Configure'} ${platform.name}"
             @click=${() => this._togglePlatformExpand(platform)}
-          >
-            ${isExpanded ? 'Close' : 'Configure'}
-          </button>
+          >${isExpanded ? 'Close' : 'Configure'}</crowclaw-button>
           ${hasPairingPolicy && pendingPairings.length > 0
             ? html`
-                <button
-                  class="btn"
+                <crowclaw-button
+                  variant="ghost"
+                  size="sm"
                   aria-label="Show pending pairings for ${platform.name}"
                   @click=${() => this._togglePairingView(platform.name)}
-                >
-                  Pairings (${pendingPairings.length})
-                </button>
+                >Pairings (${pendingPairings.length})</crowclaw-button>
               `
             : nothing}
         </div>
@@ -2092,25 +2104,30 @@ export class ConnectView extends LitElement {
         <span class="pairing-code">${pairing.code}</span>
         <span class="pairing-meta">${pairing.senderId} / ${pairing.channelId}</span>
         <span class="pairing-expires">${expiresMinutes}m left</span>
-        <button
-          class="btn btn-p"
+        <crowclaw-button
+          variant="primary"
+          size="sm"
           aria-label="Approve pairing ${pairing.code}"
+          ?loading=${isApproving}
           ?disabled=${isApproving}
           @click=${() => this._approvePairing(pairing.code)}
-        >
-          ${isApproving ? 'Approving...' : 'Approve'}
-        </button>
+        >${isApproving ? 'Approving' : 'Approve'}</crowclaw-button>
       </div>
     `;
   }
 
   private _renderPlatformConfigPanel(platform: GatewayPlatform) {
+    const tokenId = `platform-${platform.name}-token`;
+    const webhookId = `platform-${platform.name}-webhook`;
+    const dmPolicyId = `platform-${platform.name}-dm-policy`;
+    const groupPolicyId = `platform-${platform.name}-group-policy`;
     return html`
       <div class="platform-expand-panel">
         <!-- Token / webhook config -->
         <div class="form-group">
-          <label class="form-label">Token</label>
+          <label class="form-label" for=${tokenId}>Token</label>
           <input
+            id=${tokenId}
             class="form-input"
             type="password"
             placeholder="Bot token or API key"
@@ -2125,8 +2142,9 @@ export class ConnectView extends LitElement {
           />
         </div>
         <div class="form-group">
-          <label class="form-label">Webhook URL</label>
+          <label class="form-label" for=${webhookId}>Webhook URL</label>
           <input
+            id=${webhookId}
             class="form-input"
             placeholder="https://..."
             aria-label="Webhook URL for ${platform.name}"
@@ -2144,8 +2162,9 @@ export class ConnectView extends LitElement {
         <div class="form-group">
           <label class="form-label">Policy</label>
           <div class="policy-row">
-            <label>DM Policy</label>
+            <label for=${dmPolicyId}>DM Policy</label>
             <select
+              id=${dmPolicyId}
               aria-label="DM policy for ${platform.name}"
               .value=${this.platformPolicyForm.dmPolicy}
               @change=${(e: Event) => {
@@ -2162,8 +2181,9 @@ export class ConnectView extends LitElement {
             </select>
           </div>
           <div class="policy-row">
-            <label>Group Policy</label>
+            <label for=${groupPolicyId}>Group Policy</label>
             <select
+              id=${groupPolicyId}
               aria-label="Group policy for ${platform.name}"
               .value=${this.platformPolicyForm.groupPolicy}
               @change=${(e: Event) => {
@@ -2194,20 +2214,18 @@ export class ConnectView extends LitElement {
         </div>
 
         <div class="form-actions">
-          <button
-            class="btn"
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
             aria-label="Save policy for ${platform.name}"
             @click=${() => this._savePlatformPolicy(platform)}
-          >
-            Save Policy
-          </button>
-          <button
-            class="btn btn-p"
+          >Save Policy</crowclaw-button>
+          <crowclaw-button
+            variant="primary"
+            size="sm"
             aria-label="Save config for ${platform.name}"
             @click=${() => this._savePlatformConfig(platform)}
-          >
-            Save Config
-          </button>
+          >Save Config</crowclaw-button>
         </div>
       </div>
     `;
@@ -2221,10 +2239,11 @@ export class ConnectView extends LitElement {
         <div class="section-header">Channels</div>
         ${this.channels.length === 0
           ? html`
-              <div class="empty-state">
-                <div class="title">No Active Channels</div>
-                <div class="subtitle">Channels appear when messages are received via gateway platforms</div>
-              </div>
+              <crowclaw-empty
+                icon="chat"
+                title="No active channels"
+                description="Channels appear once a paired platform receives its first message."
+              ></crowclaw-empty>
             `
           : html`
               <div class="channel-grid">
@@ -2278,21 +2297,23 @@ export class ConnectView extends LitElement {
           <div class="remote-row">
             <span class="label">Server URL</span>
             <span class="value">${origin}</span>
-            <button
-              class="copy-btn"
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
               aria-label="Copy server URL"
               @click=${() => this._copyToClipboard(origin)}
             >
+              <crowclaw-icon slot="icon" name="copy" size="14"></crowclaw-icon>
               Copy
-            </button>
+            </crowclaw-button>
           </div>
 
           <!-- Public URL override -->
           <div class="remote-row">
-            <span class="label">Public URL</span>
+            <label class="label" for="public-url-override">Public URL</label>
             <input
-              class="form-input"
-              style="flex: 1;"
+              id="public-url-override"
+              class="form-input remote-flex"
               placeholder="https://your-public-domain.com (for webhook callbacks)"
               aria-label="Public URL override"
               .value=${this.publicUrlOverride}
@@ -2306,20 +2327,22 @@ export class ConnectView extends LitElement {
           <div class="remote-row">
             <span class="label">Gateway URL</span>
             <span class="value">${this.publicUrlOverride || origin}/api/gateway</span>
-            <button
-              class="copy-btn"
+            <crowclaw-button
+              variant="ghost"
+              size="sm"
               aria-label="Copy gateway URL"
               @click=${() => this._copyToClipboard(`${this.publicUrlOverride || origin}/api/gateway`)}
             >
+              <crowclaw-icon slot="icon" name="copy" size="14"></crowclaw-icon>
               Copy
-            </button>
+            </crowclaw-button>
           </div>
 
           <!-- Telegram webhook management -->
           ${hasTelegram
             ? html`
-                <div class="remote-row" style="flex-direction: column; align-items: stretch;">
-                  <div style="display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-2);">
+                <div class="remote-row column">
+                  <div class="webhook-row-head">
                     <span class="label">Telegram Webhook</span>
                     ${webhookInfo?.url
                       ? html`<span class="tag ok">active</span>`
@@ -2350,9 +2373,11 @@ export class ConnectView extends LitElement {
                         this.webhookUrlInput = (e.target as HTMLInputElement).value;
                       }}
                     />
-                    <button
-                      class="btn btn-p"
+                    <crowclaw-button
+                      variant="primary"
+                      size="sm"
                       aria-label="Set Telegram webhook"
+                      ?loading=${this.settingWebhook}
                       ?disabled=${this.settingWebhook}
                       @click=${() => {
                         if (!this.webhookUrlInput.trim()) {
@@ -2360,14 +2385,14 @@ export class ConnectView extends LitElement {
                         }
                         this._setTelegramWebhook();
                       }}
-                    >
-                      ${this.settingWebhook ? 'Setting...' : 'Set Webhook'}
-                    </button>
+                    >${this.settingWebhook ? 'Setting' : 'Set Webhook'}</crowclaw-button>
                     ${webhookInfo?.url
                       ? html`
-                          <button
-                            class="btn btn-danger"
+                          <crowclaw-button
+                            variant="danger"
+                            size="sm"
                             aria-label="Delete Telegram webhook"
+                            ?loading=${this.deletingWebhook}
                             ?disabled=${this.deletingWebhook}
                             @click=${() => {
                               if (this.showWebhookDeleteConfirm) {
@@ -2376,18 +2401,16 @@ export class ConnectView extends LitElement {
                                 this.showWebhookDeleteConfirm = true;
                               }
                             }}
-                          >
-                            ${this.deletingWebhook
-                              ? 'Deleting...'
+                          >${this.deletingWebhook
+                              ? 'Deleting'
                               : this.showWebhookDeleteConfirm
                                 ? 'Confirm Delete'
-                                : 'Delete Webhook'}
-                          </button>
+                                : 'Delete Webhook'}</crowclaw-button>
                         `
                       : nothing}
                   </div>
                   ${this.showWebhookDeleteConfirm && !this.deletingWebhook
-                    ? html`<div class="confirm-msg">Click "Confirm Delete" to remove the webhook</div>`
+                    ? html`<div class="confirm-msg" role="alert" aria-live="polite">Click "Confirm Delete" to remove the webhook</div>`
                     : nothing}
                 </div>
               `
@@ -2406,6 +2429,7 @@ export class ConnectView extends LitElement {
         <input
           class="srch"
           placeholder="Search tools by name or description..."
+          aria-label="Search tools"
           .value=${this.toolSearch}
           @input=${(e: InputEvent) => {
             this.toolSearch = (e.target as HTMLInputElement).value;
@@ -2413,14 +2437,13 @@ export class ConnectView extends LitElement {
         />
         ${this._filteredTools.length === 0
           ? html`
-              <div class="empty-state">
-                <div class="title">No Tools Found</div>
-                <div class="subtitle">
-                  ${this.toolSearch
-                    ? 'No tools match your search'
-                    : 'No tools registered'}
-                </div>
-              </div>
+              <crowclaw-empty
+                icon="skills"
+                title=${this.toolSearch ? 'No tools match your search' : 'No tools registered'}
+                description=${this.toolSearch
+                  ? 'Try a different keyword, or clear the search to see every available tool.'
+                  : 'Connect an MCP server or enable a runtime plugin to register tools the agent can call.'}
+              ></crowclaw-empty>
             `
           : html`
               ${[...this._groupedTools.entries()].map(

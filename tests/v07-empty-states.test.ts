@@ -105,14 +105,14 @@ describe('empty-state wiring per view (#176)', () => {
     expect(view).toContain('No matching sessions');
   });
 
-  it('agent-view: skills empty links to the OpenClaw catalog', () => {
-    const view = read('views/agent-view.ts');
+  it('settings-view (post-#246): skills empty in the absorbed Plugins surface keeps the catalog link', () => {
+    // v0.8.1 #246: agent-view was merged into settings-view → the Skills
+    // empty state now lives there. Tracking by content, not file path.
+    const view = read('views/settings-view.ts');
     expect(view).toContain('<crowclaw-empty');
-    // Empty branch fires only when skills array is fully empty
-    expect(view).toMatch(/this\.skills\.length\s*===\s*0[\s\S]{0,400}<crowclaw-empty/);
     expect(view).toContain('No skills loaded');
     expect(view).toContain('cta-label="Browse the catalog"');
-    // Routes to the published skills repo (external href).
+    // Catalog link still points at the published OpenClaw skills repo.
     expect(view).toMatch(/cta-href=["']https?:\/\/[^"']*openclaw[^"']*["']/i);
     // Search-mismatch fallback still present.
     expect(view).toContain('No matching skills');
@@ -180,9 +180,9 @@ describe('empty-state wiring per view (#176)', () => {
 /* ------------------------------------------------------------------ */
 
 describe('cross-view audit (#176)', () => {
+  // v0.8.1 #246: agent-view was merged into settings-view; the file is gone.
   const VIEWS = [
     'views/chat-view.ts',
-    'views/agent-view.ts',
     'views/automate-view.ts',
     'views/connect-view.ts',
     'views/settings-view.ts',
@@ -190,9 +190,10 @@ describe('cross-view audit (#176)', () => {
 
   it('every view that imports the empty CTA also keeps its existing copy fallbacks', () => {
     // Constraint: the rewrite must NOT delete the surrounding view structure.
-    // Spot-check that section headers are still present.
+    // Spot-check that section headers are still present. Identity now lives
+    // in settings-view post-#246.
     expect(read('views/chat-view.ts')).toContain('chat-area');
-    expect(read('views/agent-view.ts')).toContain('Identity');
+    expect(read('views/settings-view.ts')).toContain('Identity');
     expect(read('views/automate-view.ts')).toContain('Scheduler');
     expect(read('views/connect-view.ts')).toContain('MCP Servers');
     expect(read('views/settings-view.ts')).toContain('Memory Browser');

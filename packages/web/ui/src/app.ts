@@ -103,7 +103,13 @@ export function fallbackRegisterCommandPalette(_parent: HTMLElement): CommandPal
   };
 }
 
-export type ViewName = 'chat' | 'agent' | 'connect' | 'automate' | 'settings' | 'onboarding';
+/**
+ * v0.8.1 (#246 Phase A): the dedicated Agent view has been merged into
+ * Settings → Agent. The top-nav and hash router only know about the four
+ * primary surfaces plus onboarding. Bookmarks pointing at the legacy
+ * `#agent` hash are redirected to `#settings` in the hash handlers below.
+ */
+export type ViewName = 'chat' | 'connect' | 'automate' | 'settings' | 'onboarding';
 
 interface PairingEntry {
   platform: string;
@@ -367,85 +373,46 @@ export class CrowClawApp extends LitElement {
         height: 100vh;
       }
 
-      /* Sidebar */
-      .sb {
+      /* #246 Phase B: when the palette dispatches a toggle-sidebar action
+         the sidebar collapses to a fixed off-canvas position. We keep it
+         in the DOM so focus management and reactive state stay intact. */
+      .app.sidebar-collapsed { grid-template-columns: 0 1fr; }
+      .app.sidebar-collapsed crowclaw-sidebar { display: none; }
+
+      /* #249 — Skip-to-content link. Visually hidden by default; pulls into
+         the top-left corner only when keyboard-focused so AT/keyboard users
+         can jump past the sidebar nav. */
+      .skip-to-content {
+        position: absolute;
+        left: -9999px;
+        top: auto;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        z-index: 1000;
         background: var(--bg-secondary);
-        border-right: 1px solid var(--glass-border);
-        display: flex;
-        flex-direction: column;
-      }
-
-      .sb-logo {
-        padding: var(--sp-5) var(--sp-5) var(--sp-4);
-        display: flex;
-        align-items: center;
-        gap: var(--sp-3);
-        border-bottom: 1px solid var(--glass-border);
-        background: linear-gradient(135deg, rgba(224, 85, 69, 0.04) 0%, transparent 60%);
-      }
-
-      .sb-logo img { width: 28px; height: 28px; flex-shrink: 0; }
-      .sb-logo span { font-size: var(--text-lg); font-weight: 700; letter-spacing: -0.01em; }
-
-      .sb-nav { flex: 1; overflow-y: auto; padding: var(--sp-3) var(--sp-2); }
-
-      .ni {
-        display: flex;
-        align-items: center;
-        gap: var(--sp-2);
+        color: var(--accent);
+        border: 1px solid var(--accent);
+        border-radius: var(--radius-sm);
         padding: var(--sp-2) var(--sp-3);
         font-size: var(--text-sm);
-        color: var(--text-secondary);
-        cursor: pointer;
-        transition: color 0.15s, background 0.15s, border-color 0.15s;
-        border-left: 2px solid transparent;
-        margin-bottom: 1px;
-        border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+        font-weight: 600;
+        text-decoration: none;
+      }
+      .skip-to-content:focus {
+        left: var(--sp-3);
+        top: var(--sp-3);
+        width: auto;
+        height: auto;
+        outline: 2px solid var(--accent);
       }
 
-      .ni:hover { color: #c8cdd6; background: var(--bg-card-hover); }
-
-      .ni.a {
-        color: var(--accent);
-        background: var(--accent-soft);
-        border-left-color: var(--accent);
-        font-weight: 500;
-      }
-
-      .ni svg { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.45; transition: opacity 0.15s; }
-      .ni:hover svg { opacity: 0.7; }
-      .ni.a svg { opacity: 1; }
-
-      .ni .ct {
-        margin-left: auto;
-        padding: 1px var(--sp-1);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
-        font-family: var(--font-mono);
-        font-size: var(--text-xs);
-        color: var(--text-muted);
-        border-radius: var(--radius-sm);
-      }
-
-      .ni.a .ct { color: var(--accent); background: var(--accent-soft); border-color: rgba(224,85,69,.2); }
-
-      /* Sidebar Footer */
-      .sb-ft {
-        padding: var(--sp-3) var(--sp-4);
-        border-top: 1px solid var(--glass-border);
-        display: flex;
-        flex-direction: column;
-        gap: var(--sp-1);
-      }
-
-      .sb-ft-r { display: flex; align-items: center; gap: var(--sp-2); }
-
-      .led { width: 6px; height: 6px; background: var(--text-muted); flex-shrink: 0; border-radius: 50%; }
-      .led.ok { background: var(--success); box-shadow: 0 0 8px rgba(48,209,88,.35); }
-      .led.er { background: var(--error); box-shadow: 0 0 8px rgba(255,69,58,.35); }
-
-      .sb-ft span { font-size: var(--text-xs); color: var(--text-muted); font-weight: 500; }
-      .sb-ft .ft-stat { font-size: var(--text-xs); color: var(--text-muted); font-family: var(--font-mono); }
+      /* Sidebar (delegated to <crowclaw-sidebar>) — only the slotted
+         footer-extras need shell-local styles now. The component owns logo,
+         nav, and base footer rendering. */
+      .sb-extras { display: flex; flex-direction: column; gap: var(--sp-1); margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--glass-border); }
+      .sb-extras-row { display: flex; align-items: center; gap: var(--sp-2); }
+      .sb-extras .ft-stat { font-size: var(--text-xs); color: var(--text-muted); font-family: var(--font-mono); }
 
       .ft-transport {
         font-size: 9px;
@@ -746,8 +713,8 @@ export class CrowClawApp extends LitElement {
 
       @media (max-width: 768px) {
         .hamburger { display: block; }
-        .sb { position: fixed; left: -240px; top: 0; bottom: 0; z-index: 100; transition: left 0.2s ease; }
-        .sb.mobile-open { left: 0; }
+        crowclaw-sidebar { position: fixed; left: -240px; top: 0; bottom: 0; z-index: 100; transition: left 0.2s ease; }
+        crowclaw-sidebar.mobile-open { left: 0; }
         .app { grid-template-columns: 1fr; }
       }
     `,
@@ -755,6 +722,10 @@ export class CrowClawApp extends LitElement {
 
   @state() private currentView: ViewName = 'chat';
   @state() private mobileOpen = false;
+  /** #248: command palette dispatches `crowclaw:cmdk-action` toggle-sidebar. */
+  @state() private sidebarCollapsed = false;
+  /** #248: keyboard-help modal shown on `crowclaw:open-shortcut-help`. */
+  @state() private shortcutHelpOpen = false;
   @state() private connectionStatus: 'connecting' | 'connected' | 'error' = 'connecting';
   @state() private authenticated = false;
   @state() private authError = '';
@@ -803,17 +774,32 @@ export class CrowClawApp extends LitElement {
   };
 
   private _hashChangeHandler = () => {
-    const hash = location.hash.slice(1) as ViewName;
-    if (['chat', 'agent', 'connect', 'automate', 'settings', 'onboarding'].includes(hash)) {
-      this.currentView = hash;
+    const raw = location.hash.slice(1);
+    // #246: legacy `#agent` bookmarks redirect to `#settings` (Agent tab lives
+    // there now). Mutating the hash re-enters this handler with the canonical
+    // value, so we early-return to avoid double-applying state.
+    if (raw === 'agent' || raw.startsWith('agent/')) {
+      location.hash = 'settings';
+      return;
+    }
+    // `#settings/agent` is the canonical deep-link form for the absorbed
+    // Agent surface — strip the sub-route here; the settings view picks up
+    // the sub-tab via its own hash listener.
+    const view = raw.split('/')[0] as ViewName;
+    if (['chat', 'connect', 'automate', 'settings', 'onboarding'].includes(view)) {
+      this.currentView = view;
     }
   };
 
   private _globalKeyHandler = (e: KeyboardEvent) => {
     if (e.key === 'Escape') {
-      // Close auth overlay or mobile sidebar
+      // Close auth overlay or mobile sidebar / floating panels.
       if (this.mobileOpen) this.mobileOpen = false;
       if (this.presenceOpen) this.presenceOpen = false;
+      // #248: dismiss shortcut-help on Esc — A1's component dispatches its
+      // own close event but we backstop it here so a stuck modal cannot
+      // capture focus indefinitely.
+      if (this.shortcutHelpOpen) this.shortcutHelpOpen = false;
     }
   };
 
@@ -856,6 +842,57 @@ export class CrowClawApp extends LitElement {
   };
 
   /**
+   * #248: command palette dispatches `crowclaw:cmdk-action` with a string
+   * `detail.action`. The orchestrator translates each action into the right
+   * effect — direct state mutation (sidebar collapse), a re-broadcast
+   * window event for chat-view (new-chat / abort-session) or a navigate
+   * call (open-settings). Unknown actions are ignored so a future palette
+   * update with new actions does not crash the shell.
+   */
+  private _cmdkActionHandler = (e: Event) => {
+    const detail = (e as CustomEvent).detail;
+    const action: string | undefined = detail?.action;
+    if (!action) return;
+    switch (action) {
+      case 'new-chat':
+        window.dispatchEvent(new CustomEvent('crowclaw:new-chat'));
+        break;
+      case 'abort-session':
+        window.dispatchEvent(new CustomEvent('crowclaw:abort-session'));
+        break;
+      case 'toggle-sidebar':
+        this.sidebarCollapsed = !this.sidebarCollapsed;
+        break;
+      case 'toggle-inspector':
+        window.dispatchEvent(new CustomEvent('crowclaw:toggle-inspector'));
+        break;
+      case 'open-settings':
+        this._navigateTo('settings');
+        break;
+      case 'open-keyboard-help':
+        window.dispatchEvent(new CustomEvent('crowclaw:open-shortcut-help'));
+        break;
+      default:
+        // Unknown action — ignore. Palette may emit other shapes for
+        // session/memory/skill picks; those have no shell-level effect.
+        break;
+    }
+  };
+
+  /**
+   * #248: window-level open/close events for the keyboard-help modal so any
+   * surface (palette, footer button, future hotkey) can request the help
+   * sheet without coupling to the modal's element identity.
+   */
+  private _shortcutHelpOpenHandler = () => {
+    this.shortcutHelpOpen = true;
+  };
+
+  private _shortcutHelpCloseHandler = () => {
+    this.shortcutHelpOpen = false;
+  };
+
+  /**
    * #174: when the onboarding wizard reports completion we re-fetch system
    * status (so the demo badge / hasProvider flags reflect the new key) and
    * route to the chat view. We never re-enter onboarding from the same
@@ -881,10 +918,17 @@ export class CrowClawApp extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
-    // Restore view from hash
-    const hash = location.hash.slice(1) as ViewName;
-    if (['chat', 'agent', 'connect', 'automate', 'settings', 'onboarding'].includes(hash)) {
-      this.currentView = hash;
+    // Restore view from hash. Legacy `#agent` bookmarks rewrite to `#settings`
+    // (the Agent surface was merged into Settings → Agent in v0.8.1 / #246).
+    const raw = location.hash.slice(1);
+    if (raw === 'agent' || raw.startsWith('agent/')) {
+      location.hash = 'settings';
+      this.currentView = 'settings';
+    } else {
+      const view = raw.split('/')[0] as ViewName;
+      if (['chat', 'connect', 'automate', 'settings', 'onboarding'].includes(view)) {
+        this.currentView = view;
+      }
     }
     document.addEventListener('crowclaw:auth-required', this._authRequiredHandler);
     window.addEventListener('hashchange', this._hashChangeHandler);
@@ -897,6 +941,12 @@ export class CrowClawApp extends LitElement {
     document.addEventListener(STATUS_PILL_ACTIONS.resumeScheduler, this._resumeSchedulerHandler);
     // #174 onboarding-view emits this when the user completes the wizard.
     document.addEventListener('crowclaw:onboarding-complete', this._onboardingCompleteHandler);
+    // #248 (v0.8.1): command palette → orchestrator action bus. Listening on
+    // window because the palette is mounted under document.body, outside
+    // this shell's shadow DOM.
+    window.addEventListener('crowclaw:cmdk-action', this._cmdkActionHandler);
+    window.addEventListener('crowclaw:open-shortcut-help', this._shortcutHelpOpenHandler);
+    window.addEventListener('crowclaw:close-shortcut-help', this._shortcutHelpCloseHandler);
     this._checkAuth();
   }
 
@@ -954,6 +1004,9 @@ export class CrowClawApp extends LitElement {
     document.removeEventListener(STATUS_PILL_ACTIONS.testProvider, this._testProviderHandler);
     document.removeEventListener(STATUS_PILL_ACTIONS.resumeScheduler, this._resumeSchedulerHandler);
     document.removeEventListener('crowclaw:onboarding-complete', this._onboardingCompleteHandler);
+    window.removeEventListener('crowclaw:cmdk-action', this._cmdkActionHandler);
+    window.removeEventListener('crowclaw:open-shortcut-help', this._shortcutHelpOpenHandler);
+    window.removeEventListener('crowclaw:close-shortcut-help', this._shortcutHelpCloseHandler);
     if (this._commandPaletteHandle) {
       this._commandPaletteHandle.dispose();
       this._commandPaletteHandle = null;
@@ -1045,7 +1098,12 @@ export class CrowClawApp extends LitElement {
             // v0.8.0 (#238) — self-improvement loop. Drafts tab listens to
             // `crowclaw-event` for `learning:*` to live-refresh its pending
             // drafts list without waiting for the polling tick.
-            event.type.startsWith('learning:'))
+            event.type.startsWith('learning:') ||
+            // v0.8.1 (#246) — chat-view's memory stream subscribes to the
+            // `crowclaw-event` bridge for `memory:captured` / `memory:recalled`.
+            // Without this allowlist entry the bridge silently drops every
+            // memory event and the panel never updates outside its polling tick.
+            event.type.startsWith('memory:'))
         ) {
           window.dispatchEvent(new CustomEvent('crowclaw-event', {
             detail: { type: event.type },
@@ -1219,44 +1277,51 @@ export class CrowClawApp extends LitElement {
            @click=${() => { this.mobileOpen = false; }}></div>
       <button class="hamburger" aria-label="Toggle sidebar" @click=${() => { this.mobileOpen = !this.mobileOpen; }}>&#9776;</button>
 
+      <!-- #249 — Skip-to-content link, visually hidden until focused. -->
+      <a class="skip-to-content" href="#main-content">Skip to content</a>
+
       <!-- App Shell -->
-      <div class="app">
-        <aside class="sb ${this.mobileOpen ? 'mobile-open' : ''}">
-          <div class="sb-logo">
-            <img src="/docs/logo.png" alt="CrowClaw">
-            <span>CrowClaw</span>
-          </div>
-          <nav class="sb-nav">
-            <div class="sb-s">
-              ${this._nav('chat', 'Chat', this._iconChat, this.sessionCount)}
-              ${this._nav('agent', 'Agent', this._iconAgent)}
-              ${this._nav('connect', 'Connect', this._iconConnect)}
-              ${this._nav('automate', 'Automate', this._iconAutomate, this.jobCount)}
-              ${this._nav('settings', 'Settings', this._iconSettings)}
-            </div>
-          </nav>
-          <div class="sb-ft">
-            <!-- Connection status + transport badge -->
-            <div class="sb-ft-r">
-              <div class="led ${this.connectionStatus === 'connected' ? 'ok' : this.connectionStatus === 'error' ? 'er' : ''}"></div>
-              <span>${this.connectionStatus === 'connected' ? 'Connected' : this.connectionStatus === 'error' ? 'Error' : 'Connecting'}</span>
+      <div class="app ${this.sidebarCollapsed ? 'sidebar-collapsed' : ''}">
+        <!-- #246 Phase B — sidebar mounted as the shared
+             crowclaw-sidebar component. The previous duplicated inline
+             aside-sb markup and CSS was deleted; the sidebar now owns
+             its own logo, nav, and footer rendering. The shell still
+             owns the connection footer (transport badge + presence list
+             + pair/logout) which the component does not render today,
+             so we keep that block as a distinct aside-sb-footer next to
+             the sidebar. -->
+        <crowclaw-sidebar
+          class="${this.mobileOpen ? 'mobile-open' : ''}"
+          .currentView=${this.currentView === 'onboarding' ? 'chat' : this.currentView}
+          .connectionStatus=${this.connectionStatus}
+          .sessionCount=${this.sessionCount}
+          .jobCount=${this.jobCount}
+          .toolCount=${this.toolCount}
+          .modelName=${this.modelName}
+          @view-change=${(e: CustomEvent<ViewName>) => this._navigateTo(e.detail)}
+        >
+          <!-- Slotted into <crowclaw-sidebar slot="footer-extras">: transport
+               badge, presence panel, instance info, pair/logout. These rely
+               on app-shell state + APIs (sessions/active, pairings, auth)
+               that don't belong inside the reusable sidebar component. -->
+          <div slot="footer-extras" class="sb-extras">
+            <div class="sb-extras-row">
               <span class="ft-transport">${this.transportType}</span>
+              <span class="ft-stat">${this.subscriberCount} client${this.subscriberCount !== 1 ? 's' : ''}</span>
             </div>
 
-            <!-- Presence / connected clients -->
-            <div class="sb-ft-r ft-clickable"
+            <div class="sb-extras-row ft-clickable"
                  role="button"
                  tabindex="0"
                  aria-label="Toggle connected clients panel"
                  @click=${this._togglePresence}
                  @keydown=${(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') this._togglePresence(); }}>
-              <span class="ft-stat">${this.subscriberCount} client${this.subscriberCount !== 1 ? 's' : ''} connected</span>
+              <span class="ft-stat">${this.presenceOpen ? 'Hide sessions' : 'Show sessions'}</span>
             </div>
 
-            <!-- Expandable active sessions panel -->
             <div class="presence-panel ${this.presenceOpen ? 'on' : ''}">
               ${this.activeSessions.length === 0
-                ? html`<div class="session-row"><span style="color:var(--text-muted);font-size:var(--text-xs)">No active sessions</span></div>`
+                ? html`<div class="session-row"><span class="ft-stat">No active sessions</span></div>`
                 : this.activeSessions.map(s => html`
                   <div class="session-row">
                     <span class="session-id" title="${s.id}">${s.id}</span>
@@ -1265,20 +1330,15 @@ export class CrowClawApp extends LitElement {
                 `)}
             </div>
 
-            ${this.modelName ? html`<div class="sb-ft-r"><span class="ft-stat">${this.modelName}</span></div>` : nothing}
-            ${this.toolCount ? html`<div class="sb-ft-r"><span class="ft-stat">${this.toolCount} tools</span></div>` : nothing}
-
-            <!-- Instance info from /health -->
             ${this.instanceVersion || this.instanceRuntime
               ? html`
-                <div class="sb-ft-r">
+                <div class="sb-extras-row">
                   <span class="ft-stat">
                     ${this.instanceVersion ? `v${this.instanceVersion}` : ''}${this.instanceVersion && this.instanceRuntime ? ' / ' : ''}${this.instanceRuntime || ''}
                   </span>
                 </div>`
               : nothing}
 
-            <!-- Pair Device + Logout buttons -->
             ${this.authenticated
               ? html`
                 <button class="ft-btn" aria-label="Pair a new device" @click=${this._openPairingModal}>
@@ -1298,9 +1358,9 @@ export class CrowClawApp extends LitElement {
                 </button>`
               : nothing}
           </div>
-        </aside>
+        </crowclaw-sidebar>
 
-        <main class="mn">
+        <main class="mn" id="main-content" tabindex="-1">
           ${this.authenticated
             ? html`
                 <!-- v0.7.0 header strip: status pill, demo badge, persona, theme -->
@@ -1365,11 +1425,11 @@ export class CrowClawApp extends LitElement {
                       </div>
                     `
                   : html`
+                      <!-- #246 Phase A: 4-surface render. The legacy
+                           crowclaw-agent-view block was removed; its
+                           content lives under Settings - Agent now. -->
                       <div class="vw ${this.currentView === 'chat' ? 'on' : ''}">
                         <crowclaw-chat-view></crowclaw-chat-view>
-                      </div>
-                      <div class="vw ${this.currentView === 'agent' ? 'on' : ''}">
-                        <crowclaw-agent-view></crowclaw-agent-view>
                       </div>
                       <div class="vw ${this.currentView === 'connect' ? 'on' : ''}">
                         <div class="mh"><h2>Connect</h2><p>Providers, integrations, and service connections</p></div>
@@ -1386,6 +1446,17 @@ export class CrowClawApp extends LitElement {
             : nothing}
         </main>
       </div>
+
+      <!-- #248: keyboard-help modal. Mounted only while open so a missing
+           crowclaw-shortcut-help element is inert. The component is
+           expected to dispatch crowclaw:close-shortcut-help on dismiss;
+           we also unmount on Esc via the global keydown handler below. -->
+      ${this.shortcutHelpOpen
+        ? html`<crowclaw-shortcut-help
+            @close=${this._shortcutHelpCloseHandler}
+            @crowclaw:close-shortcut-help=${this._shortcutHelpCloseHandler}
+          ></crowclaw-shortcut-help>`
+        : nothing}
     `;
   }
 
@@ -1401,36 +1472,9 @@ export class CrowClawApp extends LitElement {
     location.hash = view;
   }
 
-  private _nav(view: ViewName, label: string, icon: ReturnType<typeof html>, count?: number) {
-    return html`
-      <div class="ni ${this.currentView === view ? 'a' : ''}"
-           role="button"
-           tabindex="0"
-           aria-label="Navigate to ${label}"
-           @click=${() => { this._navigateTo(view); }}
-           @keydown=${(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { this._navigateTo(view); } }}>
-        ${icon}${label}
-        ${count ? html`<span class="ct">${count}</span>` : nothing}
-      </div>
-    `;
-  }
-
-  // SVG icons
-  private get _iconChat() {
-    return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z"/></svg>`;
-  }
-  private get _iconAgent() {
-    return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`;
-  }
-  private get _iconConnect() {
-    return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
-  }
-  private get _iconAutomate() {
-    return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
-  }
-  private get _iconSettings() {
-    return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
-  }
+  // #246 Phase B: the inline `_nav` row helper and per-view SVG getters were
+  // deleted along with `aside.sb`; nav rendering now lives in
+  // `<crowclaw-sidebar>` (components/sidebar.ts).
 }
 
 declare global {

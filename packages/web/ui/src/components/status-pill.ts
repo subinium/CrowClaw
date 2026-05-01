@@ -11,11 +11,15 @@
  *   - scheduler (running / paused / errored)
  *   - mcp       (all connected / N degraded / none)
  *
- * The pill polls `/api/diagnostics` every 30s and also reacts to live
- * EventBus events (`session:*`, `gateway:*`, `job:*`) re-dispatched on the
- * `window` as `crowclaw-event` CustomEvents by the orchestrator (app.ts).
- * This decouples the pill from the WebSocket client lifecycle owned by
- * `app.ts` — the orchestrator just bridges WS frames to window events.
+ * The pill no longer polls — v0.8.1 (#250) dropped the 30s timer in favour
+ * of pure event-driven updates. It runs one initial fetch on
+ * `firstUpdated()`, listens for `system:status_changed` (and other
+ * relevant `session:*` / `gateway:*` / `job:*`) EventBus events
+ * re-dispatched on `window` as `crowclaw-event` CustomEvents by the
+ * orchestrator (app.ts), and re-fetches lazily when the popover is
+ * opened. This decouples the pill from the WebSocket client lifecycle
+ * owned by `app.ts` and removes one of the dashboard's idle network
+ * requests.
  *
  * Click opens a popover with per-system details and three quick-action
  * buttons. Each button dispatches a bubbling/composed CustomEvent that
@@ -201,8 +205,14 @@ export const STATUS_PILL_REFRESH_EVENT = 'crowclaw-status-refresh' as const;
  */
 export const STATUS_PILL_EVENTBUS_BRIDGE_EVENT = 'crowclaw-event' as const;
 
-const POLL_INTERVAL_MS = 30_000;
-const RELEVANT_EVENT_PREFIXES = ['session:', 'gateway:', 'job:'];
+/**
+ * EventBus event types the pill reacts to. `system:status_changed` is the
+ * dedicated signal app.ts dispatches whenever any of the four sub-systems
+ * (transport / provider / scheduler / mcp) changes state. The other
+ * prefixes catch broader runtime activity that may indirectly imply a
+ * status change.
+ */
+const RELEVANT_EVENT_PREFIXES = ['system:status_changed', 'session:', 'gateway:', 'job:'];
 
 @customElement('crowclaw-status-pill')
 export class CrowClawStatusPill extends LitElement {
@@ -373,7 +383,8 @@ export class CrowClawStatusPill extends LitElement {
   /** True when a fetch is currently in flight — prevents request stacking. */
   private _fetching = false;
 
-  private _pollHandle: ReturnType<typeof setInterval> | null = null;
+  /** True after the initial connectedCallback fetch has been kicked off. */
+  private _initialFetched = false;
 
   // Bound listeners (need stable references for add/removeEventListener).
   private readonly _onWindowEvent = (e: Event): void => {
@@ -399,12 +410,6 @@ export class CrowClawStatusPill extends LitElement {
   connectedCallback(): void {
     super.connectedCallback();
 
-    // Kick off an initial fetch — fire-and-forget so connection time
-    // isn't gated on the network round-trip.
-    void this.refresh();
-
-    this._pollHandle = setInterval(() => void this.refresh(), POLL_INTERVAL_MS);
-
     if (typeof window !== 'undefined') {
       window.addEventListener(STATUS_PILL_EVENTBUS_BRIDGE_EVENT, this._onWindowEvent as EventListener);
       window.addEventListener(STATUS_PILL_REFRESH_EVENT, this._onWindowRefresh as EventListener);
@@ -414,12 +419,19 @@ export class CrowClawStatusPill extends LitElement {
     }
   }
 
+  /**
+   * v0.8.1 (#250): single initial fetch on first render. Replaces the
+   * old 30s polling interval — subsequent updates come from
+   * `system:status_changed` events and on-popover-open refresh.
+   */
+  protected firstUpdated(): void {
+    if (this._initialFetched) return;
+    this._initialFetched = true;
+    void this.refresh();
+  }
+
   disconnectedCallback(): void {
     super.disconnectedCallback();
-    if (this._pollHandle !== null) {
-      clearInterval(this._pollHandle);
-      this._pollHandle = null;
-    }
     if (typeof window !== 'undefined') {
       window.removeEventListener(STATUS_PILL_EVENTBUS_BRIDGE_EVENT, this._onWindowEvent as EventListener);
       window.removeEventListener(STATUS_PILL_REFRESH_EVENT, this._onWindowRefresh as EventListener);
@@ -461,7 +473,13 @@ export class CrowClawStatusPill extends LitElement {
   }
 
   private _toggle(): void {
-    this._open = !this._open;
+    const willOpen = !this._open;
+    this._open = willOpen;
+    // v0.8.1 (#250): refresh on popover open so the user sees current
+    // state without us paying the cost of a 30s background poll.
+    if (willOpen) {
+      void this.refresh();
+    }
   }
 
   private _emit(type: string): void {
@@ -473,8 +491,8 @@ export class CrowClawStatusPill extends LitElement {
       }),
     );
     // Optimistic refresh after an action — the route may take a tick to
-    // reflect new state, so wait one second then re-poll. The next 30s
-    // tick will catch up either way.
+    // reflect new state, so wait one second then re-fetch. The next
+    // `system:status_changed` event will catch up either way.
     setTimeout(() => void this.refresh(), 1_000);
   }
 

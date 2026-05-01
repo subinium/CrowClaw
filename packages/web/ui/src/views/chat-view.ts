@@ -23,6 +23,14 @@ import '../components/reasoning-block.js';
 // inline whenever a `code.execute` tool message appears. The only other
 // change in this file is the sibling-branch in `_renderMessage` below.
 import '../components/code-execute-trace.js';
+// v0.8.1 #241/#247/#249 — UI primitives + inspector rail used by the
+// overhauled chat surface (hover actions, accessible icon-only buttons,
+// the right-side rail mount that replaces the old toggle-button pair).
+import '../components/button.js';
+import '../components/icon.js';
+import '../components/skeleton.js';
+import '../components/status-dot.js';
+import '../components/inspector-rail.js';
 import type { ForkParentInfo } from '../components/fork-modal.js';
 import type { ToolTraceEntry } from '../components/tool-call-trace.js';
 import type { CodeExecuteTraceData } from '../components/code-execute-trace.js';
@@ -167,6 +175,8 @@ export class ChatView extends LitElement {
 
       .sess-item:hover { background: var(--bg-card); }
       .sess-item.active { background: var(--accent-soft); border-left: 2px solid var(--accent); }
+      .sess-item.focused { outline: 2px solid var(--accent); outline-offset: -2px; }
+      .sess-item:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
 
       .sess-item-top {
         display: flex;
@@ -303,6 +313,9 @@ export class ChatView extends LitElement {
         flex-direction: column;
         flex: 1;
         overflow: hidden;
+        /* v0.8.1 #247 — leave room for the inspector rail's collapsed
+           strip (40px) which overlays the right edge via fixed-position. */
+        padding-right: 40px;
       }
 
       .sess-toggle-btn {
@@ -587,42 +600,126 @@ export class ChatView extends LitElement {
         flex: 1;
         overflow-y: auto;
         padding: var(--sp-4);
+        position: relative;
       }
 
+      /* v0.8.1 #241 — chat surface overhaul. Assistant blocks render
+         full-width with a 24px left margin reserved for a subtle role
+         indicator; user blocks are right-aligned with a 70% max-width
+         and no border. Bubbles dropped (no .bubble class). */
       .msg {
-        max-width: 85%;
         margin-bottom: var(--sp-3);
-        padding: var(--sp-3) var(--sp-4);
+        padding: var(--sp-2) var(--sp-3);
         border-radius: var(--radius-md);
         font-size: var(--text-sm);
         line-height: 1.6;
         position: relative;
       }
 
-      .msg .role-tag {
-        font-size: 9px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: var(--sp-1);
-        display: block;
+      /* Role indicator — visible on hover only. Screen readers always
+         see the label via aria-label on the host span. */
+      .role-indicator {
+        position: absolute;
+        left: 0;
+        top: 6px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10px;
+        color: var(--text-muted);
+        opacity: 0;
+        transition: opacity var(--duration-fast) ease;
+        pointer-events: none;
+      }
+      .msg:hover .role-indicator,
+      .msg:focus-within .role-indicator {
+        opacity: 1;
+      }
+      .role-indicator .ri-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        flex-shrink: 0;
       }
 
       .msg.user {
         align-self: flex-end;
         margin-left: auto;
-        background: var(--accent-soft);
-        border: 1px solid rgba(224, 85, 69, 0.2);
+        max-width: 70%;
+        background: var(--surface-2, var(--bg-card, rgba(255,255,255,0.04)));
+        border: none;
       }
-
-      .msg.user .role-tag { color: var(--accent); }
 
       .msg.assistant {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: transparent;
+        border: none;
+        padding-left: 24px;
       }
 
-      .msg.assistant .role-tag { color: var(--text-secondary); }
+      .msg.assistant .role-indicator { color: var(--text-muted); }
+      .msg.user .role-indicator {
+        left: auto;
+        right: 0;
+        justify-content: flex-end;
+      }
+
+      /* Per-message hover-revealed action row (#241). */
+      .msg-actions {
+        display: flex;
+        gap: 4px;
+        margin-top: var(--sp-1);
+        opacity: 0;
+        transition: opacity var(--duration-fast) ease;
+      }
+      .msg:hover .msg-actions,
+      .msg:focus-within .msg-actions {
+        opacity: 1;
+      }
+      .msg.user .msg-actions { justify-content: flex-end; }
+
+      /* Edit composer for user messages. */
+      .msg-edit-wrap {
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-2);
+      }
+      .msg-edit-wrap textarea {
+        width: 100%;
+        min-height: 64px;
+        padding: var(--sp-2);
+        border: 1px solid var(--glass-border);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        font-size: var(--text-sm);
+        font-family: inherit;
+        outline: none;
+        border-radius: var(--radius-sm);
+        resize: vertical;
+        line-height: 1.5;
+      }
+      .msg-edit-wrap textarea:focus { border-color: var(--accent); }
+      .msg-edit-actions {
+        display: flex;
+        gap: 6px;
+        justify-content: flex-end;
+      }
+
+      /* Floating "↓ N new" jump-to-bottom pill (#241). */
+      .scroll-bottom-btn {
+        position: absolute;
+        bottom: var(--sp-3);
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 6;
+        box-shadow: var(--shadow-md);
+      }
+
+      /* IntersectionObserver sentinel near the bottom of the message list. */
+      .scroll-sentinel {
+        height: 1px;
+        width: 100%;
+      }
 
       .msg.system {
         background: rgba(100, 210, 255, 0.04);
@@ -914,100 +1011,14 @@ export class ChatView extends LitElement {
       .empty-title { font-size: var(--text-base); font-weight: 600; color: #c8cdd6; }
       .empty-subtitle { font-size: var(--text-xs); color: var(--text-muted); }
 
-      /* Trace Panel */
-      .trace-toggle {
-        position: absolute;
-        bottom: 60px;
-        right: 12px;
-        width: 28px;
-        height: 28px;
-        background: var(--bg-tertiary);
-        border: 1px solid var(--glass-border);
-        color: var(--text-muted);
-        cursor: pointer;
-        border-radius: var(--radius-sm);
-        z-index: 5;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0;
+      /* v0.8.1 #247 — trace panel renders inside the inspector rail's
+         slot=trace, so we drop the absolute-positioning shell and let the
+         rail body manage layout. The legacy classes used by the inner rows
+         are kept since _renderTracePanel still emits them. */
+      .trace-panel-inline {
+        display: flex;
+        flex-direction: column;
       }
-
-      .trace-toggle svg { display: block; }
-
-      .trace-toggle:hover { color: var(--accent); border-color: var(--accent); }
-
-      /* v0.7.1 #224 — collapsible right-side memory-stream panel.
-         Shares the visual language of the trace-toggle/trace-panel pair so
-         operators recognize it as another "inspector" affordance. */
-      .memory-toggle {
-        position: absolute;
-        bottom: 100px;
-        right: 12px;
-        width: 28px;
-        height: 28px;
-        background: var(--bg-tertiary);
-        border: 1px solid var(--glass-border);
-        color: var(--text-muted);
-        cursor: pointer;
-        border-radius: var(--radius-sm);
-        z-index: 5;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0;
-      }
-
-      .memory-toggle svg { display: block; }
-
-      .memory-toggle:hover { color: var(--accent); border-color: var(--accent); }
-
-      .memory-toggle .memory-badge {
-        position: absolute;
-        top: -4px;
-        right: -4px;
-        min-width: 14px;
-        height: 14px;
-        padding: 0 4px;
-        background: var(--accent);
-        color: #fff;
-        font-size: 9px;
-        font-weight: 700;
-        border-radius: 7px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        line-height: 1;
-      }
-
-      .memory-panel {
-        position: absolute;
-        bottom: 100px;
-        right: 48px;
-        width: 320px;
-        max-height: 60vh;
-        z-index: 5;
-        display: none;
-        overflow-y: auto;
-      }
-
-      .memory-panel.open { display: block; }
-
-      .trace-panel {
-        position: absolute;
-        bottom: 60px;
-        right: 48px;
-        width: 260px;
-        background: var(--bg-secondary);
-        border: 1px solid var(--glass-border);
-        border-radius: var(--radius-md);
-        z-index: 5;
-        display: none;
-        max-height: 400px;
-        overflow-y: auto;
-      }
-
-      .trace-panel.open { display: block; }
 
       .tp-hdr {
         display: flex;
@@ -1206,9 +1217,30 @@ export class ChatView extends LitElement {
 
   // v0.7.1 #224 — memory-stream side panel state. Events are appended as
   // they arrive on the window-level `crowclaw-event` bridge (memory:captured
-  // / memory:recalled). The panel is collapsible via `showMemoryPanel`.
-  @state() private showMemoryPanel = false;
+  // / memory:recalled). v0.8.1 #247 moves the panel into the inspector rail
+  // so `showMemoryPanel` is no longer used; events still drive the rail's
+  // memory tab content.
   @state() private memoryEvents: MemoryStreamEvent[] = [];
+
+  // v0.8.1 #242 — live tool-call trace state. Populated from SSE
+  // `tool:start` / `tool:complete` events forwarded through the stream.
+  // Persisted-history fallback (in `_renderMessage`) keeps replay working.
+  @state() private liveToolTrace: Map<string, ToolTraceEntry> = new Map();
+
+  // v0.8.1 #241 — edit-mode for user messages. When non-null, the matching
+  // index renders a textarea instead of plain text.
+  @state() private editingMessageIndex: number | null = null;
+  @state() private editingDraft = '';
+
+  // v0.8.1 #241 — smart auto-scroll state. When the bottom sentinel is
+  // off-screen, we surface a floating "N new" button instead of yanking
+  // the user back. `bottomVisible` mirrors the IntersectionObserver
+  // result so the streaming flush path can decide whether to follow.
+  @state() private bottomVisible = true;
+  @state() private newMessageCount = 0;
+
+  // v0.8.1 #248 — session-list keyboard focus index (j/k navigation).
+  @state() private focusedSessionIndex = -1;
 
   // v0.7.0 #193/#194/#195: state for the new session-action components.
   // These flags are independent from the legacy inline overlays so the old
@@ -1231,10 +1263,30 @@ export class ChatView extends LitElement {
 
   @query('#msgInput') private msgInput!: HTMLTextAreaElement;
   @query('.messages') private messagesEl!: HTMLElement;
+  @query('.scroll-sentinel') private scrollSentinelEl!: HTMLElement;
 
   private _streamController?: AbortController;
   private _streamStart = 0;
   private _activePollingInterval?: ReturnType<typeof setInterval>;
+
+  // v0.8.1 #250 — stream delta batching. Chunks land in `_pendingDelta` and
+  // a single Lit re-render flushes them per animation frame regardless of
+  // arrival rate. If the stream pauses (>50ms gap), the next chunk gets an
+  // immediate flush so the cursor doesn't visibly stall.
+  private _pendingDelta = '';
+  private _rafHandle: number | null = null;
+  private _lastDeltaAt = 0;
+
+  // v0.8.1 #241 — IntersectionObserver for smart auto-scroll.
+  private _bottomObserver?: IntersectionObserver;
+
+  // v0.8.1 #250 — WS-driven active-session refresh. Falls back to a 60s
+  // poll only when the WS bridge is disconnected.
+  private _wsActiveHandler = (e: Event) => {
+    const detail = (e as CustomEvent<{ type?: string; data?: Record<string, unknown> }>).detail;
+    if (detail?.type !== 'session:active_changed') return;
+    void this._pollActiveSessions();
+  };
 
   private _transportFallbackHandler = (e: Event) => {
     const detail = (e as CustomEvent<{ active: boolean }>).detail;
@@ -1242,16 +1294,11 @@ export class ChatView extends LitElement {
   };
 
   /**
-   * v0.7.1 #224 — listens to the window-level `crowclaw-event` bridge for
-   * `memory:captured` / `memory:recalled` event types and appends them to
-   * the side-panel feed. The orchestrator (app.ts) currently bridges
-   * `session:` / `gateway:` / `job:` events; once the runtime EventBus
-   * starts forwarding `memory:*` through the same bridge, this handler
-   * picks them up automatically.
-   *
-   * TODO: wire memory:* event passthrough in app.ts so the bridge actually
-   * dispatches these. Until then this listener is a no-op but the panel
-   * still renders (with an empty state).
+   * v0.7.1 #224 / v0.8.1 #242 — listens to the window-level `crowclaw-event`
+   * bridge for `memory:captured` / `memory:recalled` event types and
+   * appends them to the per-session memory feed shown in the inspector
+   * rail's Memory tab. Live now that `app.ts` forwards `memory:*` events
+   * through the same bridge.
    */
   private _memoryEventHandler = (e: Event) => {
     const detail = (e as CustomEvent<{ type?: string; data?: Record<string, unknown> }>).detail;
@@ -1357,16 +1404,49 @@ export class ChatView extends LitElement {
     document.addEventListener('crowclaw:transport-fallback', this._transportFallbackHandler);
     document.addEventListener('crowclaw:session-event', this._sessionEventHandler);
     window.addEventListener('crowclaw-event', this._memoryEventHandler);
+    // v0.8.1 #250 — replace the 10s active-session poll with a WS-driven
+    // refresh on the same `crowclaw-event` channel. The fallback poll
+    // started by `_startActivePolling` is now 60s instead of 10s.
+    window.addEventListener('crowclaw-event', this._wsActiveHandler);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     this._streamController?.abort();
     this._stopActivePolling();
+    if (this._rafHandle != null) {
+      cancelAnimationFrame(this._rafHandle);
+      this._rafHandle = null;
+    }
+    if (this._bottomObserver) {
+      this._bottomObserver.disconnect();
+      this._bottomObserver = undefined;
+    }
     document.removeEventListener('click', this._onDocClick);
     document.removeEventListener('crowclaw:transport-fallback', this._transportFallbackHandler);
     document.removeEventListener('crowclaw:session-event', this._sessionEventHandler);
     window.removeEventListener('crowclaw-event', this._memoryEventHandler);
+    window.removeEventListener('crowclaw-event', this._wsActiveHandler);
+  }
+
+  /**
+   * v0.8.1 #241 — wire up the IntersectionObserver on the bottom sentinel
+   * after the messages list is in the DOM. Run on every render so that a
+   * fresh sentinel from a session swap re-binds correctly.
+   */
+  protected updated(): void {
+    if (!this.scrollSentinelEl) return;
+    if (this._bottomObserver) return;
+    this._bottomObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          this.bottomVisible = entry.isIntersecting;
+          if (entry.isIntersecting) this.newMessageCount = 0;
+        }
+      },
+      { root: this.messagesEl, threshold: 0.01, rootMargin: '0px 0px -100px 0px' },
+    );
+    this._bottomObserver.observe(this.scrollSentinelEl);
   }
 
   private _onDocClick() {
@@ -1378,10 +1458,14 @@ export class ChatView extends LitElement {
   // --- Active session polling ---
 
   private _startActivePolling() {
+    // v0.8.1 #250 — WS-first: a `session:active_changed` event on the
+    // `crowclaw-event` bridge triggers an immediate refresh (see
+    // `_wsActiveHandler`). The 60s interval below is purely a fallback
+    // for when the WS bridge is offline.
     this._pollActiveSessions();
     this._activePollingInterval = setInterval(() => {
       this._pollActiveSessions();
-    }, 10_000);
+    }, 60_000);
   }
 
   private _stopActivePolling() {
@@ -1761,18 +1845,20 @@ export class ChatView extends LitElement {
     this.streamReasoning = [];
     this.toolSteps = [];
     this.traceToolHistory = [];
+    this.liveToolTrace = new Map();
     this._streamStart = Date.now();
     this.traceData = { iteration: 0, tool: '--', tokens: 0, elapsed: 0, maxIterations: 0 };
     this.aborting = false;
 
-    this._scrollToBottom();
+    this._scrollToBottomIfPinned();
 
     const callbacks: StreamCallbacks = {
       onTextDelta: (content) => {
         this.thinking = false;
-        this.streamText += content;
+        // v0.8.1 #250 — buffer incoming chunks and flush via rAF so we
+        // get one Lit re-render per frame regardless of arrival rate.
+        this._enqueueDelta(content);
         this.traceData = { ...this.traceData, tokens: this.traceData.tokens + 1 };
-        this._scrollToBottom();
       },
       onToolStart: (toolName, toolCallId, input) => {
         this.thinking = false;
@@ -1781,6 +1867,17 @@ export class ChatView extends LitElement {
         }];
         this.traceData = { ...this.traceData, tool: toolName };
         this.traceToolHistory = [...this.traceToolHistory, { toolName, status: 'running' }];
+        // v0.8.1 #242 — populate live tool-trace map for the inspector rail
+        // and for the inline `<crowclaw-tool-call-trace>` mount.
+        const next = new Map(this.liveToolTrace);
+        next.set(toolCallId, {
+          callId: toolCallId,
+          toolName,
+          status: 'running',
+          args: input,
+          startedAt: new Date().toISOString(),
+        });
+        this.liveToolTrace = next;
         if (this.streamText.trim()) {
           this.messages = [...this.messages, { role: 'assistant', content: this.streamText, createdAt: new Date().toISOString() }];
           this.streamText = '';
@@ -1799,6 +1896,22 @@ export class ChatView extends LitElement {
           const updated = [...this.traceToolHistory];
           updated[histIdx] = { ...updated[histIdx], status: success ? 'done' : 'error', elapsed: endTime - this._streamStart };
           this.traceToolHistory = updated;
+        }
+        // v0.8.1 #242 — close out the live tool-trace map entry.
+        const prev = this.liveToolTrace.get(toolCallId);
+        if (prev) {
+          const next = new Map(this.liveToolTrace);
+          next.set(toolCallId, {
+            ...prev,
+            status: success ? 'ok' : 'error',
+            output,
+            outputLength: output?.length,
+            durationMs: prev.startedAt
+              ? Date.now() - new Date(prev.startedAt).getTime()
+              : undefined,
+            errorMessage: success ? undefined : output,
+          });
+          this.liveToolTrace = next;
         }
         const step = this.toolSteps.find((s) => s.toolCallId === toolCallId);
         if (step) {
@@ -1841,6 +1954,9 @@ export class ChatView extends LitElement {
       },
       onDone: () => {
         this.thinking = false;
+        // Flush any buffered deltas before closing out the stream so the
+        // final assistant message picks up the last chunk (#250).
+        this._flushDelta();
         if (this.streamText.trim() || this.streamReasoning.length > 0) {
           this.messages = [
             ...this.messages,
@@ -1857,7 +1973,7 @@ export class ChatView extends LitElement {
         this.streamReasoning = [];
         this.aborting = false;
         this.traceData = { ...this.traceData, elapsed: Date.now() - this._streamStart };
-        this._scrollToBottom();
+        this._scrollToBottomIfPinned();
         this._applyHighlighting();
       },
       onError: (error) => {
@@ -1870,7 +1986,7 @@ export class ChatView extends LitElement {
         this.streaming = false;
         this.aborting = false;
         this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Error: ${error}`, createdAt: new Date().toISOString() }];
-        this._scrollToBottom();
+        this._scrollToBottomIfPinned();
       },
     };
 
@@ -1938,12 +2054,65 @@ export class ChatView extends LitElement {
     this.msgInput.style.height = Math.min(this.msgInput.scrollHeight, 160) + 'px';
   }
 
+  /**
+   * Force scroll to bottom regardless of user position. Used by the
+   * floating "↓ N new" pill click and by explicit user actions (sending
+   * a message, switching sessions).
+   */
   private _scrollToBottom() {
     requestAnimationFrame(() => {
       if (this.messagesEl) {
         this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+        this.bottomVisible = true;
+        this.newMessageCount = 0;
       }
     });
+  }
+
+  /**
+   * v0.8.1 #241 — smart auto-scroll. Only follows the stream when the
+   * sentinel near the bottom is on-screen. When the user has scrolled
+   * up, we instead bump `newMessageCount` so the floating jump pill
+   * can show the unread count.
+   */
+  private _scrollToBottomIfPinned() {
+    if (this.bottomVisible) {
+      requestAnimationFrame(() => {
+        if (this.messagesEl) {
+          this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+        }
+      });
+    } else {
+      this.newMessageCount += 1;
+    }
+  }
+
+  /**
+   * v0.8.1 #250 — buffer streaming deltas and flush via rAF. Pause >50ms
+   * triggers an immediate flush so a slow-then-resumed stream doesn't
+   * sit in the buffer for a frame.
+   */
+  private _enqueueDelta(content: string) {
+    const now = performance.now();
+    const idleGap = this._lastDeltaAt > 0 && now - this._lastDeltaAt > 50;
+    this._lastDeltaAt = now;
+    this._pendingDelta += content;
+    if (idleGap) {
+      this._flushDelta();
+      return;
+    }
+    if (this._rafHandle != null) return;
+    this._rafHandle = requestAnimationFrame(() => {
+      this._rafHandle = null;
+      this._flushDelta();
+    });
+  }
+
+  private _flushDelta() {
+    if (!this._pendingDelta) return;
+    this.streamText += this._pendingDelta;
+    this._pendingDelta = '';
+    this._scrollToBottomIfPinned();
   }
 
   /**
@@ -2002,14 +2171,25 @@ export class ChatView extends LitElement {
       <div class="chat-area">
         <!-- Session Sidebar -->
         ${this.sessSidebarOpen ? html`
-          <div class="sess-sb" @click=${(e: Event) => e.stopPropagation()}>
+          <div class="sess-sb"
+               @click=${(e: Event) => e.stopPropagation()}
+               @keydown=${this._sessionListKeydown}>
             <div class="sess-hdr">
               <input placeholder="Search sessions..."
+                     aria-label="Search sessions"
                      .value=${this.searchQuery}
                      @input=${(e: InputEvent) => { this.searchQuery = (e.target as HTMLInputElement).value; }}>
-              <button class="btn btn-p" style="padding:6px 10px" @click=${this._createSession} aria-label="New Session" title="New Session">+</button>
+              <crowclaw-button
+                variant="primary"
+                size="sm"
+                aria-label="New session"
+                @click=${this._createSession}
+              >
+                <crowclaw-icon name="send" size="14" aria-hidden="true"></crowclaw-icon>
+                New
+              </crowclaw-button>
             </div>
-            <div class="sess-list">
+            <div class="sess-list" role="listbox" aria-label="Sessions" tabindex="0">
               ${this._filteredSessions.length === 0
                 ? this.sessions.length === 0
                   ? html`<crowclaw-empty
@@ -2021,14 +2201,20 @@ export class ChatView extends LitElement {
                       @cc-empty-new-session=${this._createSession}
                     ></crowclaw-empty>`
                   : html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">No matching sessions</div></div>`
-                : this._filteredSessions.map((s) => this._renderSessionCard(s))}
+                : this._filteredSessions.map((s, idx) => this._renderSessionCard(s, idx))}
             </div>
           </div>
         ` : nothing}
 
         <!-- Chat Content -->
         <div class="chat-content" style="position:relative">
-          <button class="sess-toggle-btn" @click=${() => { this.sessSidebarOpen = !this.sessSidebarOpen; }} aria-label="Toggle sidebar">&#9776;</button>
+          <button class="sess-toggle-btn"
+                  @click=${() => { this.sessSidebarOpen = !this.sessSidebarOpen; }}
+                  aria-label="Toggle sidebar"
+                  aria-expanded=${this.sessSidebarOpen ? 'true' : 'false'}
+                  title="Toggle session sidebar">
+            <crowclaw-icon name="menu" size="14" aria-hidden="true"></crowclaw-icon>
+          </button>
 
           <!-- Operations Toolbar -->
           ${this.currentSessionId ? this._renderOpsToolbar() : nothing}
@@ -2044,14 +2230,20 @@ export class ChatView extends LitElement {
                 : html`
                     ${this.messages.map((m, i) => this._renderMessage(m, i))}
                     ${this.streaming && this.thinking ? html`
-                      <div class="thinking-indicator">
-                        <div class="thinking-dots"><span></span><span></span><span></span></div>
+                      <div class="thinking-indicator" role="status" aria-live="polite">
+                        <div class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></div>
                         Thinking...
                       </div>
                     ` : nothing}
                     ${this.streaming && (this.streamText || this.streamReasoning.length > 0) ? html`
-                      <div class="msg assistant streaming">
-                        <span class="role-tag">assistant</span>
+                      <div class="msg assistant streaming"
+                           role="log"
+                           aria-live="polite"
+                           aria-atomic="false"
+                           aria-label="Streaming assistant response">
+                        <span class="role-indicator" aria-label="assistant">
+                          <span class="ri-dot"></span>assistant
+                        </span>
                         ${this.streamReasoning.map((rb) => html`
                           <crowclaw-reasoning-block
                             .tag=${rb.tag}
@@ -2061,11 +2253,27 @@ export class ChatView extends LitElement {
                           ></crowclaw-reasoning-block>
                         `)}
                         ${this.streamText ? html`<div class="md">${unsafeHTML(renderMarkdown(this.streamText))}</div>` : nothing}
-                        <span class="cursor-blink"></span>
+                        <span class="cursor-blink" aria-hidden="true"></span>
                       </div>
                     ` : nothing}
                   `}
+            <!-- v0.8.1 #241 — bottom sentinel for the IntersectionObserver
+                 driving smart auto-scroll. Always present so the observer
+                 has something to track even between sessions. -->
+            <div class="scroll-sentinel" aria-hidden="true"></div>
           </div>
+          ${!this.bottomVisible && this.currentSessionId ? html`
+            <crowclaw-button
+              class="scroll-bottom-btn"
+              variant="ghost"
+              size="sm"
+              aria-label="Scroll to latest"
+              @click=${this._scrollToBottom}
+            >
+              <crowclaw-icon name="chevron-down" size="14" aria-hidden="true"></crowclaw-icon>
+              ${this.newMessageCount > 0 ? `${this.newMessageCount} new` : 'Latest'}
+            </crowclaw-button>
+          ` : nothing}
 
           <!-- v0.7.0 #193: sticky bottom-of-stream Steer trigger + composer.
                Only visible while a turn is running so the operator can
@@ -2097,73 +2305,46 @@ export class ChatView extends LitElement {
 
           <!-- Chat Input -->
           <div class="chat-input">
-            <textarea id="msgInput" placeholder="Send a message... (Shift+Enter for newline)"
+            <textarea id="msgInput" placeholder="Send a message... (Shift+Enter for newline, Cmd+/ to steer)"
                       rows="1"
+                      aria-label="Message composer"
                       ?disabled=${!this.currentSessionId}
-                      @keydown=${this._inputKeydown}
+                      @keydown=${this._composerKeydown}
                       @input=${this._autoResizeTextarea}></textarea>
-            <button class="send-btn" @click=${this._sendMessage}
-                    ?disabled=${!this.currentSessionId || this.streaming}
-                    aria-label="Send message">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <line x1="22" y1="2" x2="11" y2="13"/>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-              </svg>
-            </button>
+            <crowclaw-button
+              variant="primary"
+              size="md"
+              aria-label="Send message"
+              ?disabled=${!this.currentSessionId || this.streaming}
+              @click=${this._sendMessage}
+            >
+              <crowclaw-icon name="send" size="16" aria-hidden="true"></crowclaw-icon>
+            </crowclaw-button>
           </div>
 
-          <!-- Trace Panel -->
-          <!-- v0.7.1 #225 — replaced bare letter "T" with an inline activity
-               pulse SVG icon + accessible label/title so the affordance is
-               recognizable at a glance. -->
-          <button class="trace-toggle"
-                  @click=${() => { this.traceOpen = !this.traceOpen; }}
-                  aria-label="Toggle debug trace"
-                  title="Debug trace">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-            </svg>
-          </button>
-          ${this._renderTracePanel()}
-
-          <!-- v0.7.1 #224 — memory-stream pull-tab + collapsible panel.
-               The component listens (via this view) to the window-level
-               `crowclaw-event` bridge for `memory:captured` / `memory:recalled`
-               event types and renders a newest-first feed. -->
-          <button class="memory-toggle"
-                  @click=${() => { this.showMemoryPanel = !this.showMemoryPanel; }}
-                  aria-label="Toggle memory stream"
-                  title="Memory stream">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-            </svg>
-            ${this.memoryEvents.length > 0
-              ? html`<span class="memory-badge">${this.memoryEvents.length}</span>`
-              : nothing}
-          </button>
-          <div class="memory-panel ${this.showMemoryPanel ? 'open' : ''}">
-            <crowclaw-memory-stream
-              heading="Memory stream"
-              .events=${this.memoryEvents}
-            ></crowclaw-memory-stream>
-          </div>
-
-          <!-- v0.7.0 #195: checkpoint side panel. Mounted inside chat-content
-               so it slides in over the message list (z-index: 50 in the
-               component) without escaping to the dashboard root. -->
+          <!-- v0.8.1 #247 — single inspector rail replaces the legacy
+               trace-toggle + memory-toggle + standalone checkpoint-panel.
+               Three slot contents drive the Trace / Memory / Checkpoints
+               tabs. -->
           ${this.currentSessionId ? html`
-            <crowclaw-checkpoint-panel
-              ?open=${this.showCheckpointPanel}
-              .sessionId=${this.currentSessionId}
-              @close=${() => { this.showCheckpointPanel = false; }}
-              @saved=${() => { void this._loadCheckpointCount(); }}
-              @restored=${(e: CustomEvent) => this._onCheckpointRestored(e as CustomEvent<{ checkpointId: string; messageCount?: number; restoredIteration?: number }>)}
-              @replay-opened=${(e: CustomEvent) => this._onReplayOpened(e as CustomEvent<{ newSessionId: string; sourceCheckpointId: string }>)}
-            ></crowclaw-checkpoint-panel>
+            <crowclaw-inspector-rail>
+              <div slot="trace">${this._renderTracePanel()}</div>
+              <div slot="memory">
+                <crowclaw-memory-stream
+                  heading="Memory stream"
+                  .events=${this.memoryEvents}
+                ></crowclaw-memory-stream>
+              </div>
+              <div slot="checkpoints">
+                <crowclaw-checkpoint-panel
+                  open
+                  .sessionId=${this.currentSessionId}
+                  @saved=${() => { void this._loadCheckpointCount(); }}
+                  @restored=${(e: CustomEvent) => this._onCheckpointRestored(e as CustomEvent<{ checkpointId: string; messageCount?: number; restoredIteration?: number }>)}
+                  @replay-opened=${(e: CustomEvent) => this._onReplayOpened(e as CustomEvent<{ newSessionId: string; sourceCheckpointId: string }>)}
+                ></crowclaw-checkpoint-panel>
+              </div>
+            </crowclaw-inspector-rail>
           ` : nothing}
         </div>
 
@@ -2182,16 +2363,28 @@ export class ChatView extends LitElement {
 
   // --- Rich session card ---
 
-  private _renderSessionCard(s: SessionInfo) {
+  private _renderSessionCard(s: SessionInfo, listIndex = -1) {
     const isActive = this._isSessionActive(s.id);
     const isCurrent = s.id === this.currentSessionId;
+    const isFocused = listIndex >= 0 && listIndex === this.focusedSessionIndex;
     const showMenu = this.contextMenuSessionId === s.id;
 
     return html`
-      <div class="sess-item ${isCurrent ? 'active' : ''}"
-           @click=${() => this._selectSession(s.id)}>
+      <div class="sess-item ${isCurrent ? 'active' : ''} ${isFocused ? 'focused' : ''}"
+           role="option"
+           tabindex="0"
+           aria-selected=${isCurrent ? 'true' : 'false'}
+           @click=${() => this._selectSession(s.id)}
+           @focus=${() => { this.focusedSessionIndex = listIndex; }}>
         <div class="sess-actions">
-          <button @click=${(e: Event) => this._openContextMenu(e, s.id)} aria-label="Session actions" title="Actions">...</button>
+          <crowclaw-button
+            variant="ghost"
+            size="sm"
+            aria-label="Session actions"
+            @click=${(e: Event) => this._openContextMenu(e, s.id)}
+          >
+            <crowclaw-icon name="more-horizontal" size="14" aria-hidden="true"></crowclaw-icon>
+          </crowclaw-button>
         </div>
         ${showMenu ? html`
           <div class="sess-ctx-menu" @click=${(e: Event) => e.stopPropagation()}>
@@ -2204,7 +2397,7 @@ export class ChatView extends LitElement {
           </div>
         ` : nothing}
         <div class="sess-item-top">
-          ${isActive ? html`<span class="sess-active-dot" title="Active"></span>` : nothing}
+          ${isActive ? html`<span class="sess-active-dot" title="Active" aria-label="Active session"></span>` : nothing}
           <span class="sess-id" title="${s.id}">${truncateId(s.id)}</span>
         </div>
         <div class="sess-title">${s.title || s.preview?.slice(0, 30) || 'Untitled'}</div>
@@ -2247,15 +2440,12 @@ export class ChatView extends LitElement {
                 aria-label="Search messages">
           Search
         </button>
-        <!-- v0.7.0 #195: header button for the checkpoint side panel.
-             Label includes the count so operators can see at a glance how
-             many save points exist for the current session. -->
-        <button class="ops-btn"
-                @click=${this._toggleCheckpointPanel}
-                aria-label="Open checkpoints panel"
-                title="Manage checkpoints (save / restore / replay)">
+        <!-- v0.8.1 #247 — Checkpoints management moved into the inspector
+             rail's slot=checkpoints. The badge stays here as a passive
+             count so operators glance the number without opening the rail. -->
+        <span class="ops-btn" aria-label="Checkpoint count" title="Saved checkpoints (open the inspector rail to manage)">
           Checkpoints (${this.checkpointCount})
-        </button>
+        </span>
       </div>
     `;
   }
@@ -2287,7 +2477,9 @@ export class ChatView extends LitElement {
             const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
             if (input && this.renameSessionId) this._renameSession(this.renameSessionId, input.value);
           }} aria-label="Confirm rename">Rename</button>
-          <button class="ops-btn" @click=${() => { this.showRenameInput = false; this.renameSessionId = null; }} aria-label="Cancel rename">X</button>
+          <button class="ops-btn" @click=${() => { this.showRenameInput = false; this.renameSessionId = null; }} aria-label="Cancel rename" title="Cancel">
+            <crowclaw-icon name="x" size="12" aria-hidden="true"></crowclaw-icon>
+          </button>
         </div>
       ` : nothing}
 
@@ -2307,7 +2499,9 @@ export class ChatView extends LitElement {
               const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
               if (input) this._searchSession(input.value);
             }} aria-label="Search">Go</button>
-            <button class="ops-btn" @click=${() => { this.showSearchOverlay = false; this.searchResults = []; }} aria-label="Close search">X</button>
+            <button class="ops-btn" @click=${() => { this.showSearchOverlay = false; this.searchResults = []; }} aria-label="Close search" title="Close">
+              <crowclaw-icon name="x" size="12" aria-hidden="true"></crowclaw-icon>
+            </button>
           </div>
           ${this.searchResults.length > 0 ? html`
             <div class="search-results">
@@ -2338,12 +2532,22 @@ export class ChatView extends LitElement {
   // --- Enhanced Trace Panel ---
 
   private _renderTracePanel() {
+    // v0.8.1 #242/#247 — rendered inside the inspector rail's `slot="trace"`,
+    // so we drop the absolute-positioning shell and render the panel content
+    // inline. Live tool entries from `liveToolTrace` bubble up so the
+    // operator sees args/output/duration as they arrive.
+    const liveEntries = Array.from(this.liveToolTrace.values());
     return html`
-      <div class="trace-panel ${this.traceOpen ? 'open' : ''}">
+      <div class="trace-panel-inline">
         <div class="tp-hdr">
           <span>Debug Trace</span>
           ${this.streaming ? html`
-            <button class="tp-stop-btn" @click=${this._abortSession} aria-label="Stop streaming">Stop</button>
+            <crowclaw-button
+              variant="danger"
+              size="sm"
+              aria-label="Stop streaming"
+              @click=${this._abortSession}
+            >Stop</crowclaw-button>
           ` : nothing}
         </div>
         <div class="tp-body">
@@ -2357,8 +2561,16 @@ export class ChatView extends LitElement {
             <span>Elapsed</span>
             <span>${this.streaming ? `${Math.floor((Date.now() - this._streamStart) / 1000)}s` : `${this.traceData.elapsed}ms`}</span>
           </div>
-          ${this.aborting ? html`<div class="tp-aborting">Aborting...</div>` : nothing}
+          ${this.aborting ? html`<div class="tp-aborting" role="status" aria-live="polite">Aborting...</div>` : nothing}
         </div>
+        ${liveEntries.length > 0 ? html`
+          <div class="tp-section-label">Live tool calls</div>
+          <div class="tp-tool-list" style="display:flex;flex-direction:column;gap:4px;">
+            ${liveEntries.map((entry) => html`
+              <crowclaw-tool-call-trace .entry=${entry}></crowclaw-tool-call-trace>
+            `)}
+          </div>
+        ` : nothing}
         ${this.traceToolHistory.length > 0 ? html`
           <div class="tp-section-label">Tool History</div>
           <div class="tp-tool-list">
@@ -2384,13 +2596,12 @@ export class ChatView extends LitElement {
 
     if (msg.role === 'tool') {
       const ok = !msg.content?.match(/error|fail/i);
-      // v0.7.1 #224 — render the rich <crowclaw-tool-call-trace> inline so
-      // the component (which ships in the bundle) actually appears in the
-      // DOM. The legacy `.tool-step` row is preserved as a compact fallback
-      // for any tool message we can't synthesize a full trace entry for.
-      // TODO: wire from the streamed tool-step events so `args`, `output`,
-      //       `durationMs`, and `auditId` come from the runtime instead of
-      //       being derived from the persisted history line.
+      // v0.7.1 #224 / v0.8.1 #242 — render the rich <crowclaw-tool-call-trace>
+      // inline. Live-streamed tool runs populate `liveToolTrace` via the
+      // SSE callbacks (`onToolStart` / `onToolEnd`) so `args`, `output`,
+      // `durationMs`, and `auditId` come from the runtime. For replay /
+      // persisted history, we synthesize the entry from the message line
+      // since the streamed events have already been consumed.
 
       // v0.8.0 #234 — sibling branch for `code.execute`. Parse the persisted
       // payload (the tool's output is a JSON-encoded ExecuteWithToolsResult)
@@ -2477,9 +2688,19 @@ export class ChatView extends LitElement {
     // chain of thought without the harness re-injecting it into the prompt.
     const reasoningBlocks = msg.role === 'assistant' ? msg.reasoningBlocks ?? [] : [];
 
+    // v0.8.1 #241 — system rows keep the legacy role-tag for visual parity.
+    // Assistant + user rows get the hover-revealed `.role-indicator` instead.
+    const showLegacyRoleTag = msg.role === 'system';
+    const isEditingThis =
+      msg.role === 'user' && this.editingMessageIndex === index;
+
     return html`
       <div class="msg ${roleClass}">
-        <span class="role-tag">${tagLabel}${msg.name ? ` / ${msg.name}` : ''}</span>
+        ${showLegacyRoleTag
+          ? html`<span class="role-tag">${tagLabel}${msg.name ? ` / ${msg.name}` : ''}</span>`
+          : html`<span class="role-indicator" aria-label=${tagLabel}>
+              <span class="ri-dot" aria-hidden="true"></span>${tagLabel}
+            </span>`}
         ${reasoningBlocks.length > 0
           ? reasoningBlocks.map((rb) => html`
               <crowclaw-reasoning-block
@@ -2489,13 +2710,104 @@ export class ChatView extends LitElement {
               ></crowclaw-reasoning-block>
             `)
           : nothing}
-        ${msg.role === 'user'
-          ? html`${msg.content}`
-          : msg.content
-            ? html`<div class="md">${unsafeHTML(content)}</div>`
-            : nothing}
-        ${msg.role === 'assistant' && index > 0
-          ? html`<button class="btn retry-btn" @click=${() => this._retryMessage(index)}>Retry</button>`
+        ${isEditingThis
+          ? html`
+              <div class="msg-edit-wrap">
+                <textarea
+                  aria-label="Edit message"
+                  .value=${this.editingDraft}
+                  @input=${(e: InputEvent) => {
+                    this.editingDraft = (e.target as HTMLTextAreaElement).value;
+                  }}
+                  @keydown=${(e: KeyboardEvent) => {
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      this._cancelEditMessage();
+                    } else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                      e.preventDefault();
+                      void this._saveEditMessage();
+                    }
+                  }}
+                ></textarea>
+                <div class="msg-edit-actions">
+                  <crowclaw-button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Cancel edit"
+                    @click=${this._cancelEditMessage}
+                  >Cancel</crowclaw-button>
+                  <crowclaw-button
+                    variant="primary"
+                    size="sm"
+                    aria-label="Save edit"
+                    @click=${() => { void this._saveEditMessage(); }}
+                  >Save</crowclaw-button>
+                </div>
+              </div>
+            `
+          : msg.role === 'user'
+            ? html`${msg.content}`
+            : msg.content
+              ? html`<div class="md">${unsafeHTML(content)}</div>`
+              : nothing}
+        ${!isEditingThis && msg.role === 'assistant'
+          ? html`
+              <div class="msg-actions" role="group" aria-label="Assistant message actions">
+                <crowclaw-button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Copy message"
+                  @click=${() => { void this._copyMessage(msg.content); }}
+                >
+                  <crowclaw-icon name="copy" size="14" aria-hidden="true"></crowclaw-icon>
+                  Copy
+                </crowclaw-button>
+                ${index > 0 ? html`
+                  <crowclaw-button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Retry from this message"
+                    @click=${() => this._retryMessage(index)}
+                  >
+                    <crowclaw-icon name="refresh" size="14" aria-hidden="true"></crowclaw-icon>
+                    Retry
+                  </crowclaw-button>
+                ` : nothing}
+                <crowclaw-button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Branch from this message"
+                  @click=${() => this._branchFromMessage(index)}
+                >
+                  <crowclaw-icon name="branch" size="14" aria-hidden="true"></crowclaw-icon>
+                  Branch
+                </crowclaw-button>
+              </div>
+            `
+          : nothing}
+        ${!isEditingThis && msg.role === 'user'
+          ? html`
+              <div class="msg-actions" role="group" aria-label="User message actions">
+                <crowclaw-button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Copy message"
+                  @click=${() => { void this._copyMessage(msg.content); }}
+                >
+                  <crowclaw-icon name="copy" size="14" aria-hidden="true"></crowclaw-icon>
+                  Copy
+                </crowclaw-button>
+                <crowclaw-button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Edit message"
+                  @click=${() => this._beginEditMessage(index)}
+                >
+                  <crowclaw-icon name="pencil" size="14" aria-hidden="true"></crowclaw-icon>
+                  Edit
+                </crowclaw-button>
+              </div>
+            `
           : nothing}
         ${msg.createdAt ? html`<div class="msg-time">${timeAgo(msg.createdAt)}</div>` : nothing}
       </div>
@@ -2510,6 +2822,132 @@ export class ChatView extends LitElement {
         this._sendMessageWithText(retryText);
         break;
       }
+    }
+  }
+
+  // --- v0.8.1 #241 message-level hover actions ---
+
+  /** Copy the message content to the clipboard. */
+  private async _copyMessage(content: string) {
+    try {
+      await navigator.clipboard.writeText(content);
+      showToast('Copied to clipboard', 'success');
+    } catch {
+      showToast('Copy failed', 'error');
+    }
+  }
+
+  /**
+   * Branch from the given assistant message — opens the fork modal so
+   * the operator picks a starting point + toolset for the new session.
+   */
+  private _branchFromMessage(index: number) {
+    if (!this.currentSessionId) return;
+    void this._openForkModal(this.currentSessionId);
+    // Tag the fork modal so it reads "fork from message N" once A4 wires
+    // the message-anchor field. Until then this just opens the standard
+    // fork flow which already supports child-from-current sessions.
+    void index;
+  }
+
+  /** Enter edit mode for a user message. */
+  private _beginEditMessage(index: number) {
+    const msg = this.messages[index];
+    if (!msg || msg.role !== 'user') return;
+    this.editingMessageIndex = index;
+    this.editingDraft = msg.content;
+  }
+
+  private _cancelEditMessage() {
+    this.editingMessageIndex = null;
+    this.editingDraft = '';
+  }
+
+  /**
+   * Save the edited user message. POSTs to the v0.8.1 #241 endpoint
+   * `/api/sessions/:id/edit-from { messageIndex, newContent }` (shipped
+   * by Agent A7) and re-runs from that point. Response shape mirrors
+   * `/message` so existing callbacks would re-process it; for now we
+   * just trim history locally and fire a fresh stream from the edited
+   * message — the server is the authority for both branches.
+   */
+  private async _saveEditMessage() {
+    const idx = this.editingMessageIndex;
+    if (idx == null || !this.currentSessionId) return;
+    const newContent = this.editingDraft.trim();
+    if (!newContent) return;
+    const sid = this.currentSessionId;
+    this.editingMessageIndex = null;
+    this.editingDraft = '';
+    try {
+      await api(
+        `/api/sessions/${encodeURIComponent(sid)}/edit-from`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ messageIndex: idx, newContent }),
+        },
+      );
+      // Reload history so the local view picks up the rewritten branch.
+      this.messages = this.messages.slice(0, idx);
+      await this._loadHistory();
+      // If the edit endpoint already triggered a re-run, history will
+      // include the fresh assistant turn. Otherwise nudge a stream.
+      const tail = this.messages[this.messages.length - 1];
+      if (!tail || tail.role !== 'assistant') {
+        this._sendMessageWithText(newContent);
+      }
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Edit failed';
+      showToast(msg, 'error');
+    }
+  }
+
+  // --- v0.8.1 #248 chat-local keyboard ---
+
+  /** Cmd+/ in the composer toggles the steer composer while running. */
+  private _composerKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key === '/') {
+      const isActive = this.currentSessionId
+        ? this._isSessionActive(this.currentSessionId)
+        : false;
+      if (this.streaming || isActive) {
+        e.preventDefault();
+        this._toggleSteerComposer();
+        return;
+      }
+    }
+    this._inputKeydown(e);
+  }
+
+  /** j/k + arrow keys move focus through the session list. Enter opens. */
+  private _sessionListKeydown(e: KeyboardEvent) {
+    const list = this._filteredSessions;
+    if (list.length === 0) return;
+    const target = e.target as HTMLElement | null;
+    const inForm =
+      !!target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable);
+    // Inside the search input we only allow Escape to bubble out — j/k
+    // and Cmd+Backspace are normal typing/erase actions there.
+    if (inForm) return;
+
+    const current = Math.max(0, this.focusedSessionIndex);
+    if (e.key === 'j' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      this.focusedSessionIndex = Math.min(list.length - 1, current + 1);
+    } else if (e.key === 'k' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      this.focusedSessionIndex = Math.max(0, current - 1);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const focused = list[this.focusedSessionIndex] ?? list[0];
+      if (focused) this._selectSession(focused.id);
+    } else if ((e.metaKey || e.ctrlKey) && e.key === 'Backspace') {
+      e.preventDefault();
+      const focused = list[this.focusedSessionIndex] ?? list[0];
+      if (focused) void this._deleteSession(new Event('keyboard-delete'), focused.id);
     }
   }
 }

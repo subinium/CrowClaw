@@ -1,7 +1,12 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 
-export type ViewName = 'chat' | 'agent' | 'connect' | 'automate' | 'settings';
+/**
+ * #246 Phase A: dropped `'agent'` — the standalone Agent surface was merged
+ * into Settings → Agent in v0.8.1. The sidebar nav and the orchestrator
+ * (`app.ts`) share this union so a stale view name is a build error.
+ */
+export type ViewName = 'chat' | 'connect' | 'automate' | 'settings';
 
 interface NavItem {
   view: ViewName;
@@ -171,10 +176,15 @@ export class CrowClawSidebar extends LitElement {
   @property({ type: String, attribute: 'model-name' })
   modelName = '';
 
+  /**
+   * v0.8.1 (#246 Phase A): top-nav has four primary surfaces — Chat,
+   * Connect, Automate, Settings. The standalone Agent view was merged
+   * into Settings → Agent in the same release, so it no longer needs
+   * its own slot in the sidebar.
+   */
   private get _navItems(): NavItem[] {
     return [
       { view: 'chat', label: 'Chat', badge: this.sessionCount },
-      { view: 'agent', label: 'Agent' },
       { view: 'connect', label: 'Connect' },
       { view: 'automate', label: 'Automate', badge: this.jobCount },
       { view: 'settings', label: 'Settings' },
@@ -204,6 +214,11 @@ export class CrowClawSidebar extends LitElement {
               </div>
             `
           : nothing}
+        <!-- #246 Phase B: app-shell-level footer extras (transport badge,
+             presence panel, pair-device, sign-out) project through this
+             slot. Keeping them in the orchestrator's render avoids
+             plumbing API state and event handlers into the sidebar. -->
+        <slot name="footer-extras"></slot>
       </div>
     `;
   }
@@ -272,8 +287,6 @@ export class CrowClawSidebar extends LitElement {
     switch (view) {
       case 'chat':
         return this._chatIcon;
-      case 'agent':
-        return this._agentIcon;
       case 'connect':
         return this._connectIcon;
       case 'automate':
@@ -298,13 +311,6 @@ export class CrowClawSidebar extends LitElement {
       <path
         d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z"
       />
-    </svg>`;
-  }
-
-  private get _agentIcon() {
-    return html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-      <circle cx="12" cy="7" r="4" />
     </svg>`;
   }
 
