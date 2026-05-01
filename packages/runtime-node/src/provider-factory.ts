@@ -6,6 +6,7 @@
 import type { ProviderAdapter } from '@crowclaw/core';
 import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, CredentialPool, resolveApiMode } from '@crowclaw/providers';
 import type { ProviderConfig, ProviderSlot } from './config-store.js';
+import { tryCreateOpenAIChatGPTProvider } from './openai-chatgpt-provider.js';
 
 export interface CrowClawFileConfig {
   provider: string;
@@ -179,6 +180,24 @@ export async function resolveProviderFromConfig(
       }),
       source: 'env',
     };
+  }
+
+  // 3b. ChatGPT (Codex CLI) OAuth — runs after explicit API keys but before
+  //     onboarding config. Lets users who already ran `codex login` use their
+  //     ChatGPT subscription without pasting a key. Skipped when callers pass
+  //     an explicit env override (test paths must stay hermetic) or set
+  //     CROWCLAW_DISABLE_CODEX_AUTH=1.
+  const callerProvidedEnv = options.env !== undefined;
+  if (!callerProvidedEnv && env.CROWCLAW_DISABLE_CODEX_AUTH !== '1') {
+    const chatgptProvider = await tryCreateOpenAIChatGPTProvider({
+      ...(env.CROWCLAW_CODEX_MODEL ? { model: env.CROWCLAW_CODEX_MODEL } : {}),
+    });
+    if (chatgptProvider) {
+      return {
+        provider: chatgptProvider,
+        source: 'env',
+      };
+    }
   }
 
   // 4. OPENROUTER_API_KEY — same shape as OpenAI (chat completions API)

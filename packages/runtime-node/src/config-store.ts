@@ -188,6 +188,7 @@ type ConfigChangeListener = (key: string, value: unknown) => void;
 export class RuntimeConfigStore {
   protected config: RuntimeConfig;
   private listeners: ConfigChangeListener[] = [];
+  private disabledToolNames: Set<string> = new Set();
 
   constructor() {
     const defaultPresets = new Map<string, ConfigPreset>();
@@ -343,6 +344,18 @@ export class RuntimeConfigStore {
     this.emit('activeToolset', name);
   }
 
+  // --- Disabled tools (per-tool toggle, independent of toolset filter) ---
+  isToolDisabled(name: string): boolean { return this.disabledToolNames.has(name); }
+  getDisabledTools(): string[] { return [...this.disabledToolNames]; }
+  setToolDisabled(name: string, disabled: boolean): void {
+    if (disabled) {
+      this.disabledToolNames.add(name);
+    } else {
+      this.disabledToolNames.delete(name);
+    }
+    this.emit('disabledTool', { name, disabled });
+  }
+
   toggleSkill(slug: string, enabled: boolean): void {
     if (enabled) {
       this.config.disabledSkills.delete(slug);
@@ -478,6 +491,7 @@ interface SerializedConfig {
   agentConfig?: AgentConfig;
   publicUrl?: string | null;
   trustProxy?: boolean;
+  disabledTools?: string[];
 }
 
 /** Build a clone of a ProviderConfig with every slot's apiKey stripped. */
@@ -599,6 +613,11 @@ export class FileConfigStore extends RuntimeConfigStore {
     if (data.publicUrl !== undefined || data.trustProxy !== undefined) {
       super.setRemoteAccess(data.publicUrl ?? null, data.trustProxy ?? false);
     }
+    if (Array.isArray(data.disabledTools)) {
+      for (const name of data.disabledTools) {
+        super.setToolDisabled(name, true);
+      }
+    }
   }
 
   /**
@@ -652,6 +671,7 @@ export class FileConfigStore extends RuntimeConfigStore {
       agentConfig: cfg.agentConfig,
       publicUrl: cfg.publicUrl,
       trustProxy: cfg.trustProxy,
+      disabledTools: this.getDisabledTools(),
     };
   }
 
@@ -786,6 +806,11 @@ export class FileConfigStore extends RuntimeConfigStore {
 
   override setRemoteAccess(publicUrl: string | null, trustProxy: boolean): void {
     super.setRemoteAccess(publicUrl, trustProxy);
+    void this.persistToDisk();
+  }
+
+  override setToolDisabled(name: string, disabled: boolean): void {
+    super.setToolDisabled(name, disabled);
     void this.persistToDisk();
   }
 

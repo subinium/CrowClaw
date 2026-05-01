@@ -1,46 +1,78 @@
-import { describe, it, expect } from 'vitest';
-import { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames } from '../packages/core/src/agent-presets.js';
+import { describe, it, expect, expectTypeOf } from 'vitest';
+import {
+  agentPresets,
+  getAgentPreset,
+  listAgentPresets,
+  listAgentPresetNames,
+  type AgentPreset,
+} from '../packages/core/src/agent-presets.js';
 
 describe('Agent Presets', () => {
-  it('should have at least 10 presets', () => {
-    expect(listAgentPresets().length).toBeGreaterThanOrEqual(10);
+  it('default registry is empty', () => {
+    expect(agentPresets).toEqual({});
+    expect(listAgentPresets()).toEqual([]);
+    expect(listAgentPresetNames()).toEqual([]);
   });
 
-  it('should return preset by name', () => {
-    const preset = getAgentPreset('coding-assistant');
-    expect(preset).toBeDefined();
-    expect(preset!.name).toBe('Coding Assistant');
-    expect(preset!.role).toBeTruthy();
-    expect(preset!.goal).toBeTruthy();
-  });
-
-  it('should return undefined for unknown preset', () => {
+  it('getAgentPreset returns undefined for any name when registry is empty', () => {
+    expect(getAgentPreset('coding-assistant')).toBeUndefined();
     expect(getAgentPreset('nonexistent')).toBeUndefined();
   });
 
-  it('should list all preset names', () => {
+  it('listAgentPresets returns an array', () => {
+    const presets = listAgentPresets();
+    expect(Array.isArray(presets)).toBe(true);
+    expect(presets).toHaveLength(0);
+  });
+
+  it('listAgentPresetNames returns an array', () => {
     const names = listAgentPresetNames();
-    expect(names).toContain('coding-assistant');
-    expect(names).toContain('research-agent');
-    expect(names).toContain('devops-engineer');
-    expect(names).toContain('fullstack-developer');
+    expect(Array.isArray(names)).toBe(true);
+    expect(names).toHaveLength(0);
   });
 
-  it('every preset should have required fields', () => {
-    for (const preset of listAgentPresets()) {
-      expect(preset.name).toBeTruthy();
-      expect(preset.role).toBeTruthy();
-      expect(preset.goal).toBeTruthy();
-    }
+  it('AgentPreset interface accepts the documented fields', () => {
+    const preset: AgentPreset = {
+      name: 'Test Persona',
+      role: 'tester',
+      goal: 'verify the type surface',
+      backstory: 'optional backstory',
+      tools: ['terminal.exec'],
+      model: 'claude-opus',
+    };
+    expect(preset.name).toBe('Test Persona');
+    expect(preset.role).toBe('tester');
+    expect(preset.goal).toBe('verify the type surface');
+    expect(preset.backstory).toBe('optional backstory');
+    expect(preset.tools).toEqual(['terminal.exec']);
+    expect(preset.model).toBe('claude-opus');
   });
 
-  it('presets with tools should reference valid tool name patterns', () => {
-    for (const preset of listAgentPresets()) {
-      if (preset.tools) {
-        for (const tool of preset.tools) {
-          expect(tool).toMatch(/^[a-zA-Z][a-zA-Z0-9.]*$/);
-        }
-      }
+  it('AgentPreset interface no longer exposes systemPromptExtra', () => {
+    // systemPromptExtra was removed (had no readers). Confirm it is not part
+    // of the public type surface.
+    expectTypeOf<AgentPreset>().not.toHaveProperty('systemPromptExtra');
+  });
+
+  it('public API surface still works for runtime registration', () => {
+    // Consumers may add entries at runtime; verify the API behaves correctly
+    // when entries exist, then clean up so the registry stays empty.
+    const key = '__test-runtime-preset__';
+    agentPresets[key] = {
+      name: 'Runtime Preset',
+      role: 'runtime tester',
+      goal: 'confirm the registry is mutable',
+    };
+    try {
+      const found = getAgentPreset(key);
+      expect(found).toBeDefined();
+      expect(found!.name).toBe('Runtime Preset');
+      expect(listAgentPresetNames()).toContain(key);
+      expect(listAgentPresets().map((p) => p.name)).toContain('Runtime Preset');
+    } finally {
+      delete agentPresets[key];
     }
+    expect(getAgentPreset(key)).toBeUndefined();
+    expect(listAgentPresets()).toHaveLength(0);
   });
 });

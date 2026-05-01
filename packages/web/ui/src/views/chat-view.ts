@@ -11,7 +11,14 @@ import { showToast } from '../components/toast.js';
 import '../components/steer-composer.js';
 import '../components/fork-modal.js';
 import '../components/checkpoint-panel.js';
+// v0.7.1 #224 — register tool-call-trace + memory-stream so they actually
+// render in the DOM. Both components ship in the bundle but were never
+// mounted in any view template prior to this fix.
+import '../components/tool-call-trace.js';
+import '../components/memory-stream.js';
 import type { ForkParentInfo } from '../components/fork-modal.js';
+import type { ToolTraceEntry } from '../components/tool-call-trace.js';
+import type { MemoryStreamEvent } from '../components/memory-stream.js';
 
 interface SessionInfo {
   id: string;
@@ -26,13 +33,6 @@ interface ActiveSessionInfo {
   sessionId: string;
   status: string;
   startedAt: string;
-}
-
-interface CheckpointInfo {
-  id: string;
-  label?: string;
-  createdAt: string;
-  messageCount?: number;
 }
 
 interface SearchResult {
@@ -903,13 +903,73 @@ export class ChatView extends LitElement {
         border: 1px solid var(--glass-border);
         color: var(--text-muted);
         cursor: pointer;
-        font-size: 12px;
-        font-weight: 700;
         border-radius: var(--radius-sm);
         z-index: 5;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
       }
 
+      .trace-toggle svg { display: block; }
+
       .trace-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
+      /* v0.7.1 #224 — collapsible right-side memory-stream panel.
+         Shares the visual language of the trace-toggle/trace-panel pair so
+         operators recognize it as another "inspector" affordance. */
+      .memory-toggle {
+        position: absolute;
+        bottom: 100px;
+        right: 12px;
+        width: 28px;
+        height: 28px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--glass-border);
+        color: var(--text-muted);
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+        z-index: 5;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+      }
+
+      .memory-toggle svg { display: block; }
+
+      .memory-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
+      .memory-toggle .memory-badge {
+        position: absolute;
+        top: -4px;
+        right: -4px;
+        min-width: 14px;
+        height: 14px;
+        padding: 0 4px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 9px;
+        font-weight: 700;
+        border-radius: 7px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        line-height: 1;
+      }
+
+      .memory-panel {
+        position: absolute;
+        bottom: 100px;
+        right: 48px;
+        width: 320px;
+        max-height: 60vh;
+        z-index: 5;
+        display: none;
+        overflow-y: auto;
+      }
+
+      .memory-panel.open { display: block; }
 
       .trace-panel {
         position: absolute;
@@ -1108,16 +1168,18 @@ export class ChatView extends LitElement {
   @state() private contextMenuSessionId: string | null = null;
   @state() private aborting = false;
   @state() private traceToolHistory: TraceToolEntry[] = [];
-  @state() private showSteerInput = false;
   @state() private showSearchOverlay = false;
   @state() private searchResults: SearchResult[] = [];
-  @state() private showCheckpointList = false;
-  @state() private checkpoints: CheckpointInfo[] = [];
   @state() private showConfirmCompact = false;
   @state() private showRenameInput = false;
   @state() private renameSessionId: string | null = null;
-  @state() private showCheckpointLabel = false;
   @state() private thinking = false;
+
+  // v0.7.1 #224 — memory-stream side panel state. Events are appended as
+  // they arrive on the window-level `crowclaw-event` bridge (memory:captured
+  // / memory:recalled). The panel is collapsible via `showMemoryPanel`.
+  @state() private showMemoryPanel = false;
+  @state() private memoryEvents: MemoryStreamEvent[] = [];
 
   // v0.7.0 #193/#194/#195: state for the new session-action components.
   // These flags are independent from the legacy inline overlays so the old
@@ -1148,6 +1210,40 @@ export class ChatView extends LitElement {
   private _transportFallbackHandler = (e: Event) => {
     const detail = (e as CustomEvent<{ active: boolean }>).detail;
     this.transportFallback = !!detail?.active;
+  };
+
+  /**
+   * v0.7.1 #224 — listens to the window-level `crowclaw-event` bridge for
+   * `memory:captured` / `memory:recalled` event types and appends them to
+   * the side-panel feed. The orchestrator (app.ts) currently bridges
+   * `session:` / `gateway:` / `job:` events; once the runtime EventBus
+   * starts forwarding `memory:*` through the same bridge, this handler
+   * picks them up automatically.
+   *
+   * TODO: wire memory:* event passthrough in app.ts so the bridge actually
+   * dispatches these. Until then this listener is a no-op but the panel
+   * still renders (with an empty state).
+   */
+  private _memoryEventHandler = (e: Event) => {
+    const detail = (e as CustomEvent<{ type?: string; data?: Record<string, unknown> }>).detail;
+    const type = detail?.type;
+    if (type !== 'memory:captured' && type !== 'memory:recalled') return;
+    const data = detail?.data ?? {};
+    const kind: 'captured' | 'recalled' = type === 'memory:captured' ? 'captured' : 'recalled';
+    const evt: MemoryStreamEvent = {
+      kind,
+      timestamp: new Date().toISOString(),
+      sessionId: typeof data.sessionId === 'string' ? data.sessionId : undefined,
+      memoryId: typeof data.memoryId === 'string' ? data.memoryId : undefined,
+      summary: typeof data.summary === 'string' ? data.summary : undefined,
+      scope: typeof data.scope === 'string' ? data.scope : undefined,
+      tags: Array.isArray(data.tags) ? (data.tags as string[]) : undefined,
+      query: typeof data.query === 'string' ? data.query : undefined,
+      hits: typeof data.hits === 'number' ? data.hits : undefined,
+      ids: Array.isArray(data.ids) ? (data.ids as string[]) : undefined,
+      summaries: Array.isArray(data.summaries) ? (data.summaries as string[]) : undefined,
+    };
+    this.memoryEvents = [...this.memoryEvents, evt];
   };
 
   /**
@@ -1231,6 +1327,7 @@ export class ChatView extends LitElement {
     document.addEventListener('click', this._onDocClick);
     document.addEventListener('crowclaw:transport-fallback', this._transportFallbackHandler);
     document.addEventListener('crowclaw:session-event', this._sessionEventHandler);
+    window.addEventListener('crowclaw-event', this._memoryEventHandler);
   }
 
   disconnectedCallback() {
@@ -1240,6 +1337,7 @@ export class ChatView extends LitElement {
     document.removeEventListener('click', this._onDocClick);
     document.removeEventListener('crowclaw:transport-fallback', this._transportFallbackHandler);
     document.removeEventListener('crowclaw:session-event', this._sessionEventHandler);
+    window.removeEventListener('crowclaw-event', this._memoryEventHandler);
   }
 
   private _onDocClick() {
@@ -1412,53 +1510,16 @@ export class ChatView extends LitElement {
     }
   }
 
-  private async _steerSession(directive: string) {
-    if (!this.currentSessionId || !directive.trim()) return;
-    this.showSteerInput = false;
-    try {
-      const data = await api<{ ok: boolean; injectedPrompt: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/steer`, { method: 'POST', body: JSON.stringify({ directive: directive.trim() }) });
-      this.messages = [...this.messages, { role: 'system', kind: 'steer', content: data.injectedPrompt }];
-      this._scrollToBottom();
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : 'Steer failed';
-      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Steer error: ${msg}` }];
-    }
-  }
-
   private async _checkpointSession(label?: string) {
     if (!this.currentSessionId) return;
-    this.showCheckpointLabel = false;
     try {
       await api<{ ok: boolean; checkpoint: unknown }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/checkpoint`, { method: 'POST', body: JSON.stringify({ label: label || undefined }) });
       this.messages = [...this.messages, { role: 'system', kind: 'checkpoint', content: `Checkpoint created${label ? `: ${label}` : ''}` }];
       this._scrollToBottom();
+      void this._loadCheckpointCount();
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Checkpoint failed';
       this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Checkpoint error: ${msg}` }];
-    }
-  }
-
-  private async _loadCheckpoints() {
-    if (!this.currentSessionId) return;
-    this.showCheckpointList = !this.showCheckpointList;
-    if (!this.showCheckpointList) return;
-    try {
-      const data = await api<{ checkpoints: CheckpointInfo[] }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/checkpoints`);
-      this.checkpoints = data.checkpoints || [];
-    } catch {
-      this.checkpoints = [];
-    }
-  }
-
-  private async _restoreCheckpoint(checkpointId: string) {
-    if (!this.currentSessionId) return;
-    try {
-      await api<{ ok: boolean; restoredTo: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/restore`, { method: 'POST', body: JSON.stringify({ checkpointId }) });
-      this.showCheckpointList = false;
-      this._loadHistory();
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : 'Restore failed';
-      this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Restore error: ${msg}` }];
     }
   }
 
@@ -1488,12 +1549,9 @@ export class ChatView extends LitElement {
   }
 
   private _closeAllOverlays() {
-    this.showSteerInput = false;
     this.showSearchOverlay = false;
-    this.showCheckpointList = false;
     this.showConfirmCompact = false;
     this.showRenameInput = false;
-    this.showCheckpointLabel = false;
     this.searchResults = [];
     // The new session-action components are also overlay-style affordances —
     // close them so swapping between Steer/Fork/Checkpoints is mutually
@@ -1961,8 +2019,44 @@ export class ChatView extends LitElement {
           </div>
 
           <!-- Trace Panel -->
-          <button class="trace-toggle" @click=${() => { this.traceOpen = !this.traceOpen; }} aria-label="Toggle trace panel">T</button>
+          <!-- v0.7.1 #225 — replaced bare letter "T" with an inline activity
+               pulse SVG icon + accessible label/title so the affordance is
+               recognizable at a glance. -->
+          <button class="trace-toggle"
+                  @click=${() => { this.traceOpen = !this.traceOpen; }}
+                  aria-label="Toggle debug trace"
+                  title="Debug trace">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+            </svg>
+          </button>
           ${this._renderTracePanel()}
+
+          <!-- v0.7.1 #224 — memory-stream pull-tab + collapsible panel.
+               The component listens (via this view) to the window-level
+               `crowclaw-event` bridge for `memory:captured` / `memory:recalled`
+               event types and renders a newest-first feed. -->
+          <button class="memory-toggle"
+                  @click=${() => { this.showMemoryPanel = !this.showMemoryPanel; }}
+                  aria-label="Toggle memory stream"
+                  title="Memory stream">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+            ${this.memoryEvents.length > 0
+              ? html`<span class="memory-badge">${this.memoryEvents.length}</span>`
+              : nothing}
+          </button>
+          <div class="memory-panel ${this.showMemoryPanel ? 'open' : ''}">
+            <crowclaw-memory-stream
+              heading="Memory stream"
+              .events=${this.memoryEvents}
+            ></crowclaw-memory-stream>
+          </div>
 
           <!-- v0.7.0 #195: checkpoint side panel. Mounted inside chat-content
                so it slides in over the message list (z-index: 50 in the
@@ -2038,6 +2132,11 @@ export class ChatView extends LitElement {
     const isActive = this.currentSessionId ? this._isSessionActive(this.currentSessionId) : false;
     const canAbort = this.streaming || isActive;
 
+    // v0.7.1 #220 — toolbar consolidated to Abort + Search + Checkpoints.
+    // Steer moved to the sticky-bottom <crowclaw-steer-composer> button
+    // (only visible mid-run); Compact moved to the session 3-dot menu;
+    // Checkpoint/History collapsed into the single <crowclaw-checkpoint-panel>
+    // which already has a Save row + restore list.
     return html`
       <div class="ops-toolbar">
         <span class="ops-label">Ops</span>
@@ -2050,27 +2149,11 @@ export class ChatView extends LitElement {
           </button>
         ` : nothing}
         <button class="ops-btn"
-                @click=${() => { this._closeAllOverlays(); this.showConfirmCompact = true; }}
-                aria-label="Compact session">
-          Compact
+                @click=${() => { this._closeAllOverlays(); this.showSearchOverlay = !this.showSearchOverlay; this.searchResults = []; }}
+                aria-label="Search messages">
+          Search
         </button>
-        <button class="ops-btn"
-                @click=${() => { this._closeAllOverlays(); this.showSteerInput = !this.showSteerInput; }}
-                aria-label="Steer session">
-          Steer
-        </button>
-        <div class="ops-sep"></div>
-        <button class="ops-btn"
-                @click=${() => { this._closeAllOverlays(); this.showCheckpointLabel = true; }}
-                aria-label="Create checkpoint">
-          Checkpoint
-        </button>
-        <button class="ops-btn"
-                @click=${() => { this._closeAllOverlays(); this._loadCheckpoints(); }}
-                aria-label="View checkpoint history">
-          History
-        </button>
-        <!-- v0.7.0 #195: header button for the new checkpoint side panel.
+        <!-- v0.7.0 #195: header button for the checkpoint side panel.
              Label includes the count so operators can see at a glance how
              many save points exist for the current session. -->
         <button class="ops-btn"
@@ -2078,12 +2161,6 @@ export class ChatView extends LitElement {
                 aria-label="Open checkpoints panel"
                 title="Manage checkpoints (save / restore / replay)">
           Checkpoints (${this.checkpointCount})
-        </button>
-        <div class="ops-sep"></div>
-        <button class="ops-btn"
-                @click=${() => { this._closeAllOverlays(); this.showSearchOverlay = !this.showSearchOverlay; this.searchResults = []; }}
-                aria-label="Search messages">
-          Search
         </button>
       </div>
     `;
@@ -2098,42 +2175,6 @@ export class ChatView extends LitElement {
           <span class="confirm-msg">Compact this session? This will summarize and reduce message count.</span>
           <button class="ops-btn danger" @click=${this._compactSession} aria-label="Confirm compact">Confirm</button>
           <button class="ops-btn" @click=${() => { this.showConfirmCompact = false; }} aria-label="Cancel compact">Cancel</button>
-        </div>
-      ` : nothing}
-
-      ${this.showSteerInput ? html`
-        <div class="steer-overlay">
-          <input placeholder="Enter directive to steer the session..."
-                 @keydown=${(e: KeyboardEvent) => {
-                   if (e.key === 'Enter') {
-                     this._steerSession((e.target as HTMLInputElement).value);
-                   } else if (e.key === 'Escape') {
-                     this.showSteerInput = false;
-                   }
-                 }}>
-          <button class="ops-btn" @click=${(e: Event) => {
-            const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
-            if (input) this._steerSession(input.value);
-          }} aria-label="Send steer directive">Send</button>
-          <button class="ops-btn" @click=${() => { this.showSteerInput = false; }} aria-label="Close steer">X</button>
-        </div>
-      ` : nothing}
-
-      ${this.showCheckpointLabel ? html`
-        <div class="steer-overlay">
-          <input placeholder="Checkpoint label (optional, press Enter)..."
-                 @keydown=${(e: KeyboardEvent) => {
-                   if (e.key === 'Enter') {
-                     this._checkpointSession((e.target as HTMLInputElement).value || undefined);
-                   } else if (e.key === 'Escape') {
-                     this.showCheckpointLabel = false;
-                   }
-                 }}>
-          <button class="ops-btn" @click=${(e: Event) => {
-            const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
-            this._checkpointSession(input?.value || undefined);
-          }} aria-label="Create checkpoint">Create</button>
-          <button class="ops-btn" @click=${() => { this.showCheckpointLabel = false; }} aria-label="Cancel checkpoint">X</button>
         </div>
       ` : nothing}
 
@@ -2187,23 +2228,6 @@ export class ChatView extends LitElement {
         </div>
       ` : nothing}
 
-      ${this.showCheckpointList ? html`
-        <div class="checkpoint-overlay">
-          <div class="cp-hdr">
-            <span>Checkpoints</span>
-            <button class="ops-btn" @click=${() => { this.showCheckpointList = false; }} aria-label="Close checkpoints">X</button>
-          </div>
-          ${this.checkpoints.length === 0
-            ? html`<div style="font-size:var(--text-xs);color:var(--text-muted);padding:var(--sp-2) 0">No checkpoints</div>`
-            : this.checkpoints.map((cp) => html`
-                <div class="cp-item">
-                  <span class="cp-label">${cp.label || cp.id.slice(0, 12)}</span>
-                  <span class="cp-time">${timeAgo(cp.createdAt)}</span>
-                  <button class="cp-restore" @click=${() => this._restoreCheckpoint(cp.id)} aria-label="Restore checkpoint">Restore</button>
-                </div>
-              `)}
-        </div>
-      ` : nothing}
     `;
   }
 
@@ -2223,7 +2247,7 @@ export class ChatView extends LitElement {
     return html`
       <div class="trace-panel ${this.traceOpen ? 'open' : ''}">
         <div class="tp-hdr">
-          <span>Trace</span>
+          <span>Debug Trace</span>
           ${this.streaming ? html`
             <button class="tp-stop-btn" @click=${this._abortSession} aria-label="Stop streaming">Stop</button>
           ` : nothing}
@@ -2266,14 +2290,24 @@ export class ChatView extends LitElement {
 
     if (msg.role === 'tool') {
       const ok = !msg.content?.match(/error|fail/i);
+      // v0.7.1 #224 — render the rich <crowclaw-tool-call-trace> inline so
+      // the component (which ships in the bundle) actually appears in the
+      // DOM. The legacy `.tool-step` row is preserved as a compact fallback
+      // for any tool message we can't synthesize a full trace entry for.
+      // TODO: wire from the streamed tool-step events so `args`, `output`,
+      //       `durationMs`, and `auditId` come from the runtime instead of
+      //       being derived from the persisted history line.
+      const traceEntry: ToolTraceEntry = {
+        callId: `${msg.name ?? 'tool'}-${index}`,
+        toolName: msg.name ?? 'tool',
+        status: ok ? 'ok' : 'error',
+        output: msg.content,
+        outputLength: msg.content?.length,
+        errorMessage: ok ? undefined : msg.content,
+      };
       return html`
         <div class="tool-step">
-          <div class="sf-row ${ok ? 'ok' : 'er'}" @click=${this._toggleStepDetail}>
-            <span class="sf-dot ${ok ? 'ok' : 'er'}"></span>
-            <span class="sf-name">${msg.name ?? 'tool'}</span>
-            <span class="sf-status" style="color:${ok ? 'var(--success)' : 'var(--error)'}">${ok ? 'done' : 'error'}</span>
-          </div>
-          <div class="sf-detail">${msg.content?.slice(0, 500)}</div>
+          <crowclaw-tool-call-trace .entry=${traceEntry}></crowclaw-tool-call-trace>
         </div>
       `;
     }

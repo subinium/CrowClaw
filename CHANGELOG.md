@@ -5,6 +5,85 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.7.1] — 2026-05-01 — ChatGPT (Codex) OAuth provider + 18-issue dashboard audit sweep
+
+Two threads in one release:
+1. **ChatGPT subscription via `codex login`** (Codex backend OAuth, no API key required).
+2. **Internal dashboard audit** — 18 issues filed across the 5 main views (Chat / Agent / Connect / Automate / Settings), driven into this release in a single 8-agent parallel sweep with strict file ownership.
+
+### Dashboard audit sweep (18 issues, eight agents)
+
+**Critical fixes**
+- **#212** Settings → Security: SSRF toggle was an interactive switch that the backend dropped silently. Now rendered as a locked badge `Always on (enforced)` with a tooltip explaining SSRF is enforced at the code level. Other 5 protection toggles unchanged.
+- **#213** Settings → Agent: removed the ghost `model` field that wrote to `agentConfig.model` while the runtime read from `providerConfig.primary.model`. Replaced with a read-only `Active model: <name>` line linking to **Connect → Providers**.
+- **#214** Scheduler: `POST /api/scheduler/jobs` now auto-starts `autonomousScheduler` when the first job is created. Response shape extended with `wasStarted: boolean`. Automate view shows a `Scheduler started — your job will fire on schedule.` toast on the transition, plus a yellow dormant-state banner above the job grid when the scheduler is stopped with non-zero jobs.
+- **#224** Mounted `<crowclaw-tool-call-trace>` and `<crowclaw-memory-stream>` — they shipped in v0.7.0 but never appeared in any view template. Tool-call rows now render inline between assistant messages; memory stream renders as a collapsible right-edge panel.
+
+**Wiring gaps closed**
+- **#215** Removed `<option value="webhook">` from the Automate delivery select — the backend's `deliverToGateway` switch had no case for it.
+- **#216** Automate delivery options now disable telegram/slack platforms when no gateway token is configured server-side; option label suffixes with `(set up in Connect → Platforms)`. A green `token configured` badge renders next to the channel input when prerequisites are met. Discord stays enabled (webhook URL based).
+- **#217** Removed 15 hardcoded CrewAI/OpenClaw-clone personas from `agent-presets.ts` (Coding Assistant, DevOps Engineer, etc.). Personas tab now reads only from the file-backed `PersonaRegistry`. Removed the dead `systemPromptExtra` field from the `AgentPreset` interface (no readers in repo). Onboarding wizard step 2 now fetches personas from `/api/personas` and shows a Skip card when the registry is empty.
+- **#218** New `POST /api/tools/:name/toggle { disabled: boolean }` endpoint backed by `configStore.disabledToolNames: Set<string>`. `buildConfiguredToolRegistry()` filters disabled tools after the toolset filter. `<crowclaw-toggle>` rendered per-tool in both Connect → Tools and Agent → Toolsets ("Individual tool overrides" section).
+- **#222** Connect → Providers now shows "Add slot" cards for missing fallback/vision/compression/embedding slots, pre-filled with primary slot defaults. Added "Remove" button for non-primary slots.
+
+**Cleanup**
+- **#219** Agent → MCP tab removed (`activeMcp: null` was hardcoded). `IdentityTab` narrowed to `'personas' | 'toolsets'`. `/api/presets` no longer emits `activeMcp` (Node and Cloudflare runtimes both); `dashboard-contract.test.ts` updated to match. Footer hint added: "MCP servers are managed in Connect → MCP Servers".
+- **#220** Chat OPS toolbar consolidated. Removed legacy `Steer` button + `showSteerInput` overlay (sticky composer is canonical), `Checkpoint` button + label overlay (panel covers it), `History` button + checkpoint-list overlay (panel covers it). `Compact` moved into the session 3-dot context menu. Final OPS toolbar: `Abort` (when active) + `Search` + `Checkpoints (N)`.
+- **#221** Removed Connect view's redundant Status Overview panel — per-section indicators already cover it.
+- **#223** Settings → System: replaced the opaque Config Snapshot KV dump with a 2-line "Active Profile" summary (active persona + active toolset). Raw KV moved behind a `<details>` disclosure.
+
+**Architecture / polish**
+- **#225** Trace `T` button replaced with an inline activity-pulse SVG icon + `aria-label="Toggle debug trace"` and `title="Debug trace"`. Trace panel header relabelled to `Debug Trace`.
+- **#226** "MCP" naming clash resolved — the Agent view tab is gone (#219); Connect view section confirmed as `MCP Servers`.
+- **#227** Provider config canonical surface designated as **Connect → Providers**. Settings → Agent shows a hint pointing there instead of duplicating the form.
+- **#228** Settings tab strip split into two visual rows: `Settings` (agent / usage / system / memory / feedback) and `Advanced` (security). Functionality preserved; Security tab is no longer a peer to Agent in the default scan.
+- **#229** Audit of Settings → Memory + Feedback tabs. Memory tab is correctly wired (session selector → memories list with scope filter and delete) and stays as-is. Feedback tab gains an `<crowclaw-empty>` zero-state ("No tool calls recorded yet" + Start-a-chat CTA) so a fresh install no longer renders four `0` cards as if broken. Also fixes a regression introduced by #217: `shouldShowOnboarding` no longer requires `hasPreset` (persona selection became optional when the hardcoded registry was emptied), so users who Skip step 2 don't see the wizard reappear on every reload.
+
+### ChatGPT (Codex) OAuth provider
+
+CrowClaw can now use a ChatGPT subscription via the `codex` CLI's existing OAuth login. Users who already ran `codex login` don't have to paste an API key — the runtime detects `~/.codex/auth.json` and routes through the same Codex backend the official CLI uses. EchoProvider demo mode stays as the no-credentials fallback.
+
+This follows the same path taken by opencode (sst), Cline, and Roo Code. The Codex backend at `chatgpt.com/backend-api/codex/responses` is undocumented and may break — see "Caveats" below.
+
+### Added
+- **`@crowclaw/runtime-node/codex-auth`**: `CodexAuthStore` reads `~/.codex/auth.json`, decodes the access-token JWT to know when to refresh, and refreshes via `https://auth.openai.com/oauth/token` with the stored `refresh_token`. Concurrent refreshes are serialised through a single in-flight promise. The refreshed file is rewritten atomically (mode 0o600); rewrite failures are non-fatal so read-only filesystems don't crash the runtime.
+- **`@crowclaw/runtime-node/openai-chatgpt-provider`**: `createOpenAIChatGPTProvider(store, options)` factory + `tryCreateOpenAIChatGPTProvider()` convenience that returns a configured `OpenAICompatibleProvider` ready to call the Codex backend. Default model `gpt-5.5` (override with `CROWCLAW_CODEX_MODEL`); base URL `https://chatgpt.com/backend-api/codex` with `endpointPath: '/responses'`.
+- **`@crowclaw/providers/OpenAICompatibleConfig` hooks (6 new fields)**:
+  - `tokenProvider?: () => Promise<string>` — async bearer source; takes precedence over `apiKey` and `credentialPool` so refreshed tokens are always used.
+  - `extraHeaders?: Record<string, string>` — request-header overlay, used for `chatgpt-account-id`, `originator: codex_cli_rs`, and `OpenAI-Beta: responses=experimental`.
+  - `extraBodyFields?: Record<string, unknown>` — JSON body overlay for backend-required fields (`store: false` for Codex).
+  - `systemPromptAsInstructions?: boolean` — when on, the Responses API request routes the system prompt to top-level `instructions` instead of injecting a `developer` message into `input`. Codex backend rejects the in-array form.
+  - `requireStream?: boolean` — when on, `generate()` collects from `generateStream()` instead of issuing a non-streaming POST. Codex backend rejects `stream: false` outright.
+  - `onAuthFailure?: () => Promise<boolean>` — called on 401, returns `true` to retry once after the caller refreshes credentials.
+- **`buildResponsesApiTools()`** in `@crowclaw/providers`: emits the flat `{type, name, description, parameters}` tool shape the Responses API requires, instead of the nested `{type, function: {...}}` form used by `/chat/completions`. Switching is automatic when `endpointPath: '/responses'` resolves.
+
+### Wired
+- **`provider-factory.resolveProviderFromConfig()`**: new step `3b. ChatGPT (Codex CLI) OAuth` runs after explicit API keys but before the onboarding `~/.crowclaw/config.json`. Skipped when callers pass an explicit `env` override (preserves test hermeticity) or set `CROWCLAW_DISABLE_CODEX_AUTH=1`. Returns `source: 'env'` so the runtime treats it like a real provider, not the EchoProvider demo fallback.
+- **`runtime-node/src/index.ts` startup banner**: prints `[crowclaw] Using ChatGPT subscription via Codex CLI (model=gpt-5.5). Run \`codex login\` if auth fails.` when the resolved provider is the Codex-backed OpenAICompatibleProvider, so operators know the runtime is talking to the undocumented `chatgpt.com` backend instead of `api.openai.com`.
+
+### Errors / debuggability
+- The 4xx/5xx error message from `OpenAICompatibleProvider.generate()` and the streaming `error` chunk now include the first 200 chars of the response body, not just the status text. Surfaces issues like `"Stream must be set to true"`, `"Instructions are required"`, `"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account"` — silent before this release.
+
+### Codex backend requirements (verified by direct probe 2026-05-01)
+- Endpoint: `POST https://chatgpt.com/backend-api/codex/responses`
+- Allowed models with ChatGPT-account auth: `gpt-5.5`, `gpt-5.4`. **Rejected**: `gpt-5-codex`, `gpt-5-codex-latest`, `gpt-5`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `o3`, `o4-mini`, `chatgpt-4o-latest`, `codex-1`, `codex-mini-latest`. The `OPENAI_API_KEY` flow exposes a different set; this list is **subscription-only**.
+- Required headers: `Authorization`, `chatgpt-account-id`, `originator: codex_cli_rs`, `OpenAI-Beta: responses=experimental`.
+- Required body: `instructions` (top-level), `store: false`, `stream: true`. Tools must use the flat Responses API shape.
+
+### Verification
+- `npm run typecheck` → clean.
+- `npm test` → **2,709 / 2,709** (up from 2,702 — 7 new tests in `tests/codex-auth.test.ts` covering missing-file, non-chatgpt mode, unexpired-token cache hit, proactive-refresh window, refresh persistence, concurrent-refresh serialisation, and factory-built header/body shape).
+- End-to-end probe via `node scripts/serve-local.mjs` → `POST /api/sessions/:id/message` returned `{"finalResponse":"PONG"}` against `gpt-5.5`. Streaming via `POST /api/sessions/:id/stream` produced ordered `text-delta` chunks for a counting prompt.
+
+### Caveats
+- **Undocumented endpoint**. `chatgpt.com/backend-api/codex/responses` is what the official Codex CLI uses but it is not part of the public OpenAI API surface. OpenAI may change request/response shapes, headers, or model entitlements without notice.
+- **ToS gray area**. The ChatGPT Terms of Service prohibit "automated or programmatic" access, and as of May 2026 OpenAI has not opened a third-party OAuth program for ChatGPT subscriptions. opencode (sst), Cline, and Roo Code have shipped equivalent integrations since January 2026 with no public takedown, but this remains the user's risk.
+- **Not a replacement for `OPENAI_API_KEY`**. The Codex backend rejects most OpenAI models and runs against subscription quota, not the metered API. For production-grade integrations, prefer a real API key.
+
+### Environment knobs
+- `CROWCLAW_DISABLE_CODEX_AUTH=1` — skip the auto-detection.
+- `CROWCLAW_CODEX_MODEL=gpt-5.4` — override the default `gpt-5.5`.
+
 ## [0.7.0] — 2026-04-28 — UX live wave: 10-issue platform polish sweep (onboarding, demo mode, real-time observability, session controls UI)
 
 The v0.6.x cycle delivered a battle-tested backend; v0.7.0 turns the dashboard from "looks empty / amateurish" into a working product. Eight parallel agents implemented 10 spec'd issues against `release/v0.7.0` simultaneously with strict file ownership. The previous post-v0.6.7 audit found that 17/23 dashboard routes returned real data but the user couldn't see anything alive without an API key configured + setup completed; this release closes that perception gap.

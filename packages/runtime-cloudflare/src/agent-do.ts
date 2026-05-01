@@ -638,16 +638,17 @@ export class AgentSessionDurableObject {
     if (request.method === 'GET' && url.pathname.endsWith('/presets')) {
       await this.ensureActivePresetHydrated();
       const mcpNames = listMcpPresetNames();
-      // `activeAgent`/`activeToolset`/`activeMcp` are now sourced from
-      // persisted DO storage (#33). Prior implementation hardcoded `null`,
-      // which permanently broke the dashboard's "Active" badge on CF.
+      // `activeAgent`/`activeToolset` are sourced from persisted DO storage
+      // (#33). #219: `activeMcp` removed from this payload — the dashboard
+      // sources MCP state from the connections endpoint, not this preset
+      // shape. The active MCP slot is still persisted on the DO and exposed
+      // via /config-presets/active for the switcher UI.
       return Response.json({
         agents: listAgentPresets(),
         toolsets: listToolsetPresets(),
         mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) })),
         activeAgent: this.activePreset.agent,
         activeToolset: this.activePreset.toolset,
-        activeMcp: this.activePreset.mcp,
       });
     }
 

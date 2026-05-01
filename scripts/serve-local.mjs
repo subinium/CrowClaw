@@ -113,6 +113,36 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// v0.7.1: WebSocket upgrade. The runtime's /ws fetch path uses
+// WebSocketPair (Workers/Bun) which is unavailable on Node, so we
+// terminate the upgrade here with the `ws` library and hand the resulting
+// WHATWG-shaped socket to runtime.wsManager.addConnection().
+import { WebSocketServer } from 'ws';
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  const { pathname } = new URL(req.url, `http://localhost:${port}`);
+  if (pathname !== '/ws') {
+    socket.destroy();
+    return;
+  }
+  // Localhost open-access mirrors the dev-mode auth carve-out: when no
+  // CROWCLAW_DASHBOARD_TOKEN is set we accept the connection unauthenticated
+  // so the dashboard can subscribe to live events from a fresh git clone.
+  // Tokenless connections still pass authenticated=false so the broadcast
+  // gate enforces per-connection scopes downstream.
+  const dashToken = process.env.CROWCLAW_DASHBOARD_TOKEN;
+  let authenticated = !dashToken;
+  if (dashToken) {
+    const auth = req.headers['authorization'];
+    if (typeof auth === 'string' && auth === `Bearer ${dashToken}`) {
+      authenticated = true;
+    }
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    runtime.wsManager.addConnection(ws, authenticated);
+  });
+});
+
 server.listen(port, () => {
   console.log(`CrowClaw v${pkg.version} running at http://localhost:${port}`);
   console.log(`Dashboard token: ${process.env.CROWCLAW_DASHBOARD_TOKEN ? 'SET' : 'NOT SET (open access)'}`);

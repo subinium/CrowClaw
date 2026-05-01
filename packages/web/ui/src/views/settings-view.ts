@@ -19,7 +19,6 @@ import { showToast } from '../components/toast.js';
 
 interface AgentConfig {
   name: string;
-  model: string;
   systemPrompt: string;
   temperature: number;
   maxTokens: number;
@@ -28,6 +27,18 @@ interface AgentConfig {
   synthesizeOnExhaustion: boolean;
   maxToolResultLength: number;
   requireApprovalForDangerousTools: boolean;
+  [key: string]: unknown;
+}
+
+interface ProviderSlot {
+  provider?: string;
+  model?: string;
+  apiKey?: string;
+}
+
+interface ProvidersConfig {
+  primary?: ProviderSlot;
+  fallback?: ProviderSlot;
   [key: string]: unknown;
 }
 
@@ -138,13 +149,16 @@ type SettingsTab =
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
-const TABS: { key: SettingsTab; label: string }[] = [
+const PRIMARY_TABS: { key: SettingsTab; label: string }[] = [
   { key: 'agent', label: 'Agent Config' },
-  { key: 'security', label: 'Security' },
   { key: 'usage', label: 'Usage' },
   { key: 'system', label: 'System' },
   { key: 'memory', label: 'Memory' },
   { key: 'feedback', label: 'Feedback' },
+];
+
+const ADVANCED_TABS: { key: SettingsTab; label: string }[] = [
+  { key: 'security', label: 'Security' },
 ];
 
 const SCOPES = ['All', 'Session', 'User', 'Workspace'] as const;
@@ -222,9 +236,32 @@ export class SettingsView extends LitElement {
       /* Tab bar */
       .tabs {
         display: flex;
+        flex-direction: column;
         gap: 0;
         border-bottom: 1px solid var(--glass-border);
         margin-bottom: var(--sp-6);
+      }
+
+      .tab-row {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+      }
+
+      .tab-row-label {
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        padding-right: var(--sp-2);
+        opacity: 0.7;
+      }
+
+      .tab-row.advanced .tab {
+        font-size: 10px;
+        opacity: 0.75;
+        padding: var(--sp-1) var(--sp-3);
       }
 
       .tab {
@@ -245,6 +282,70 @@ export class SettingsView extends LitElement {
       .tab.active {
         color: var(--accent);
         border-bottom-color: var(--accent);
+      }
+
+      /* Protection badge (read-only enforced state) */
+      .protection-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--sp-1);
+        padding: var(--sp-1) var(--sp-2);
+        font-size: var(--text-xs);
+        font-weight: 500;
+        color: var(--success);
+        background: var(--accent-soft, rgba(46, 160, 67, 0.12));
+        border: 1px solid var(--success);
+        border-radius: var(--radius-sm);
+        cursor: help;
+        user-select: none;
+        white-space: nowrap;
+      }
+
+      /* Hint text */
+      .hint {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        margin: 0 0 var(--sp-3) 0;
+      }
+
+      .hint a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+
+      .hint a:hover {
+        text-decoration: underline;
+      }
+
+      /* Active profile summary */
+      .profile-summary {
+        display: flex;
+        flex-direction: column;
+        gap: var(--sp-1);
+        margin-bottom: var(--sp-3);
+        font-size: var(--text-sm);
+        color: var(--text-primary);
+      }
+
+      .profile-summary .label {
+        color: var(--text-muted);
+        margin-right: var(--sp-2);
+      }
+
+      .raw-config-disclosure {
+        margin-top: var(--sp-3);
+      }
+
+      .raw-config-disclosure summary {
+        cursor: pointer;
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        padding: var(--sp-1) 0;
+        user-select: none;
+      }
+
+      .raw-config-disclosure summary:hover {
+        color: var(--text-secondary);
       }
 
       /* Summary cards row */
@@ -609,6 +710,9 @@ export class SettingsView extends LitElement {
   @state() private agentSaving = false;
   @state() private agentStatus: { msg: string; ok: boolean } | null = null;
 
+  // Providers config (read-only here; canonical source is Connect → Providers)
+  @state() private providersConfig: ProvidersConfig | null = null;
+
   // Security
   @state() private securityStatus: SecurityStatus | null = null;
   @state() private securityEvents: SecurityEvent[] = [];
@@ -620,6 +724,8 @@ export class SettingsView extends LitElement {
 
   // System
   @state() private systemConfig: Record<string, string> = {};
+  @state() private activePresetName: string | null = null;
+  @state() private activeToolsetName: string | null = null;
 
   // Remote Access
   @state() private remoteAccess: RemoteAccessConfig = { serverUrl: '', publicUrl: '', trustProxy: false };
@@ -660,6 +766,7 @@ export class SettingsView extends LitElement {
     switch (this.activeTab) {
       case 'agent':
         this._loadAgentConfig();
+        this._loadProvidersConfig();
         break;
       case 'security':
         this._loadSecurityStatus();
@@ -689,7 +796,6 @@ export class SettingsView extends LitElement {
     } catch {
       this.agentConfig = {
         name: '',
-        model: '',
         systemPrompt: '',
         temperature: 0.7,
         maxTokens: 4096,
@@ -699,6 +805,15 @@ export class SettingsView extends LitElement {
         maxToolResultLength: 4000,
         requireApprovalForDangerousTools: true,
       };
+    }
+  }
+
+  private async _loadProvidersConfig() {
+    try {
+      const data = await api<ProvidersConfig>('/api/providers/config');
+      this.providersConfig = data;
+    } catch {
+      this.providersConfig = null;
     }
   }
 
@@ -737,7 +852,15 @@ export class SettingsView extends LitElement {
   private async _loadSystem() {
     try {
       const data = await api<Record<string, unknown>>('/api/config/snapshot');
-      // Flatten the snapshot into displayable key-value pairs
+      // Capture active profile fields for the human-readable summary
+      const presetName = data['activePresetName'];
+      const toolsetName = data['activeToolsetName'];
+      this.activePresetName =
+        typeof presetName === 'string' && presetName ? presetName : null;
+      this.activeToolsetName =
+        typeof toolsetName === 'string' && toolsetName ? toolsetName : null;
+      // Flatten the snapshot into displayable key-value pairs (kept for the
+      // raw-config debug disclosure)
       const flat: Record<string, string> = {};
       for (const [k, v] of Object.entries(data)) {
         flat[k] = typeof v === 'string' ? v : JSON.stringify(v);
@@ -745,6 +868,8 @@ export class SettingsView extends LitElement {
       this.systemConfig = flat;
     } catch {
       this.systemConfig = {};
+      this.activePresetName = null;
+      this.activeToolsetName = null;
     }
   }
 
@@ -966,16 +1091,36 @@ export class SettingsView extends LitElement {
   render() {
     return html`
       <div class="tabs">
-        ${TABS.map(
-          (t) => html`
-            <div
-              class="tab ${this.activeTab === t.key ? 'active' : ''}"
-              @click=${() => this._switchTab(t.key)}
-            >
-              ${t.label}
-            </div>
-          `,
-        )}
+        <div class="tab-row" role="tablist" aria-label="Settings tabs">
+          <span class="tab-row-label">Settings</span>
+          ${PRIMARY_TABS.map(
+            (t) => html`
+              <div
+                class="tab ${this.activeTab === t.key ? 'active' : ''}"
+                role="tab"
+                aria-selected=${this.activeTab === t.key}
+                @click=${() => this._switchTab(t.key)}
+              >
+                ${t.label}
+              </div>
+            `,
+          )}
+        </div>
+        <div class="tab-row advanced" role="tablist" aria-label="Advanced tabs">
+          <span class="tab-row-label">Advanced</span>
+          ${ADVANCED_TABS.map(
+            (t) => html`
+              <div
+                class="tab ${this.activeTab === t.key ? 'active' : ''}"
+                role="tab"
+                aria-selected=${this.activeTab === t.key}
+                @click=${() => this._switchTab(t.key)}
+              >
+                ${t.label}
+              </div>
+            `,
+          )}
+        </div>
       </div>
 
       ${this._renderActiveTab()}
@@ -1007,9 +1152,28 @@ export class SettingsView extends LitElement {
     const cfg = this.agentConfig;
     if (!cfg) return html`<div class="status-msg">Loading...</div>`;
 
+    const primary = this.providersConfig?.primary;
+    const activeModelLine = primary?.model
+      ? html`<div class="form-group">
+          <span class="label" style="color:var(--text-muted);font-size:var(--text-xs)">Active model:</span>
+          <span style="font-family:var(--font-mono);font-size:var(--text-sm);color:var(--text-primary);margin-left:var(--sp-2)">${primary.model}</span>
+          <span style="color:var(--text-muted);margin:0 var(--sp-2)">·</span>
+          <a href="#connect" style="color:var(--accent);font-size:var(--text-xs);text-decoration:none">Edit in Connect → Providers</a>
+        </div>`
+      : html`<div class="form-group">
+          <span class="label" style="color:var(--text-muted);font-size:var(--text-xs)">Active model:</span>
+          <span style="font-size:var(--text-sm);color:var(--text-muted);margin-left:var(--sp-2)">not configured</span>
+          <span style="color:var(--text-muted);margin:0 var(--sp-2)">·</span>
+          <a href="#connect" style="color:var(--accent);font-size:var(--text-xs);text-decoration:none">Set in Connect → Providers</a>
+        </div>`;
+
     return html`
       <div class="section-block">
         <div class="section-header">Agent Configuration</div>
+
+        <p class="hint">Provider, model, and API key are configured in <a href="#connect">Connect → Providers</a>.</p>
+
+        ${activeModelLine}
 
         <div class="form-group">
           <label class="form-label">Agent Name</label>
@@ -1019,19 +1183,6 @@ export class SettingsView extends LitElement {
             .value=${cfg.name}
             @input=${(e: InputEvent) => {
               this.agentConfig = { ...cfg, name: (e.target as HTMLInputElement).value };
-            }}
-          />
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Model</label>
-          <input
-            class="form-input"
-            type="text"
-            .value=${cfg.model}
-            placeholder="e.g. claude-sonnet-4-20250514"
-            @input=${(e: InputEvent) => {
-              this.agentConfig = { ...cfg, model: (e.target as HTMLInputElement).value };
             }}
           />
         </div>
@@ -1252,8 +1403,9 @@ export class SettingsView extends LitElement {
               <!-- Protection toggles -->
               <div class="sec-h">Protections</div>
               <div class="sub-card">
-                ${sec.protections.map(
-                  (p) => html`
+                ${sec.protections.map((p) => {
+                  const isSsrf = p.key.toLowerCase().includes('ssrf');
+                  return html`
                     <div class="toggle-row">
                       <div class="toggle-info">
                         <div class="toggle-name">${p.name}</div>
@@ -1261,21 +1413,27 @@ export class SettingsView extends LitElement {
                           ? html`<div class="toggle-desc">${p.description}</div>`
                           : nothing}
                       </div>
-                      <label class="switch">
-                        <input
-                          type="checkbox"
-                          .checked=${p.enabled}
-                          @change=${(e: Event) =>
-                            this._toggleProtection(
-                              p.key,
-                              (e.target as HTMLInputElement).checked,
-                            )}
-                        />
-                        <span class="slider"></span>
-                      </label>
+                      ${isSsrf
+                        ? html`<span
+                            class="protection-badge"
+                            title="SSRF protection is enforced at the code level and cannot be disabled at runtime."
+                            aria-label="SSRF protection is enforced at the code level and cannot be disabled at runtime."
+                          >Always on (enforced)</span>`
+                        : html`<label class="switch">
+                            <input
+                              type="checkbox"
+                              .checked=${p.enabled}
+                              @change=${(e: Event) =>
+                                this._toggleProtection(
+                                  p.key,
+                                  (e.target as HTMLInputElement).checked,
+                                )}
+                            />
+                            <span class="slider"></span>
+                          </label>`}
                     </div>
-                  `,
-                )}
+                  `;
+                })}
               </div>
             `
           : html`<div class="status-msg">Loading security status...</div>`}
@@ -1489,20 +1647,34 @@ export class SettingsView extends LitElement {
 
     return html`
       <div class="section-block">
-        <div class="section-header">System Configuration</div>
+        <div class="section-header">Active Profile</div>
+
+        <div class="profile-summary">
+          <div>
+            <span class="label">Active persona:</span>
+            <span>${this.activePresetName ?? '—'}</span>
+          </div>
+          <div>
+            <span class="label">Active toolset:</span>
+            <span>${this.activeToolsetName ?? '—'}</span>
+          </div>
+        </div>
 
         ${entries.length > 0
           ? html`
-              <div class="sub-card">
-                ${entries.map(
-                  ([k, v]) => html`
-                    <div class="kv">
-                      <span class="kv-k">${k}</span>
-                      <span class="kv-v">${v}</span>
-                    </div>
-                  `,
-                )}
-              </div>
+              <details class="raw-config-disclosure">
+                <summary>Show raw config</summary>
+                <div class="sub-card" style="margin-top:var(--sp-2)">
+                  ${entries.map(
+                    ([k, v]) => html`
+                      <div class="kv">
+                        <span class="kv-k">${k}</span>
+                        <span class="kv-v">${v}</span>
+                      </div>
+                    `,
+                  )}
+                </div>
+              </details>
             `
           : html`<div class="status-msg" style="color:var(--text-muted)">
               No system configuration available.
@@ -1761,6 +1933,26 @@ export class SettingsView extends LitElement {
     const successRate = stats && stats.total > 0
       ? ((stats.success / stats.total) * 100).toFixed(1)
       : '0.0';
+
+    // #229: Empty state — when the ledger is unpopulated, show a CTA that
+    // points the user toward generating tool-call traffic (i.e. start a chat
+    // with tools enabled). Without this, the tab renders four "0" cards plus
+    // a "No per-tool data yet" line, which reads as broken to first-run users.
+    if (stats && stats.total === 0 && this.feedbackEntries.length === 0) {
+      return html`
+        <div class="section-block">
+          <div class="section-header">Feedback Ledger</div>
+          <crowclaw-empty
+            icon="feedback"
+            title="No tool calls recorded yet"
+            description="The feedback ledger fills as the agent invokes tools. Start a chat that asks for web search, file ops, or any other tool to populate this view."
+            cta-label="Start a chat"
+            cta-event="cc-empty-go-chat"
+            @cc-empty-go-chat=${this._navigateToChat}
+          ></crowclaw-empty>
+        </div>
+      `;
+    }
 
     return html`
       <div class="section-block">

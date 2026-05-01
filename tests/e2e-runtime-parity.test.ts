@@ -518,10 +518,12 @@ describe('E2E runtime: scheduler execution overrides', () => {
   it('scheduler tick does not mutate global configStore', async () => {
     const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
-    // Set a global preset
+    // Set a global preset. Issue #217: the hardcoded `agentPresets` registry
+    // is empty, so the preset is supplied inline (role/goal). The route
+    // stores `name` verbatim regardless of whether it's a built-in entry.
     await runtime.fetch(
       json('http://localhost/api/agent/preset', {
-        name: 'coding-assistant',
+        name: 'custom-coder',
         role: 'Coder',
         goal: 'Write code',
       }),
@@ -546,7 +548,7 @@ describe('E2E runtime: scheduler execution overrides', () => {
     // Global config should be unchanged
     const snapshot = await runtime.fetch(new Request('http://localhost/api/config/snapshot'));
     const config = await snapshot.json() as { activePreset: string | null };
-    expect(config.activePreset).toBe('coding-assistant');
+    expect(config.activePreset).toBe('custom-coder');
   });
 
   it('multiple scheduler jobs run independently without state leakage', async () => {
@@ -583,6 +585,10 @@ describe('E2E runtime: rich scheduler job creation', () => {
   it('creates scheduler job with all rich fields via HTTP', async () => {
     const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
 
+    // Issue #217: `agentPreset` on a job is now an opaque label — there is
+    // no built-in registry to resolve it against. The job round-trips the
+    // string through save/list intact regardless of whether the name maps
+    // to anything.
     const res = await runtime.fetch(
       json('http://localhost/api/scheduler/jobs', {
         id: 'rich-job',
@@ -590,7 +596,7 @@ describe('E2E runtime: rich scheduler job creation', () => {
         task: 'generate daily briefing',
         skillSlugs: ['git-commit-workflow', 'deploy-vercel'],
         toolsetPreset: 'minimal',
-        agentPreset: 'coding-assistant',
+        agentPreset: 'custom-coder',
         model: 'gpt-4o-mini',
         maxRuns: 10,
         timeoutMs: 30000,
@@ -613,7 +619,7 @@ describe('E2E runtime: rich scheduler job creation', () => {
     expect(job.task).toBe('generate daily briefing');
     expect(job.skillSlugs).toEqual(['git-commit-workflow', 'deploy-vercel']);
     expect(job.toolsetPreset).toBe('minimal');
-    expect(job.agentPreset).toBe('coding-assistant');
+    expect(job.agentPreset).toBe('custom-coder');
     expect(job.model).toBe('gpt-4o-mini');
     expect(job.maxRuns).toBe(10);
     expect(job.timeoutMs).toBe(30000);
@@ -633,7 +639,7 @@ describe('E2E runtime: rich scheduler job creation', () => {
     expect(found).toBeDefined();
     expect(found!.skillSlugs).toEqual(['git-commit-workflow', 'deploy-vercel']);
     expect(found!.toolsetPreset).toBe('minimal');
-    expect(found!.agentPreset).toBe('coding-assistant');
+    expect(found!.agentPreset).toBe('custom-coder');
     expect(found!.model).toBe('gpt-4o-mini');
     expect(found!.maxRuns).toBe(10);
   });
@@ -688,21 +694,25 @@ describe('E2E runtime: scheduler tick with overrides', () => {
     const schedulerStore = new InMemorySchedulerStore();
     const runtime = createNodeRuntime({ schedulerStore });
 
-    // Set global preset
+    // Set global preset. Issue #217: hardcoded `agentPresets` registry is
+    // empty — the route accepts any name with inline role/goal and stores
+    // the name verbatim.
     await runtime.fetch(
       json('http://localhost/api/agent/preset', {
-        name: 'research-agent',
+        name: 'custom-researcher',
         role: 'Researcher',
         goal: 'Find info',
       }),
     );
 
-    // Create job with different preset, force due
+    // Create job with different preset override label (just a string —
+    // resolution against `agentPresets` is a no-op since the registry is
+    // empty, but the job-level override is still recorded on the job).
     const job = createScheduledAgentJob({
       id: 'override-job',
       schedule: 'every:1m',
       task: 'run security scan',
-      agentPreset: 'security-auditor',
+      agentPreset: 'custom-auditor',
       skillSlugs: ['security-audit'],
     });
     job.nextRunAt = new Date(Date.now() - 60_000).toISOString();
@@ -723,7 +733,7 @@ describe('E2E runtime: scheduler tick with overrides', () => {
     // Global config unchanged
     const snapshot = await runtime.fetch(new Request('http://localhost/api/config/snapshot'));
     const config = await snapshot.json() as { activePreset: string | null };
-    expect(config.activePreset).toBe('research-agent');
+    expect(config.activePreset).toBe('custom-researcher');
   });
 });
 

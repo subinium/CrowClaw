@@ -12,6 +12,7 @@ import {
 } from '../lib/shared-styles.js';
 import { api } from '../lib/api.js';
 import { showToast } from '../components/toast.js';
+import '../components/toggle-switch.js';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -21,7 +22,7 @@ interface Preset {
   id: string;
   name: string;
   description: string;
-  type: 'agent' | 'toolset' | 'mcp' | 'config';
+  type: 'persona' | 'toolset' | 'config';
   active?: boolean;
 }
 
@@ -29,10 +30,25 @@ interface Preset {
 interface PresetsResponse {
   agents: Array<{ name: string; role?: string; goal?: string; backstory?: string }>;
   toolsets: Array<{ name: string; description?: string; toolNames?: string[] }>;
-  mcp: Array<{ name: string; description?: string }>;
   activeAgent?: string | null;
   activeToolset?: string | null;
-  activeMcp?: string | null;
+}
+
+/** Raw shape returned by GET /api/personas (file-backed PersonaRegistry). */
+interface PersonasResponse {
+  personas: Array<{ name: string; active: boolean }>;
+}
+
+/** Raw shape returned by GET /api/tools. Each entry now exposes `disabled`. */
+interface ToolEntry {
+  name: string;
+  description: string;
+  disabled: boolean;
+}
+
+interface ToolsResponse {
+  tools: ToolEntry[];
+  count?: number;
 }
 
 /** Raw shape returned by GET /api/config-presets/list */
@@ -63,7 +79,7 @@ interface SkillsResponse {
   skills: BackendSkill[];
 }
 
-type IdentityTab = 'personas' | 'toolsets' | 'mcp';
+type IdentityTab = 'personas' | 'toolsets';
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
@@ -300,10 +316,14 @@ export class AgentView extends LitElement {
 
   // Identity
   @state() private identityTab: IdentityTab = 'personas';
-  @state() private presetAgents: Preset[] = [];
+  @state() private personas: Preset[] = [];
+  @state() private personasLoading = true;
   @state() private presetToolsets: Preset[] = [];
-  @state() private presetMcp: Preset[] = [];
   @state() private presetsLoading = true;
+
+  // Per-tool overrides (Issue #218)
+  @state() private tools: ToolEntry[] = [];
+  @state() private toolsLoading = true;
 
   // Skills
   @state() private skills: Skill[] = [];
@@ -332,6 +352,8 @@ export class AgentView extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this._fetchPresets();
+    this._fetchPersonas();
+    this._fetchTools();
     this._fetchSkills();
   }
 
@@ -345,30 +367,14 @@ export class AgentView extends LitElement {
         api<PresetsResponse>('/api/presets'),
         api<ConfigPresetsResponse>('/api/config-presets').catch(() => ({ presets: [], active: null } as ConfigPresetsResponse)),
       ]);
-      const activeAgent = data.activeAgent ?? null;
       const activeToolset = data.activeToolset ?? null;
-      const activeMcp = data.activeMcp ?? null;
 
-      this.presetAgents = (data.agents ?? []).map((a) => ({
-        id: a.name,
-        name: a.name,
-        description: [a.role, a.goal].filter(Boolean).join(' — ') || 'No description',
-        type: 'agent',
-        active: a.name === activeAgent,
-      }));
       this.presetToolsets = (data.toolsets ?? []).map((t) => ({
         id: t.name,
         name: t.name,
         description: t.description ?? `${t.toolNames?.length ?? 0} tools`,
         type: 'toolset',
         active: t.name === activeToolset,
-      }));
-      this.presetMcp = (data.mcp ?? []).map((m) => ({
-        id: m.name,
-        name: m.name,
-        description: m.description ?? 'MCP server preset',
-        type: 'mcp',
-        active: m.name === activeMcp,
       }));
 
       // Config presets are bundled MCP+Skill+Tool configurations from the dedicated endpoint
@@ -386,6 +392,66 @@ export class AgentView extends LitElement {
     } finally {
       this.presetsLoading = false;
       this.configPresetsLoading = false;
+    }
+  }
+
+  /**
+   * Issue #217: Personas tab now reads from the file-backed PersonaRegistry
+   * (`/api/personas`) instead of the removed hardcoded `agentPresets`.
+   */
+  private async _fetchPersonas() {
+    this.personasLoading = true;
+    try {
+      const data = await api<PersonasResponse>('/api/personas');
+      this.personas = (data.personas ?? []).map((p) => ({
+        id: p.name,
+        name: p.name,
+        description: p.active ? 'Currently active persona' : 'Registered persona',
+        type: 'persona',
+        active: p.active,
+      }));
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        showToast('Failed to fetch personas', 'error');
+      }
+    } finally {
+      this.personasLoading = false;
+    }
+  }
+
+  /**
+   * Issue #218: per-tool override list. Fetches the configured tool registry
+   * with each entry's current `disabled` flag.
+   */
+  private async _fetchTools() {
+    this.toolsLoading = true;
+    try {
+      const data = await api<ToolsResponse>('/api/tools');
+      this.tools = (data.tools ?? []).map((t) => ({
+        name: t.name,
+        description: t.description ?? '',
+        disabled: Boolean(t.disabled),
+      }));
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        showToast('Failed to fetch tools', 'error');
+      }
+    } finally {
+      this.toolsLoading = false;
+    }
+  }
+
+  private async _toggleTool(tool: ToolEntry, nextDisabled: boolean) {
+    try {
+      await api(`/api/tools/${encodeURIComponent(tool.name)}/toggle`, {
+        method: 'POST',
+        body: JSON.stringify({ disabled: nextDisabled }),
+      });
+      await this._fetchTools();
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        showToast(`Failed to toggle ${tool.name}`, 'error');
+      }
     }
   }
 
@@ -513,7 +579,7 @@ export class AgentView extends LitElement {
 
   private async _activatePreset(preset: Preset) {
     const endpointMap: Partial<Record<Preset['type'], string>> = {
-      agent: '/api/agent/preset',
+      persona: '/api/persona/switch',
       toolset: '/api/toolset/select',
       config: '/api/config-presets/switch',
     };
@@ -528,7 +594,8 @@ export class AgentView extends LitElement {
         method: 'POST',
         body: JSON.stringify({ name: preset.name }),
       });
-      await this._fetchPresets();
+      // Refresh both lists since persona/toolset/config affect different fetchers.
+      await Promise.all([this._fetchPresets(), this._fetchPersonas()]);
     } catch (error: unknown) {
       if (error instanceof Error) {
         showToast('Failed to activate preset', 'error');
@@ -616,17 +683,8 @@ export class AgentView extends LitElement {
     );
   }
 
-  private get _identityPresets(): Preset[] {
-    switch (this.identityTab) {
-      case 'personas':
-        return this.presetAgents;
-      case 'toolsets':
-        return this.presetToolsets;
-      case 'mcp':
-        return this.presetMcp;
-      default:
-        return [];
-    }
+  private get _identityLoading(): boolean {
+    return this.identityTab === 'personas' ? this.personasLoading : this.presetsLoading;
   }
 
   /* ---- Render ---- */
@@ -651,34 +709,105 @@ export class AgentView extends LitElement {
     return html`
       <div class="section-block">
         <div class="section-header">Identity</div>
-        <p style="font-size:var(--text-xs);color:var(--text-muted);margin-bottom:var(--sp-3)">Manage agent personas, toolsets, and MCP server configurations.</p>
+        <p style="font-size:var(--text-xs);color:var(--text-muted);margin-bottom:var(--sp-3)">Manage agent personas and toolset overrides. (MCP servers in Connect.)</p>
         <div class="tabs">
           <div class="tab ${this.identityTab === 'personas' ? 'active' : ''}"
                @click=${() => { this.identityTab = 'personas'; }}>Personas</div>
           <div class="tab ${this.identityTab === 'toolsets' ? 'active' : ''}"
                @click=${() => { this.identityTab = 'toolsets'; }}>Toolsets</div>
-          <div class="tab ${this.identityTab === 'mcp' ? 'active' : ''}"
-               @click=${() => { this.identityTab = 'mcp'; }}>MCP</div>
         </div>
-        ${this.presetsLoading
-          ? html`<div class="loading">Loading presets</div>`
-          : this._identityPresets.length === 0
-            ? html`<div class="empty">
-                <div class="empty-title">No ${this.identityTab}</div>
-                <div class="empty-subtitle">No ${this.identityTab} presets configured yet.</div>
-              </div>`
-            : html`
-                <div class="grid">
-                  ${this._identityPresets.map((p) => this._renderPresetCard(p))}
-                </div>
-              `}
+        ${this._renderIdentityTabContent()}
+        <p class="hint" style="font-size:var(--text-xs);color:var(--text-muted);margin-top:var(--sp-4)">MCP servers are managed in <a href="#connect">Connect → MCP Servers</a>.</p>
+      </div>
+    `;
+  }
+
+  private _renderIdentityTabContent() {
+    if (this._identityLoading) {
+      return html`<div class="loading">Loading ${this.identityTab}</div>`;
+    }
+
+    if (this.identityTab === 'personas') {
+      return this._renderPersonasTab();
+    }
+
+    return this._renderToolsetsTab();
+  }
+
+  /** Issue #217: Personas tab — file-backed PersonaRegistry only. */
+  private _renderPersonasTab() {
+    if (this.personas.length === 0) {
+      return html`<crowclaw-empty
+        icon="memory"
+        title="No personas yet"
+        description="Create a persona file under your config directory to get started."
+        cta-label="View documentation"
+        cta-href="https://github.com/subinium/CrowClaw#personas"
+      ></crowclaw-empty>`;
+    }
+    return html`
+      <div class="grid">
+        ${this.personas.map((p) => this._renderPresetCard(p))}
+      </div>
+    `;
+  }
+
+  /** Issue #218: Toolsets tab — bundle activation + per-tool overrides. */
+  private _renderToolsetsTab() {
+    return html`
+      ${this.presetToolsets.length === 0
+        ? html`<div class="empty">
+            <div class="empty-title">No toolsets</div>
+            <div class="empty-subtitle">No toolset bundles configured yet.</div>
+          </div>`
+        : html`
+            <div class="grid">
+              ${this.presetToolsets.map((p) => this._renderPresetCard(p))}
+            </div>
+          `}
+      ${this._renderToolOverrides()}
+    `;
+  }
+
+  private _renderToolOverrides() {
+    return html`
+      <div class="section-header" style="margin-top:var(--sp-5)">Individual tool overrides</div>
+      ${this.toolsLoading
+        ? html`<div class="loading">Loading tools</div>`
+        : this.tools.length === 0
+          ? html`<div class="empty">
+              <div class="empty-title">No tools registered</div>
+              <div class="empty-subtitle">Activate a toolset or config preset to populate the tool registry.</div>
+            </div>`
+          : html`
+              <div class="grid">
+                ${this.tools.map((tool) => this._renderToolRow(tool))}
+              </div>
+            `}
+    `;
+  }
+
+  private _renderToolRow(tool: ToolEntry) {
+    const enabled = !tool.disabled;
+    return html`
+      <div class="card">
+        <div class="card-name">
+          ${tool.name}
+          ${enabled ? nothing : html`<span class="tag">Disabled</span>`}
+        </div>
+        <div class="card-desc">${tool.description || 'No description'}</div>
+        <div class="card-footer">
+          <crowclaw-toggle
+            .checked=${enabled}
+            aria-label="Toggle tool ${tool.name}"
+            @change=${(e: CustomEvent<boolean>) => this._toggleTool(tool, !e.detail)}
+          ></crowclaw-toggle>
+        </div>
       </div>
     `;
   }
 
   private _renderPresetCard(preset: Preset) {
-    // MCP presets have no activation endpoint yet — render as informational only.
-    const canActivate = preset.type === 'agent' || preset.type === 'toolset';
     return html`
       <div class="card">
         <div class="card-name">
@@ -686,15 +815,11 @@ export class AgentView extends LitElement {
           ${preset.active ? html`<span class="badge-active">Active</span>` : nothing}
         </div>
         <div class="card-desc">${preset.description || 'No description'}</div>
-        ${canActivate
-          ? html`
-              <div class="card-footer">
-                ${preset.active
-                  ? html`<span class="tag ok">Activated</span>`
-                  : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
-              </div>
-            `
-          : nothing}
+        <div class="card-footer">
+          ${preset.active
+            ? html`<span class="tag ok">Activated</span>`
+            : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
+        </div>
       </div>
     `;
   }
