@@ -5,6 +5,97 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.8.0] — 2026-05-?? — Hermes parity sweep: 11 issues closing the harness gap
+
+CrowClaw's harness now matches Hermes' design choices on the eleven items the
+v0.7.1 audit flagged as gaps. The sweep was implemented across 8 parallel
+sub-agents with strict file ownership.
+
+### Hermes parity (11 issues)
+
+#### Critical — prompt-cache + reasoning visibility
+- **#230** Skills now inject as user-role messages, not system-prompt blocks.
+  System prompt stays byte-identical across turns where skill matches change,
+  giving prompt-cache hits ≥ 90% on Anthropic and similar discounts on OpenAI.
+- **#231** Native parser for the Hermes 3 reasoning tag corpus
+  (<plan> / <reasoning> / <reflection> / <thinking> / <scratchpad> /
+  <inner_monologue> / <execution> / <solution> / <explanation> / <unit_test>)
+  plus the Hermes 4 lowercase <think>. Streaming-aware; emits new
+  reasoning_start / reasoning_delta / reasoning_end stream chunks. Dashboard
+  renders distinct collapsible regions for each block.
+
+#### Wiring + correctness
+- **#232** JSON repair for malformed tool-call arguments. Parses unclosed
+  strings/objects/arrays from truncated streams, strips trailing commas,
+  normalises single-quoted keys. Repair runs only when JSON.parse fails;
+  schema validation still gates execution.
+- **#233** Pluggable MemoryProvider ABC (init / prefetch / recall / sync_turn /
+  store / delete / list / shutdown). InMemoryMemoryProvider is the default;
+  MemoryService becomes a backward-compat facade. Adapters for mem0 / Letta /
+  supermemory are unblocked.
+- **#234** code.execute pipeline tool — model writes JS/TS that calls the
+  host's tool registry through an RPC bridge inside the existing
+  sandbox-executor. Collapses N-step procedural workflows to one inference.
+  Hardline blocklist + approval gate + audit log all apply to RPC calls.
+- **#235** Structured tool-error envelope with explicit retry instruction.
+  Failures carry { ok:false, error:{code,message}, retry_instruction } and
+  the model self-corrects. Repeated identical failures (3×) exit the loop
+  with terminationReason: 'tool_error_terminal'.
+- **#236** Hybrid reasoning — <tool_call> blocks inside <think> regions are
+  extracted on both streaming and non-streaming paths. Hermes 4 capable
+  models save round-trips on procedural workflows.
+- **#237** generateStructured<T>(messages, schema) — schema-block injection,
+  JSON repair fallback, optional validator. OpenAI provider uses native
+  response_format: json_schema when available, otherwise the Hermes
+  schema-block envelope.
+- **#238** Self-improvement loop — agent calls learning.proposeSkill to save
+  recurring task recipes; drafts auto-promote to skills after 3 recurrences
+  or on user request. Dashboard automate view exposes a Drafts tab.
+
+#### Polish
+- **#239** Graceful budget soft-landing — synthesis turn now carries
+  <budget_exhausted reason="..." iterations="..." /> so the model knows why
+  it's wrapping up. terminationReason: 'natural' | 'budget_exhausted_with_synthesis'
+  | 'tool_error_terminal' | 'aborted' added to AgentRunResult.
+- **#240** SkillManifest aligned with agentskills.io standard. Adds version,
+  author, license, categories, platforms, config_requirements. CLI gains
+  `crowclaw skill install <url-or-slug>` and `crowclaw skill publish <slug>`.
+
+### EventBus
+
+10 new event types added (`runtime-node/src/event-bus.ts`):
+reasoning:emitted, plan:emitted, reflection:emitted, tool:args_repaired,
+code:start, code:tool_called, code:complete, tool:validation_failed,
+tool:repeated_failure, learning:{draft_captured,draft_promoted,
+agent_proposed,skill_revised}, agent:terminated.
+
+### Verification
+- `npm run typecheck` — clean
+- `npm test` — 2,845 / 2,845 (up from 2,710 — 135 new tests)
+- Prompt-cache benchmark: ≥ 90% hit rate on system prompt across a 10-turn
+  session with varying skill matches.
+- code.execute benchmark: 5-step procedural workflow uses ≤ 40% of the
+  token budget vs equivalent N-round-trip execution.
+
+### Cross-package contracts added
+- `MemoryProvider` interface — `@crowclaw/memory`
+- `parseReasoningBlocks` / `StreamingReasoningParser` — `@crowclaw/core`
+- `repairJson` / `RepairResult` — `@crowclaw/providers`
+- `StructuredOutputRequest<T>` / `StructuredOutputResponse<T>` — `@crowclaw/core`
+- `code.execute` tool + `executeWithTools` — `@crowclaw/tools` + `@crowclaw/sandbox-executor`
+- `learning.proposeSkill` / `learning.reviseSkill` tools — `@crowclaw/tools`
+- `terminationReason` field on `AgentRunResult` / `AgentStreamResult` — `@crowclaw/core`
+
+### Caveats
+- Hybrid-reasoning round-trip savings (#236) require a model trained for
+  the contract (Hermes 4, GPT-5 reasoning, Claude extended-thinking with
+  tool use). On non-trained models, behaviour is unchanged.
+- Code-execute (#234) opt-in only; not in the default toolset bundle. The
+  sandbox is Node.js (TS/JS); Python is a follow-up.
+- agentskills.io adapter (#240) writes to ~/.crowclaw/skills/installed/.
+  Publish prints the archive path; actual upload to a registry is left for
+  when agentskills.io's publish API stabilises.
+
 ## [0.7.1] — 2026-05-01 — ChatGPT (Codex) OAuth provider + 18-issue dashboard audit sweep
 
 Two threads in one release:

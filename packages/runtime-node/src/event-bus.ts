@@ -39,7 +39,42 @@ export type RuntimeEventType =
   // dashboard's MemoryStream component can show capture/recall in real time
   // without modifying every gateway/scheduler dispatch handler.
   | 'memory:captured'
-  | 'memory:recalled';
+  | 'memory:recalled'
+  // v0.8.0 (#231) — reasoning-block extraction. `reasoning:emitted` fires when
+  // a `<plan>` / `<reflection>` / `<thinking>` block is parsed from the model
+  // output; carries the tag name and text. Lets the dashboard render the
+  // model's reasoning lifecycle as distinct surfaces from regular assistant text.
+  | 'reasoning:emitted'
+  | 'plan:emitted'
+  | 'reflection:emitted'
+  // v0.8.0 (#232) — JSON repair telemetry. Fires when malformed tool-call args
+  // are recovered by the repair pass. Lets observability track repair frequency
+  // and surface chronically-malformed model behaviour.
+  | 'tool:args_repaired'
+  // v0.8.0 (#234) — code.execute pipeline tool lifecycle. `code:start` /
+  // `code:tool_called` / `code:complete` mirror the existing `tool:*` events
+  // but at sandbox granularity so the dashboard's code-execute trace can show
+  // sub-tools called from within a single sandboxed run.
+  | 'code:start'
+  | 'code:tool_called'
+  | 'code:complete'
+  // v0.8.0 (#235) — structured tool-error envelope. `tool:validation_failed`
+  // fires when args fail input-schema validation (no tool execution attempted).
+  // `tool:repeated_failure` fires when the same (toolName, errorCode) pair has
+  // failed three iterations in a row, signalling the harness exit path.
+  | 'tool:validation_failed'
+  | 'tool:repeated_failure'
+  // v0.8.0 (#238) — self-improvement loop. Skill drafts captured / promoted
+  // / agent-proposed / revised lifecycle so the dashboard's drafts tab can
+  // live-update.
+  | 'learning:draft_captured'
+  | 'learning:draft_promoted'
+  | 'learning:agent_proposed'
+  | 'learning:skill_revised'
+  // v0.8.0 (#239) — agent termination reason discriminator. Fires once per
+  // `AgentLoop.run` exit with `{ reason: 'natural'|'budget_exhausted_with_synthesis'|'tool_error_terminal'|'aborted' }`
+  // so observability can distinguish "model stopped" from "harness stopped".
+  | 'agent:terminated';
 
 export interface RuntimeEvent {
   type: RuntimeEventType;

@@ -5,11 +5,26 @@ import type { ProviderRequest, ProviderResponse } from './index.js';
 // ---------------------------------------------------------------------------
 
 export interface StreamChunk {
-  type: 'text' | 'tool_use_start' | 'tool_use_delta' | 'tool_use_end' | 'done' | 'error';
+  type:
+    | 'text'
+    | 'tool_use_start'
+    | 'tool_use_delta'
+    | 'tool_use_end'
+    | 'reasoning_start'
+    | 'reasoning_delta'
+    | 'reasoning_end'
+    | 'done'
+    | 'error';
   text?: string;
   toolName?: string;
   toolInput?: string;
   toolCallId?: string;
+  /**
+   * v0.8.0 (#231): tag name for reasoning_start / reasoning_end (e.g. 'plan',
+   * 'reasoning', 'reflection', 'thinking', 'think'). Lower-cased — Hermes 3 and
+   * Hermes 4 mix casing and the parser normalises both forms.
+   */
+  reasoningTag?: string;
   error?: string;
 }
 
@@ -54,6 +69,14 @@ export async function collectStream(stream: AsyncIterable<StreamChunk>): Promise
           }
           currentTool = null;
         }
+        break;
+      case 'reasoning_start':
+      case 'reasoning_delta':
+      case 'reasoning_end':
+        // v0.8.0 (#231): reasoning chunks are routed by upstream consumers
+        // (agent loop / runtime SSE bridge) — collectStream just discards
+        // them so the final `assistantMessage` stays clean of <plan>/<think>
+        // text the user shouldn't see in a turn-style response.
         break;
       case 'error':
         throw new Error(chunk.error ?? 'Stream error');

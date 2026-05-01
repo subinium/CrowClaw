@@ -5,7 +5,7 @@ import {
   SKIP_REDACTION_FLAG,
   cosineSimilarity,
   type ManagerMemoryRecord,
-  type MemoryProvider,
+  type LegacyMemoryProvider as MemoryProvider,
 } from '@crowclaw/memory';
 
 /**

@@ -16,8 +16,16 @@ import '../components/checkpoint-panel.js';
 // mounted in any view template prior to this fix.
 import '../components/tool-call-trace.js';
 import '../components/memory-stream.js';
+// v0.8.0 (#231) — register `<crowclaw-reasoning-block>` so chat-view can mount
+// it inline above assistant content (both persisted and live-streaming).
+import '../components/reasoning-block.js';
+// v0.8.0 #234 — register the code-execute trace so chat-view can mount it
+// inline whenever a `code.execute` tool message appears. The only other
+// change in this file is the sibling-branch in `_renderMessage` below.
+import '../components/code-execute-trace.js';
 import type { ForkParentInfo } from '../components/fork-modal.js';
 import type { ToolTraceEntry } from '../components/tool-call-trace.js';
+import type { CodeExecuteTraceData } from '../components/code-execute-trace.js';
 import type { MemoryStreamEvent } from '../components/memory-stream.js';
 
 interface SessionInfo {
@@ -53,6 +61,20 @@ interface ChatMessage {
    * on string-matching the content.
    */
   kind?: 'steer' | 'compact' | 'restore' | 'checkpoint' | 'abort' | 'fork' | 'error' | 'info';
+  /**
+   * v0.8.0 (#231): Hermes-style reasoning blocks parsed from the model
+   * output (e.g. `<plan>`, `<reasoning>`, `<reflection>`, `<thinking>`).
+   * Rendered inline above the assistant text via `<crowclaw-reasoning-block>`.
+   */
+  reasoningBlocks?: Array<{ tag: string; content: string }>;
+}
+
+/** v0.8.0 (#231): live reasoning state during a single streaming turn. */
+interface LiveReasoningBlock {
+  tag: string;
+  content: string;
+  /** True until the matching `reasoning-end` arrives. */
+  open: boolean;
 }
 
 interface ToolStep {
@@ -1158,6 +1180,13 @@ export class ChatView extends LitElement {
   @state() private searchQuery = '';
   @state() private streaming = false;
   @state() private streamText = '';
+  /**
+   * v0.8.0 (#231): live reasoning blocks for the in-flight streaming turn.
+   * Driven by `reasoning-start` / `reasoning-delta` / `reasoning-end` SSE
+   * events; flushed onto the persisted assistant message at `onDone` so the
+   * blocks survive past the streaming surface.
+   */
+  @state() private streamReasoning: LiveReasoningBlock[] = [];
   @state() private toolSteps: ToolStep[] = [];
   @state() private traceOpen = false;
   @state() private traceData = { iteration: 0, tool: '--', tokens: 0, elapsed: 0, maxIterations: 0 };
@@ -1483,6 +1512,7 @@ export class ChatView extends LitElement {
       this._streamController?.abort();
       this.streaming = false;
       this.streamText = '';
+      this.streamReasoning = [];
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Abort failed';
       this.messages = [...this.messages, { role: 'system', kind: 'error', content: `Abort error: ${msg}` }];
@@ -1728,6 +1758,7 @@ export class ChatView extends LitElement {
     this.streaming = true;
     this.thinking = true;
     this.streamText = '';
+    this.streamReasoning = [];
     this.toolSteps = [];
     this.traceToolHistory = [];
     this._streamStart = Date.now();
@@ -1776,21 +1807,54 @@ export class ChatView extends LitElement {
       },
       onIterationStart: (iteration) => {
         this.traceData = { ...this.traceData, iteration, maxIterations: Math.max(this.traceData.maxIterations, iteration + 1) };
-        if (this.streamText.trim()) {
-          this.messages = [...this.messages, { role: 'assistant', content: this.streamText }];
+        if (this.streamText.trim() || this.streamReasoning.length > 0) {
+          this.messages = [...this.messages, { role: 'assistant', content: this.streamText, reasoningBlocks: this._snapshotReasoning() }];
           this.streamText = '';
+          this.streamReasoning = [];
         }
         if (iteration > 0) {
           this.messages = [...this.messages, { role: 'iteration', content: `Iteration ${iteration + 1}` }];
         }
       },
+      // v0.8.0 (#231): live reasoning lifecycle. Each block opens with a
+      // `reasoning-start`, accumulates content via `reasoning-delta`, and
+      // closes with `reasoning-end`. Deltas attach to the most-recently-
+      // opened block; nested reasoning is impossible per the Hermes flat
+      // contract, so a missing `open` block from a stray delta is a no-op.
+      onReasoningStart: (tag) => {
+        this.thinking = false;
+        this.streamReasoning = [...this.streamReasoning, { tag, content: '', open: true }];
+      },
+      onReasoningDelta: (content) => {
+        const idx = this._lastOpenReasoningIdx();
+        if (idx < 0) return;
+        const next = [...this.streamReasoning];
+        next[idx] = { ...next[idx], content: next[idx].content + content };
+        this.streamReasoning = next;
+      },
+      onReasoningEnd: (_tag) => {
+        const idx = this._lastOpenReasoningIdx();
+        if (idx < 0) return;
+        const next = [...this.streamReasoning];
+        next[idx] = { ...next[idx], open: false };
+        this.streamReasoning = next;
+      },
       onDone: () => {
         this.thinking = false;
-        if (this.streamText.trim()) {
-          this.messages = [...this.messages, { role: 'assistant', content: this.streamText, createdAt: new Date().toISOString() }];
+        if (this.streamText.trim() || this.streamReasoning.length > 0) {
+          this.messages = [
+            ...this.messages,
+            {
+              role: 'assistant',
+              content: this.streamText,
+              createdAt: new Date().toISOString(),
+              reasoningBlocks: this._snapshotReasoning(),
+            },
+          ];
         }
         this.streaming = false;
         this.streamText = '';
+        this.streamReasoning = [];
         this.aborting = false;
         this.traceData = { ...this.traceData, elapsed: Date.now() - this._streamStart };
         this._scrollToBottom();
@@ -1882,6 +1946,28 @@ export class ChatView extends LitElement {
     });
   }
 
+  /**
+   * v0.8.0 (#231): index of the most-recently-opened streaming reasoning
+   * block (still awaiting `reasoning-end`). Returns -1 when none is open.
+   */
+  private _lastOpenReasoningIdx(): number {
+    for (let i = this.streamReasoning.length - 1; i >= 0; i--) {
+      if (this.streamReasoning[i].open) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * v0.8.0 (#231): snapshot the live reasoning state into the persistent
+   * shape stored on the assistant message. Drops the `open` flag — once a
+   * message lands in history every block is treated as final regardless of
+   * whether the matching `reasoning-end` arrived (defensive against a
+   * truncated stream).
+   */
+  private _snapshotReasoning(): Array<{ tag: string; content: string }> {
+    return this.streamReasoning.map((b) => ({ tag: b.tag, content: b.content }));
+  }
+
   private _applyHighlighting() {
     requestAnimationFrame(() => {
       if (this.messagesEl) {
@@ -1963,10 +2049,18 @@ export class ChatView extends LitElement {
                         Thinking...
                       </div>
                     ` : nothing}
-                    ${this.streaming && this.streamText ? html`
+                    ${this.streaming && (this.streamText || this.streamReasoning.length > 0) ? html`
                       <div class="msg assistant streaming">
                         <span class="role-tag">assistant</span>
-                        <div class="md">${unsafeHTML(renderMarkdown(this.streamText))}</div>
+                        ${this.streamReasoning.map((rb) => html`
+                          <crowclaw-reasoning-block
+                            .tag=${rb.tag}
+                            .content=${rb.content}
+                            ?streaming=${rb.open}
+                            collapsed-by-default
+                          ></crowclaw-reasoning-block>
+                        `)}
+                        ${this.streamText ? html`<div class="md">${unsafeHTML(renderMarkdown(this.streamText))}</div>` : nothing}
                         <span class="cursor-blink"></span>
                       </div>
                     ` : nothing}
@@ -2297,6 +2391,36 @@ export class ChatView extends LitElement {
       // TODO: wire from the streamed tool-step events so `args`, `output`,
       //       `durationMs`, and `auditId` come from the runtime instead of
       //       being derived from the persisted history line.
+
+      // v0.8.0 #234 — sibling branch for `code.execute`. Parse the persisted
+      // payload (the tool's output is a JSON-encoded ExecuteWithToolsResult)
+      // and feed it into <crowclaw-code-execute-trace>. On parse failure we
+      // fall through to the regular tool-call-trace rendering so we never
+      // hide the message entirely.
+      if (msg.name === 'code.execute' && typeof msg.content === 'string') {
+        try {
+          const parsed = JSON.parse(msg.content) as Partial<CodeExecuteTraceData>;
+          const data: CodeExecuteTraceData = {
+            language: (parsed.language as 'js' | 'ts' | 'python' | undefined) ?? 'js',
+            codeHash: parsed.codeHash,
+            code: parsed.code,
+            stdout: typeof parsed.stdout === 'string' ? parsed.stdout : '',
+            stderr: typeof parsed.stderr === 'string' ? parsed.stderr : '',
+            toolCalls: Array.isArray(parsed.toolCalls) ? parsed.toolCalls : [],
+            durationMs: typeof parsed.durationMs === 'number' ? parsed.durationMs : 0,
+            ok: typeof parsed.ok === 'boolean' ? parsed.ok : ok,
+            error: parsed.error,
+          };
+          return html`
+            <div class="tool-step">
+              <crowclaw-code-execute-trace .data=${data}></crowclaw-code-execute-trace>
+            </div>
+          `;
+        } catch {
+          // Fall through to the regular trace-call rendering.
+        }
+      }
+
       const traceEntry: ToolTraceEntry = {
         callId: `${msg.name ?? 'tool'}-${index}`,
         toolName: msg.name ?? 'tool',
@@ -2347,12 +2471,29 @@ export class ChatView extends LitElement {
       : renderMarkdown(msg.content);
     const tagLabel = msg.role === 'system' && msg.kind ? msg.kind : msg.role;
 
+    // v0.8.0 (#231): assistant messages may carry parsed reasoning blocks
+    // (`<plan>` / `<reasoning>` / `<reflection>` / `<thinking>` etc.). Mount
+    // them inline ABOVE the regular text so the operator sees the model's
+    // chain of thought without the harness re-injecting it into the prompt.
+    const reasoningBlocks = msg.role === 'assistant' ? msg.reasoningBlocks ?? [] : [];
+
     return html`
       <div class="msg ${roleClass}">
         <span class="role-tag">${tagLabel}${msg.name ? ` / ${msg.name}` : ''}</span>
+        ${reasoningBlocks.length > 0
+          ? reasoningBlocks.map((rb) => html`
+              <crowclaw-reasoning-block
+                .tag=${rb.tag}
+                .content=${rb.content}
+                collapsed-by-default
+              ></crowclaw-reasoning-block>
+            `)
+          : nothing}
         ${msg.role === 'user'
           ? html`${msg.content}`
-          : html`<div class="md">${unsafeHTML(content)}</div>`}
+          : msg.content
+            ? html`<div class="md">${unsafeHTML(content)}</div>`
+            : nothing}
         ${msg.role === 'assistant' && index > 0
           ? html`<button class="btn retry-btn" @click=${() => this._retryMessage(index)}>Retry</button>`
           : nothing}

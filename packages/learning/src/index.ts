@@ -597,3 +597,23 @@ export {
   type ImprovementAction,
   type ImprovementPlan,
 } from './auto-improver.js';
+
+// v0.8.0 (#238) — self-improvement loop
+export {
+  buildAutoCaptureDigest,
+  extractTriggerPhrases,
+  abstractToolSequence,
+  detectSuccessMarker,
+  computeDraftFingerprint,
+  type AutoCaptureDigest,
+} from './auto-capture.js';
+
+export {
+  SkillPromotionEngine,
+  InMemoryPromotionStateStore,
+  type PromotionCriteria,
+  type PromotionEventBus,
+  type PromotionInput,
+  type PromotionStateStore,
+  type SkillPromotionEngineOptions,
+} from './promotion.js';

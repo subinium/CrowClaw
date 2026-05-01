@@ -1,7 +1,18 @@
-import type { ConversationMessage, ProviderAdapter, ProviderRequest, ProviderResponse, ProviderResponseUsage, ToolCall, ToolManifest } from '@crowclaw/core';
+import type { ConversationMessage, ProviderAdapter, ProviderRequest, ProviderResponse, ProviderResponseUsage, StructuredOutputRequest, StructuredOutputResponse, ToolCall, ToolManifest } from '@crowclaw/core';
 import { parseSlashToolCall } from '@crowclaw/core';
 import type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
 import { collectStream } from '@crowclaw/core/streaming';
+// v0.8.0 (#232) — JSON repair for malformed tool-call arguments.
+import { repairJson, type RepairResult } from './json-repair.js';
+// v0.8.0 (#231 / #236) — reasoning-block parser. Wraps streaming text deltas so
+// `<plan>...</plan>` / `<think>...</think>` regions are emitted as distinct
+// chunks, and lifts `<tool_call>...</tool_call>` JSON spans out of reasoning
+// regions so they can flow through the standard tool-call extractor.
+import {
+  parseReasoningBlocks,
+  StreamingReasoningParser,
+  type ReasoningBlock,
+} from '@crowclaw/core/reasoning-blocks';
 import {
   loadManifest,
   findModelEntry,
@@ -52,6 +63,14 @@ export interface OpenAICompatibleConfig {
    * which rejects `stream: false` calls.
    */
   requireStream?: boolean;
+  /**
+   * v0.8.0 (#232): Telemetry hook fired when malformed tool-call arguments are
+   * recovered by the JSON repair pass. The runtime attaches this to forward
+   * `tool:args_repaired` to its EventBus so the dashboard can surface chronic
+   * model misbehaviour. Optional — providers without observability wired in
+   * pay no cost.
+   */
+  onArgsRepaired?: (info: { toolName: string; originalLength: number; repairedLength: number; reason: string }) => void;
 }
 
 export interface AnthropicConfig {
@@ -64,6 +83,8 @@ export interface AnthropicConfig {
   manifestUrl?: string;
   /** Issue #60: Optional manifest cache (in-memory map keyed by URL). */
   manifestCache?: ManifestCache;
+  /** v0.8.0 (#232): see {@link OpenAICompatibleConfig.onArgsRepaired}. */
+  onArgsRepaired?: (info: { toolName: string; originalLength: number; repairedLength: number; reason: string }) => void;
 }
 
 export interface ModelMetadata {
@@ -155,6 +176,8 @@ interface AnthropicContentBlock {
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  /** v0.8.0 (#231): native `thinking` / `redacted_thinking` content payload. */
+  thinking?: string;
 }
 
 interface AnthropicMessagesResponse {
@@ -255,7 +278,54 @@ function buildResponsesApiTools(availableTools: ToolManifest[]): Array<Record<st
   }));
 }
 
-function parseOpenAIToolCalls(toolCalls: OpenAIToolCall[] | undefined, availableTools?: ToolManifest[]): ToolCall[] | undefined {
+/**
+ * v0.8.0 (#232): Repair-aware JSON parse for tool-call arguments. Returns an
+ * empty record on outright failure (preserving the prior behavior of
+ * `JSON.parse` falling back to `{ raw }`), and emits `onRepair` telemetry when
+ * the JSON repair pipeline successfully recovered from a malformed payload.
+ */
+function parseToolCallArgsWithRepair(
+  rawArguments: string,
+  toolName: string,
+  onRepair?: ArgsRepairedCallback,
+): Record<string, unknown> {
+  try {
+    const result = repairJson(rawArguments);
+    emitRepairTelemetry(result, rawArguments, toolName, onRepair);
+    if (result.value && typeof result.value === 'object' && !Array.isArray(result.value)) {
+      return result.value as Record<string, unknown>;
+    }
+    // Repair returned a non-object (e.g. array). Fall back to `{ raw }` so the
+    // tool sees the original payload rather than a coerced shape.
+    return { raw: rawArguments };
+  } catch {
+    return { raw: rawArguments };
+  }
+}
+
+type ArgsRepairedCallback = (info: { toolName: string; originalLength: number; repairedLength: number; reason: string }) => void;
+
+function emitRepairTelemetry(
+  result: RepairResult,
+  rawArguments: string,
+  toolName: string,
+  onRepair?: ArgsRepairedCallback,
+): void {
+  if (!result.repaired || !onRepair) return;
+  try {
+    const repairedLength = JSON.stringify(result.value).length;
+    onRepair({
+      toolName,
+      originalLength: rawArguments.length,
+      repairedLength,
+      reason: result.reason ?? 'reformatted',
+    });
+  } catch {
+    // Never let a broken telemetry hook crash the tool-call parser.
+  }
+}
+
+function parseOpenAIToolCalls(toolCalls: OpenAIToolCall[] | undefined, availableTools?: ToolManifest[], onRepair?: ArgsRepairedCallback): ToolCall[] | undefined {
   if (!toolCalls || toolCalls.length === 0) {
     return undefined;
   }
@@ -277,30 +347,20 @@ function parseOpenAIToolCalls(toolCalls: OpenAIToolCall[] | undefined, available
 
       const name = nameMap.get(sanitizedName) ?? sanitizedName;
       const rawArguments = toolCall.function?.arguments ?? '{}';
-      let input: Record<string, unknown> = {};
-      try {
-        input = JSON.parse(rawArguments) as Record<string, unknown>;
-      } catch {
-        input = { raw: rawArguments };
-      }
+      const input = parseToolCallArgsWithRepair(rawArguments, name, onRepair);
 
       return { name, input } satisfies ToolCall;
     })
     .filter((value): value is ToolCall => Boolean(value));
 }
 
-function parseOpenAIFunctionCall(functionCall: OpenAIFunctionCall | undefined): ToolCall[] | undefined {
+function parseOpenAIFunctionCall(functionCall: OpenAIFunctionCall | undefined, onRepair?: ArgsRepairedCallback): ToolCall[] | undefined {
   if (!functionCall?.name) {
     return undefined;
   }
 
   const rawArguments = functionCall.arguments ?? '{}';
-  let input: Record<string, unknown> = {};
-  try {
-    input = JSON.parse(rawArguments) as Record<string, unknown>;
-  } catch {
-    input = { raw: rawArguments };
-  }
+  const input = parseToolCallArgsWithRepair(rawArguments, functionCall.name, onRepair);
 
   return [{ name: functionCall.name, input }];
 }
@@ -343,6 +403,134 @@ function normalizeOpenAIMessageContent(
     .filter(Boolean);
 
   return parts.length > 0 ? parts.join('\n') : refusal;
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 (#231 / #236) — Reasoning-block streaming/non-streaming helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * #236: scan a complete assistant turn for Hermes-style `<tool_call>` blocks
+ * and return them as ToolCall objects. Used as a FALLBACK only — native
+ * function-call slots (OpenAI tool_calls / Responses function_call) take
+ * precedence. Resolves sanitized tool names back to the original manifest
+ * names so the agent loop can dispatch them.
+ *
+ * The Hermes 4 hybrid contract allows tool_call blocks INSIDE `<think>`
+ * regions; `parseReasoningBlocks` already returns those spans via
+ * `toolCallSpans`, so this helper just consumes that view directly.
+ */
+function parseHermesToolCallSpans(
+  text: string,
+  availableTools?: ToolManifest[],
+): ToolCall[] | undefined {
+  if (!text || !text.includes('<tool_call>')) {
+    return undefined;
+  }
+  const { toolCallSpans } = parseReasoningBlocks(text);
+  if (toolCallSpans.length === 0) return undefined;
+
+  const nameMap = new Map<string, string>();
+  if (availableTools) {
+    for (const tool of availableTools) {
+      nameMap.set(sanitizeToolName(tool.name), tool.name);
+    }
+  }
+
+  const calls: ToolCall[] = [];
+  for (const span of toolCallSpans) {
+    const json = span.json.trim();
+    if (!json) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      continue; // malformed span — skip silently; #232 (json-repair) owns recovery
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+    const obj = parsed as Record<string, unknown>;
+    // Hermes payload shape: { name: string, arguments: object | string }
+    // Some models emit { tool: string, args: object } — accept both.
+    const rawName =
+      typeof obj.name === 'string' ? obj.name :
+      typeof obj.tool === 'string' ? obj.tool :
+      undefined;
+    if (!rawName) continue;
+    const resolvedName = nameMap.get(rawName) ?? rawName;
+    let input: Record<string, unknown> = {};
+    const rawArgs = obj.arguments ?? obj.args ?? {};
+    if (typeof rawArgs === 'string') {
+      try { input = JSON.parse(rawArgs) as Record<string, unknown>; } catch { input = { raw: rawArgs }; }
+    } else if (rawArgs && typeof rawArgs === 'object') {
+      input = rawArgs as Record<string, unknown>;
+    }
+    calls.push({ name: resolvedName, input });
+  }
+  return calls.length > 0 ? calls : undefined;
+}
+
+/**
+ * #231: convert a `StreamingReasoningParser` event into the wire-shape
+ * `StreamChunk` that the agent loop / runtime SSE bridge consume. Tool-call
+ * spans are folded into a synthetic tool_use_{start,delta,end} sequence so
+ * the existing collectStream / runStreaming logic can pick them up without
+ * special casing the Hermes XML contract.
+ */
+function* reasoningEventsToChunks(
+  events: ReturnType<StreamingReasoningParser['feed']>,
+  hermesToolCallIdSeed: { count: number },
+  availableTools: ToolManifest[] | undefined,
+): Generator<StreamChunk, void, void> {
+  const nameMap = new Map<string, string>();
+  if (availableTools) {
+    for (const tool of availableTools) {
+      nameMap.set(sanitizeToolName(tool.name), tool.name);
+    }
+  }
+  for (const ev of events) {
+    switch (ev.type) {
+      case 'text':
+        if (ev.content) yield { type: 'text', text: ev.content };
+        break;
+      case 'reasoning_start':
+        yield { type: 'reasoning_start', reasoningTag: ev.tag };
+        break;
+      case 'reasoning_delta':
+        yield { type: 'reasoning_delta', text: ev.content };
+        break;
+      case 'reasoning_end':
+        yield { type: 'reasoning_end', reasoningTag: ev.tag };
+        break;
+      case 'tool_call_span': {
+        // #236: synthesize tool_use_{start,delta,end} from a complete Hermes
+        // span so downstream consumers see one logical tool call. The id is
+        // synthetic (`hermes-N`) and the name comes from the parsed JSON
+        // payload — if parsing fails we drop the span (json-repair owns
+        // recovery for partial payloads in #232).
+        let name = '';
+        let argsString = '{}';
+        let parsed: unknown;
+        try { parsed = JSON.parse(ev.json); } catch { /* keep raw */ }
+        if (parsed && typeof parsed === 'object') {
+          const obj = parsed as Record<string, unknown>;
+          const rawName =
+            typeof obj.name === 'string' ? obj.name :
+            typeof obj.tool === 'string' ? obj.tool : '';
+          name = nameMap.get(rawName) ?? rawName;
+          const rawArgs = obj.arguments ?? obj.args ?? {};
+          argsString = typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs);
+        } else {
+          argsString = ev.json;
+        }
+        if (!name) break; // can't dispatch without a name; drop silently
+        const id = `hermes-${++hermesToolCallIdSeed.count}`;
+        yield { type: 'tool_use_start', toolName: name, toolCallId: id };
+        if (argsString) yield { type: 'tool_use_delta', toolInput: argsString, toolCallId: id };
+        yield { type: 'tool_use_end', toolName: name, toolInput: argsString, toolCallId: id };
+        break;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +747,137 @@ function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: stri
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Structured-output helpers (#237)
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect whether the configured (baseUrl, model) combination supports
+ * OpenAI's native `response_format: json_schema` mode. We restrict the native
+ * path to api.openai.com gpt-4o / gpt-4.1 family to avoid 400s from
+ * OpenAI-compatible backends (OpenRouter, NVIDIA, vLLM) that don't honour the
+ * field. Everything else falls back to the schema-block envelope.
+ */
+function supportsNativeJsonSchema(baseUrl: string, model: string): boolean {
+  if (!/api\.openai\.com/i.test(baseUrl)) return false;
+  return /^gpt-4o|^gpt-4\.1/i.test(model);
+}
+
+/**
+ * Build the schema-block envelope used by providers without a native JSON
+ * mode. Keeps the prompt minimal so caller-provided messages still drive the
+ * generation; the schema just specifies the *shape*.
+ */
+function buildSchemaSystemPrompt(schema: object, schemaDescription?: string): string {
+  const lines: string[] = [
+    'You are a helpful assistant that answers in JSON.',
+    "Here's the json schema you must adhere to:",
+    `<schema>${JSON.stringify(schema)}</schema>`,
+  ];
+  if (schemaDescription) {
+    lines.push(`Schema notes: ${schemaDescription}`);
+  }
+  lines.push('Respond with only the JSON object, no prose, no code fences.');
+  return lines.join('\n');
+}
+
+/**
+ * Shared response finalizer: parses (with JSON repair), validates, and packs
+ * the typed envelope. Used by both providers' `generateStructured` paths.
+ */
+function finalizeStructuredResponse<T>(
+  raw: string,
+  req: StructuredOutputRequest<T>,
+): StructuredOutputResponse<T> {
+  // Strip a leading/trailing code fence if the model emitted one despite
+  // instructions (common on instruction-tuned local models).
+  const trimmed = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+
+  let parsed: unknown;
+  let repaired = false;
+  try {
+    const result = repairJson(trimmed.length > 0 ? trimmed : '{}');
+    parsed = result.value;
+    repaired = result.repaired;
+  } catch (err) {
+    return { ok: false, error: 'parse', details: err instanceof Error ? err.message : String(err), raw };
+  }
+
+  // Validation pass: caller-supplied validator wins; otherwise tiny inline
+  // top-level required+types check (mirrors #235 depth).
+  if (req.validator) {
+    try {
+      const value = req.validator(parsed);
+      return repaired ? { ok: true, value, raw, repaired: true } : { ok: true, value, raw };
+    } catch (err) {
+      return { ok: false, error: 'validate', details: err instanceof Error ? err.message : String(err), raw };
+    }
+  }
+
+  const valid = validateAgainstSchema(parsed, req.schema);
+  if (!valid.ok) {
+    return { ok: false, error: 'validate', details: valid.reason, raw };
+  }
+
+  return repaired
+    ? { ok: true, value: parsed as T, raw, repaired: true }
+    : { ok: true, value: parsed as T, raw };
+}
+
+/**
+ * Tiny inline JSON-schema validator. Top-level only — checks `type` /
+ * `required` / per-property `type`. Sufficient for the v0.8.0 contract; full
+ * Ajv-grade validation is the caller's responsibility via `req.validator`.
+ */
+function validateAgainstSchema(value: unknown, schema: object): { ok: true } | { ok: false; reason: string } {
+  const s = schema as { type?: string; required?: string[]; properties?: Record<string, { type?: string }> };
+  if (s.type === 'object') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, reason: 'expected object at root' };
+    }
+    const obj = value as Record<string, unknown>;
+    if (Array.isArray(s.required)) {
+      for (const key of s.required) {
+        if (!(key in obj)) return { ok: false, reason: `missing required property "${key}"` };
+      }
+    }
+    if (s.properties) {
+      for (const [key, propSchema] of Object.entries(s.properties)) {
+        if (!(key in obj)) continue;
+        const expected = propSchema?.type;
+        if (!expected) continue;
+        const actual = obj[key];
+        if (!matchesJsonType(actual, expected)) {
+          return { ok: false, reason: `property "${key}" expected ${expected}, got ${typeOfJson(actual)}` };
+        }
+      }
+    }
+    return { ok: true };
+  }
+  if (s.type === 'array') {
+    if (!Array.isArray(value)) return { ok: false, reason: 'expected array at root' };
+    return { ok: true };
+  }
+  // Unknown / unspecified root type — accept anything.
+  return { ok: true };
+}
+
+function matchesJsonType(value: unknown, expected: string): boolean {
+  if (expected === 'string') return typeof value === 'string';
+  if (expected === 'number' || expected === 'integer') return typeof value === 'number';
+  if (expected === 'boolean') return typeof value === 'boolean';
+  if (expected === 'null') return value === null;
+  if (expected === 'array') return Array.isArray(value);
+  if (expected === 'object') return value !== null && typeof value === 'object' && !Array.isArray(value);
+  return true;
+}
+
+function typeOfJson(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
 }
 
 // ---------------------------------------------------------------------------
@@ -887,9 +1206,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
           }
         }
         if (item.type === 'function_call' && item.name) {
-          let args: Record<string, unknown> = {};
-          try { args = JSON.parse(item.arguments ?? '{}') as Record<string, unknown>; } catch { /* ignore */ }
+          // v0.8.0 (#232): repair-aware parse so truncated / unquoted-key
+          // payloads from /responses still feed the agent loop.
           const originalName = request.availableTools.find((t) => sanitizeToolName(t.name) === item.name)?.name ?? item.name;
+          const args = parseToolCallArgsWithRepair(item.arguments ?? '{}', originalName, this.config.onArgsRepaired);
           toolCalls.push({ name: originalName, input: args, id: item.call_id });
         }
       }
@@ -899,33 +1219,68 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         outputTokens: rawUsage.output_tokens ?? 0,
         totalTokens: (rawUsage.input_tokens ?? 0) + (rawUsage.output_tokens ?? 0),
       } : undefined;
-      return {
-        assistantMessage: text || undefined,
-        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      // v0.8.0 (#231 / #236): scan the full assistant turn for reasoning
+      // blocks and Hermes-style `<tool_call>` spans. Native function_call
+      // outputs from the Responses API still win — XML extraction only
+      // contributes additional calls if no native ones were emitted.
+      const responsesParsed = text ? parseReasoningBlocks(text) : null;
+      const responsesStripped = responsesParsed?.stripped ?? text;
+      const responsesBlocks = responsesParsed?.blocks ?? [];
+      let responsesToolCalls = toolCalls;
+      if (responsesToolCalls.length === 0 && text) {
+        const hermesCalls = parseHermesToolCallSpans(text, request.availableTools);
+        if (hermesCalls && hermesCalls.length > 0) {
+          responsesToolCalls = hermesCalls.map((c) => ({ name: c.name, input: c.input }));
+        }
+      }
+      const responsesResp: ProviderResponse = {
+        assistantMessage: responsesStripped || undefined,
+        toolCalls: responsesToolCalls.length > 0 ? responsesToolCalls : undefined,
         ...(usage ? { usage } : {}),
       };
+      if (responsesBlocks.length > 0) responsesResp.reasoningBlocks = responsesBlocks;
+      return responsesResp;
     }
 
     // Standard Chat Completions format
     const payload = rawPayload as ChatCompletionsResponse;
     const message = payload.choices?.[0]?.message;
     const assistantMessage = normalizeOpenAIMessageContent(message?.content, message?.refusal);
-    const parsedToolCalls = parseOpenAIToolCalls(message?.tool_calls, request.availableTools) ?? parseOpenAIFunctionCall(message?.function_call);
+    let parsedToolCalls = parseOpenAIToolCalls(message?.tool_calls, request.availableTools, this.config.onArgsRepaired) ?? parseOpenAIFunctionCall(message?.function_call, this.config.onArgsRepaired);
     const usage = extractOpenAIUsage(payload);
 
+    // v0.8.0 (#231): extract reasoning blocks from the assistant turn before
+    // the slash-tool fallback so the slash-call regex doesn't see inner-tag text.
+    const cmpParsed = assistantMessage ? parseReasoningBlocks(assistantMessage) : null;
+    const cmpStripped = cmpParsed?.stripped ?? assistantMessage;
+    const cmpBlocks = cmpParsed?.blocks ?? [];
+
+    // v0.8.0 (#236): Hermes XML `<tool_call>` blocks are an ADDITIONAL fallback
+    // — applied only when no native function_call slots were present.
     if ((!parsedToolCalls || parsedToolCalls.length === 0) && assistantMessage) {
-      const slashToolCall = parseSlashToolCall(assistantMessage.trim());
-      if (slashToolCall) {
-        const resolved = resolveKnownTool(slashToolCall, request.availableTools);
-        return usage ? { ...resolved, usage } : resolved;
+      const hermesCalls = parseHermesToolCallSpans(assistantMessage, request.availableTools);
+      if (hermesCalls && hermesCalls.length > 0) {
+        parsedToolCalls = hermesCalls;
       }
     }
 
-    return {
-      assistantMessage,
+    if ((!parsedToolCalls || parsedToolCalls.length === 0) && cmpStripped) {
+      const slashToolCall = parseSlashToolCall(cmpStripped.trim());
+      if (slashToolCall) {
+        const resolved = resolveKnownTool(slashToolCall, request.availableTools);
+        const merged: ProviderResponse = usage ? { ...resolved, usage } : resolved;
+        if (cmpBlocks.length > 0) merged.reasoningBlocks = cmpBlocks;
+        return merged;
+      }
+    }
+
+    const finalResp: ProviderResponse = {
+      assistantMessage: cmpStripped,
       toolCalls: parsedToolCalls,
       ...(usage ? { usage } : {}),
     };
+    if (cmpBlocks.length > 0) finalResp.reasoningBlocks = cmpBlocks;
+    return finalResp;
   }
 
   async *generateStream(request: ProviderRequest): AsyncGenerator<StreamChunk> {
@@ -1036,6 +1391,31 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     let buffer = '';
     const toolAccumulators = new Map<number, { name: string; args: string; id?: string }>();
 
+    // v0.8.0 (#231 / #236): per-stream reasoning parser. Every text delta
+    // flows through this state machine before being yielded so `<plan>` /
+    // `<think>` regions are emitted as `reasoning_*` chunks and Hermes-style
+    // `<tool_call>` payloads (inside or outside a reasoning block) are
+    // promoted to synthetic tool_use_* chunks.
+    const reasoningParser = new StreamingReasoningParser();
+    const hermesIdSeed = { count: 0 };
+
+    // v0.8.0 (#232): repair-aware finalization for streamed tool args. Returns
+    // the (possibly-repaired) JSON string so downstream consumers parse the
+    // recovered payload rather than the truncated one. Telemetry fires via
+    // `config.onArgsRepaired` so the runtime can re-emit `tool:args_repaired`.
+    const onArgsRepaired = this.config.onArgsRepaired;
+    const finalizeStreamArgs = (toolName: string, args: string): string => {
+      if (!args) return args;
+      try {
+        const result = repairJson(args);
+        emitRepairTelemetry(result, args, toolName, onArgsRepaired);
+        if (result.repaired) return JSON.stringify(result.value);
+        return args;
+      } catch {
+        return args;
+      }
+    };
+
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -1050,9 +1430,11 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
           if (!trimmed.startsWith('data: ')) continue;
           const data = trimmed.slice(6).trim();
           if (data === '[DONE]') {
-            // Flush any remaining tool accumulators
+            // Drain the reasoning parser so any trailing buffered text /
+            // unclosed reasoning region surfaces before we emit `done`.
+            yield* reasoningEventsToChunks(reasoningParser.flush(), hermesIdSeed, request.availableTools);
             for (const [, acc] of toolAccumulators) {
-              yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+              yield { type: 'tool_use_end', toolName: acc.name, toolInput: finalizeStreamArgs(acc.name, acc.args) };
             }
             toolAccumulators.clear();
             yield { type: 'done' };
@@ -1070,7 +1452,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
           const eventType = parsed.type as string | undefined;
           if (isResponsesApi && eventType) {
             if (eventType === 'response.output_text.delta' && typeof parsed.delta === 'string') {
-              yield { type: 'text', text: parsed.delta };
+              yield* reasoningEventsToChunks(reasoningParser.feed(parsed.delta), hermesIdSeed, request.availableTools);
             } else if (eventType === 'response.function_call_arguments.delta' && typeof parsed.delta === 'string') {
               // Route delta to the correct tool accumulator by output_index
               const outputIdx = typeof parsed.output_index === 'number' ? parsed.output_index : toolAccumulators.size - 1;
@@ -1093,13 +1475,14 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
               if (item?.type === 'function_call') {
                 const acc = doneIdx !== undefined ? toolAccumulators.get(doneIdx) : [...toolAccumulators.values()].at(-1);
                 if (acc) {
-                  yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+                  yield { type: 'tool_use_end', toolName: acc.name, toolInput: finalizeStreamArgs(acc.name, acc.args) };
                   if (doneIdx !== undefined) toolAccumulators.delete(doneIdx);
                 }
               }
             } else if (eventType === 'response.completed' || eventType === 'response.done') {
+              yield* reasoningEventsToChunks(reasoningParser.flush(), hermesIdSeed, request.availableTools);
               for (const [, acc] of toolAccumulators) {
-                yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+                yield { type: 'tool_use_end', toolName: acc.name, toolInput: finalizeStreamArgs(acc.name, acc.args) };
               }
               toolAccumulators.clear();
               yield { type: 'done' };
@@ -1114,7 +1497,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
           const finishReason = choices?.[0]?.finish_reason as string | undefined;
 
           if (delta?.content && typeof delta.content === 'string') {
-            yield { type: 'text', text: delta.content };
+            // v0.8.0 (#231): route every text delta through the reasoning
+            // parser so `<plan>...</plan>` regions are emitted as
+            // reasoning_* chunks instead of plain text.
+            yield* reasoningEventsToChunks(reasoningParser.feed(delta.content), hermesIdSeed, request.availableTools);
           }
 
           if (delta?.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -1137,8 +1523,13 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
           }
 
           if (finishReason === 'tool_calls' || finishReason === 'stop') {
+            // v0.8.0 (#231): drain any text still buffered in the reasoning
+            // parser before we emit the final tool_use_end events. Closes
+            // unclosed regions cleanly so the dashboard doesn't show a
+            // dangling reasoning block.
+            yield* reasoningEventsToChunks(reasoningParser.flush(), hermesIdSeed, request.availableTools);
             for (const [, acc] of toolAccumulators) {
-              yield { type: 'tool_use_end', toolName: acc.name, toolInput: acc.args };
+              yield { type: 'tool_use_end', toolName: acc.name, toolInput: finalizeStreamArgs(acc.name, acc.args) };
             }
             toolAccumulators.clear();
           }
@@ -1148,7 +1539,114 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       reader.releaseLock();
     }
 
+    // Final safety flush — covers streams that ended without [DONE] / finish_reason.
+    yield* reasoningEventsToChunks(reasoningParser.flush(), hermesIdSeed, request.availableTools);
     yield { type: 'done' };
+  }
+
+  /**
+   * v0.8.0 Hermes parity (#237): JSON-schema-typed generation. On
+   * api.openai.com gpt-4o / gpt-4.1 family models, uses the native
+   * `response_format: json_schema` mode (strict). Everything else falls back
+   * to a system-prompt envelope that embeds the schema.
+   *
+   * Failures are surfaced as a typed envelope (`ok: false`) rather than
+   * thrown, so route handlers can render a structured error in the dashboard
+   * without try/catching the whole call.
+   */
+  async generateStructured<T = unknown>(req: StructuredOutputRequest<T>): Promise<StructuredOutputResponse<T>> {
+    const useNativeJsonSchema = supportsNativeJsonSchema(this.config.baseUrl, this.config.model);
+
+    if (useNativeJsonSchema) {
+      try {
+        return await this.callNativeStructured<T>(req);
+      } catch (err) {
+        return { ok: false, error: 'provider', details: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    // Schema-block envelope path: prepend a system-prompt instruction.
+    const systemMessage = buildSchemaSystemPrompt(req.schema, req.schemaDescription);
+    const augmentedMessages: ConversationMessage[] = [
+      { role: 'system', content: systemMessage, createdAt: new Date().toISOString() },
+      ...req.messages,
+    ];
+
+    let response: ProviderResponse;
+    try {
+      response = await this.generate({
+        messages: augmentedMessages,
+        availableTools: [],
+      });
+    } catch (err) {
+      return { ok: false, error: 'provider', details: err instanceof Error ? err.message : String(err) };
+    }
+
+    return finalizeStructuredResponse<T>(response.assistantMessage ?? '', req);
+  }
+
+  /** Native /chat/completions json_schema path for OpenAI gpt-4o / gpt-4.1 family. */
+  private async callNativeStructured<T>(req: StructuredOutputRequest<T>): Promise<StructuredOutputResponse<T>> {
+    const pool = this.config.credentialPool;
+    const tokenProvider = this.config.tokenProvider;
+    const apiKey = tokenProvider
+      ? await tokenProvider()
+      : pool
+      ? pool.getKey()
+      : this.config.apiKey;
+
+    if (!apiKey) {
+      // No key — fall back to the envelope path (Echo provider) so hermetic
+      // / no-key flows still produce a typed response.
+      const systemMessage = buildSchemaSystemPrompt(req.schema, req.schemaDescription);
+      const augmentedMessages: ConversationMessage[] = [
+        { role: 'system', content: systemMessage, createdAt: new Date().toISOString() },
+        ...req.messages,
+      ];
+      const echo = new EchoProvider();
+      const response = await echo.generate({ messages: augmentedMessages, availableTools: [] });
+      return finalizeStructuredResponse<T>(response.assistantMessage ?? '', req);
+    }
+
+    const mappedMessages = req.messages.map((message) => ({
+      role: message.role === 'tool' ? 'user' : message.role,
+      content: message.role === 'tool'
+        ? `[Tool result: ${message.name ?? 'tool'}]\n${message.content}`
+        : message.content,
+    }));
+
+    const body = {
+      model: this.config.model,
+      messages: mappedMessages,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'output',
+          schema: req.schema,
+          strict: true,
+        },
+      },
+      ...(this.config.extraBodyFields ?? {}),
+    };
+
+    const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'content-type': 'application/json',
+        ...(this.config.extraHeaders ?? {}),
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      return { ok: false, error: 'provider', details: `${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}` };
+    }
+
+    const payload = (await response.json()) as ChatCompletionsResponse;
+    const text = normalizeOpenAIMessageContent(payload.choices?.[0]?.message?.content) ?? '';
+    return finalizeStructuredResponse<T>(text, req);
   }
 }
 
@@ -1254,16 +1752,57 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
       .map((part) => part.text as string)
       .join('\n') || undefined;
 
+    // v0.8.0 (#231): map native Anthropic `thinking` content blocks into the
+    // shared ReasoningBlock shape so the dashboard renders them identically
+    // to Hermes <thinking> regions.
+    const thinkingBlocks: ReasoningBlock[] = [];
+    if (Array.isArray(payload.content)) {
+      let cursor = 0;
+      for (const part of payload.content) {
+        if ((part.type === 'thinking' || part.type === 'redacted_thinking') && typeof (part as { thinking?: string }).thinking === 'string') {
+          const content = (part as { thinking: string }).thinking;
+          // Synthetic range — Anthropic doesn't expose offsets and we never
+          // concatenated the thinking text into assistantMessage, so the
+          // numbers are placeholders the dashboard can sort by.
+          thinkingBlocks.push({
+            tag: 'thinking',
+            content,
+            range: [cursor, cursor + content.length],
+          });
+          cursor += content.length;
+        }
+      }
+    }
+
     // Extract tool_use blocks
     const toolCalls = parseAnthropicToolCalls(payload.content);
 
     // If the API returned native tool calls, use them
     if (toolCalls && toolCalls.length > 0) {
-      return {
+      const resp: ProviderResponse = {
         assistantMessage,
         toolCalls,
         ...(usage ? { usage } : {}),
       };
+      if (thinkingBlocks.length > 0) resp.reasoningBlocks = thinkingBlocks;
+      return resp;
+    }
+
+    // v0.8.0 (#236): Hermes-style XML tool_call fallback. A few Claude finetunes
+    // route their tool calls through `<tool_call>` blocks instead of the native
+    // tool_use slot. Apply the same precedence as the OpenAI path: only run
+    // when no native tool_use was emitted.
+    if (assistantMessage) {
+      const hermesCalls = parseHermesToolCallSpans(assistantMessage, request.availableTools);
+      if (hermesCalls && hermesCalls.length > 0) {
+        const resp: ProviderResponse = {
+          assistantMessage,
+          toolCalls: hermesCalls,
+          ...(usage ? { usage } : {}),
+        };
+        if (thinkingBlocks.length > 0) resp.reasoningBlocks = thinkingBlocks;
+        return resp;
+      }
     }
 
     // Fallback: parse slash tool calls from text when no native tool_use blocks
@@ -1271,14 +1810,18 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
       const slashToolCall = parseSlashToolCall(assistantMessage.trim());
       if (slashToolCall) {
         const resolved = resolveKnownTool(slashToolCall, request.availableTools);
-        return usage ? { ...resolved, usage } : resolved;
+        const resp: ProviderResponse = usage ? { ...resolved, usage } : resolved;
+        if (thinkingBlocks.length > 0) resp.reasoningBlocks = thinkingBlocks;
+        return resp;
       }
     }
 
-    return {
+    const resp: ProviderResponse = {
       assistantMessage,
       ...(usage ? { usage } : {}),
     };
+    if (thinkingBlocks.length > 0) resp.reasoningBlocks = thinkingBlocks;
+    return resp;
   }
 
   async *generateStream(request: ProviderRequest): AsyncGenerator<StreamChunk> {
@@ -1347,6 +1890,26 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     let currentToolName = '';
     let currentToolId = '';
     let currentToolInput = '';
+    // v0.8.0 (#231): track whether the active Anthropic content block is a
+    // native `thinking` block so deltas can be rerouted to reasoning_* chunks
+    // and a matching reasoning_end is emitted on `content_block_stop`. We
+    // deliberately do NOT run the XML reasoning parser on Anthropic streams
+    // — the API already structures the data for us.
+    let currentThinkingTag: string | null = null;
+
+    // v0.8.0 (#232): repair-aware finalization for Anthropic streamed tool args.
+    const onArgsRepaired = this.config.onArgsRepaired;
+    const finalizeStreamArgs = (toolName: string, args: string): string => {
+      if (!args) return args;
+      try {
+        const result = repairJson(args);
+        emitRepairTelemetry(result, args, toolName, onArgsRepaired);
+        if (result.repaired) return JSON.stringify(result.value);
+        return args;
+      } catch {
+        return args;
+      }
+    };
 
     try {
       while (true) {
@@ -1385,27 +1948,41 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
                 currentToolId = contentBlock.id ?? '';
                 currentToolInput = '';
                 yield { type: 'tool_use_start', toolName: currentToolName, toolCallId: currentToolId };
+              } else if (contentBlock?.type === 'thinking' || contentBlock?.type === 'redacted_thinking') {
+                // v0.8.0 (#231): native Anthropic reasoning content. Surface
+                // it under the `thinking` tag so the dashboard reasoning-block
+                // component renders it identically to Hermes <thinking>.
+                currentThinkingTag = 'thinking';
+                yield { type: 'reasoning_start', reasoningTag: 'thinking' };
               }
               break;
             }
 
             case 'content_block_delta': {
-              const delta = parsed.delta as { type?: string; text?: string; partial_json?: string } | undefined;
+              const delta = parsed.delta as { type?: string; text?: string; partial_json?: string; thinking?: string } | undefined;
               if (delta?.type === 'text_delta' && delta.text) {
                 yield { type: 'text', text: delta.text };
               } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
                 currentToolInput += delta.partial_json;
                 yield { type: 'tool_use_delta', toolInput: delta.partial_json };
+              } else if ((delta?.type === 'thinking_delta' || delta?.type === 'redacted_thinking_delta') && currentThinkingTag) {
+                // Anthropic emits thinking content as either `delta.thinking`
+                // (text) or `delta.partial_json` (rare for redacted blocks).
+                const text = delta.thinking ?? delta.partial_json ?? '';
+                if (text) yield { type: 'reasoning_delta', text };
               }
               break;
             }
 
             case 'content_block_stop': {
               if (currentToolName) {
-                yield { type: 'tool_use_end', toolName: currentToolName, toolInput: currentToolInput, toolCallId: currentToolId };
+                yield { type: 'tool_use_end', toolName: currentToolName, toolInput: finalizeStreamArgs(currentToolName, currentToolInput), toolCallId: currentToolId };
                 currentToolName = '';
                 currentToolId = '';
                 currentToolInput = '';
+              } else if (currentThinkingTag) {
+                yield { type: 'reasoning_end', reasoningTag: currentThinkingTag };
+                currentThinkingTag = null;
               }
               break;
             }
@@ -1434,6 +2011,31 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     }
 
     yield { type: 'done' };
+  }
+
+  /**
+   * v0.8.0 Hermes parity (#237): JSON-schema-typed generation. Anthropic has
+   * no native JSON-schema mode, so we always inject a schema-block envelope
+   * via the system prompt.
+   */
+  async generateStructured<T = unknown>(req: StructuredOutputRequest<T>): Promise<StructuredOutputResponse<T>> {
+    const systemMessage = buildSchemaSystemPrompt(req.schema, req.schemaDescription);
+    const augmentedMessages: ConversationMessage[] = [
+      { role: 'system', content: systemMessage, createdAt: new Date().toISOString() },
+      ...req.messages,
+    ];
+
+    let response: ProviderResponse;
+    try {
+      response = await this.generate({
+        messages: augmentedMessages,
+        availableTools: [],
+      });
+    } catch (err) {
+      return { ok: false, error: 'provider', details: err instanceof Error ? err.message : String(err) };
+    }
+
+    return finalizeStructuredResponse<T>(response.assistantMessage ?? '', req);
   }
 }
 
@@ -2530,6 +3132,9 @@ export class CredentialPool {
 export { buildOpenAITools, normalizeOpenAIMessageContent, parseOpenAIFunctionCall, parseOpenAIToolCalls, countMessageChars };
 export { collectStream } from '@crowclaw/core/streaming';
 export type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
+
+// v0.8.0 (#232): JSON repair for malformed tool-call arguments.
+export { repairJson, type RepairResult } from './json-repair.js';
 
 // Issue #60: Model manifest API
 export {

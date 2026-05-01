@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/workspace",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",

@@ -4,7 +4,19 @@
  */
 
 export interface StreamEvent {
-  type: 'text-delta' | 'tool-start' | 'tool-end' | 'iteration-start' | 'error' | 'done';
+  type:
+    | 'text-delta'
+    | 'tool-start'
+    | 'tool-end'
+    | 'iteration-start'
+    // v0.8.0 (#231): Hermes-style reasoning lifecycle. Emitted by the runtime
+    // SSE bridge once the orchestrator forwards `reasoning_*` chunks from the
+    // provider into the per-session event stream.
+    | 'reasoning-start'
+    | 'reasoning-delta'
+    | 'reasoning-end'
+    | 'error'
+    | 'done';
   content?: string;
   toolName?: string;
   toolCallId?: string;
@@ -15,6 +27,8 @@ export interface StreamEvent {
   durationMs?: number;
   iteration?: number;
   error?: string;
+  /** v0.8.0 (#231): tag name for `reasoning-start` / `reasoning-end`. */
+  reasoningTag?: string;
 }
 
 export interface StreamCallbacks {
@@ -24,6 +38,14 @@ export interface StreamCallbacks {
   onIterationStart: (iteration: number) => void;
   onDone: () => void;
   onError: (error: string) => void;
+  /**
+   * v0.8.0 (#231): reasoning-block lifecycle. Optional — clients that don't
+   * render reasoning surfaces (legacy CLI, embeds) can omit them and the
+   * dispatcher silently drops the corresponding events.
+   */
+  onReasoningStart?: (tag: string) => void;
+  onReasoningDelta?: (content: string) => void;
+  onReasoningEnd?: (tag: string) => void;
 }
 
 /**
@@ -122,6 +144,15 @@ const dispatchEvent = (event: StreamEvent, callbacks: StreamCallbacks): void => 
       break;
     case 'iteration-start':
       callbacks.onIterationStart(event.iteration ?? 0);
+      break;
+    case 'reasoning-start':
+      callbacks.onReasoningStart?.(event.reasoningTag ?? 'reasoning');
+      break;
+    case 'reasoning-delta':
+      callbacks.onReasoningDelta?.(event.content ?? '');
+      break;
+    case 'reasoning-end':
+      callbacks.onReasoningEnd?.(event.reasoningTag ?? 'reasoning');
       break;
     case 'error':
       callbacks.onError(event.error ?? 'Unknown error');

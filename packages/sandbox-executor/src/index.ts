@@ -2014,3 +2014,309 @@ export async function runSandboxTool(
 
 export { PlaywrightBrowserBackend, getOrCreateBrowserBackend, closeBrowserBackend, isPlaywrightAvailable } from './playwright.js';
 export { SshExecutor, type SshExecutorOptions } from './ssh.js';
+
+// ---------------------------------------------------------------------------
+// v0.8.0 #234 — `code.execute` pipeline tool
+//
+// Runs a JS/TS snippet inside a Node `vm` sandbox with access to a curated
+// subset of host-registry tools via the tool-rpc bridge. Used by the
+// `code.execute` tool in `@crowclaw/tools`. The function is deliberately
+// generic — it accepts any ToolRegistry-shaped object plus a SandboxPolicy,
+// and emits `code:start` / `code:tool_called` / `code:complete` lifecycle
+// events on the supplied EventBus (the runtime-node EventBus already declares
+// these types; see packages/runtime-node/src/event-bus.ts).
+//
+// Sandbox boundary:
+//   - Code runs in `vm.runInContext` with a fresh context object.
+//   - No `require`, no `process`, no `import` from user code (we don't expose
+//     them on the context). The only escape is `tools.*`, which routes through
+//     the host bridge (which itself enforces allowedTools / hardline / approval).
+//   - `console.log` / `console.error` are captured into stdout / stderr.
+//   - Hard 30s default timeout via `vm`'s `timeout` option AND a parallel
+//     setTimeout that aborts the host signal. Tear-down is in `finally`.
+//
+// Why we don't reuse `executeCodeCommand` (the existing `code.exec` path):
+//   `code.exec` shells out to `node -e`, which is fine for terminal-style
+//   workloads but cannot share a tool bridge with the host process — the
+//   subprocess can't access the host's tool registry without re-implementing
+//   IPC. `executeWithTools` runs in-process, so the bridge is just a JS call.
+// ---------------------------------------------------------------------------
+import { createHostBridge, type ToolCallRecord } from './tool-rpc.js';
+import type { SandboxPolicy } from './policy.js';
+import { DEFAULT_SANDBOX_POLICY } from './policy.js';
+import type { AgentEventEmitter, ToolCall } from '@crowclaw/core';
+import { createHash } from 'node:crypto';
+
+export type { SandboxPolicy } from './policy.js';
+export {
+  SandboxPolicyError,
+  DEFAULT_SANDBOX_POLICY,
+  makePolicy,
+  type SandboxPolicyErrorCode,
+} from './policy.js';
+export {
+  createHostBridge,
+  buildShimSource,
+  type HostBridge,
+  type ToolRpcRequest,
+  type ToolRpcResponse,
+  type ToolCallRecord,
+  type CreateHostBridgeOptions,
+} from './tool-rpc.js';
+
+export interface ExecuteWithToolsOptions {
+  /** Source code to execute. */
+  code: string;
+  /** 'js' | 'ts' supported in v0.8.0; 'python' is reserved (deferred). */
+  language: 'js' | 'ts' | 'python';
+  toolRegistry: ToolRegistry;
+  sessionId: string;
+  agentId?: string;
+  workspaceId?: string;
+  policy?: Partial<SandboxPolicy>;
+  eventBus?: AgentEventEmitter;
+  /** Same-path `executeTool` callback — see CreateHostBridgeOptions. */
+  executeTool?: (
+    toolCall: ToolCall,
+    context: import('@crowclaw/core').ToolExecutionContext
+  ) => Promise<ToolExecutionResult>;
+  hardlineBlocklist?: ReadonlyArray<{ pattern: RegExp; description: string }>;
+  signal?: AbortSignal;
+  env?: unknown;
+}
+
+export interface ExecuteWithToolsResult {
+  ok: boolean;
+  returnValue?: unknown;
+  stdout: string;
+  stderr: string;
+  toolCalls: ToolCallRecord[];
+  durationMs: number;
+  error?: string;
+}
+
+function hashCode(code: string): string {
+  return createHash('sha256').update(code, 'utf8').digest('hex').slice(0, 16);
+}
+
+function clipBuffer(parts: string[], maxBytes: number): string {
+  let out = '';
+  for (const p of parts) {
+    if (out.length + p.length > maxBytes) {
+      out += p.slice(0, Math.max(0, maxBytes - out.length));
+      out += `\n[truncated: stream exceeded ${maxBytes} bytes]`;
+      break;
+    }
+    out += p;
+  }
+  return out;
+}
+
+export async function executeWithTools(
+  options: ExecuteWithToolsOptions
+): Promise<ExecuteWithToolsResult> {
+  const policy: SandboxPolicy = { ...DEFAULT_SANDBOX_POLICY, ...(options.policy ?? {}) };
+  const startedAt = Date.now();
+  const codeHash = hashCode(options.code);
+
+  options.eventBus?.emit('code:start', {
+    sessionId: options.sessionId,
+    language: options.language,
+    codeHash,
+  });
+
+  if (options.language === 'python') {
+    const durationMs = Date.now() - startedAt;
+    options.eventBus?.emit('code:complete', {
+      sessionId: options.sessionId,
+      ok: false,
+      durationMs,
+      toolCallCount: 0,
+    });
+    return {
+      ok: false,
+      stdout: '',
+      stderr: 'Python sandbox is deferred in v0.8.0; only "js"/"ts" are supported.',
+      toolCalls: [],
+      durationMs,
+      error: 'LanguageNotSupported',
+    };
+  }
+
+  // We import `node:vm` lazily so the cloudflare-sandbox alias used in tests
+  // doesn't blow up at module-eval time on workers (vm doesn't exist there).
+  let vm: typeof import('node:vm');
+  try {
+    vm = await import('node:vm');
+  } catch (err) {
+    const durationMs = Date.now() - startedAt;
+    const message = err instanceof Error ? err.message : String(err);
+    options.eventBus?.emit('code:complete', {
+      sessionId: options.sessionId,
+      ok: false,
+      durationMs,
+      toolCallCount: 0,
+    });
+    return {
+      ok: false,
+      stdout: '',
+      stderr: `node:vm unavailable: ${message}`,
+      toolCalls: [],
+      durationMs,
+      error: 'VmUnavailable',
+    };
+  }
+
+  // Compose the host bridge — the same allowedTools list goes into the shim
+  // source so user code can introspect what's available.
+  const bridge = createHostBridge({
+    toolRegistry: options.toolRegistry,
+    sessionId: options.sessionId,
+    agentId: options.agentId,
+    workspaceId: options.workspaceId,
+    policy,
+    eventBus: options.eventBus,
+    executeTool: options.executeTool,
+    hardlineBlocklist: options.hardlineBlocklist,
+    signal: options.signal,
+    env: options.env,
+  });
+
+  // stdout / stderr capture
+  const stdoutBuf: string[] = [];
+  const stderrBuf: string[] = [];
+  const fmt = (args: unknown[]): string =>
+    args
+      .map((a) => {
+        if (typeof a === 'string') return a;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(' ') + '\n';
+  const fakeConsole = {
+    log: (...args: unknown[]) => stdoutBuf.push(fmt(args)),
+    info: (...args: unknown[]) => stdoutBuf.push(fmt(args)),
+    warn: (...args: unknown[]) => stderrBuf.push(fmt(args)),
+    error: (...args: unknown[]) => stderrBuf.push(fmt(args)),
+    debug: (...args: unknown[]) => stdoutBuf.push(fmt(args)),
+  };
+
+  // Build the sandboxed globalThis. Note we deliberately don't expose
+  // `require`, `process`, `Buffer`, or the timer family of bypasses; user code
+  // can only reach the host through the `tools` shim.
+  const sandboxGlobal: Record<string, unknown> = {
+    console: fakeConsole,
+    setTimeout,
+    clearTimeout,
+    Promise,
+    JSON,
+    Math,
+    Date,
+    URL,
+    URLSearchParams,
+    TextEncoder,
+    TextDecoder,
+    Error,
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    Symbol,
+    RegExp,
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+    __crowclawHostBridge: {
+      call: (req: { id: number; tool: string; args: unknown }) => bridge.handleRequest(req),
+    },
+  };
+  // Self-reference for `globalThis`-style access (the shim uses `globalThis`).
+  sandboxGlobal.globalThis = sandboxGlobal;
+
+  const context = vm.createContext(sandboxGlobal, {
+    name: `crowclaw-sandbox-${options.sessionId}`,
+    codeGeneration: { strings: false, wasm: false },
+  });
+
+  // Wrap user code in an async IIFE so we can `await` and return a value.
+  // TypeScript "support" in v0.8.0 is type-strip only — we don't compile, we
+  // just feed the source to V8 which tolerates simple TS in many cases. Real
+  // TS support is deferred; the manifest still advertises 'ts' so the agent
+  // can opt in once the compiler step lands.
+  const userBody = options.language === 'ts'
+    ? `// NOTE: TS sources are passed to V8 as-is in v0.8.0; type annotations\n// outside of the standard JS subset will throw a SyntaxError. Stick to\n// type-erasable syntax (no enums, no decorators, no namespace imports).\n${options.code}`
+    : options.code;
+  const wrapped = `(async () => {\n${bridge.shimSource}\n;return (async () => {\n${userBody}\n})();\n})()`;
+
+  const abortController = new AbortController();
+  if (options.signal) {
+    if (options.signal.aborted) abortController.abort();
+    else options.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  let returnValue: unknown;
+  let executionError: string | undefined;
+  let ok = false;
+
+  try {
+    const timeoutMs = policy.timeoutMs;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        abortController.abort();
+        reject(new Error('Sandbox timeout exceeded'));
+      }, timeoutMs);
+    });
+
+    const script = new vm.Script(wrapped, { filename: `crowclaw-sandbox-${options.sessionId}.js` });
+
+    const runPromise = script.runInContext(context, {
+      // vm's own timeout: kills synchronous infinite loops.
+      timeout: timeoutMs,
+      breakOnSigint: true,
+    }) as Promise<unknown>;
+
+    returnValue = await Promise.race([runPromise, timeoutPromise]);
+    ok = true;
+  } catch (err: unknown) {
+    if (timedOut) {
+      executionError = 'Sandbox timeout exceeded';
+      stderrBuf.push(`${executionError}\n`);
+    } else {
+      executionError = err instanceof Error ? err.message : String(err);
+      stderrBuf.push(`${executionError}\n`);
+    }
+    ok = false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  const stdout = clipBuffer(stdoutBuf, policy.maxOutputBytes);
+  const stderr = clipBuffer(stderrBuf, policy.maxOutputBytes);
+  const durationMs = Date.now() - startedAt;
+  const toolCalls = [...bridge.callRecords];
+
+  options.eventBus?.emit('code:complete', {
+    sessionId: options.sessionId,
+    ok,
+    durationMs,
+    toolCallCount: toolCalls.length,
+  });
+
+  return {
+    ok,
+    returnValue,
+    stdout,
+    stderr,
+    toolCalls,
+    durationMs,
+    error: executionError,
+  };
+}

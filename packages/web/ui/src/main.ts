@@ -16,6 +16,9 @@ import './components/demo-badge.js';     // #175 agent A2
 import './components/status-pill.js';    // #177 agent A4
 import './components/command-palette.js'; // #178 agent A5 (palette element)
 
+// v0.8.0 — Hermes-parity reasoning-block surface (#231).
+import './components/reasoning-block.js';
+
 // Views
 import './views/chat-view.js';
 import './views/agent-view.js';

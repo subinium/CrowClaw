@@ -15,7 +15,9 @@ class FlakyProvider implements ProviderAdapter {
     }
     return {
       assistantMessage: 'Recovered response.',
-      toolCalls: [{ name: 'echo', input: { value: 'hi' } }]
+      // v0.8.0 (#235): echo's inputSchema requires `message`; pre-exec
+      // validation gate would otherwise reject `value` and skip the tool.
+      toolCalls: [{ name: 'echo', input: { message: 'hi' } }]
     };
   }
 }
@@ -42,7 +44,9 @@ describe('plugin integration with agent loop', () => {
     await agent.run({
       agentId: 'crowclaw',
       sessionId: 'plugin-run-1',
-      userMessage: '/tool echo {"value":"hi"}'
+      // v0.8.0 (#235): echo's inputSchema requires `message`; the agent
+      // loop now validates pre-execution. Use the schema-correct field.
+      userMessage: '/tool echo {"message":"hi"}'
     });
 
     expect(plugin.seen).toEqual([

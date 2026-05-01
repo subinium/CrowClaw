@@ -11,7 +11,7 @@ import {
 } from '../packages/tools/src/index.js';
 import {
   MemoryManager,
-  type MemoryProvider,
+  type LegacyMemoryProvider as MemoryProvider,
   type ManagerMemoryRecord,
   type SessionTranscriptMessage,
 } from '../packages/memory/src/index.js';

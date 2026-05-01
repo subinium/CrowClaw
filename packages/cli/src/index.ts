@@ -158,7 +158,8 @@ export type CliCommandName =
   | 'gateway'
   | 'mcp'
   | 'presets'
-  | 'providers';
+  | 'providers'
+  | 'skill';
 
 export interface ParsedCliCommand {
   command: CliCommandName;
@@ -175,6 +176,11 @@ export interface ParsedCliCommand {
   presetsArgs?: string[];
   providersSubcommand?: string;
   providersArgs?: string[];
+  /** v0.8.0 Hermes parity (#240): `crowclaw skill install|publish [...args]` */
+  skillSubcommand?: string;
+  skillArgs?: string[];
+  /** Forwarded `--dry-run` flag (used by `skill publish`) */
+  dryRun?: boolean;
 }
 
 export interface CliRuntimeLike {
@@ -559,6 +565,14 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     const providersSubcommand = rest[0] ?? 'list';
     const providersArgs = rest.slice(1);
     return { command: 'providers', providersSubcommand, providersArgs, noOnboarding };
+  }
+
+  // skill — v0.8.0 #240: agentskills.io install/publish
+  if (first === 'skill') {
+    const skillSubcommand = rest[0] ?? 'help';
+    const dryRun = rest.includes('--dry-run');
+    const skillArgs = rest.slice(1).filter((a) => a !== '--dry-run');
+    return { command: 'skill', skillSubcommand, skillArgs, dryRun, noOnboarding };
   }
 
   // serve — supports --port
@@ -2294,6 +2308,13 @@ export async function runCli(argv: string[], options: CliRunOptions = {}): Promi
       return runMcpCommand(runtime, parsed);
     case 'repl':
       return 'Run `crowclaw` directly to start the REPL.';
+    case 'skill':
+      // v0.8.0 #240: agentskills.io install/publish handled in main() (interactive I/O).
+      return 'Run `crowclaw skill <subcommand>` directly (not via runCli).';
+    default: {
+      const exhaustive: never = parsed.command as never;
+      return `Unknown command: ${String(exhaustive)}`;
+    }
   }
 }
 
@@ -3034,6 +3055,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       return;
     }
 
+    case 'skill': {
+      // v0.8.0 #240: agentskills.io install/publish handlers (see end of file)
+      await runSkillSubcommand(parsed.skillSubcommand ?? 'help', parsed.skillArgs ?? [], { dryRun: parsed.dryRun });
+      return;
+    }
+
     default: {
       // One-shot commands: doctor, status, tools, chat, sessions, skills, jobs
       const output = await runCli(argv);
@@ -3053,3 +3080,69 @@ export const cliPackage = {
   name: '@crowclaw/cli',
   purpose: 'Minimum local CLI entry surface for status, tools, session chat flows, and interactive slash-command handling.'
 };
+
+// ---------------------------------------------------------------------------
+// v0.8.0 Hermes parity (#240) — `crowclaw skill install|publish` registration
+// ---------------------------------------------------------------------------
+// Append-only block: do not move handlers above this line. Keeps the diff
+// surface in index.ts minimal so other concurrent v0.8.0 work doesn't merge-
+// conflict on the CLI dispatch table.
+
+export { skillInstall } from './commands/skill-install.js';
+export type { SkillInstallOptions, SkillInstallResult } from './commands/skill-install.js';
+export { skillPublish } from './commands/skill-publish.js';
+export type { SkillPublishOptions, SkillPublishResult } from './commands/skill-publish.js';
+
+import { skillInstall as _skillInstall } from './commands/skill-install.js';
+import { skillPublish as _skillPublish } from './commands/skill-publish.js';
+
+export async function runSkillSubcommand(
+  sub: string,
+  args: string[],
+  opts: { dryRun?: boolean } = {}
+): Promise<void> {
+  switch (sub) {
+    case 'install': {
+      const source = args[0];
+      if (!source) {
+        stdout.write('usage: crowclaw skill install <url-or-slug-or-path>\n');
+        process.exitCode = 1;
+        return;
+      }
+      const result = await _skillInstall(source);
+      if (!result.ok) {
+        stdout.write(`error: ${result.error ?? 'install failed'}\n`);
+        process.exitCode = 1;
+      }
+      return;
+    }
+    case 'publish': {
+      const slug = args[0];
+      if (!slug) {
+        stdout.write('usage: crowclaw skill publish <slug> [--dry-run]\n');
+        process.exitCode = 1;
+        return;
+      }
+      const result = await _skillPublish(slug, { dryRun: opts.dryRun });
+      if (!result.ok) {
+        stdout.write(`error: ${result.error ?? 'publish failed'}\n`);
+        process.exitCode = 1;
+      }
+      return;
+    }
+    case 'help':
+    default: {
+      stdout.write(
+        [
+          'crowclaw skill — install or publish SKILL.md (agentskills.io v1.0)',
+          '',
+          'Commands:',
+          '  install <url-or-slug-or-path>   Install a skill into ~/.crowclaw/skills/installed',
+          '  publish <slug> [--dry-run]      Package a local skill for upload',
+          '',
+        ].join('\n')
+      );
+      if (sub !== 'help') process.exitCode = 1;
+    }
+  }
+}

@@ -42,6 +42,23 @@ interface SkillInfo {
   triggerPhrases?: string[];
 }
 
+/**
+ * Pending skill draft surfaced from GET /api/learning/drafts/pending.
+ * Source distinguishes auto-capture / agent-proposed / explicit drafts so the
+ * Drafts tab can label each row with its origin.
+ */
+interface PendingDraft {
+  id: string;
+  slug: string;
+  title: string;
+  summary?: string;
+  triggerPhrases?: string[];
+  recurrenceCount?: number;
+  source?: 'auto-capture' | 'agent-proposed' | 'explicit';
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 const timeAgo = (d: string) => {
   if (!d) return '--';
   const s = Math.floor((Date.now() - new Date(d).getTime()) / 1000);
@@ -515,7 +532,14 @@ export class AutomateView extends LitElement {
   @state() private gatewayStatus: Record<string, boolean> = {};
   @state() private gatewayStatusLoaded = false;
 
+  // v0.8.0 (#238) — Drafts tab state
+  @state() private pendingDrafts: PendingDraft[] = [];
+  @state() private draftsLoading = false;
+  @state() private draftActionInFlight: Set<string> = new Set();
+
   private _refreshInterval?: ReturnType<typeof setInterval>;
+  private _draftsRefreshInterval?: ReturnType<typeof setInterval>;
+  private _learningEventHandler?: (e: Event) => void;
 
   connectedCallback() {
     super.connectedCallback();
@@ -525,6 +549,25 @@ export class AutomateView extends LitElement {
       this._fetchJobs();
       this._fetchSchedulerStatus();
     }, 30_000);
+
+    // v0.8.0 (#238) — Drafts tab: poll the pending drafts every 10s so the
+    // tab stays current even on transports where SSE doesn't reach this view.
+    void this._fetchPendingDrafts();
+    this._draftsRefreshInterval = setInterval(() => {
+      void this._fetchPendingDrafts();
+    }, 10_000);
+
+    // Live updates: bridge `crowclaw-event` (window-scoped) for learning:*
+    // events emitted by the runtime EventBus. The runtime-node app.ts already
+    // dispatches the `learning:*` family alongside session/gateway/job events
+    // via the same SSE/WS transport.
+    this._learningEventHandler = (e: Event) => {
+      const detail = (e as CustomEvent<{ type?: string }>).detail;
+      if (detail && typeof detail.type === 'string' && detail.type.startsWith('learning:')) {
+        void this._fetchPendingDrafts();
+      }
+    };
+    window.addEventListener('crowclaw-event', this._learningEventHandler);
   }
 
   disconnectedCallback() {
@@ -532,6 +575,14 @@ export class AutomateView extends LitElement {
     if (this._refreshInterval) {
       clearInterval(this._refreshInterval);
       this._refreshInterval = undefined;
+    }
+    if (this._draftsRefreshInterval) {
+      clearInterval(this._draftsRefreshInterval);
+      this._draftsRefreshInterval = undefined;
+    }
+    if (this._learningEventHandler) {
+      window.removeEventListener('crowclaw-event', this._learningEventHandler);
+      this._learningEventHandler = undefined;
     }
   }
 
@@ -593,6 +644,64 @@ export class AutomateView extends LitElement {
     } catch {
       this.skills = [];
     }
+  }
+
+  /**
+   * v0.8.0 (#238) — GET /api/learning/drafts/pending returns
+   * `{ drafts: PendingDraft[] }`. Tolerates both shapes (bare array or wrapped
+   * object) so the UI doesn't break if the contract evolves.
+   */
+  private async _fetchPendingDrafts() {
+    this.draftsLoading = true;
+    try {
+      const data = await api<{ drafts?: PendingDraft[] } | PendingDraft[]>('/api/learning/drafts/pending');
+      this.pendingDrafts = Array.isArray(data) ? data : (data?.drafts ?? []);
+    } catch {
+      this.pendingDrafts = [];
+    } finally {
+      this.draftsLoading = false;
+    }
+  }
+
+  private async _promoteDraft(draft: PendingDraft) {
+    if (this.draftActionInFlight.has(draft.id)) return;
+    this.draftActionInFlight = new Set([...this.draftActionInFlight, draft.id]);
+    try {
+      await api(`/api/learning/drafts/${encodeURIComponent(draft.id)}/promote`, { method: 'POST' });
+      showToast(`Skill '${draft.slug || draft.title}' promoted.`, 'success');
+      await this._fetchPendingDrafts();
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'unknown';
+      showToast(`Failed to promote draft: ${msg}`, 'error');
+    } finally {
+      const updated = new Set(this.draftActionInFlight);
+      updated.delete(draft.id);
+      this.draftActionInFlight = updated;
+    }
+  }
+
+  private async _rejectDraft(draft: PendingDraft) {
+    if (this.draftActionInFlight.has(draft.id)) return;
+    if (!confirm(`Reject draft '${draft.title || draft.slug}'? It will be removed from the pending list.`)) return;
+    this.draftActionInFlight = new Set([...this.draftActionInFlight, draft.id]);
+    try {
+      await api(`/api/learning/drafts/${encodeURIComponent(draft.id)}/reject`, { method: 'POST' });
+      showToast(`Draft rejected.`, 'success');
+      await this._fetchPendingDrafts();
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'unknown';
+      showToast(`Failed to reject draft: ${msg}`, 'error');
+    } finally {
+      const updated = new Set(this.draftActionInFlight);
+      updated.delete(draft.id);
+      this.draftActionInFlight = updated;
+    }
+  }
+
+  private _editDraft(draft: PendingDraft) {
+    // Edit flows through Connect/Skills tab today; surface a helpful pointer
+    // rather than implement a duplicate editor here.
+    showToast(`Open the Skills tab to edit '${draft.title || draft.slug}'.`, 'info');
   }
 
   private async _toggleScheduler() {
@@ -818,9 +927,99 @@ export class AutomateView extends LitElement {
           ? html`<div class="loading">Loading scheduler data...</div>`
           : html`
               ${this._renderSchedulerSection()}
+              ${this._renderDraftsSection()}
             `}
       </div>
       ${this.showForm ? this._renderForm() : nothing}
+    `;
+  }
+
+  /**
+   * v0.8.0 (#238) — Skill Drafts section. Renders pending drafts surfaced by
+   * the auto-capture + agent-proposed flows, with Promote / Edit / Reject
+   * actions per row.
+   */
+  private _renderDraftsSection() {
+    const drafts = this.pendingDrafts;
+    return html`
+      <div class="section-block" style="margin-top: var(--sp-6)">
+        <div class="section-header">Skill Drafts</div>
+        ${this.draftsLoading && drafts.length === 0
+          ? html`<div class="loading">Loading drafts...</div>`
+          : drafts.length === 0
+            ? html`
+                <div class="empty">
+                  <div class="empty-title">No pending drafts</div>
+                  <div class="empty-subtitle">
+                    Drafts appear here when the agent proposes a new skill or auto-capture finds a recurring pattern.
+                  </div>
+                </div>
+              `
+            : html`
+                <div class="job-grid">
+                  ${drafts.map((draft) => this._renderDraftCard(draft))}
+                </div>
+              `}
+      </div>
+    `;
+  }
+
+  private _renderDraftCard(draft: PendingDraft) {
+    const sourceLabel: Record<NonNullable<PendingDraft['source']>, string> = {
+      'auto-capture': 'auto-capture',
+      'agent-proposed': 'agent',
+      'explicit': 'explicit',
+    };
+    const source = draft.source ?? 'auto-capture';
+    const inFlight = this.draftActionInFlight.has(draft.id);
+    const triggerPreview = (draft.triggerPhrases ?? []).slice(0, 3).join(', ');
+    return html`
+      <div class="job-card">
+        <div class="job-card-header">
+          <span class="job-name" title=${draft.title || draft.slug}>${draft.title || draft.slug}</span>
+          <span class="tag">${sourceLabel[source] ?? source}</span>
+        </div>
+        <div class="job-meta">
+          ${typeof draft.recurrenceCount === 'number' ? html`
+            <div class="job-meta-row">
+              <span class="job-meta-label">Recurrence</span>
+              <span class="job-meta-value">${draft.recurrenceCount}x</span>
+            </div>
+          ` : nothing}
+          ${triggerPreview ? html`
+            <div class="job-meta-row">
+              <span class="job-meta-label">Triggers</span>
+              <span class="job-meta-value" style="font-family:var(--font-sans);font-size:var(--text-xs);text-align:right;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=${(draft.triggerPhrases ?? []).join(', ')}>${triggerPreview}</span>
+            </div>
+          ` : nothing}
+          ${draft.summary ? html`
+            <div class="job-meta-row" style="align-items:flex-start">
+              <span class="job-meta-label">Summary</span>
+              <span class="job-meta-value" style="font-family:var(--font-sans);font-size:var(--text-xs);text-align:right;max-width:65%;line-height:1.4">${draft.summary.slice(0, 160)}</span>
+            </div>
+          ` : nothing}
+        </div>
+        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);justify-content:flex-end">
+          <button
+            class="btn"
+            aria-label="Edit draft skill"
+            @click=${() => this._editDraft(draft)}
+            ?disabled=${inFlight}
+          >Edit</button>
+          <button
+            class="btn"
+            aria-label="Reject draft skill"
+            @click=${() => this._rejectDraft(draft)}
+            ?disabled=${inFlight}
+          >Reject</button>
+          <button
+            class="btn btn-p"
+            aria-label="Promote draft skill"
+            @click=${() => this._promoteDraft(draft)}
+            ?disabled=${inFlight}
+          >${inFlight ? 'Working...' : 'Promote'}</button>
+        </div>
+      </div>
     `;
   }
 

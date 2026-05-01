@@ -44,13 +44,12 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
     sections.push(['Agent identity:', ...identityLines].join('\n'));
   }
 
-  if (input.matchedSkills && input.matchedSkills.length > 0) {
-    const skillBlocks = input.matchedSkills.slice(0, 3).map((skill) => {
-      const toolsAttr = skill.tools?.length ? ` tools="${skill.tools.join(',')}"` : '';
-      return `<skill name="${skill.name}"${toolsAttr}>${skill.description}\n${skill.instructions}\n</skill>`;
-    });
-    sections.push(['Relevant skills:', ...skillBlocks].join('\n'));
-  }
+  // #230 (Hermes parity): matched skills are NO LONGER embedded in the system
+  // prompt. They are injected as a synthetic user-role message in the agent
+  // loop instead, which preserves prefix-cache hits on the system prompt
+  // across turns where skill matches change. The `matchedSkills` parameter is
+  // still accepted (kept for observability / external callers that read it),
+  // but is intentionally not consumed here. See AgentLoop.run() for injection.
 
   const runtimeLines = [
     input.runtimeName ? `Runtime: ${input.runtimeName}` : null,

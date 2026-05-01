@@ -210,10 +210,13 @@ describe('E2E: closed learning loop', () => {
       userMessage: 'deploy to vercel production',
     });
 
-    // Verify the skill was injected into the system prompt
+    // v0.8.0 (#230): the skill is injected as a user-role message, not in
+    // the system prompt — verify the message envelope.
     expect(provider.requests.length).toBe(1);
-    const systemPrompt = provider.requests[0].systemPrompt ?? '';
-    expect(systemPrompt).toContain('vercel-deploy-learned');
+    const skillMsg = provider.requests[0].messages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<crowclaw-skills>'),
+    );
+    expect(skillMsg?.content as string).toContain('vercel-deploy-learned');
   });
 
   it('autoCapture only captures completed tasks', async () => {
@@ -635,9 +638,12 @@ describe('E2E: full Hermes-style workflow', () => {
       userMessage: 'set up nextjs with authentication',
     });
 
-    // Verify the learned skill was in the system prompt
-    const lastRequest = provider.requests.at(-1)!;
-    expect(lastRequest.systemPrompt).toContain('nextjs-auth-setup');
+    // v0.8.0 (#230): learned skill is now in a user-role message.
+    const lastRequest = provider.requests[provider.requests.length - 1]!;
+    const lastSkillMsg = lastRequest.messages.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<crowclaw-skills>'),
+    );
+    expect(lastSkillMsg?.content as string).toContain('nextjs-auth-setup');
 
     // === Batch processing with the learned skill ===
     const batchSummary = await runBatch(

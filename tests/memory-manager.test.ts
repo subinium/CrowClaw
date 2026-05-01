@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MemoryManager,
   BuiltInMemoryProvider,
-  type MemoryProvider,
+  type LegacyMemoryProvider as MemoryProvider,
   type ManagerMemoryRecord,
 } from '@crowclaw/memory';
 import { InMemoryMemoryStore } from '@crowclaw/storage';
