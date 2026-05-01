@@ -142,7 +142,11 @@ const FIRST_CHAT_PROMPT = 'Tell me what you can do';
  */
 export const shouldShowOnboarding = (status: OnboardingStatus | null | undefined): boolean => {
   if (!status) return false;
-  return !(status.hasProvider && status.hasPreset && status.firstChatComplete);
+  // #229: persona selection is optional after #217 made the registry empty by
+  // default. Drop `hasPreset` from the gate so the wizard doesn't reappear
+  // forever for users who clicked Skip on step 2. Provider + first chat are
+  // the meaningful onboarding milestones.
+  return !(status.hasProvider && status.firstChatComplete);
 };
 
 /**

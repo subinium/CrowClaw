@@ -1934,6 +1934,26 @@ export class SettingsView extends LitElement {
       ? ((stats.success / stats.total) * 100).toFixed(1)
       : '0.0';
 
+    // #229: Empty state — when the ledger is unpopulated, show a CTA that
+    // points the user toward generating tool-call traffic (i.e. start a chat
+    // with tools enabled). Without this, the tab renders four "0" cards plus
+    // a "No per-tool data yet" line, which reads as broken to first-run users.
+    if (stats && stats.total === 0 && this.feedbackEntries.length === 0) {
+      return html`
+        <div class="section-block">
+          <div class="section-header">Feedback Ledger</div>
+          <crowclaw-empty
+            icon="feedback"
+            title="No tool calls recorded yet"
+            description="The feedback ledger fills as the agent invokes tools. Start a chat that asks for web search, file ops, or any other tool to populate this view."
+            cta-label="Start a chat"
+            cta-event="cc-empty-go-chat"
+            @cc-empty-go-chat=${this._navigateToChat}
+          ></crowclaw-empty>
+        </div>
+      `;
+    }
+
     return html`
       <div class="section-block">
         <div class="section-header">Feedback Ledger</div>

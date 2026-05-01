@@ -37,6 +37,7 @@ Two threads in one release:
 - **#226** "MCP" naming clash resolved — the Agent view tab is gone (#219); Connect view section confirmed as `MCP Servers`.
 - **#227** Provider config canonical surface designated as **Connect → Providers**. Settings → Agent shows a hint pointing there instead of duplicating the form.
 - **#228** Settings tab strip split into two visual rows: `Settings` (agent / usage / system / memory / feedback) and `Advanced` (security). Functionality preserved; Security tab is no longer a peer to Agent in the default scan.
+- **#229** Audit of Settings → Memory + Feedback tabs. Memory tab is correctly wired (session selector → memories list with scope filter and delete) and stays as-is. Feedback tab gains an `<crowclaw-empty>` zero-state ("No tool calls recorded yet" + Start-a-chat CTA) so a fresh install no longer renders four `0` cards as if broken. Also fixes a regression introduced by #217: `shouldShowOnboarding` no longer requires `hasPreset` (persona selection became optional when the hardcoded registry was emptied), so users who Skip step 2 don't see the wizard reappear on every reload.
 
 ### ChatGPT (Codex) OAuth provider
 
