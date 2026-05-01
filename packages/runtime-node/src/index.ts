@@ -1687,18 +1687,47 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   function buildConfiguredToolRegistry(overrides?: ExecutionOverrides): ToolRegistry {
     const activeToolset = overrides?.toolsetPreset ?? configStore.getActiveToolset();
+    const disabledTools = new Set(configStore.getDisabledTools());
+
+    // #218 — when no toolset is active, still apply the per-tool disabled
+    // filter so dashboard toggles take effect immediately. We materialize a
+    // new registry instead of returning the shared `tools` instance.
     if (!activeToolset) {
-      return tools;
+      if (disabledTools.size === 0) {
+        return tools;
+      }
+      const filtered = new ToolRegistry();
+      for (const manifest of tools.list()) {
+        if (disabledTools.has(manifest.name)) continue;
+        const definition = tools.get(manifest.name);
+        if (definition) filtered.register(definition);
+      }
+      return filtered;
     }
 
     const preset = toolsetPresets.get(activeToolset);
     if (!preset || preset.toolNames.length === 0) {
-      return tools;
+      if (disabledTools.size === 0) {
+        return tools;
+      }
+      const filtered = new ToolRegistry();
+      for (const manifest of tools.list()) {
+        if (disabledTools.has(manifest.name)) continue;
+        const definition = tools.get(manifest.name);
+        if (definition) filtered.register(definition);
+      }
+      return filtered;
     }
 
     const filtered = new ToolRegistry();
     for (const manifest of tools.list()) {
       if (!preset.toolNames.includes(manifest.name)) {
+        continue;
+      }
+      // #218 — additionally drop tools the user has explicitly disabled via
+      // POST /api/tools/:name/toggle. Disabled tools are removed from the
+      // agent-loop registry so the LLM never sees them in its tool list.
+      if (disabledTools.has(manifest.name)) {
         continue;
       }
       const definition = tools.get(manifest.name);
@@ -2786,9 +2815,45 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       // Tool inventory shortcut (used by app shell sidebar)
       if (request.method === 'GET' && url.pathname === '/api/tools') {
-        const registry = buildConfiguredToolRegistry();
-        const allTools = registry.list();
+        // #218 — expose the *full* tool inventory (not the toolset-filtered
+        // registry) so the dashboard can render disable toggles for every
+        // tool, including ones currently hidden by the active toolset preset.
+        // Each entry carries a `disabled` flag from the configStore so the
+        // UI can render the toggle state without a second round-trip.
+        const allTools = tools.list().map((manifest) => ({
+          ...manifest,
+          disabled: configStore.isToolDisabled(manifest.name),
+        }));
         return Response.json({ tools: allTools, count: allTools.length });
+      }
+
+      // #218 — POST /api/tools/:name/toggle: persist a per-tool enable/disable
+      // flag. Disabled tools are stripped from the agent-loop registry by
+      // `buildConfiguredToolRegistry()` so the LLM never sees them. The UI
+      // calls this endpoint when the user flips a tool toggle in the
+      // dashboard tool inventory panel.
+      {
+        const toolToggleMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/toggle$/);
+        if (request.method === 'POST' && toolToggleMatch) {
+          const toolName = decodeURIComponent(toolToggleMatch[1]);
+          const body = (await request.json().catch(() => ({}))) as { disabled?: boolean };
+          if (typeof body.disabled !== 'boolean') {
+            return Response.json(
+              { error: { code: 'VALIDATION_ERROR', message: 'Body must include `disabled: boolean`' } },
+              { status: 400 },
+            );
+          }
+          // Reject toggles for unknown tool names so the UI can't silently
+          // accumulate dead entries in the disabled set.
+          if (!tools.get(toolName)) {
+            return Response.json(
+              { error: { code: 'TOOL_NOT_FOUND', message: `Tool '${toolName}' is not registered` } },
+              { status: 404 },
+            );
+          }
+          configStore.setToolDisabled(toolName, body.disabled);
+          return Response.json({ ok: true, name: toolName, disabled: body.disabled });
+        }
       }
 
       if (request.method === 'GET' && url.pathname === '/api/system/status') {
@@ -3392,6 +3457,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/presets') {
+        // #219 — `activeMcp` removed: the runtime no longer tracks a single
+        // "active" MCP preset (multiple connections can be live), and the UI
+        // now sources MCP state from the connections endpoint.
         const mcpNames = listMcpPresetNames();
         return Response.json({
           agents: listAgentPresets(),
@@ -3399,7 +3467,6 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           mcp: mcpNames.map((name) => ({ name, description: getMcpPresetDescription(name) })),
           activeAgent: configStore.getActivePreset(),
           activeToolset: configStore.getActiveToolset(),
-          activeMcp: null,
         });
       }
 
@@ -5163,7 +5230,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           timeoutMs: body.timeoutMs,
         });
         await schedulerStore.saveJob(job);
-        return Response.json(job);
+        // #214 — autostart the autonomous scheduler the first time a job is
+        // created so the dashboard "save job" UX doesn't silently leave jobs
+        // dormant. `wasStarted` lets the frontend show a "Scheduler started"
+        // toast on the transition.
+        const wasRunningBefore = autonomousScheduler.isRunning();
+        if (!wasRunningBefore) {
+          autonomousScheduler.start();
+        }
+        const wasStarted = !wasRunningBefore && autonomousScheduler.isRunning();
+        return Response.json({ ...job, wasStarted });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/scheduler/tick') {

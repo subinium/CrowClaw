@@ -116,6 +116,7 @@ interface ToolInfo {
   description: string;
   runtime?: string;
   dangerLevel?: 'safe' | 'moderate' | 'dangerous';
+  disabled?: boolean;
 }
 
 /** Matches GET /api/system/status response shape */
@@ -877,6 +878,9 @@ export class ConnectView extends LitElement {
   @state() private loading = true;
   @state() private toolSearch = '';
 
+  /* Tools toggle */
+  @state() private togglingTool: string | null = null;
+
   /* Provider test */
   @state() private testingProvider: string | null = null;
 
@@ -1320,6 +1324,49 @@ export class ConnectView extends LitElement {
     }
   }
 
+  /* ---- provider slot add / remove ---- */
+
+  private _openAddSlot(slotName: string) {
+    if (this.configuringProvider === slotName) {
+      this.configuringProvider = null;
+      return;
+    }
+    // Pre-fill with primary slot's provider/baseUrl so the user only types the API key.
+    const primary = this.providers.find((p) => p.slot === 'primary');
+    this.configuringProvider = slotName;
+    this.providerForm = {
+      slot: slotName,
+      name: slotName,
+      provider: primary?.provider ?? '',
+      baseUrl: primary?.baseUrl ?? '',
+      apiKey: '',
+      model: primary?.model ?? '',
+    };
+  }
+
+  private async _removeProviderSlot(slot: string) {
+    if (slot === 'primary') return; // Guard: never remove primary
+    if (!window.confirm(`Remove ${slot} slot?`)) return;
+    try {
+      // Re-fetch current config, drop the slot, POST the merged result.
+      const current = await api<{ slots: ProviderConfig }>('/api/providers/config');
+      const merged: Record<string, ProviderSlot | null> = { ...(current.slots ?? {}) };
+      delete merged[slot];
+      await api('/api/providers/config', {
+        method: 'POST',
+        body: JSON.stringify(merged),
+      });
+      if (this.configuringProvider === slot) {
+        this.configuringProvider = null;
+      }
+      await this._fetchProviders();
+      showToast(`Removed ${slot} slot`, 'success');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      showToast(`Failed to remove ${slot} slot: ${msg}`, 'error');
+    }
+  }
+
   /* ---- provider test ---- */
 
   private async _testProvider(provider: ProviderDisplay) {
@@ -1476,6 +1523,37 @@ export class ConnectView extends LitElement {
     }
   }
 
+  /* ---- tool toggle ---- */
+
+  private async _toggleTool(tool: ToolInfo) {
+    const newDisabled = !tool.disabled;
+    this.togglingTool = tool.name;
+    // Optimistic update
+    this.tools = this.tools.map((t) =>
+      t.name === tool.name ? { ...t, disabled: newDisabled } : t,
+    );
+    try {
+      await api<{ ok: boolean; name: string; disabled: boolean }>(
+        `/api/tools/${encodeURIComponent(tool.name)}/toggle`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ disabled: newDisabled }),
+        },
+      );
+      // Refresh tools list to reflect the persisted state
+      await this._fetchStatus();
+    } catch (error: unknown) {
+      // Revert
+      this.tools = this.tools.map((t) =>
+        t.name === tool.name ? { ...t, disabled: !newDisabled } : t,
+      );
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      showToast(`Failed to toggle ${tool.name}: ${msg}`, 'error');
+    } finally {
+      this.togglingTool = null;
+    }
+  }
+
   /* ---- tools helpers ---- */
 
   private get _filteredTools(): ToolInfo[] {
@@ -1522,7 +1600,6 @@ export class ConnectView extends LitElement {
     }
 
     return html`
-      ${this._renderStatusOverview()}
       ${this._renderProviders()}
       ${this._renderMcpServers()}
       ${this._renderPlatforms()}
@@ -1532,51 +1609,17 @@ export class ConnectView extends LitElement {
     `;
   }
 
-  /* ---- Section 1: Status Overview ---- */
+  /* ---- Section: Providers ---- */
 
-  private _renderStatusOverview() {
-    const s = this.systemStatus;
-    const provCount = this.providers.length;
-    return html`
-      <div class="section-block">
-        <div class="section-header">Status Overview</div>
-        <div class="status-list">
-          <div class="status-row">
-            <span class="dot ${provCount > 0 ? 'live' : 'disc'}"></span>
-            <span class="label">Providers</span>
-            <span class="detail">${provCount > 0 ? `${provCount} configured` : 'No active providers'}</span>
-            <span class="count">${provCount}</span>
-          </div>
-          <div class="status-row">
-            <span class="dot ${s?.gateway ? this._statusDotClass(s.gateway.status) : 'disc'}"></span>
-            <span class="label">Gateway</span>
-            <span class="detail">${s?.gateway ? this._statusLabel(s.gateway.status) : '--'}</span>
-            <span class="count">${s?.gateway?.platforms ?? 0} platforms</span>
-          </div>
-          <div class="status-row">
-            <span class="dot ${s?.mcp ? this._statusDotClass(s.mcp.status) : 'disc'}"></span>
-            <span class="label">MCP</span>
-            <span class="detail">${s?.mcp ? this._statusLabel(s.mcp.status) : '--'}</span>
-            <span class="count">${s?.mcp?.servers ?? 0} servers</span>
-          </div>
-          <div class="status-row">
-            <span class="dot ${s && s.tools.count > 0 ? 'live' : 'disc'}"></span>
-            <span class="label">Tools</span>
-            <span class="detail">${s && s.tools.count > 0 ? 'Available' : '--'}</span>
-            <span class="count">${s?.tools.count ?? 0} tools</span>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  /* ---- Section 2: Providers ---- */
+  private static readonly KNOWN_SLOTS = ['primary', 'fallback', 'vision', 'compression', 'embedding'] as const;
 
   private _renderProviders() {
+    const present = new Set(this.providers.map((p) => p.slot));
+    const missing = ConnectView.KNOWN_SLOTS.filter((s) => !present.has(s));
     return html`
       <div class="section-block">
         <div class="section-header">Providers</div>
-        ${this.providers.length === 0
+        ${this.providers.length === 0 && missing.length === 0
           ? html`
               <div class="empty-state">
                 <div class="title">No Providers</div>
@@ -1586,14 +1629,39 @@ export class ConnectView extends LitElement {
           : html`
               <div class="provider-grid">
                 ${this.providers.map((p) => this._renderProviderCard(p))}
+                ${missing.map((slot) => this._renderAddSlotCard(slot))}
               </div>
             `}
       </div>
     `;
   }
 
+  private _renderAddSlotCard(slotName: string) {
+    const isConfiguring = this.configuringProvider === slotName;
+    return html`
+      <div class="provider-card">
+        <div class="provider-hdr">
+          <span class="dot disc"></span>
+          <span class="provider-name">Add ${slotName} slot</span>
+        </div>
+        <div class="provider-url">No ${slotName} slot configured</div>
+        <div class="provider-actions">
+          <button
+            class="btn ${isConfiguring ? 'btn-p' : ''}"
+            aria-label="Add ${slotName} slot"
+            @click=${() => this._openAddSlot(slotName)}
+          >
+            ${isConfiguring ? 'Close' : 'Add'}
+          </button>
+        </div>
+        ${isConfiguring ? this._renderProviderForm() : nothing}
+      </div>
+    `;
+  }
+
   private _renderProviderCard(provider: ProviderDisplay) {
     const isConfiguring = this.configuringProvider === provider.slot;
+    const canRemove = provider.slot !== 'primary';
     return html`
       <div class="provider-card">
         <div class="provider-hdr">
@@ -1616,6 +1684,17 @@ export class ConnectView extends LitElement {
           >
             ${isConfiguring ? 'Close' : 'Configure'}
           </button>
+          ${canRemove
+            ? html`
+                <button
+                  class="btn btn-danger"
+                  aria-label="Remove ${provider.slot} slot"
+                  @click=${() => this._removeProviderSlot(provider.slot)}
+                >
+                  Remove
+                </button>
+              `
+            : nothing}
         </div>
         ${isConfiguring ? this._renderProviderForm() : nothing}
       </div>
@@ -2360,6 +2439,7 @@ export class ConnectView extends LitElement {
   }
 
   private _renderToolItem(tool: ToolInfo) {
+    const isToggling = this.togglingTool === tool.name;
     return html`
       <div class="tool-item">
         <span class="tool-name">${tool.name}</span>
@@ -2371,6 +2451,12 @@ export class ConnectView extends LitElement {
           ${tool.dangerLevel
             ? html`<span class="danger-badge ${tool.dangerLevel}">${tool.dangerLevel}</span>`
             : nothing}
+          <crowclaw-toggle
+            .checked=${!tool.disabled}
+            .disabled=${isToggling}
+            aria-label="${tool.disabled ? 'Enable' : 'Disable'} tool ${tool.name}"
+            @change=${() => this._toggleTool(tool)}
+          ></crowclaw-toggle>
         </div>
       </div>
     `;

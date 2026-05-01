@@ -41,19 +41,24 @@ describe('Dashboard contract: agent-view.ts', () => {
       mcp: Array<{ name: string; description?: string }>;
       activeAgent: string | null;
       activeToolset: string | null;
-      activeMcp: string | null;
     };
     expect(Array.isArray(data.agents)).toBe(true);
-    expect(data.agents.length).toBeGreaterThan(0);
-    expect(data.agents[0]).toHaveProperty('name');
-    expect(data.agents[0]).toHaveProperty('role');
-    expect(data.agents[0]).toHaveProperty('goal');
+    // #217: hardcoded agent personas removed — registry is empty by default.
+    // The UI now consumes user-defined personas via the file-backed
+    // PersonaRegistry. The shape contract here just guarantees the field is
+    // an array; per-entry shape is verified at the registry level.
+    if (data.agents.length > 0) {
+      expect(data.agents[0]).toHaveProperty('name');
+      expect(data.agents[0]).toHaveProperty('role');
+      expect(data.agents[0]).toHaveProperty('goal');
+    }
     expect(Array.isArray(data.toolsets)).toBe(true);
     expect(Array.isArray(data.mcp)).toBe(true);
-    // Active markers must be present so the UI can render the "Active" badge
+    // Active markers must be present so the UI can render the "Active" badge.
+    // #219: `activeMcp` removed — the dashboard sources MCP state from the
+    // connections endpoint instead.
     expect(data).toHaveProperty('activeAgent');
     expect(data).toHaveProperty('activeToolset');
-    expect(data).toHaveProperty('activeMcp');
   });
 
   it('GET /api/skills includes requiredTools so skill cards can render tool badges', async () => {

@@ -1,10 +1,14 @@
 /**
- * First-run setup wizard (#174).
+ * First-run setup wizard (#174 + #217).
  *
  * Renders a 3-step horizontal stepper that walks a brand-new user through
  *
  *   1. picking + validating a provider key
- *   2. picking a tool preset (MCP+Skill+Tool bundle)
+ *   2. picking a persona from the file-backed PersonaRegistry
+ *      (`GET /api/personas`). When the registry is empty the step
+ *      renders a skip card and advances to step 3 without activating
+ *      anything. (#217 — the previous hardcoded `agentPresets` list
+ *      backing this step has been removed.)
  *   3. sending their first chat
  *
  * The orchestrator (`app.ts`) decides whether to mount this view by calling
@@ -54,14 +58,23 @@ interface ProviderOption {
   keyless?: boolean;
 }
 
-interface PresetOption {
-  id: string;
-  /** Preset name as known by the runtime (`/api/config-presets/switch`). */
-  presetName: string;
-  label: string;
-  description: string;
-  mcps: string[];
-  skills: string[];
+/**
+ * Issue #217: the wizard's "persona" step now sources its options from the
+ * file-backed PersonaRegistry (`GET /api/personas`) instead of a hardcoded
+ * list of (now-deleted) `agentPresets` entries like `coding-assistant` or
+ * `creative-writer`. When the registry is empty the step renders a skip
+ * card and advances to step 3 without activating anything.
+ */
+interface PersonaOption {
+  /** Persona name as registered in PersonaRegistry. Used as the body for
+   *  `POST /api/persona/switch`. */
+  name: string;
+  active: boolean;
+}
+
+/** Raw shape returned by `GET /api/personas`. */
+interface PersonasResponse {
+  personas: Array<{ name: string; active: boolean }>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -111,33 +124,6 @@ const PROVIDER_OPTIONS: ProviderOption[] = [
     defaultModel: 'llama3.1:8b',
     defaultBaseUrl: 'http://localhost:11434/v1',
     keyless: true,
-  },
-];
-
-const PRESET_OPTIONS: PresetOption[] = [
-  {
-    id: 'coding',
-    presetName: 'code-development',
-    label: 'Coding Assistant',
-    description: 'Write, review, and debug code with filesystem + GitHub access.',
-    mcps: ['github', 'filesystem'],
-    skills: ['code-review', 'write-tests', 'debug-error', 'refactor-module'],
-  },
-  {
-    id: 'research',
-    presetName: 'web-research',
-    label: 'Web Researcher',
-    description: 'Browse, scrape, and summarize web content.',
-    mcps: ['braveSearch', 'playwright'],
-    skills: ['web-research', 'summarize-article', 'web-scraping'],
-  },
-  {
-    id: 'custom',
-    presetName: 'minimal',
-    label: 'Custom (start blank)',
-    description: 'No MCPs, no skills — configure it yourself in Settings.',
-    mcps: [],
-    skills: [],
   },
 ];
 
@@ -468,8 +454,16 @@ export class CrowClawOnboarding extends LitElement {
   @state() private step1Saving = false;
   @state() private step1Error: string | null = null;
 
-  /* Step 2 state */
-  @state() private selectedPreset: string | null = null;
+  /* Step 2 state — persona picker (issue #217). The wizard fetches
+   * `/api/personas` lazily when the user lands on step 2 so a slow
+   * registry read doesn't block step 1. `personasFetched` flips true
+   * after the first fetch completes (success or empty), which is what
+   * the renderer uses to distinguish "still loading" from "registry is
+   * empty" — both produce an empty `personas` array. */
+  @state() private personas: PersonaOption[] = [];
+  @state() private personasLoading = false;
+  @state() private personasFetched = false;
+  @state() private selectedPersona: string | null = null;
   @state() private step2Saving = false;
   @state() private step2Error: string | null = null;
 
@@ -493,6 +487,12 @@ export class CrowClawOnboarding extends LitElement {
    */
   setInitialStatus(status: OnboardingStatus): void {
     this.currentStep = initialStepFromStatus(status);
+    // Issue #217: if the user resumes directly into step 2 we need to
+    // populate the persona list — there's no preceding step that would
+    // have triggered the fetch.
+    if (this.currentStep === 2) {
+      void this._fetchPersonas();
+    }
   }
 
   /* ---------------------------- Step 1 ---------------------------- */
@@ -568,6 +568,10 @@ export class CrowClawOnboarding extends LitElement {
       });
       showToast('Provider saved', 'success');
       this.currentStep = 2;
+      // Lazy-load personas the moment we transition into step 2. Done after
+      // `currentStep = 2` so the panel shows a brief loading state instead
+      // of jumping from step 1 straight to a populated list.
+      void this._fetchPersonas();
     } catch (err: unknown) {
       this.step1Error =
         err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'Save failed';
@@ -578,25 +582,52 @@ export class CrowClawOnboarding extends LitElement {
 
   /* ---------------------------- Step 2 ---------------------------- */
 
-  private _selectPreset(id: string): void {
-    this.selectedPreset = id;
+  /**
+   * Issue #217: read the file-backed persona registry. Failures degrade to
+   * the empty-list path so the wizard always offers a "Skip persona setup"
+   * card rather than dead-ending the user on a network error.
+   */
+  private async _fetchPersonas(): Promise<void> {
+    if (this.personasLoading) return;
+    this.personasLoading = true;
+    this.step2Error = null;
+    try {
+      const data = await api<PersonasResponse>('/api/personas');
+      this.personas = (data.personas ?? []).map((p) => ({
+        name: p.name,
+        active: Boolean(p.active),
+      }));
+    } catch (err: unknown) {
+      // Network / 500 — treat as "no personas" so the user can still skip
+      // through. Surface the underlying message so debugging is possible.
+      this.personas = [];
+      this.step2Error =
+        err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'Failed to load personas';
+    } finally {
+      this.personasLoading = false;
+      this.personasFetched = true;
+    }
+  }
+
+  private _selectPersona(name: string): void {
+    this.selectedPersona = name;
     this.step2Error = null;
   }
 
-  private async _savePreset(): Promise<void> {
-    const preset = PRESET_OPTIONS.find((p) => p.id === this.selectedPreset);
-    if (!preset) {
-      this.step2Error = 'Pick a preset to continue.';
+  private async _savePersona(): Promise<void> {
+    const name = this.selectedPersona;
+    if (!name) {
+      this.step2Error = 'Pick a persona to continue.';
       return;
     }
     this.step2Saving = true;
     this.step2Error = null;
     try {
-      await api('/api/config-presets/switch', {
+      await api('/api/persona/switch', {
         method: 'POST',
-        body: JSON.stringify({ name: preset.presetName }),
+        body: JSON.stringify({ name }),
       });
-      showToast(`${preset.label} activated`, 'success');
+      showToast(`${name} activated`, 'success');
       this.currentStep = 3;
     } catch (err: unknown) {
       this.step2Error =
@@ -604,6 +635,17 @@ export class CrowClawOnboarding extends LitElement {
     } finally {
       this.step2Saving = false;
     }
+  }
+
+  /**
+   * Empty-state CTA (issue #217): when the registry has no personas the
+   * wizard renders a `<crowclaw-empty>` card whose Skip button advances
+   * the flow to step 3 without activating anything. We do NOT dispatch
+   * the global `crowclaw:onboarding-skip` event here — that exits the
+   * wizard entirely, which is too aggressive for "just no personas yet".
+   */
+  private _skipPersonaStep(): void {
+    this.currentStep = 3;
   }
 
   /* ---------------------------- Step 3 ---------------------------- */
@@ -657,7 +699,7 @@ export class CrowClawOnboarding extends LitElement {
   private _renderStepper() {
     const steps: Array<{ n: 1 | 2 | 3; label: string }> = [
       { n: 1, label: 'Provider key' },
-      { n: 2, label: 'Tool preset' },
+      { n: 2, label: 'Persona' },
       { n: 3, label: 'First chat' },
     ];
     return html`
@@ -755,32 +797,72 @@ export class CrowClawOnboarding extends LitElement {
   }
 
   private _renderStep2() {
+    // Issue #217: three render branches in priority order —
+    //   (a) personas still loading → spinner-style placeholder
+    //   (b) fetched + non-empty   → file-backed picker
+    //   (c) fetched + empty       → `<crowclaw-empty>` skip card
+    if (this.personasLoading && !this.personasFetched) {
+      return html`
+        <div class="panel">
+          <div class="preset-desc">Loading personas…</div>
+          <div class="actions">
+            <button class="skip" @click=${this._skip}>Skip</button>
+            <div class="actions-right">
+              <button class="btn" @click=${() => (this.currentStep = 1)}>Back</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (this.personasFetched && this.personas.length === 0) {
+      return html`
+        <div class="panel">
+          <crowclaw-empty
+            icon="memory"
+            title="Skip persona setup"
+            description="You can create personas later from the Agent tab."
+            cta-label="Skip"
+            cta-event="crowclaw:onboarding-skip-persona"
+            @crowclaw:onboarding-skip-persona=${this._skipPersonaStep}
+          ></crowclaw-empty>
+
+          ${this.step2Error ? html`<div class="err">${this.step2Error}</div>` : nothing}
+
+          <div class="actions">
+            <button class="skip" @click=${this._skip}>Skip onboarding</button>
+            <div class="actions-right">
+              <button class="btn" @click=${() => (this.currentStep = 1)}>Back</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     return html`
       <div class="panel">
         <div class="preset-list">
-          ${PRESET_OPTIONS.map(
+          ${this.personas.map(
             (p) => html`
               <div
-                class="preset-card ${this.selectedPreset === p.id ? 'sel' : ''}"
+                class="preset-card ${this.selectedPersona === p.name ? 'sel' : ''}"
                 role="button"
                 tabindex="0"
-                @click=${() => this._selectPreset(p.id)}
+                @click=${() => this._selectPersona(p.name)}
                 @keydown=${(e: KeyboardEvent) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    this._selectPreset(p.id);
+                    this._selectPersona(p.name);
                   }
                 }}
               >
-                <div class="preset-title">${p.label}</div>
-                <div class="preset-desc">${p.description}</div>
-                <div class="preset-tags">
-                  ${p.mcps.map((m) => html`<span class="preset-tag">mcp:${m}</span>`)}
-                  ${p.skills.map((s) => html`<span class="preset-tag">skill:${s}</span>`)}
-                  ${p.mcps.length === 0 && p.skills.length === 0
-                    ? html`<span class="preset-tag">empty</span>`
-                    : nothing}
+                <div class="preset-title">${p.name}</div>
+                <div class="preset-desc">
+                  ${p.active ? 'Currently active persona' : 'Registered persona'}
                 </div>
+                ${p.active
+                  ? html`<div class="preset-tags"><span class="preset-tag">active</span></div>`
+                  : nothing}
               </div>
             `,
           )}
@@ -800,8 +882,8 @@ export class CrowClawOnboarding extends LitElement {
             </button>
             <button
               class="btn btn-p"
-              ?disabled=${this.step2Saving || !this.selectedPreset}
-              @click=${this._savePreset}
+              ?disabled=${this.step2Saving || !this.selectedPersona}
+              @click=${this._savePersona}
             >
               ${this.step2Saving ? 'Saving…' : 'Continue'}
             </button>

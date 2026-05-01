@@ -11,15 +11,22 @@ describe('Configuration API', () => {
   }
 
   describe('POST /api/agent/preset', () => {
-    it('should set active preset', async () => {
+    // Issue #217: the hardcoded `agentPresets` registry has been emptied.
+    // Personas are now expected to come from the file-backed PersonaRegistry,
+    // and the agent/preset endpoint stores whatever role/goal/backstory the
+    // caller supplies inline. These tests verify the route still accepts
+    // user-supplied identities without depending on any built-in preset name.
+    it('accepts an inline role/goal payload (no built-in registry lookup needed)', async () => {
       const res = await req('POST', '/api/agent/preset', {
-        name: 'coding-assistant',
+        name: 'custom-engineer',
         role: 'Senior engineer',
         goal: 'Write clean code',
       });
       const data = await res.json() as { ok: boolean; activePreset: string };
       expect(data.ok).toBe(true);
-      expect(data.activePreset).toBe('coding-assistant');
+      // The name is stored verbatim — it does not need to match an
+      // `agentPresets` entry (the registry is empty by design).
+      expect(data.activePreset).toBe('custom-engineer');
     });
 
     it('should clear preset with null', async () => {

@@ -5,7 +5,40 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
-## [0.7.1] — 2026-05-01 — ChatGPT (Codex) OAuth provider: sign in with `codex login`, no API key needed
+## [0.7.1] — 2026-05-01 — ChatGPT (Codex) OAuth provider + 18-issue dashboard audit sweep
+
+Two threads in one release:
+1. **ChatGPT subscription via `codex login`** (Codex backend OAuth, no API key required).
+2. **Internal dashboard audit** — 18 issues filed across the 5 main views (Chat / Agent / Connect / Automate / Settings), driven into this release in a single 8-agent parallel sweep with strict file ownership.
+
+### Dashboard audit sweep (18 issues, eight agents)
+
+**Critical fixes**
+- **#212** Settings → Security: SSRF toggle was an interactive switch that the backend dropped silently. Now rendered as a locked badge `Always on (enforced)` with a tooltip explaining SSRF is enforced at the code level. Other 5 protection toggles unchanged.
+- **#213** Settings → Agent: removed the ghost `model` field that wrote to `agentConfig.model` while the runtime read from `providerConfig.primary.model`. Replaced with a read-only `Active model: <name>` line linking to **Connect → Providers**.
+- **#214** Scheduler: `POST /api/scheduler/jobs` now auto-starts `autonomousScheduler` when the first job is created. Response shape extended with `wasStarted: boolean`. Automate view shows a `Scheduler started — your job will fire on schedule.` toast on the transition, plus a yellow dormant-state banner above the job grid when the scheduler is stopped with non-zero jobs.
+- **#224** Mounted `<crowclaw-tool-call-trace>` and `<crowclaw-memory-stream>` — they shipped in v0.7.0 but never appeared in any view template. Tool-call rows now render inline between assistant messages; memory stream renders as a collapsible right-edge panel.
+
+**Wiring gaps closed**
+- **#215** Removed `<option value="webhook">` from the Automate delivery select — the backend's `deliverToGateway` switch had no case for it.
+- **#216** Automate delivery options now disable telegram/slack platforms when no gateway token is configured server-side; option label suffixes with `(set up in Connect → Platforms)`. A green `token configured` badge renders next to the channel input when prerequisites are met. Discord stays enabled (webhook URL based).
+- **#217** Removed 15 hardcoded CrewAI/OpenClaw-clone personas from `agent-presets.ts` (Coding Assistant, DevOps Engineer, etc.). Personas tab now reads only from the file-backed `PersonaRegistry`. Removed the dead `systemPromptExtra` field from the `AgentPreset` interface (no readers in repo). Onboarding wizard step 2 now fetches personas from `/api/personas` and shows a Skip card when the registry is empty.
+- **#218** New `POST /api/tools/:name/toggle { disabled: boolean }` endpoint backed by `configStore.disabledToolNames: Set<string>`. `buildConfiguredToolRegistry()` filters disabled tools after the toolset filter. `<crowclaw-toggle>` rendered per-tool in both Connect → Tools and Agent → Toolsets ("Individual tool overrides" section).
+- **#222** Connect → Providers now shows "Add slot" cards for missing fallback/vision/compression/embedding slots, pre-filled with primary slot defaults. Added "Remove" button for non-primary slots.
+
+**Cleanup**
+- **#219** Agent → MCP tab removed (`activeMcp: null` was hardcoded). `IdentityTab` narrowed to `'personas' | 'toolsets'`. `/api/presets` no longer emits `activeMcp` (Node and Cloudflare runtimes both); `dashboard-contract.test.ts` updated to match. Footer hint added: "MCP servers are managed in Connect → MCP Servers".
+- **#220** Chat OPS toolbar consolidated. Removed legacy `Steer` button + `showSteerInput` overlay (sticky composer is canonical), `Checkpoint` button + label overlay (panel covers it), `History` button + checkpoint-list overlay (panel covers it). `Compact` moved into the session 3-dot context menu. Final OPS toolbar: `Abort` (when active) + `Search` + `Checkpoints (N)`.
+- **#221** Removed Connect view's redundant Status Overview panel — per-section indicators already cover it.
+- **#223** Settings → System: replaced the opaque Config Snapshot KV dump with a 2-line "Active Profile" summary (active persona + active toolset). Raw KV moved behind a `<details>` disclosure.
+
+**Architecture / polish**
+- **#225** Trace `T` button replaced with an inline activity-pulse SVG icon + `aria-label="Toggle debug trace"` and `title="Debug trace"`. Trace panel header relabelled to `Debug Trace`.
+- **#226** "MCP" naming clash resolved — the Agent view tab is gone (#219); Connect view section confirmed as `MCP Servers`.
+- **#227** Provider config canonical surface designated as **Connect → Providers**. Settings → Agent shows a hint pointing there instead of duplicating the form.
+- **#228** Settings tab strip split into two visual rows: `Settings` (agent / usage / system / memory / feedback) and `Advanced` (security). Functionality preserved; Security tab is no longer a peer to Agent in the default scan.
+
+### ChatGPT (Codex) OAuth provider
 
 CrowClaw can now use a ChatGPT subscription via the `codex` CLI's existing OAuth login. Users who already ran `codex login` don't have to paste an API key — the runtime detects `~/.codex/auth.json` and routes through the same Codex backend the official CLI uses. EchoProvider demo mode stays as the no-credentials fallback.
 

@@ -446,6 +446,43 @@ export class AutomateView extends LitElement {
         color: var(--text-muted);
         font-size: var(--text-sm);
       }
+
+      /* Dormant scheduler warning banner */
+      .dormant-banner {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-3);
+        padding: var(--sp-3) var(--sp-4);
+        margin-bottom: var(--sp-3);
+        background: rgba(255, 204, 0, 0.08);
+        border: 1px solid rgba(255, 204, 0, 0.35);
+        border-radius: var(--radius-md);
+      }
+
+      .dormant-banner-text {
+        flex: 1;
+        font-size: var(--text-sm);
+        color: var(--text-primary);
+        font-weight: 500;
+      }
+
+      /* Inline form badges (e.g., gateway "token configured") */
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--sp-1);
+        font-size: var(--text-xs);
+        font-weight: 500;
+        padding: 2px 6px;
+        border-radius: var(--radius-sm);
+        margin-top: var(--sp-1);
+      }
+
+      .badge.ok {
+        background: rgba(48, 209, 88, 0.12);
+        border: 1px solid rgba(48, 209, 88, 0.35);
+        color: var(--success);
+      }
     `,
   ];
 
@@ -469,6 +506,14 @@ export class AutomateView extends LitElement {
   @state() private formDeliveryPlatform = '';
   @state() private formDeliveryChannel = '';
   @state() private formSubmitting = false;
+
+  /**
+   * Per-platform gateway token configuration, fetched once per form open.
+   * Keys: 'telegram' | 'slack' | 'discord' (others ignored).
+   * Discord uses webhook URL not a token, so it's always considered "configured" here.
+   */
+  @state() private gatewayStatus: Record<string, boolean> = {};
+  @state() private gatewayStatusLoaded = false;
 
   private _refreshInterval?: ReturnType<typeof setInterval>;
 
@@ -631,6 +676,61 @@ export class AutomateView extends LitElement {
     this.formSkills = [];
     this.formDeliveryPlatform = '';
     this.formDeliveryChannel = '';
+    // Fetch gateway status once for the form's lifetime so we can disable
+    // unconfigured platform options and show "configured" badges.
+    this.gatewayStatusLoaded = false;
+    void this._fetchGatewayStatus();
+  }
+
+  /**
+   * GET /api/gateway/status — returns per-platform token configuration.
+   * We accept a few shapes defensively: a flat record of booleans, or an object
+   * with a `platforms` map. Discord uses a webhook URL (not a token), so it's
+   * treated as always-configured at the option level.
+   */
+  private async _fetchGatewayStatus() {
+    try {
+      const data = await api<Record<string, unknown>>('/api/gateway/status');
+      const next: Record<string, boolean> = {};
+      const source: Record<string, unknown> =
+        data && typeof data === 'object' && 'platforms' in data && data.platforms && typeof data.platforms === 'object'
+          ? (data.platforms as Record<string, unknown>)
+          : (data ?? {});
+      for (const platform of ['telegram', 'slack', 'discord']) {
+        const v = source[platform];
+        if (typeof v === 'boolean') {
+          next[platform] = v;
+        } else if (v && typeof v === 'object') {
+          const obj = v as Record<string, unknown>;
+          next[platform] = Boolean(obj.configured ?? obj.hasToken ?? obj.ok);
+        } else {
+          next[platform] = false;
+        }
+      }
+      // Discord delivery is webhook-URL-based, not token-gated server-side here.
+      // Keep behavior as-is: never disable the Discord option for missing token.
+      next.discord = true;
+      this.gatewayStatus = next;
+    } catch {
+      // On failure, don't disable any options — fall back to all-enabled so
+      // the user isn't blocked by a transient gateway-status fetch error.
+      this.gatewayStatus = { telegram: true, slack: true, discord: true };
+    } finally {
+      this.gatewayStatusLoaded = true;
+    }
+  }
+
+  /** Start the scheduler from the dormant-jobs banner (POST /api/scheduler/start). */
+  private async _startSchedulerFromBanner() {
+    try {
+      await api('/api/scheduler/start', { method: 'POST' });
+      this.schedulerRunning = true;
+      showToast('Scheduler started.', 'success');
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        showToast('Failed to start scheduler', 'error');
+      }
+    }
   }
 
   private _closeForm() {
@@ -670,11 +770,19 @@ export class AutomateView extends LitElement {
         };
       }
 
-      await api('/api/scheduler/jobs', {
+      const response = await api<{ wasStarted?: boolean }>('/api/scheduler/jobs', {
         method: 'POST',
         body: JSON.stringify(body),
       });
       this.showForm = false;
+      if (response?.wasStarted === true) {
+        showToast('Scheduler started — your job will fire on schedule.', 'success');
+        // Reflect new running state immediately; refresh status to confirm.
+        this.schedulerRunning = true;
+        void this._fetchSchedulerStatus();
+      } else {
+        showToast('Job created.', 'success');
+      }
       await this._fetchJobs();
     } catch (error: unknown) {
       if (error instanceof Error) {
@@ -717,9 +825,21 @@ export class AutomateView extends LitElement {
   }
 
   private _renderSchedulerSection() {
+    const showDormantBanner = !this.schedulerRunning && this.jobs.length > 0;
     return html`
       <div class="section-block">
         <div class="section-header">Scheduler</div>
+
+        ${showDormantBanner ? html`
+          <div class="dormant-banner" role="status">
+            <span class="dormant-banner-text">
+              Scheduler is stopped — ${this.jobs.length} ${this.jobs.length === 1 ? 'job is' : 'jobs are'} dormant.
+            </span>
+            <button class="btn btn-p" aria-label="Start scheduler" @click=${this._startSchedulerFromBanner}>
+              Start scheduler
+            </button>
+          </div>
+        ` : nothing}
 
         <div class="sched-bar">
           <div class="sched-status">
@@ -855,6 +975,65 @@ export class AutomateView extends LitElement {
     `;
   }
 
+  /**
+   * Renders the Delivery Platform / Channel row in the new-job form.
+   *
+   * Issue #215: Removed the dead `webhook` option (backend rejects it).
+   * Issue #216: For telegram/slack, disable the option when the gateway has no
+   * token configured server-side, and show a green "token configured" badge
+   * next to the channel input when the selected platform is configured.
+   * Discord uses webhook URL not a token — its option is never disabled.
+   */
+  private _renderDeliveryRow() {
+    type Platform = 'slack' | 'discord' | 'telegram';
+    const platforms: { value: Platform; label: string }[] = [
+      { value: 'slack', label: 'Slack' },
+      { value: 'discord', label: 'Discord' },
+      { value: 'telegram', label: 'Telegram' },
+    ];
+    const isConfigured = (p: Platform) =>
+      // Before status loads, treat as available so the form isn't gated on the fetch.
+      // Discord is always treated as configured (webhook-URL based).
+      !this.gatewayStatusLoaded || p === 'discord' || this.gatewayStatus[p] === true;
+    const selectedConfigured =
+      (this.formDeliveryPlatform === 'slack' || this.formDeliveryPlatform === 'telegram') &&
+      this.gatewayStatusLoaded &&
+      this.gatewayStatus[this.formDeliveryPlatform] === true;
+    return html`
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Delivery Platform</label>
+          <select
+            class="form-select"
+            .value=${this.formDeliveryPlatform}
+            @change=${(e: Event) => { this.formDeliveryPlatform = (e.target as HTMLSelectElement).value; }}
+          >
+            <option value="">None</option>
+            ${platforms.map((p) => {
+              const ok = isConfigured(p.value);
+              return html`
+                <option value=${p.value} ?disabled=${!ok}>
+                  ${ok ? p.label : `${p.label} (set up in Connect → Platforms)`}
+                </option>
+              `;
+            })}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Channel / Target</label>
+          <input
+            class="form-input"
+            type="text"
+            placeholder="#channel or @user"
+            .value=${this.formDeliveryChannel}
+            @input=${(e: InputEvent) => { this.formDeliveryChannel = (e.target as HTMLInputElement).value; }}
+          >
+          ${selectedConfigured ? html`<span class="badge ok">token configured</span>` : nothing}
+        </div>
+      </div>
+    `;
+  }
+
   private _renderForm() {
     return html`
       <div class="form-overlay" @click=${(e: Event) => { if (e.target === e.currentTarget) this._closeForm(); }}>
@@ -959,32 +1138,7 @@ export class AutomateView extends LitElement {
             </div>
           ` : nothing}
 
-          <div class="form-row">
-            <div class="form-group">
-              <label class="form-label">Delivery Platform</label>
-              <select
-                class="form-select"
-                .value=${this.formDeliveryPlatform}
-                @change=${(e: Event) => { this.formDeliveryPlatform = (e.target as HTMLSelectElement).value; }}
-              >
-                <option value="">None</option>
-                <option value="slack">Slack</option>
-                <option value="discord">Discord</option>
-                <option value="telegram">Telegram</option>
-                <option value="webhook">Webhook</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label">Channel / Target</label>
-              <input
-                class="form-input"
-                type="text"
-                placeholder=${this.formDeliveryPlatform === 'webhook' ? 'https://...' : '#channel or @user'}
-                .value=${this.formDeliveryChannel}
-                @input=${(e: InputEvent) => { this.formDeliveryChannel = (e.target as HTMLInputElement).value; }}
-              >
-            </div>
-          </div>
+          ${this._renderDeliveryRow()}
 
           <div class="form-actions">
             <button class="btn" aria-label="Cancel job creation" @click=${this._closeForm}>Cancel</button>
