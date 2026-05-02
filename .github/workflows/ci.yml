@@ -33,16 +33,22 @@ jobs:
       - name: Docker smoke
         run: |
           docker build -t crowclaw-ci .
-          cid=$(docker run --rm -d -p 8787:8787 --name crowclaw-ci crowclaw-ci)
+          cid=$(docker run -d -p 8787:8787 --name crowclaw-ci -e CROWCLAW_DASHBOARD_TOKEN=ci-smoke-token crowclaw-ci)
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
+            if ! docker ps --format '{{.ID}}' | grep -q "^$cid"; then
+              docker logs "$cid" || true
+              docker ps -a
+              exit 1
+            fi
             if curl -fsS http://127.0.0.1:8787/healthz; then
               docker stop --time 10 "$cid"
               exit 0
             fi
             sleep 2
           done
-          docker logs "$cid"
+          docker logs "$cid" || true
+          docker ps -a
           exit 1
 
       - name: Test Summary
