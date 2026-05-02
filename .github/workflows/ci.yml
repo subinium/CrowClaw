@@ -36,7 +36,7 @@ jobs:
           cid=$(docker run -d -p 8787:8787 --name crowclaw-ci -e CROWCLAW_DASHBOARD_TOKEN=ci-smoke-token crowclaw-ci)
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 20); do
-            if ! docker ps --format '{{.ID}}' | grep -q "^$cid"; then
+            if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo false)" != "true" ]; then
               docker logs "$cid" || true
               docker ps -a
               exit 1
