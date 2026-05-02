@@ -64,6 +64,14 @@ export class InMemoryDreamStore implements DreamMemoryStore {
     const chunkSize = Math.max(1, Math.ceil(liveEntries.length / maxEntries));
     for (let i = 0; i < liveEntries.length; i += chunkSize) {
       const chunk = liveEntries.slice(i, i + chunkSize);
+      const firstEntry = chunk[0];
+      if (!firstEntry) {
+        continue;
+      }
+      const firstLiveEntry = firstEntry[1];
+      if (!firstLiveEntry) {
+        continue;
+      }
       const sessionIds = chunk.map(([id]) => id);
       const mergedContent = chunk
         .map(([, entry]) => entry.summary)
@@ -74,7 +82,7 @@ export class InMemoryDreamStore implements DreamMemoryStore {
         content: mergedContent,
         source: 'consolidation',
         sourceSessionIds: sessionIds,
-        createdAt: chunk[0][1].createdAt,
+        createdAt: firstLiveEntry.createdAt,
         consolidatedAt: new Date().toISOString(),
       };
 

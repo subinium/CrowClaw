@@ -77,7 +77,10 @@ function canonicalize(value: ApprovedCommandShape): string {
 function sortEntries(obj: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const key of Object.keys(obj).sort()) {
-    out[key] = obj[key];
+    const value = obj[key];
+    if (value !== undefined) {
+      out[key] = value;
+    }
   }
   return out;
 }
@@ -88,8 +91,8 @@ async function sha256Hex(data: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   const view = new Uint8Array(digest);
   let hex = '';
-  for (let i = 0; i < view.length; i++) {
-    hex += view[i].toString(16).padStart(2, '0');
+  for (const byte of view) {
+    hex += byte.toString(16).padStart(2, '0');
   }
   return hex;
 }

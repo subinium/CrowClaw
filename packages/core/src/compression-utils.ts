@@ -16,6 +16,9 @@ export function identifyToolPairs(messages: ConversationMessage[]): ToolCallPair
   for (let i = 0; i < messages.length - 1; i++) {
     const msg = messages[i];
     const next = messages[i + 1];
+    if (!msg || !next) {
+      continue;
+    }
     if (msg.role === 'assistant' && next.role === 'tool') {
       pairs.push({
         callIndex: i,
@@ -43,7 +46,7 @@ export function splitWithPairPreservation(
     const pairs = identifyToolPairs(messages);
     if (pairs.length > 0) {
       const lastPair = pairs[pairs.length - 1];
-      if (lastPair.resultIndex === messages.length - 1) {
+      if (lastPair && lastPair.resultIndex === messages.length - 1) {
         // The final message is part of a pair — keep the pair
         return {
           toCompress: messages.slice(0, lastPair.callIndex),
@@ -56,7 +59,11 @@ export function splitWithPairPreservation(
 
   // Separate system prefix
   let systemEnd = 0;
-  while (systemEnd < messages.length && messages[systemEnd].role === 'system') {
+  while (systemEnd < messages.length) {
+    const message = messages[systemEnd];
+    if (!message || message.role !== 'system') {
+      break;
+    }
     systemEnd++;
   }
 

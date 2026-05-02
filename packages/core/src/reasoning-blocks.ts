@@ -382,6 +382,9 @@ export class StreamingReasoningParser {
   /** Consume a single character at `i`, route it to text/reasoning/tool-call. */
   private emitChar(events: StreamingReasoningEvent[], i: number): number {
     const ch = this.buffer[i];
+    if (ch === undefined) {
+      return i + 1;
+    }
     if (this.toolCallBuf !== null) {
       this.toolCallBuf += ch;
     } else if (this.currentTag) {

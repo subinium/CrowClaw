@@ -480,11 +480,12 @@ export class FileWorkspaceStore implements WorkspaceStore {
             const lines = text.split('\n');
             for (let i = 0; i < lines.length; i++) {
               if (results.length >= MAX_SEARCH_MATCHES) break;
-              if (lines[i].toLowerCase().includes(lowered)) {
+              const line = lines[i];
+              if (line && line.toLowerCase().includes(lowered)) {
                 results.push({
                   path: relative(this.rootDir, absPath),
                   line: i + 1,
-                  content: lines[i],
+                  content: line,
                 });
               }
             }

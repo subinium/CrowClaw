@@ -108,6 +108,8 @@ export class UsageTracker {
     }
 
     const timestamps = sessionRecords.map(r => r.timestamp).sort();
+    const firstRequestAt = timestamps[0] ?? '';
+    const lastRequestAt = timestamps[timestamps.length - 1] ?? firstRequestAt;
 
     return {
       sessionId,
@@ -119,8 +121,8 @@ export class UsageTracker {
       averageLatencyMs: totalLatency / sessionRecords.length,
       modelBreakdown,
       toolCallCount,
-      firstRequestAt: timestamps[0],
-      lastRequestAt: timestamps[timestamps.length - 1],
+      firstRequestAt,
+      lastRequestAt,
     };
   }
 

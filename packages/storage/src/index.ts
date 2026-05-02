@@ -734,7 +734,7 @@ export class FileCheckpointStore implements CheckpointStore {
 
   async getLatest(sessionId: string): Promise<SessionCheckpoint | null> {
     const checkpoints = await this.listBySession(sessionId);
-    return checkpoints.length > 0 ? checkpoints[checkpoints.length - 1] : null;
+    return checkpoints[checkpoints.length - 1] ?? null;
   }
 
   async delete(id: string): Promise<boolean> {

@@ -51,6 +51,9 @@ function parseField(field: string, min: number, max: number): number[] {
         throw new Error(`Invalid step value: ${step}`);
       }
       const base = stepMatch[1];
+      if (!base) {
+        throw new Error(`Invalid cron field value: "${trimmed}"`);
+      }
 
       let start: number;
       let end: number;
@@ -152,13 +155,27 @@ export function parseCron(expression: string): CronExpression {
       `Invalid cron expression: expected 5 fields, got ${fields.length} in "${expression}"`,
     );
   }
+  const minutes = fields[0];
+  const hours = fields[1];
+  const daysOfMonth = fields[2];
+  const months = fields[3];
+  const daysOfWeek = fields[4];
+  if (
+    minutes === undefined ||
+    hours === undefined ||
+    daysOfMonth === undefined ||
+    months === undefined ||
+    daysOfWeek === undefined
+  ) {
+    throw new Error(`Invalid cron expression: "${expression}"`);
+  }
 
   return {
-    minutes: parseField(fields[0], 0, 59),
-    hours: parseField(fields[1], 0, 23),
-    daysOfMonth: parseField(fields[2], 1, 31),
-    months: parseField(fields[3], 1, 12),
-    daysOfWeek: parseField(fields[4], 0, 6),
+    minutes: parseField(minutes, 0, 59),
+    hours: parseField(hours, 0, 23),
+    daysOfMonth: parseField(daysOfMonth, 1, 31),
+    months: parseField(months, 1, 12),
+    daysOfWeek: parseField(daysOfWeek, 0, 6),
   };
 }
 
@@ -289,17 +306,23 @@ function formatField(values: number[], min: number, max: number): string {
 
   // Check if values form a step pattern from min
   if (values.length >= 2) {
-    const step = values[1] - values[0];
-    if (step > 0) {
-      let isStep = true;
-      for (let i = 1; i < values.length; i++) {
-        if (values[i] - values[i - 1] !== step) {
-          isStep = false;
-          break;
+    const first = values[0];
+    const second = values[1];
+    if (first !== undefined && second !== undefined) {
+      const step = second - first;
+      if (step > 0) {
+        let isStep = true;
+        for (let i = 1; i < values.length; i++) {
+          const current = values[i];
+          const previous = values[i - 1];
+          if (current === undefined || previous === undefined || current - previous !== step) {
+            isStep = false;
+            break;
+          }
         }
-      }
-      if (isStep && values[0] === min) {
-        return `*/${step}`;
+        if (isStep && first === min) {
+          return `*/${step}`;
+        }
       }
     }
   }
@@ -309,10 +332,17 @@ function formatField(values: number[], min: number, max: number): string {
   let i = 0;
   while (i < values.length) {
     const start = values[i];
+    if (start === undefined) {
+      break;
+    }
     let end = start;
-    while (i + 1 < values.length && values[i + 1] === end + 1) {
+    while (i + 1 < values.length) {
+      const next = values[i + 1];
+      if (next === undefined || next !== end + 1) {
+        break;
+      }
       i++;
-      end = values[i];
+      end = next;
     }
     parts.push(start === end ? String(start) : `${start}-${end}`);
     i++;
@@ -337,7 +367,10 @@ export function describeCron(cron: CronExpression): string {
   if (cron.hours.length === 24) {
     parts.push('of every hour');
   } else if (cron.hours.length === 1) {
-    parts.push(`of ${formatHour(cron.hours[0])}`);
+    const hour = cron.hours[0];
+    if (hour !== undefined) {
+      parts.push(`of ${formatHour(hour)}`);
+    }
   } else {
     parts.push(`of ${cron.hours.map(formatHour).join(', ')}`);
   }
@@ -358,7 +391,13 @@ export function describeCron(cron: CronExpression): string {
       'July', 'August', 'September', 'October', 'November', 'December',
     ];
     if (cron.months.length === 1) {
-      parts.push(`in ${monthNames[cron.months[0]]}`);
+      const month = cron.months[0];
+      if (month !== undefined) {
+        const monthName = monthNames[month];
+        if (monthName !== undefined) {
+          parts.push(`in ${monthName}`);
+        }
+      }
     } else {
       parts.push(`in ${cron.months.map((m) => monthNames[m]).join(', ')}`);
     }
@@ -368,7 +407,13 @@ export function describeCron(cron: CronExpression): string {
   if (cron.daysOfWeek.length < 7) {
     const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     if (cron.daysOfWeek.length === 1) {
-      parts.push(`on ${dayNames[cron.daysOfWeek[0]]}`);
+      const day = cron.daysOfWeek[0];
+      if (day !== undefined) {
+        const dayName = dayNames[day];
+        if (dayName !== undefined) {
+          parts.push(`on ${dayName}`);
+        }
+      }
     } else {
       parts.push(`on ${cron.daysOfWeek.map((d) => dayNames[d]).join(', ')}`);
     }

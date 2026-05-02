@@ -1875,8 +1875,8 @@ export class AgentLoop {
       // Reset streak for any tool that succeeded in this iteration. This is
       // intentional per-tool: a different tool failing keeps its own streak.
       for (const k of Array.from(toolFailureStreak.keys())) {
-        const [toolName] = k.split('|');
-        if (successfulToolNamesThisIter.has(toolName)) {
+        const toolName = k.split('|')[0];
+        if (toolName && successfulToolNamesThisIter.has(toolName)) {
           toolFailureStreak.delete(k);
         }
       }
@@ -2245,7 +2245,7 @@ export class AgentLoop {
         let streamConsumed = false;
         for (let providerIdx = 0; providerIdx < streamProviderCandidates.length; providerIdx++) {
           const candidateProvider = streamProviderCandidates[providerIdx];
-          if (!candidateProvider.generateStream) continue;
+          if (!candidateProvider || !candidateProvider.generateStream) continue;
 
           try {
             const rawStream = candidateProvider.generateStream(request);
@@ -2369,10 +2369,10 @@ export class AgentLoop {
                 // #235: validation gate before each parallel tool call.
                 safetyPartition.parallel.map((tc) => this.runToolCallWithValidation(tc, runInput))
               );
-              for (let i = 0; i < settled.length; i++) {
-                const tc = safetyPartition.parallel[i];
-                const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
+              for (const [i, tc] of safetyPartition.parallel.entries()) {
                 const s = settled[i];
+                if (!s) continue;
+                const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
                 const rawResult: ToolExecutionResult = s.status === 'fulfilled'
                   ? s.value
                   : {
@@ -2416,10 +2416,10 @@ export class AgentLoop {
               // #235: validation gate before each tool call.
               streamToolCalls.map((tc) => this.runToolCallWithValidation(tc, runInput))
             );
-            for (let i = 0; i < settled.length; i++) {
-              const tc = streamToolCalls[i];
-              const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
+            for (const [i, tc] of streamToolCalls.entries()) {
               const s = settled[i];
+              if (!s) continue;
+              const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
               const rawResult: ToolExecutionResult = s.status === 'fulfilled'
                 ? s.value
                 : {
@@ -2619,8 +2619,8 @@ export class AgentLoop {
           }
         }
         for (const k of Array.from(streamToolFailureStreak.keys())) {
-          const [toolName] = k.split('|');
-          if (successfulStreamToolNames.has(toolName)) {
+          const toolName = k.split('|')[0];
+          if (toolName && successfulStreamToolNames.has(toolName)) {
             streamToolFailureStreak.delete(k);
           }
         }

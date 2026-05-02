@@ -876,7 +876,9 @@ export class FileSecurityAuditLog extends SecurityAuditLog {
     await Promise.all(entries.map(async (name) => {
       const match = name.match(/^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/);
       if (!match) return;
-      if (Date.parse(match[1]) >= cutoff) return;
+      const date = match[1];
+      if (!date) return;
+      if (Date.parse(date) >= cutoff) return;
       await fs.unlink(`${this.baseDir}/${name}`).catch(() => {});
     }));
   }

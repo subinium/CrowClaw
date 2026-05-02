@@ -573,7 +573,7 @@ function collectChanges(
     const newVal = after[key];
 
     // Determine section from the top-level key
-    const section = prefix ? prefix.split('.')[0] : key;
+    const section = prefix ? prefix.split('.')[0] ?? key : key;
 
     if (oldVal === newVal) {
       continue;

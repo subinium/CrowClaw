@@ -20,8 +20,9 @@ export function parseIdentity(content: string): PersonaConfig {
   for (const line of lines) {
     const match = line.match(/\*\*(\w+):\*\*\s*(.+)/);
     if (match) {
-      const key = match[1].toLowerCase();
-      const value = match[2].trim();
+      const key = match[1]?.toLowerCase();
+      const value = match[2]?.trim();
+      if (!key || !value) continue;
       if (key === 'name') config.name = value;
       if (key === 'type') config.type = value;
       if (key === 'vibe') config.vibe = value;

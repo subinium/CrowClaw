@@ -487,6 +487,9 @@ export class MultiServerMcpManager {
 
   async callTool(name: string, arguments_: Record<string, unknown>): Promise<McpCallResult> {
     const [serverName, ...rest] = name.split('.');
+    if (!serverName) {
+      throw new Error('Invalid MCP tool name.');
+    }
     const client = this.servers[serverName];
     if (!client) {
       throw new Error(`Unknown MCP server: ${serverName}`);
