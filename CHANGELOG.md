@@ -178,7 +178,7 @@ ownership; ~203 files changed, +20.2k / -8.1k lines.
 ### Verification
 - `npm run build -- --pretty false` — clean
 - `npm run typecheck` — clean
-- `npm test` — **2,982 / 2,983** (1 a11y placeholder skipped)
+- `npm test` — **2,982 / 2,982** (238 files, no skips)
 - `npm audit --audit-level=moderate` — 0 vulnerabilities
 - Focused unresolved-gap tests — 132 passed
 - Dashboard a11y/polish tests — 41 passed
