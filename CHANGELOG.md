@@ -5,133 +5,203 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
-## [Unreleased] - 2026-05-02 - release/v0.8.1 local issue sweep
+## [0.8.2] — 2026-05-03 — Audit + parity sweep: 53-issue release
 
-This local release branch sweep is staged on `release/v0.8.1` only. It has
-not been pushed and no PR has been opened yet. GitHub issues may still appear
-open until this branch is published and merged or closed.
-
-### Runtime, gateway, and observability
-- **#73** Gateway endpoint policy is now configurable through persisted
-  gateway config and schema fields (`policyTier`, `allowedEndpoints`), applied
-  to Discord outbound routes/delivery, and surfaced through
-  `gateway:policy_denied` events.
-- **#74** Gateway token rotation, revocation, webhook mutation, and pairing
-  revocation now enforce caller-scope containment before mutating owner-scoped
-  gateway secrets.
-- **#82** Prometheus metrics moved to gated `/api/metrics`; OpenTelemetry now
-  opts into `gen_ai_latest_experimental` semantic conventions and emits stable
-  GenAI span names for harness runs, tool loops, exec calls, context assembly,
-  and outbound delivery.
-- **#96** Runtime startup now restores latest `in_progress` checkpoints across
-  sessions, emits `session:resumed`, and the CLI exposes `--no-resume` as an
-  operator override.
-- **#155** `runtime-node` entrypoint responsibility was split into focused
-  route, bootstrap, lifecycle, scheduler, plugin, startup, support, and gateway
-  modules while keeping `index.ts` as the assembler.
-- **#160** Terminal background process tracking is no longer module-global;
-  terminal state is owned by injected per-runtime/per-registry sessions.
-- **#163** `noUncheckedIndexedAccess` remains enabled across the TypeScript
-  base config.
-
-### Plugins, memory, tools, and deployment
-- **#90** Memory backends now have a plugin contract, runtime provider
-  selection, and a Honcho-compatible reference example.
-- **#184** Memory edit/delete UX now warns about sensitive data and redaction,
-  requires typed delete confirmation, and keeps preview/edit affordances
-  explicit.
-- **#187** Memory records now carry size/token metadata and session memory
-  summaries include estimated memory cost.
-- **#188** The Skills settings UI can preview installed and imported skills
-  through the existing `skill.preview` tool path.
-- **#202-#203** Embedded MCP and ACP protocol servers now receive the live
-  runtime session store and tool registry instead of disconnected defaults.
-- **#204** Korean locale selection now carries into prompt-facing runtime
-  context, not only dashboard chrome.
-- **#243, #245, #249, #250** Dashboard markdown, visual reset, accessibility,
-  and chat rendering gaps are closed: highlight.js is no longer eagerly loaded,
-  legacy glass tokens are removed from source/generated UI, toast live regions
-  and reduced-motion coverage are tested, and chat history renders a bounded
-  incremental window.
-- **#255** Cloudflare route parity audit now reads the refactored route handler,
-  records `covered` vs `unsupported_on_workers`, has zero `missing` rows, and
-  runs in CI.
-- **#253-#258, #261-#264** Deployment and Cloudflare parity gaps were closed
-  or documented with explicit Worker limitations, Docker hardening, persistent
-  audit logs, launchd/self-host runbooks, and vision SSRF protection.
-- **#267** Secret loading now includes a SOPS CLI-backed reference source in
-  addition to env, files, systemd credentials, and 1Password references.
-- **#281** Local `memory.search` fallback now uses deterministic semantic-style
-  sparse ranking instead of relying only on substring matches.
-- **#282** Delegate depth is now typed, validated, and propagated through core
-  run inputs instead of legacy `__delegateDepth` casts.
-- **#287** Codex/OpenAI ChatGPT provider docs, defaults, and structured-output
-  tests now match the actual `gpt-5.5` and `requireStream` behavior.
-- **#268-#288** Provider/tool sweep added or hardened voice STT, web fetch and
-  search fallbacks, OpenAI retry/prompt-cache/model-family behavior, Docker/SSH
-  terminal planning, memory/learning parity surfaces, migration helpers, image
-  and vision provider fallbacks, and related security fixes.
-
-### Verification
-- `npm run typecheck` - clean
-- Focused unresolved-gap tests - 132 passed
-- Dashboard a11y/polish tests - 41 passed
-- `npm test` - 2,982 passed
-- `npm run build -- --pretty false` - clean
-- `npm run build:ui --workspace @crowclaw/web` - clean
-- `npm run build:html --workspace @crowclaw/web` - clean
-- `node scripts/audit-routes.mjs --check` - clean
-- `rg` checks for legacy dashboard glass/highlight.js tokens - clean
-- `git diff --check` - clean
-
-## [0.8.2] - 2026-05-02 - Runtime/security hardening: 9-issue release sweep
-
-This release tightens the release-critical runtime surfaces opened after
-v0.8.1: Docker boot/hardening, Cloudflare deployment drift, OpenAI-compatible
-provider request shapes, vision SSRF validation, persistent security audit
-logs, and optional OpenTelemetry span hooks.
+This release lands two parallel investigations against the post-v0.8.1
+codebase: the runtime/security hardening sweep that opened immediately after
+v0.8.1 (Docker boot, Cloudflare deployment drift, OpenAI-compatible request
+shapes, vision SSRF validation, persistent audit logs, optional OpenTelemetry
+hooks), plus the v0.6/v0.7 audit-debt cleanup that had been carried open
+across earlier releases. Both ship together because verifier passes for the
+audit-debt items proved the implementation contracts the audits had spec'd
+were not yet complete on `main`; closing the issues required finishing those
+contracts. 30 commits across 8 parallel sub-agents with strict file
+ownership; ~203 files changed, +20.2k / -8.1k lines.
 
 ### Critical
-- **#253** Docker now starts the built CLI server entrypoint instead of loading
-  a runtime module that never called `listen()`.
+- **#253** Docker now starts the built CLI server entrypoint instead of
+  loading a runtime module that never called `listen()`.
 - **#256** Security audit events persist to JSONL under
-  `CROWCLAW_DATA_DIR/audit` by default, with file permissions, retention, and
-  graceful shutdown flushing.
-- **#258** Security events now carry optional provenance (`agentId`, `model`,
-  `provider`, `presetId`), and audit logs expose `flush()` for tests and
-  consumers that need to drain pending events.
-- **#261** `vision.analyze` validates HTTP(S) image URLs with DNS-aware SSRF
-  preflight before fetch or provider handoff.
-- **#262** Docker image is multi-stage, non-root, `tini`-managed, healthchecked,
-  and volume-backed via `CROWCLAW_DATA_DIR=/data`.
+  `CROWCLAW_DATA_DIR/audit` by default, with file permissions, retention,
+  and graceful shutdown flushing.
+- **#258** Security events now carry optional provenance (`agentId`,
+  `model`, `provider`, `presetId`), and audit logs expose `flush()` for
+  tests and consumers that need to drain pending events.
+- **#261** `vision.analyze` validates HTTP(S) image URLs with DNS-aware
+  SSRF preflight before fetch or provider handoff.
+- **#262** Docker image is multi-stage, non-root, `tini`-managed,
+  healthchecked, and volume-backed via `CROWCLAW_DATA_DIR=/data`.
 
-### Provider/runtime correctness
-- **#254** Wrangler release config is version-synchronized, and the D1 binding
-  placeholder now points operators to the `wrangler d1 create` replacement
-  flow.
-- **#257** Optional OpenTelemetry hooks record session, iteration, and tool
-  spans without requiring `@opentelemetry/api` at runtime.
-- **#259** OpenAI-compatible providers now send the right token and sampling
+### Provider / runtime correctness
+- **#254** Wrangler release config is version-synchronized, and the D1
+  binding placeholder now points operators to the `wrangler d1 create`
+  replacement flow.
+- **#257** Optional OpenTelemetry hooks record session, iteration, and
+  tool spans without requiring `@opentelemetry/api` at runtime.
+- **#259** OpenAI-compatible providers send the right token and sampling
   fields for chat-completions vs. Responses API and strip unsupported
   temperature fields from reasoning models.
-- **#260** Native structured output now supports Responses API `text.format`
-  JSON schema requests and respects `requireStream` by staying on the streaming
-  path.
+- **#260** Native structured output now supports Responses API
+  `text.format` JSON-schema requests and respects `requireStream` by
+  staying on the streaming path.
+- **#287** Codex/OpenAI ChatGPT provider docs, defaults, and
+  structured-output tests now match the actual `gpt-5.5` and
+  `requireStream` behavior; the gpt-5 family is added to the native
+  `json_schema` guard and the codex JSDoc is corrected.
 
-### Cloudflare route parity
-- **#255** Route parity remains broader than this patch release. This sweep adds
-  a generated parity inventory (`docs/cloudflare-route-parity.md`) and explicit
-  `501 unsupported_on_workers` responses for Node-only terminal/code bridge
-  routes instead of silently pretending the Worker adapter is fully equivalent.
+### Runtime, gateway, observability (v0.6 audit-debt cleanup)
+- **#73** Gateway endpoint policy is now configurable through persisted
+  gateway config and schema fields (`policyTier`, `allowedEndpoints`),
+  applied to Discord outbound routes/delivery, and surfaced through
+  `gateway:policy_denied` events.
+- **#74** Gateway token rotation, revocation, webhook mutation, and
+  pairing revocation enforce caller-scope containment before mutating
+  owner-scoped gateway secrets.
+- **#82** Prometheus metrics moved to gated `/api/metrics`; OpenTelemetry
+  opts into `gen_ai_latest_experimental` semantic conventions and emits
+  stable GenAI span names for harness runs, tool loops, exec calls,
+  context assembly, and outbound delivery.
+- **#96** Runtime startup restores latest `in_progress` checkpoints
+  across sessions, emits `session:resumed`, and the CLI exposes
+  `--no-resume` as an operator override.
+- **#155** `runtime-node` entrypoint responsibility was split into
+  focused route, bootstrap, lifecycle, scheduler, plugin, startup,
+  support, and gateway modules while keeping `index.ts` as the
+  assembler.
+- **#160** Terminal background process tracking is no longer
+  module-global; terminal state is owned by injected
+  per-runtime/per-registry sessions.
+- **#163** `noUncheckedIndexedAccess` remains enabled across the
+  TypeScript base config.
+
+### Memory, skills, embedded protocol surfaces (v0.7 audit-debt + parity)
+- **#90** Memory backends now have a plugin contract, runtime provider
+  selection, and a Honcho-compatible reference example.
+- **#184** Memory edit/delete UX warns about sensitive data and
+  redaction, requires typed delete confirmation, and keeps preview/edit
+  affordances explicit.
+- **#187** Memory records carry size/token metadata, and per-session
+  summaries include estimated memory cost.
+- **#188** The Skills settings UI can preview installed and imported
+  skills through the existing `skill.preview` tool path.
+- **#202**, **#203** Embedded MCP and ACP protocol servers receive the
+  live runtime session store and tool registry instead of disconnected
+  stubs.
+- **#270** Cross-session memory recall now flows through an
+  `onSessionEnd` hook with optional LLM summarisation (Hermes parity).
+- **#271** SkillManifest carries an sha256 content-hash that is verified
+  on load (NemoClaw parity).
+- **#281** Local `memory.search` fallback uses deterministic
+  semantic-style sparse ranking instead of relying only on substring
+  matches.
+- **#282** Delegate depth is typed, validated, and propagated through
+  core run inputs instead of legacy `__delegateDepth` casts.
+- **#286** Episodic, semantic, and workspace memory now register as
+  distinct provider tiers in the memory contract (NeMo parity).
+
+### Tools (provider, fetch, voice, image, retry)
+- **#268** New `voice.stt` transcription tool (Hermes parity).
+- **#269** Atropos RL environment adapter for trajectory rollout
+  (Hermes parity).
+- **#272** Batch-runner gains expected-output assertions and accuracy
+  scoring (NeMo parity).
+- **#273** Docker and SSH terminal execution modes are activated for
+  the sandbox executor (NemoClaw parity).
+- **#274** Token counting replaces the `chars / 4` heuristic with
+  per-model encoding (`cl100k` / `o200k`).
+- **#275** OpenAI requests structure system + tools as a stable prefix
+  for automatic prompt caching.
+- **#277** OpenAI requests retry with exponential backoff on 429/5xx.
+- **#278** `web.fetch` adds reader-mode markdown conversion plus a byte
+  cap.
+- **#279** `web.search` replaces the DDG HTML scrape with a structured
+  provider API.
+- **#288** `image.generate` and `vision.analyze` add multi-provider
+  fallback (Replicate, Gemini).
+
+### Security and access
+- **#265** Tailscale-aware bind plus opt-in tailnet allowlist for SSRF.
+- **#266** Webhook and chat routes are rate-limited against credit-burn
+  DoS.
+- **#267** Secret loading now includes a SOPS CLI-backed reference
+  source in addition to env, files, systemd credentials, and 1Password
+  references.
+- **#276** `auth.json` schema is validated, and the runtime warns when
+  the file is world-readable.
+- **#280** SSRF blocklist now covers `192.0.0.0/24` and the 6to4 / Teredo
+  IPv6 ranges.
+
+### Deployment (Docker, Cloudflare, self-host)
+- **#263** `docker-compose.yml` and a Caddy template for VPS deployments.
+- **#264** launchd plist plus Mac Mini self-host runbook (pmset,
+  caffeinate, Tailscale).
+- **#283** WhatsApp and Signal channel adapters (Hermes parity).
+- **#284** `crowclaw migrate import` CLI command for
+  settings/memories/skills (Hermes parity).
+- **#285** Singularity / Apptainer HPC container backend for the sandbox
+  executor (Hermes parity).
+
+### Dashboard polish (v0.8.1 verifier-gap follow-ups)
+- **#243** Dashboard markdown rendering keeps `marked` + `dompurify` and
+  drops the eager highlight.js CDN load — highlight.js is now strictly
+  lazy-loaded only when the first code block renders.
+- **#245** Visual reset removes legacy `--glass-*` dashboard tokens from
+  both UI source and the generated HTML; only modal overlays still use
+  `backdrop-filter`.
+- **#249** A11y baseline adds toast live-region and reduced-motion test
+  coverage on top of the v0.8.1 contrast and skip-link work.
+- **#250** Chat history renders a bounded incremental window so long
+  sessions stay responsive without forcing virtualization on every list.
+
+### Localisation
+- **#204** Korean locale selection now carries into prompt-facing
+  runtime context, not only dashboard chrome.
+
+### Cross-package contracts added
+- `MemoryProvider` plugin contract — `@crowclaw/memory`
+- `gateway:policy_denied`, `session:resumed` event-bus types —
+  `@crowclaw/core`
+- `flush()` on `SecurityAuditLog` — `@crowclaw/security`
+- `parseReasoningBlocks` / `requireStream` provider hooks extended for
+  Codex / Responses API — `@crowclaw/providers`
+- `policyTier`, `allowedEndpoints` schema fields on persisted gateway
+  config — `@crowclaw/runtime-node`
+- `voice.stt`, expanded `web.fetch` / `web.search`, multi-provider
+  `image.generate` / `vision.analyze` — `@crowclaw/tools`
+- SOPS reference source for secret loading — `@crowclaw/security`
+- `unsupported_on_workers` 501 envelope — `@crowclaw/runtime-cloudflare`
+
+### New dependencies
+- `tini` (Docker runtime) — PID 1 reaper for the hardened image.
+- SOPS (optional, host-installed) — CLI-backed secret reference source.
 
 ### Verification
-- `npm run build` - clean
-- `npm run typecheck` - clean
-- `npm test` - 2,864 / 2,865 (1 skipped)
-- `npm audit --audit-level=moderate` - 0 vulnerabilities
-- Docker image smoke was not run locally because the Docker daemon was not
-  available in this workspace; CI now includes a Docker build + `/healthz`
-  smoke step.
+- `npm run build -- --pretty false` — clean
+- `npm run typecheck` — clean
+- `npm test` — **2,982 / 2,983** (1 a11y placeholder skipped)
+- `npm audit --audit-level=moderate` — 0 vulnerabilities
+- Focused unresolved-gap tests — 132 passed
+- Dashboard a11y/polish tests — 41 passed
+- `npm run build:ui --workspace @crowclaw/web` — clean
+- `npm run build:html --workspace @crowclaw/web` — clean
+- `node scripts/audit-routes.mjs --check` — clean
+- `rg` checks for legacy dashboard glass/highlight.js tokens — clean
+- `git diff --check` — clean
+
+### Caveats
+- **#255** Cloudflare route parity is intentionally bounded. This sweep
+  adds a generated parity inventory (`docs/cloudflare-route-parity.md`)
+  and explicit `501 unsupported_on_workers` responses for Node-only
+  terminal/code bridge routes — not full Cloudflare parity. CI guards
+  against new `missing` rows.
+- **#267** SOPS support is CLI-backed (the `sops` binary must be
+  installed on the host); native bindings are out of scope.
+- Local Docker image smoke was not run because the Docker daemon was
+  not available in this workspace; CI now runs Docker build + `/healthz`
+  smoke on every PR.
+- The release ledger (`docs/release-v0.8.2-worklog.md`) is retained at
+  branch-merge time to preserve the audit trail; it is not consumed at
+  runtime.
 
 ## [0.8.1] — 2026-05-?? — Dashboard overhaul: 10-issue sweep against the v0.7.1 audit findings
 

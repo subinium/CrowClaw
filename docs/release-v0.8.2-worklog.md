@@ -1,7 +1,13 @@
-# release/v0.8.1 Live Worklog
+# release/v0.8.2 Live Worklog
+
+> Branch was renamed from `release/v0.8.1` to `release/v0.8.2` on
+> 2026-05-03 for release publication. The ledger entries below preserve
+> the working branch name (`release/v0.8.1`) used during the sweep — the
+> rename is bookkeeping, not a content change.
 
 This file is the interruption-safe working ledger for the local
-`release/v0.8.1` branch. Update it during the work, not only at the end.
+`release/v0.8.2` (originally `release/v0.8.1`) branch. Update it during
+the work, not only at the end.
 
 ## Operating Rule
 
