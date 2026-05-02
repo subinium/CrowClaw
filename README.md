@@ -9,14 +9,14 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#5-minute-quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#packages"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-2856%20passed-brightgreen.svg" alt="Tests" />
-    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.5.0-blue.svg" alt="Changelog" /></a>
+    <img src="https://img.shields.io/badge/tests-2864%20passed-brightgreen.svg" alt="Tests" />
+    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.8.2-blue.svg" alt="Changelog" /></a>
   </p>
 </p>
 
 ---
 
-> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2,856 tests as of v0.8.1, five-agent cross-audit, 10-issue v0.8.1 dashboard overhaul + 11-issue v0.8.0 Hermes parity sweep + 18-issue v0.7.1 dashboard audit + 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
+> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2,864 tests as of v0.8.2, 9-issue v0.8.2 runtime/security hardening + five-agent cross-audit + 10-issue v0.8.1 dashboard overhaul + 11-issue v0.8.0 Hermes parity sweep + 18-issue v0.7.1 dashboard audit + 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
 
 CrowClaw gives you an agent loop, 50+ tools, skill learning, scheduled jobs, multi-channel webhooks, and a dashboard — without wiring the whole stack yourself.
 
@@ -255,7 +255,11 @@ Local terminal backends (local/docker/ssh) are available today. Other backend de
 | Runtime | Status | Notes |
 |---|---|---|
 | **Node.js 22+** | Primary | Full feature surface — local SKILL.md loading, persona dirs, all execution backends |
+| **Docker (Node runtime)** | Supported packaging | Multi-stage image, non-root UID/GID 10001, `tini`, `/healthz`, `/data` via `CROWCLAW_DATA_DIR` |
 | **Cloudflare Workers** | Early adapter | Functional, narrower override surface — local SKILL.md / persona dirs are Node-only. Active-preset persistence + scheduler persistence + 7 lifecycle endpoints landed in v0.5.0 |
+
+See [docs/deployment-docker.md](./docs/deployment-docker.md) for the Docker
+image's runtime and hardening defaults.
 
 See [docs/deployment-cloudflare.md](./docs/deployment-cloudflare.md) for the Cloudflare adapter's current scope and limits.
 
@@ -457,7 +461,7 @@ npm test             # vitest run
 npm run preflight    # both
 ```
 
-Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2,856 tests** as of v0.8.1.
+Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2,864 tests** as of v0.8.2.
 
 ## Packages
 

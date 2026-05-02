@@ -1,7 +1,12 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '@crowclaw/runtime-node/event-bus';
+import { setTelemetryHooks, type TelemetrySpan } from '@crowclaw/core';
 
 describe('EventBus', () => {
+  afterEach(() => {
+    setTelemetryHooks(null);
+  });
+
   it('emits events to subscribers', () => {
     const bus = new EventBus();
     const received: unknown[] = [];
@@ -112,5 +117,40 @@ describe('EventBus', () => {
     // (Set iteration snapshot behavior — for-of over Set sees additions)
     // This tests the actual behavior, whatever it is
     expect(typeof lateReceived.length).toBe('number');
+  });
+
+  it('emits telemetry spans for session, iteration, and tool events', () => {
+    const ended: string[] = [];
+    const spans: Array<{ name: string; attributes: Record<string, string | number | boolean> }> = [];
+    setTelemetryHooks({
+      startSpan(name, attributes) {
+        const record = { name, attributes: { ...(attributes ?? {}) } };
+        spans.push(record);
+        return {
+          setAttribute(key, value) {
+            record.attributes[key] = value;
+          },
+          end() {
+            ended.push(name);
+          },
+        } satisfies TelemetrySpan;
+      },
+    });
+
+    const bus = new EventBus();
+    bus.emit('chat:message', { sessionId: 's1' });
+    bus.emit('iteration:start', { sessionId: 's1', iteration: 0 });
+    bus.emit('tool:start', { sessionId: 's1', callId: 'c1', toolName: 'web.fetch' });
+    bus.emit('tool:complete', { callId: 'c1', ok: true, durationMs: 12 });
+    bus.emit('iteration:end', { sessionId: 's1', iteration: 0, toolCount: 1 });
+    bus.emit('chat:complete', { sessionId: 's1' });
+
+    expect(spans.map((span) => span.name)).toEqual(['crowclaw.session', 'crowclaw.iteration', 'crowclaw.tool-call']);
+    expect(spans[2]?.attributes).toMatchObject({
+      'crowclaw.tool.name': 'web.fetch',
+      'crowclaw.tool.ok': true,
+      'crowclaw.tool.duration_ms': 12,
+    });
+    expect(ended).toEqual(['crowclaw.tool-call', 'crowclaw.iteration', 'crowclaw.session']);
   });
 });

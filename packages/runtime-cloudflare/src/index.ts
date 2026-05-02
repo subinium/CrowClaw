@@ -92,6 +92,13 @@ function getSpecialSessionStub(env: RuntimeEnv, name: string) {
   return env.AGENT_SESSIONS.get(durableId);
 }
 
+function unsupportedOnWorkers(path: string): Response {
+  return Response.json(
+    { ok: false, error: 'unsupported_on_workers', path },
+    { status: 501 }
+  );
+}
+
 /**
  * Derive the cookie-safe token from CROWCLAW_DASHBOARD_TOKEN using HMAC-SHA256.
  * Mirrors the Node runtime so `/api/auth/verify` semantics are consistent
@@ -210,6 +217,38 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/health') {
       return Response.json({ ok: true, service: 'crowclaw', runtime: 'cloudflare' });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/healthz') {
+      return Response.json({ ok: true, service: 'crowclaw', runtime: 'cloudflare' });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/readyz') {
+      return Response.json({ ok: true, service: 'crowclaw', runtime: 'cloudflare' });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/.well-known/agent-skills') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/agent-skills', {
+        method: 'GET',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' }
+      }));
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/tools') {
+      const stub = getSpecialSessionStub(env, '__system__');
+      return stub.fetch(new Request('https://internal/session/tools', {
+        method: 'GET',
+        headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' }
+      }));
+    }
+
+    if (url.pathname.startsWith('/api/terminal/')) {
+      return unsupportedOnWorkers(url.pathname);
+    }
+
+    if (/^\/api\/code\/bridge\/(spawn|terminate|capabilities|process|ping|heartbeat)$/.test(url.pathname)) {
+      return unsupportedOnWorkers(url.pathname);
     }
 
     if (request.method === 'GET' && url.pathname === '/api/system/status') {

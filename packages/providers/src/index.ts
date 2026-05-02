@@ -51,6 +51,12 @@ export interface OpenAICompatibleConfig {
    * ChatGPT (Codex) backend, which requires `store: false` on every call.
    */
   extraBodyFields?: Record<string, unknown>;
+  /** Default token cap for provider requests when a request does not supply one. */
+  maxTokens?: number;
+  /** Default temperature for non-reasoning models. Reasoning models reject this field. */
+  temperature?: number;
+  /** OpenAI Responses API reasoning effort for o-series models. */
+  reasoningEffort?: 'low' | 'medium' | 'high';
   /**
    * v0.7.2: When the Responses API is in use, route the system prompt to the
    * top-level `instructions` field instead of injecting a `developer` message
@@ -762,7 +768,60 @@ function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: stri
  */
 function supportsNativeJsonSchema(baseUrl: string, model: string): boolean {
   if (!/api\.openai\.com/i.test(baseUrl)) return false;
-  return /^gpt-4o|^gpt-4\.1/i.test(model);
+  return /^(?:gpt-4o|gpt-4\.1|gpt-5|o1|o3|o4)/i.test(model);
+}
+
+function isReasoningModel(model: string): boolean {
+  return /^(?:o1|o3|o4)/i.test(model);
+}
+
+function applyOpenAITokenAndSamplingFields(
+  body: Record<string, unknown>,
+  options: {
+    model: string;
+    isResponsesApi: boolean;
+    maxTokens?: number;
+    temperature?: number;
+    reasoningEffort?: 'low' | 'medium' | 'high';
+  },
+): void {
+  const reasoning = isReasoningModel(options.model);
+  const maxTokens = options.maxTokens ?? 16384;
+
+  if (options.isResponsesApi) {
+    body.max_output_tokens = maxTokens;
+    if (reasoning && options.reasoningEffort) {
+      body.reasoning_effort = options.reasoningEffort;
+    }
+  } else if (reasoning) {
+    body.max_completion_tokens = maxTokens;
+  } else {
+    body.max_tokens = maxTokens;
+  }
+
+  if (reasoning) {
+    delete body.temperature;
+    return;
+  }
+
+  if (options.temperature !== undefined) {
+    body.temperature = options.temperature;
+  }
+}
+
+function extractResponsesOutputText(payload: Record<string, unknown>): string {
+  const output = payload.output;
+  if (!Array.isArray(output)) return '';
+  let text = '';
+  for (const item of output as Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>) {
+    if (item.type !== 'message' || !Array.isArray(item.content)) continue;
+    for (const part of item.content) {
+      if (part.type === 'output_text' && part.text) {
+        text += part.text;
+      }
+    }
+  }
+  return text;
 }
 
 /**
@@ -1131,6 +1190,13 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       model: this.config.model,
       ...(this.config.extraBodyFields ?? {}),
     };
+    applyOpenAITokenAndSamplingFields(body, {
+      model: this.config.model,
+      isResponsesApi,
+      maxTokens: request.maxTokens ?? this.config.maxTokens,
+      temperature: request.temperature ?? this.config.temperature,
+      reasoningEffort: this.config.reasoningEffort,
+    });
 
     if (isResponsesApi) {
       const useInstructions = !!this.config.systemPromptAsInstructions;
@@ -1319,6 +1385,13 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       stream: true,
       ...(this.config.extraBodyFields ?? {}),
     };
+    applyOpenAITokenAndSamplingFields(body, {
+      model: this.config.model,
+      isResponsesApi,
+      maxTokens: request.maxTokens ?? this.config.maxTokens,
+      temperature: request.temperature ?? this.config.temperature,
+      reasoningEffort: this.config.reasoningEffort,
+    });
 
     if (isResponsesApi) {
       const useInstructions = !!this.config.systemPromptAsInstructions;
@@ -1557,7 +1630,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
   async generateStructured<T = unknown>(req: StructuredOutputRequest<T>): Promise<StructuredOutputResponse<T>> {
     const useNativeJsonSchema = supportsNativeJsonSchema(this.config.baseUrl, this.config.model);
 
-    if (useNativeJsonSchema) {
+    if (useNativeJsonSchema && !this.config.requireStream) {
       try {
         return await this.callNativeStructured<T>(req);
       } catch (err) {
@@ -1615,21 +1688,43 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         : message.content,
     }));
 
-    const body = {
+    const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
+    const body: Record<string, unknown> = {
       model: this.config.model,
-      messages: mappedMessages,
-      response_format: {
+      ...(this.config.extraBodyFields ?? {}),
+    };
+
+    applyOpenAITokenAndSamplingFields(body, {
+      model: this.config.model,
+      isResponsesApi,
+      maxTokens: this.config.maxTokens,
+      temperature: this.config.temperature,
+      reasoningEffort: this.config.reasoningEffort,
+    });
+
+    if (isResponsesApi) {
+      body.input = mappedMessages;
+      body.text = {
+        format: {
+          type: 'json_schema',
+          name: 'output',
+          schema: req.schema,
+          strict: true,
+        },
+      };
+    } else {
+      body.messages = mappedMessages;
+      body.response_format = {
         type: 'json_schema',
         json_schema: {
           name: 'output',
           schema: req.schema,
           strict: true,
         },
-      },
-      ...(this.config.extraBodyFields ?? {}),
-    };
+      };
+    }
 
-    const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    const response = await fetch(this.getEndpointUrl(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -1644,8 +1739,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       return { ok: false, error: 'provider', details: `${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}` };
     }
 
-    const payload = (await response.json()) as ChatCompletionsResponse;
-    const text = normalizeOpenAIMessageContent(payload.choices?.[0]?.message?.content) ?? '';
+    const payload = (await response.json()) as Record<string, unknown>;
+    const text = isResponsesApi
+      ? extractResponsesOutputText(payload)
+      : normalizeOpenAIMessageContent((payload as ChatCompletionsResponse).choices?.[0]?.message?.content) ?? '';
     return finalizeStructuredResponse<T>(text, req);
   }
 }

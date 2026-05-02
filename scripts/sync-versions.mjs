@@ -25,6 +25,22 @@ async function main() {
     } catch { continue; }
   }
 
+  const wranglerPath = path.join(repoRoot, 'wrangler.jsonc');
+  try {
+    const raw = await fs.readFile(wranglerPath, 'utf-8');
+    const next = raw.replace(
+      /("__CROWCLAW_VERSION__"\s*:\s*)"\\?"[^"]+"\\?"/,
+      `$1"\\"${version}\\""`
+    );
+    if (next !== raw) {
+      await fs.writeFile(wranglerPath, next, 'utf-8');
+      console.log(`  Updated wrangler.jsonc __CROWCLAW_VERSION__ -> ${version}`);
+      updated++;
+    }
+  } catch {
+    // Wrangler is optional for non-Cloudflare consumers.
+  }
+
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const pkgPath = path.join(packagesDir, entry.name, 'package.json');

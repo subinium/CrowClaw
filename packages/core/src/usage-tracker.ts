@@ -2,6 +2,8 @@
 // DetailedUsageTracker — per-call usage tracking with cost estimation
 // ---------------------------------------------------------------------------
 
+import { getTelemetryHooks } from './telemetry.js';
+
 export interface UsageEntry {
   timestamp: string;
   model: string;
@@ -78,6 +80,13 @@ export class DetailedUsageTracker {
   private entries: UsageEntry[] = [];
 
   record(entry: Omit<UsageEntry, 'timestamp'>): void {
+    const activeSpan = getTelemetryHooks()?.getActiveSpan?.();
+    activeSpan?.setAttribute('llm.token_count.prompt', entry.inputTokens);
+    activeSpan?.setAttribute('llm.token_count.completion', entry.outputTokens);
+    activeSpan?.setAttribute('gen_ai.usage.cost', entry.costUsd);
+    activeSpan?.setAttribute('gen_ai.response.model', entry.model);
+    activeSpan?.setAttribute('gen_ai.system', entry.provider);
+
     this.entries.push({
       ...entry,
       timestamp: new Date().toISOString(),

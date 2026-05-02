@@ -10,7 +10,7 @@
   // lockstep with `package.json` during release/vX.Y.Z.
   "define": {
     "__CROWCLAW_TEST_MODE__": "false",
-    "__CROWCLAW_VERSION__": "\"0.4.3\""
+    "__CROWCLAW_VERSION__": "\"0.8.2\""
   },
   "durable_objects": {
     "bindings": [
@@ -34,7 +34,7 @@
     {
       "binding": "DB",
       "database_name": "crowclaw",
-      "database_id": "local-dev"
+      "database_id": "REPLACE_WITH_D1_UUID_FROM_npx_wrangler_d1_create"
     }
   ],
   "r2_buckets": [

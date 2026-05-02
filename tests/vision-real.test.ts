@@ -60,14 +60,14 @@ describe('vision.analyze tool', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const tool = createVisionAnalyzeTool({ apiKey: 'test-key' });
-    const result = await tool.execute({ url: 'https://images.example.com/cat.png' }, makeContext());
+    const result = await tool.execute({ url: 'https://example.com/cat.png' }, makeContext());
 
     expect(result.ok).toBe(true);
     expect(result.output).toBe('URL image analysis');
 
     // Verify the URL was passed through directly
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
-    expect(body.messages[0].content[0].image_url.url).toBe('https://images.example.com/cat.png');
+    expect(body.messages[0].content[0].image_url.url).toBe('https://example.com/cat.png');
   });
 
   it('handles base64 images by wrapping in data URI', async () => {
@@ -183,6 +183,18 @@ describe('vision.analyze tool', () => {
     expect(result.output).toContain('Image metadata');
     expect(result.output).toContain('Content-Type: image/jpeg');
     expect(result.metadata).toMatchObject({ simulated: true });
+  });
+
+  it('blocks private image URLs before any fetch', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tool = createVisionAnalyzeTool();
+    const result = await tool.execute({ url: 'http://169.254.169.254/latest/meta-data/' }, makeContext());
+
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('URL blocked:');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('returns error when url parameter is missing', async () => {

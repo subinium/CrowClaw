@@ -30,6 +30,21 @@ jobs:
       - name: Test
         run: npm test -- --reporter=verbose 2>&1 | tee test-output.txt
 
+      - name: Docker smoke
+        run: |
+          docker build -t crowclaw-ci .
+          cid=$(docker run --rm -d -p 8787:8787 --name crowclaw-ci crowclaw-ci)
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8787/healthz; then
+              docker stop --time 10 "$cid"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs "$cid"
+          exit 1
+
       - name: Test Summary
         if: always()
         run: |

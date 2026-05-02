@@ -19,6 +19,7 @@ describe('wiring verification', () => {
       const runtime = createNodeRuntime({
         provider: new StubProvider() as never,
         schedulerStorePath: null,
+        auditLogPath: null,
       });
       expect(runtime.securityAuditLog).toBeInstanceOf(SecurityAuditLog);
     });
@@ -27,6 +28,7 @@ describe('wiring verification', () => {
       const runtime = createNodeRuntime({
         provider: new StubProvider() as never,
         schedulerStorePath: null,
+        auditLogPath: null,
       });
       // Record an event manually
       runtime.securityAuditLog.record({
