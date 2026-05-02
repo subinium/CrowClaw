@@ -99,4 +99,15 @@ describe('api error envelope', () => {
     expect((err as ApiError).status).toBe(401);
     expect(events.length).toBe(1);
   });
+
+  it('sends the active dashboard locale header', async () => {
+    vi.stubGlobal('document', { documentElement: { lang: 'ko' } });
+    const fetchMock = vi.fn(async () => mockResponse(200, { ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api('/api/system/status');
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect((init.headers as Record<string, string>)['x-crowclaw-locale']).toBe('ko');
+  });
 });

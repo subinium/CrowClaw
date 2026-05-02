@@ -74,6 +74,14 @@ export interface SkillConfigRequirements {
   tools?: string[];
 }
 
+export type SkillLocale = 'en' | 'ko';
+
+export interface LocalizedSkillMetadata {
+  name?: string;
+  description?: string;
+  triggers?: string[];
+}
+
 export interface SkillManifest {
   // ---- Existing CrowClaw fields (KEEP) ----
   name: string;
@@ -108,6 +116,8 @@ export interface SkillManifest {
   config_requirements?: SkillConfigRequirements;
   /** ISO 8601 timestamp of last modification. */
   updated_at?: string;
+  /** Locale-specific display metadata. Instructions can use body markers. */
+  i18n?: Partial<Record<SkillLocale, LocalizedSkillMetadata>>;
   /**
    * Optional SHA-256 integrity pin for the instruction body.
    * Format: `sha256:<64 lowercase/uppercase hex chars>`.
@@ -118,6 +128,8 @@ export interface SkillManifest {
 export interface ParsedSkillFile {
   manifest: SkillManifest;
   instructions: string; // The markdown body (after frontmatter)
+  /** Locale-specific instruction body extracted from `<!-- i18n:xx -->` blocks. */
+  localizedInstructions?: Partial<Record<SkillLocale, string>>;
   raw: string; // Original file content
   filePath?: string;
   /** True when `manifest.content_hash` was present but did not match `instructions`. */
@@ -218,7 +230,8 @@ export function parseSkillFile(
   if (endIndex === -1) return null;
 
   const yamlBlock = trimmed.slice(3, endIndex).trim();
-  const instructions = trimmed.slice(endIndex + 3).trim();
+  const rawInstructions = trimmed.slice(endIndex + 3).trim();
+  const { defaultInstructions, localizedInstructions } = extractLocalizedInstructions(rawInstructions);
 
   // Simple YAML parser (no external dep)
   const yaml = parseSimpleYaml(yamlBlock);
@@ -253,14 +266,68 @@ export function parseSkillFile(
     platforms: Array.isArray(yaml.platforms) ? (yaml.platforms as string[]) : undefined,
     config_requirements,
     updated_at: yaml.updated_at as string | undefined,
+    i18n: parseLocalizedSkillMetadata((yaml as Record<string, unknown>).i18n),
     content_hash: yaml.content_hash as string | undefined,
   };
 
   return {
     manifest,
-    instructions,
+    instructions: defaultInstructions,
+    localizedInstructions,
     raw: content,
     filePath,
+  };
+}
+
+export function localizeSkillFile(
+  skill: ParsedSkillFile,
+  locale: SkillLocale = 'en',
+): { name: string; description: string; instructions: string; triggers: string[] } {
+  const localized = skill.manifest.i18n?.[locale];
+  return {
+    name: localized?.name ?? skill.manifest.name,
+    description: localized?.description ?? skill.manifest.description,
+    instructions: skill.localizedInstructions?.[locale] ?? skill.instructions,
+    triggers: localized?.triggers ?? skill.manifest.triggers,
+  };
+}
+
+function parseLocalizedSkillMetadata(raw: unknown): SkillManifest['i18n'] {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const out: Partial<Record<SkillLocale, LocalizedSkillMetadata>> = {};
+  for (const locale of ['en', 'ko'] as const) {
+    const value = (raw as Record<string, unknown>)[locale];
+    if (!value || typeof value !== 'object') continue;
+    const obj = value as Record<string, unknown>;
+    const meta: LocalizedSkillMetadata = {};
+    if (typeof obj.name === 'string') meta.name = obj.name;
+    if (typeof obj.description === 'string') meta.description = obj.description;
+    if (Array.isArray(obj.triggers)) meta.triggers = obj.triggers.filter((v): v is string => typeof v === 'string');
+    if (Object.keys(meta).length > 0) out[locale] = meta;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function extractLocalizedInstructions(instructions: string): {
+  defaultInstructions: string;
+  localizedInstructions?: Partial<Record<SkillLocale, string>>;
+} {
+  const localized: Partial<Record<SkillLocale, string>> = {};
+  let defaultInstructions = instructions;
+
+  for (const locale of ['en', 'ko'] as const) {
+    const pattern = new RegExp(`<!--\\s*i18n:${locale}\\s*-->([\\s\\S]*?)<!--\\s*/i18n:${locale}\\s*-->`, 'g');
+    const parts: string[] = [];
+    defaultInstructions = defaultInstructions.replace(pattern, (_match, body: string) => {
+      parts.push(body.trim());
+      return '';
+    }).trim();
+    if (parts.length > 0) localized[locale] = parts.join('\n\n');
+  }
+
+  return {
+    defaultInstructions,
+    localizedInstructions: Object.keys(localized).length > 0 ? localized : undefined,
   };
 }
 
@@ -471,7 +538,9 @@ export function matchSkillManifests(
     let score = 0;
 
     // Trigger phrase match (highest weight)
-    for (const trigger of skill.manifest.triggers) {
+    const localizedTriggers = Object.values(skill.manifest.i18n ?? {})
+      .flatMap((entry) => entry?.triggers ?? []);
+    for (const trigger of [...skill.manifest.triggers, ...localizedTriggers]) {
       if (queryLower.includes(trigger.toLowerCase())) score += 10;
       else if (trigger.toLowerCase().includes(queryLower)) score += 5;
     }
@@ -480,7 +549,10 @@ export function matchSkillManifests(
     if (queryLower.includes(skill.manifest.name.toLowerCase())) score += 8;
 
     // Description word overlap
-    const descWords = skill.manifest.description.toLowerCase().split(/\s+/);
+    const localizedDescriptions = Object.values(skill.manifest.i18n ?? {})
+      .map((entry) => entry?.description)
+      .filter((value): value is string => typeof value === 'string');
+    const descWords = [skill.manifest.description, ...localizedDescriptions].join(' ').toLowerCase().split(/\s+/);
     for (const word of queryWords) {
       if (descWords.includes(word)) score += 2;
     }

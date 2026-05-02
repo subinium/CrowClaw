@@ -13,6 +13,7 @@ import {
   checkSkillGates,
   filterAndBudgetSkills,
   matchSkillManifests,
+  localizeSkillFile,
 } from '../packages/core/src/skill-manifest.js';
 
 // --- Phase B fixtures -------------------------------------------------------
@@ -173,6 +174,40 @@ describe('parseSkillFile — legacy + new format', () => {
     });
     expect(parsed!.manifest.updated_at).toBe('2026-04-12T09:30:00Z');
     expect(parsed!.instructions).toContain('# Deploy to Vercel');
+  });
+
+  it('parses and resolves localized skill metadata and instructions', () => {
+    const parsed = parseSkillFile(`---
+name: deploy-vercel
+description: Deploy a web app to Vercel
+triggers:
+  - deploy to vercel
+i18n:
+  ko:
+    name: vercel-deploy
+    description: Vercel에 웹 앱 배포
+    triggers:
+      - vercel 배포
+---
+
+# Deploy to Vercel
+
+Default instructions.
+
+<!-- i18n:ko -->
+# Vercel 배포
+
+한국어 지침.
+<!-- /i18n:ko -->
+`)!;
+    const localized = localizeSkillFile(parsed, 'ko');
+
+    expect(localized.name).toBe('vercel-deploy');
+    expect(localized.description).toBe('Vercel에 웹 앱 배포');
+    expect(localized.triggers).toContain('vercel 배포');
+    expect(localized.instructions).toContain('한국어 지침');
+    expect(parsed.instructions).toContain('Default instructions.');
+    expect(parsed.instructions).not.toContain('한국어 지침');
   });
 
   it('returns null for files without YAML frontmatter', () => {

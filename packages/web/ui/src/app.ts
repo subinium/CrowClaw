@@ -3,6 +3,7 @@ import { customElement, state } from 'lit/decorators.js';
 import { checkAuth, verifyToken, api, clearAuthToken } from './lib/api.js';
 import { connectWebSocket, type WsClient } from './lib/ws.js';
 import { buttonStyles } from './lib/shared-styles.js';
+import { getStoredLocale, setStoredLocale, useT, type Locale } from './lib/i18n.js';
 import { showToast } from './components/toast.js';
 // Pill action event names live with the component so a rename trips a
 // type/build error rather than a silent runtime drift between emitter
@@ -299,38 +300,39 @@ export class CrowClawPairingModal extends LitElement {
   }
 
   render() {
+    const t = useT(getStoredLocale());
     return html`
       <div class="overlay ${this.open ? 'on' : ''}" @click=${(e: Event) => {
         if ((e.target as HTMLElement).classList.contains('overlay')) this.hide();
       }}>
-        <div class="modal" role="dialog" aria-label="Device Pairing">
+        <div class="modal" role="dialog" aria-label=${t('pairing.title')}>
           <div class="modal-header">
-            <h3>Device Pairing</h3>
-            <button class="close-btn" aria-label="Close pairing dialog" @click=${() => this.hide()}>&#10005;</button>
+            <h3>${t('pairing.title')}</h3>
+            <button class="close-btn" aria-label=${t('pairing.close')} @click=${() => this.hide()}>&#10005;</button>
           </div>
 
           ${this._error ? html`<div style="color:var(--error);font-size:var(--text-xs);margin-bottom:var(--sp-3)">${this._error}</div>` : nothing}
 
           ${this._pairings.length === 0 && !this._loading
-            ? html`<div class="empty-msg">No pending pairings</div>`
+            ? html`<div class="empty-msg">${t('pairing.none')}</div>`
             : html`
               <div class="pairing-list">
                 ${this._pairings.map(p => html`
                   <div class="pairing-card">
                     <div class="pairing-row">
-                      <span class="pairing-label">Platform</span>
+                      <span class="pairing-label">${t('pairing.platform')}</span>
                       <span class="pairing-value">${p.platform}</span>
                     </div>
                     <div class="pairing-row">
-                      <span class="pairing-label">Sender</span>
+                      <span class="pairing-label">${t('pairing.sender')}</span>
                       <span class="pairing-value">${p.senderId}</span>
                     </div>
                     <div class="pairing-row">
-                      <span class="pairing-label">Code</span>
+                      <span class="pairing-label">${t('pairing.code')}</span>
                       <span class="pairing-value">${p.code}</span>
                     </div>
                     <div class="pairing-row">
-                      <span class="pairing-label">Expires</span>
+                      <span class="pairing-label">${t('pairing.expires')}</span>
                       <span class="pairing-value">${this._formatExpiry(p.expiresAt)}</span>
                     </div>
                     <div class="pairing-actions">
@@ -338,7 +340,7 @@ export class CrowClawPairingModal extends LitElement {
                               aria-label="Approve pairing for ${p.platform} ${p.senderId}"
                               ?disabled=${this._approving === p.code}
                               @click=${() => this._approve(p.code)}>
-                        ${this._approving === p.code ? 'Approving...' : 'Approve'}
+                        ${this._approving === p.code ? t('common.loading') : t('pairing.approve')}
                       </button>
                     </div>
                   </div>
@@ -346,7 +348,7 @@ export class CrowClawPairingModal extends LitElement {
               </div>
             `}
 
-          ${this._loading ? html`<div class="loading-msg">Refreshing...</div>` : nothing}
+          ${this._loading ? html`<div class="loading-msg">${t('pairing.loading')}</div>` : nothing}
         </div>
       </div>
     `;
@@ -751,7 +753,7 @@ export class CrowClawApp extends LitElement {
   @state() private instanceVersion = '';
   @state() private instanceRuntime = '';
   @state() private themeMode: 'light' | 'dark' | 'system' = 'system';
-  @state() private localeMode: 'en' | 'ko' = 'en';
+  @state() private localeMode: Locale = 'en';
   @state() private releaseLatest: string | null = null;
   @state() private releaseOutdated = false;
   /** Latest snapshot from /api/system/status. Drives onboarding + demo badge. */
@@ -788,7 +790,7 @@ export class CrowClawApp extends LitElement {
 
   private _authRequiredHandler = () => {
     this.authenticated = false;
-    showToast('Session expired. Please sign in again.', 'error');
+    showToast(useT(this.localeMode)('app.sessionExpired'), 'error');
   };
 
   private _hashChangeHandler = () => {
@@ -829,7 +831,7 @@ export class CrowClawApp extends LitElement {
    */
   private _reconnectWsHandler = () => {
     this._reconnectTransport();
-    showToast('Reconnecting WebSocket…', 'info');
+    showToast(useT(this.localeMode)('app.reconnectingWs'), 'info');
   };
 
   private _testProviderHandler = async () => {
@@ -839,9 +841,9 @@ export class CrowClawApp extends LitElement {
         body: JSON.stringify({ slot: 'primary' }),
       });
       if (res.ok) {
-        showToast('Provider check passed.', 'success');
+        showToast(useT(this.localeMode)('app.providerPassed'), 'success');
       } else {
-        showToast(`Provider check failed: ${res.error ?? 'unknown error'}`, 'error');
+        showToast(useT(this.localeMode)('app.providerFailed', { error: res.error ?? 'unknown error' }), 'error');
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Provider check failed';
@@ -852,9 +854,9 @@ export class CrowClawApp extends LitElement {
   private _resumeSchedulerHandler = async () => {
     try {
       await api('/api/scheduler/resume', { method: 'POST' });
-      showToast('Scheduler resumed.', 'success');
+      showToast(useT(this.localeMode)('app.schedulerResumed'), 'success');
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to resume scheduler';
+      const msg = err instanceof Error ? err.message : useT(this.localeMode)('app.schedulerResumeFailed');
       showToast(msg, 'error');
     }
   };
@@ -930,7 +932,7 @@ export class CrowClawApp extends LitElement {
     if (!this.showOnboarding) {
       this.currentView = 'chat';
       location.hash = 'chat';
-      showToast('Setup complete — welcome to CrowClaw.', 'success');
+      showToast(useT(this.localeMode)('app.setupComplete'), 'success');
     }
   };
 
@@ -976,10 +978,7 @@ export class CrowClawApp extends LitElement {
     this.themeMode = storedTheme === 'light' || storedTheme === 'dark' || storedTheme === 'system'
       ? storedTheme
       : 'system';
-    const storedLocale = localStorage.getItem('crowclaw:locale');
-    this.localeMode = storedLocale === 'ko' || storedLocale === 'en'
-      ? storedLocale
-      : (navigator.language?.toLowerCase().startsWith('ko') ? 'ko' : 'en');
+    this.localeMode = getStoredLocale();
     this._applyTheme();
     document.documentElement.lang = this.localeMode;
   }
@@ -996,11 +995,9 @@ export class CrowClawApp extends LitElement {
     this._applyTheme();
   }
 
-  private _setLocale(locale: 'en' | 'ko') {
+  private _setLocale(locale: Locale) {
     this.localeMode = locale;
-    localStorage.setItem('crowclaw:locale', locale);
-    document.documentElement.lang = locale;
-    window.dispatchEvent(new CustomEvent('crowclaw:locale-change', { detail: { locale } }));
+    setStoredLocale(locale);
   }
 
   /**
@@ -1303,6 +1300,7 @@ export class CrowClawApp extends LitElement {
   }
 
   render() {
+    const t = useT(this.localeMode);
     return html`
       <!-- Auth Overlay -->
       <div class="auth-overlay ${this.authenticated ? '' : 'on'}">
@@ -1367,21 +1365,21 @@ export class CrowClawApp extends LitElement {
           <div slot="footer-extras" class="sb-extras">
             <div class="sb-extras-row">
               <span class="ft-transport">${this.transportType}</span>
-              <span class="ft-stat">${this.subscriberCount} client${this.subscriberCount !== 1 ? 's' : ''}</span>
+              <span class="ft-stat">${t('app.clientCount', { count: this.subscriberCount, plural: this.subscriberCount !== 1 ? 's' : '' })}</span>
             </div>
 
             <div class="sb-extras-row ft-clickable"
                  role="button"
                  tabindex="0"
-                 aria-label="Toggle connected clients panel"
+                 aria-label=${t('app.toggleClients')}
                  @click=${this._togglePresence}
                  @keydown=${(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') this._togglePresence(); }}>
-              <span class="ft-stat">${this.presenceOpen ? 'Hide sessions' : 'Show sessions'}</span>
+              <span class="ft-stat">${this.presenceOpen ? t('app.hideSessions') : t('app.showSessions')}</span>
             </div>
 
             <div class="presence-panel ${this.presenceOpen ? 'on' : ''}">
               ${this.activeSessions.length === 0
-                ? html`<div class="session-row"><span class="ft-stat">No active sessions</span></div>`
+                ? html`<div class="session-row"><span class="ft-stat">${t('app.noActiveSessions')}</span></div>`
                 : this.activeSessions.map(s => html`
                   <div class="session-row">
                     <span class="session-id" title="${s.id}">${s.id}</span>
@@ -1401,20 +1399,20 @@ export class CrowClawApp extends LitElement {
 
             ${this.authenticated
               ? html`
-                <button class="ft-btn" aria-label="Pair a new device" @click=${this._openPairingModal}>
+                <button class="ft-btn" aria-label=${t('app.pairDeviceAria')} @click=${this._openPairingModal}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <rect x="5" y="2" width="14" height="20" rx="2" ry="2"/>
                     <line x1="12" y1="18" x2="12.01" y2="18"/>
                   </svg>
-                  Pair Device
+                  ${t('app.pairDevice')}
                 </button>
-                <button class="ft-btn" aria-label="Sign out" @click=${this._logout} style="opacity:0.6">
+                <button class="ft-btn" aria-label=${t('app.signOutAria')} @click=${this._logout} style="opacity:0.6">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
                     <polyline points="16 17 21 12 16 7"/>
                     <line x1="21" y1="12" x2="9" y2="12"/>
                   </svg>
-                  Sign Out
+                  ${t('app.signOut')}
                 </button>`
               : nothing}
           </div>
@@ -1440,22 +1438,22 @@ export class CrowClawApp extends LitElement {
 
                     <select
                       class="header-select"
-                      aria-label="Language"
+                      aria-label=${t('app.language')}
                       .value=${this.localeMode}
-                      @change=${(e: Event) => this._setLocale((e.target as HTMLSelectElement).value as 'en' | 'ko')}
+                      @change=${(e: Event) => this._setLocale((e.target as HTMLSelectElement).value as Locale)}
                     >
                       <option value="en">EN</option>
                       <option value="ko">KO</option>
                     </select>
                     <select
                       class="header-select"
-                      aria-label="Theme"
+                      aria-label=${t('app.theme')}
                       .value=${this.themeMode}
                       @change=${(e: Event) => this._setTheme((e.target as HTMLSelectElement).value as 'light' | 'dark' | 'system')}
                     >
-                      <option value="system">System</option>
-                      <option value="dark">Dark</option>
-                      <option value="light">Light</option>
+                      <option value="system">${t('app.theme.system')}</option>
+                      <option value="dark">${t('app.theme.dark')}</option>
+                      <option value="light">${t('app.theme.light')}</option>
                     </select>
                   </div>
                 </header>
@@ -1463,8 +1461,8 @@ export class CrowClawApp extends LitElement {
                 <div class="banner-stack">
                   ${this.releaseOutdated && this.releaseLatest ? html`
                     <div class="banner warn" role="status" aria-live="polite">
-                      <span class="banner-msg">CrowClaw v${this.releaseLatest} is available. Running v${this.instanceVersion || 'unknown'}.</span>
-                      <a class="banner-btn" href="https://github.com/subinium/CrowClaw/releases" target="_blank" rel="noreferrer">Changelog</a>
+                      <span class="banner-msg">${t('app.releaseAvailable', { latest: this.releaseLatest, current: this.instanceVersion || 'unknown' })}</span>
+                      <a class="banner-btn" href="https://github.com/subinium/CrowClaw/releases" target="_blank" rel="noreferrer">${t('app.changelog')}</a>
                     </div>
                   ` : nothing}
                   ${this.transportFallback ? html`
@@ -1477,10 +1475,10 @@ export class CrowClawApp extends LitElement {
                           <line x1="12" y1="9" x2="12" y2="13"/>
                           <line x1="12" y1="17" x2="12.01" y2="17"/>
                         </svg>
-                        Live streaming unavailable — responses appear after completion.
+                        ${t('app.streamingUnavailable')}
                       </span>
                       <button class="banner-btn" @click=${this._reconnectTransport}
-                              aria-label="Attempt to reconnect WebSocket">Reconnect WS</button>
+                              aria-label=${t('app.reconnectWsAria')}>${t('app.reconnectWs')}</button>
                     </div>
                   ` : nothing}
                   ${this.droppedFrames > 0 ? html`
@@ -1493,7 +1491,7 @@ export class CrowClawApp extends LitElement {
                           <line x1="12" y1="8" x2="12" y2="12"/>
                           <line x1="12" y1="16" x2="12.01" y2="16"/>
                         </svg>
-                        ${this.droppedFrames} event${this.droppedFrames !== 1 ? 's' : ''} dropped from broadcast queue.
+                        ${t('app.eventsDropped', { count: this.droppedFrames, plural: this.droppedFrames !== 1 ? 's' : '' })}
                       </span>
                     </div>
                   ` : nothing}

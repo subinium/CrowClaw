@@ -1,6 +1,8 @@
 import type { ToolManifest } from './index.js';
 import type { SkillManifest } from './skill-manifest.js';
 
+export type SupportedLocale = 'en' | 'ko';
+
 export interface MatchedSkill {
   name: string;
   description: string;
@@ -18,6 +20,8 @@ export interface PromptBuilderInput {
   matchedSkills?: MatchedSkill[];
   agentPreset?: { role: string; goal: string; backstory?: string };
   personaPrompt?: string;
+  /** Preferred language for model-facing dynamic instructions and responses. */
+  locale?: SupportedLocale;
   /** Include reasoning guidance for tool usage. true = built-in, string = custom. Default: true when tools present. */
   reasoningGuidance?: boolean | string;
   /** Recalled memories to inject as context. Max ~5 entries recommended. */
@@ -26,6 +30,7 @@ export interface PromptBuilderInput {
 
 export function buildSystemPrompt(input: PromptBuilderInput): string | undefined {
   const sections: string[] = [];
+  const locale = normalizeLocale(input.locale);
 
   if (input.personaPrompt) {
     sections.push(input.personaPrompt);
@@ -62,6 +67,10 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
     sections.push(['Runtime context:', ...runtimeLines].join('\n'));
   }
 
+  if (input.locale) {
+    sections.push(buildLocaleDirective(locale));
+  }
+
   // Memory context is now injected as an untrusted user-context prefix
   // (not in the system prompt) to prevent memory injection attacks.
   // See buildMemoryPrefix() for the injection format.
@@ -83,6 +92,20 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
   }
 
   return sections.length > 0 ? sections.join('\n\n') : undefined;
+}
+
+export function normalizeLocale(locale: unknown): SupportedLocale {
+  return locale === 'ko' ? 'ko' : 'en';
+}
+
+function buildLocaleDirective(locale: SupportedLocale): string {
+  const defaultLanguage = locale === 'ko' ? 'Korean' : 'English';
+  return [
+    'Response language:',
+    `- Respond in ${defaultLanguage} by default.`,
+    '- Keep code, commands, file paths, identifiers, API names, and quoted source text in their original language.',
+    '- If the user explicitly asks for another language, follow the user request for that turn.',
+  ].join('\n');
 }
 
 function buildReasoningGuidance(tools: ToolManifest[]): string {

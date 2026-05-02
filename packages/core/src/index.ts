@@ -13,8 +13,8 @@ export type {
   PreToolCallVeto,
   ToolResultTransform,
 } from './plugins.js';
-import { buildSystemPrompt, buildMemoryPrefix, type PromptBuilderInput } from './prompt-builder.js';
-import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
+import { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
+import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, localizeSkillFile, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
@@ -193,6 +193,8 @@ export interface AgentRunInput {
   signal?: AbortSignal;
   /** Pre-recalled memories to inject into the system prompt. */
   memories?: string[];
+  /** Preferred UI/user locale for dynamic system prompt language. */
+  locale?: SupportedLocale;
 }
 
 /**
@@ -887,6 +889,7 @@ export class AgentLoop {
     agentPreset?: { role: string; goal: string; backstory?: string };
     personaPrompt?: string;
     memories?: string[];
+    locale?: SupportedLocale;
   }): string | undefined {
     // #79: When contextInjection is 'never', the caller owns the whole prompt
     // lifecycle. We strip the runtime/workspace/tools bootstrap that
@@ -899,6 +902,7 @@ export class AgentLoop {
           personaPrompt: promptParams.personaPrompt,
           agentPreset: promptParams.agentPreset,
           matchedSkills: promptParams.matchedSkills,
+          locale: promptParams.locale,
           // No runtimeName/sessionId/workspaceId/userId/availableTools/memories.
           // No reasoningGuidance (suppressed by absence of availableTools).
         }
@@ -1534,12 +1538,15 @@ export class AgentLoop {
     if (this.skills.length > 0) {
       const skillMatches = matchSkillManifests(input.userMessage, this.skills, 3);
       if (skillMatches.length > 0) {
-        matchedSkills = skillMatches.map(({ skill }) => ({
-          name: skill.manifest.name,
-          description: skill.manifest.description,
-          instructions: skill.instructions,
-          tools: skill.manifest.tools,
-        }));
+        matchedSkills = skillMatches.map(({ skill }) => {
+          const localized = localizeSkillFile(skill, normalizeLocale(input.locale));
+          return {
+            name: localized.name,
+            description: localized.description,
+            instructions: localized.instructions,
+            tools: skill.manifest.tools,
+          };
+        });
 
         // Warn about required tools that aren't registered
         const registeredToolNames = new Set(toolList.map(t => t.name));
@@ -1607,6 +1614,7 @@ export class AgentLoop {
       matchedSkills,
       agentPreset: this.agentPreset,
       memories: input.memories,
+      locale: input.locale,
     });
 
     // Track 2.3: Use prompt caching-aware system prompt builder
@@ -2079,6 +2087,7 @@ export class AgentLoop {
     userMessage: string;
     sessionState: SessionState;
     signal?: AbortSignal;
+    locale?: SupportedLocale;
   }): AsyncGenerator<AgentStreamEvent> {
     const { userMessage, sessionState: session, signal } = input;
     // #239: capture run-start so `agent:terminated` carries an honest durationMs.
@@ -2092,6 +2101,7 @@ export class AgentLoop {
         sessionId: session.sessionId,
         userMessage,
         signal,
+        locale: input.locale,
       };
       try {
         const result = await this.run(runInput);
@@ -2145,12 +2155,15 @@ export class AgentLoop {
     if (this.skills.length > 0) {
       const skillMatches = matchSkillManifests(userMessage, this.skills, 3);
       if (skillMatches.length > 0) {
-        matchedSkills = skillMatches.map(({ skill }) => ({
-          name: skill.manifest.name,
-          description: skill.manifest.description,
-          instructions: skill.instructions,
-          tools: skill.manifest.tools,
-        }));
+        matchedSkills = skillMatches.map(({ skill }) => {
+          const localized = localizeSkillFile(skill, normalizeLocale(input.locale));
+          return {
+            name: localized.name,
+            description: localized.description,
+            instructions: localized.instructions,
+            tools: skill.manifest.tools,
+          };
+        });
 
         // Warn about required tools that aren't registered
         const registeredToolNames = new Set(streamToolList.map(t => t.name));
@@ -2196,6 +2209,7 @@ export class AgentLoop {
       availableTools: streamToolList,
       matchedSkills,
       agentPreset: this.agentPreset,
+      locale: input.locale,
     });
 
     let streamErrorReflectionCount = 0;
@@ -2865,7 +2879,7 @@ export function isToolAllowedForFork(session: SessionState, toolName: string): b
   return whitelist.some((entry) => entry === toolName || toolName.startsWith(`${entry}.`));
 }
 
-export { buildSystemPrompt, buildMemoryPrefix, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
+export { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type MatchedSkill, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
 
 export {
   isPrivateUrl,
@@ -2906,7 +2920,7 @@ export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usag
 export { setTelemetryHooks, getTelemetryHooks, type TelemetryHooks, type TelemetrySpan } from './telemetry.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
-export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';
+export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, localizeSkillFile, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';
 
 export { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames, type AgentPreset } from './agent-presets.js';
 

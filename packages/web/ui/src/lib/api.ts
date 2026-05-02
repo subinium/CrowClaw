@@ -9,6 +9,8 @@
  *     proxies, and Referer headers
  */
 
+import { getCurrentLocale } from './i18n.js';
+
 export const getAuthToken = (): null => null;
 
 export const setAuthToken = (_token: string | null): void => {
@@ -47,6 +49,7 @@ export const api = async <T = unknown>(path: string, options?: ApiOptions): Prom
   const { raw, ...fetchOpts } = options ?? {};
   const headers: Record<string, string> = {
     'content-type': 'application/json',
+    'x-crowclaw-locale': getCurrentLocale(),
     ...(fetchOpts.headers as Record<string, string>),
   };
 

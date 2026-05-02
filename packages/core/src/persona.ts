@@ -3,6 +3,7 @@ export interface PersonaFiles {
   identity?: string;
   agents?: string;
   user?: string;
+  locales?: Partial<Record<'en' | 'ko', Omit<PersonaFiles, 'locales'>>>;
 }
 
 export interface PersonaConfig {
@@ -34,23 +35,30 @@ export function parseIdentity(content: string): PersonaConfig {
 }
 
 /** Build system prompt section from persona files */
-export function buildPersonaPrompt(files: PersonaFiles): string {
+export function buildPersonaPrompt(files: PersonaFiles, locale: 'en' | 'ko' = 'en'): string {
+  const localized = files.locales?.[locale];
+  const resolved: Omit<PersonaFiles, 'locales'> = {
+    identity: localized?.identity ?? files.identity,
+    soul: localized?.soul ?? files.soul,
+    agents: localized?.agents ?? files.agents,
+    user: localized?.user ?? files.user,
+  };
   const sections: string[] = [];
 
-  if (files.identity) {
-    sections.push(`<persona-identity>\n${files.identity.trim()}\n</persona-identity>`);
+  if (resolved.identity) {
+    sections.push(`<persona-identity>\n${resolved.identity.trim()}\n</persona-identity>`);
   }
 
-  if (files.soul) {
-    sections.push(`<persona-soul>\n${files.soul.trim()}\n</persona-soul>`);
+  if (resolved.soul) {
+    sections.push(`<persona-soul>\n${resolved.soul.trim()}\n</persona-soul>`);
   }
 
-  if (files.agents) {
-    sections.push(`<persona-procedures>\n${files.agents.trim()}\n</persona-procedures>`);
+  if (resolved.agents) {
+    sections.push(`<persona-procedures>\n${resolved.agents.trim()}\n</persona-procedures>`);
   }
 
-  if (files.user) {
-    sections.push(`<persona-user>\n${files.user.trim()}\n</persona-user>`);
+  if (resolved.user) {
+    sections.push(`<persona-user>\n${resolved.user.trim()}\n</persona-user>`);
   }
 
   return sections.join('\n\n');
@@ -62,7 +70,7 @@ export async function loadPersonaFiles(
   fs: { readFile(path: string): Promise<string>; joinPath(...parts: string[]): string },
 ): Promise<PersonaFiles> {
   const files: PersonaFiles = {};
-  const names: Array<[keyof PersonaFiles, string]> = [
+  const names: Array<[keyof Omit<PersonaFiles, 'locales'>, string]> = [
     ['soul', 'SOUL.md'],
     ['identity', 'IDENTITY.md'],
     ['agents', 'AGENTS.md'],
@@ -74,6 +82,20 @@ export async function loadPersonaFiles(
       files[key] = await fs.readFile(fs.joinPath(dirPath, filename));
     } catch {
       // File doesn't exist — skip
+    }
+  }
+
+  for (const locale of ['en', 'ko'] as const) {
+    const localized: Omit<PersonaFiles, 'locales'> = {};
+    for (const [key, filename] of names) {
+      try {
+        localized[key] = await fs.readFile(fs.joinPath(dirPath, filename.replace('.md', `.${locale}.md`)));
+      } catch {
+        // Locale-specific file doesn't exist — skip
+      }
+    }
+    if (localized.soul || localized.identity || localized.agents || localized.user) {
+      files.locales = { ...(files.locales ?? {}), [locale]: localized };
     }
   }
 
@@ -96,6 +118,7 @@ export interface PersonaProfile {
   name: string;
   files: PersonaFiles;
   prompt: string; // pre-built persona prompt
+  prompts?: Partial<Record<'en' | 'ko', string>>;
 }
 
 export class PersonaRegistry {
@@ -112,6 +135,10 @@ export class PersonaRegistry {
       name: 'default',
       files: defaultFiles,
       prompt: getDefaultPersonaPrompt(),
+      prompts: {
+        en: buildPersonaPrompt(defaultFiles, 'en'),
+        ko: buildPersonaPrompt(defaultFiles, 'ko'),
+      },
     });
   }
 
@@ -121,6 +148,10 @@ export class PersonaRegistry {
       name,
       files,
       prompt: buildPersonaPrompt(files),
+      prompts: {
+        en: buildPersonaPrompt(files, 'en'),
+        ko: buildPersonaPrompt(files, 'ko'),
+      },
     });
   }
 
@@ -143,6 +174,12 @@ export class PersonaRegistry {
   /** Get the currently active persona profile */
   getActive(): PersonaProfile {
     return this.personas.get(this.active)!;
+  }
+
+  /** Get the currently active persona prompt for a locale. */
+  getActivePrompt(locale: 'en' | 'ko' = 'en'): string {
+    const profile = this.getActive();
+    return profile.prompts?.[locale] ?? profile.prompt;
   }
 
   /** List all registered personas with active indicator */
@@ -193,7 +230,7 @@ export async function scanPersonaDirectories(
   for (const dirName of dirs) {
     const dirPath = baseDir.endsWith(separator) ? baseDir + dirName : baseDir + separator + dirName;
     const files: PersonaFiles = {};
-    const fileNames: Array<[keyof PersonaFiles, string]> = [
+    const fileNames: Array<[keyof Omit<PersonaFiles, 'locales'>, string]> = [
       ['soul', 'SOUL.md'],
       ['identity', 'IDENTITY.md'],
       ['agents', 'AGENTS.md'],
@@ -205,6 +242,20 @@ export async function scanPersonaDirectories(
         files[key] = await readFile(dirPath + separator + filename);
       } catch {
         // File doesn't exist — skip
+      }
+    }
+
+    for (const locale of ['en', 'ko'] as const) {
+      const localized: Omit<PersonaFiles, 'locales'> = {};
+      for (const [key, filename] of fileNames) {
+        try {
+          localized[key] = await readFile(dirPath + separator + filename.replace('.md', `.${locale}.md`));
+        } catch {
+          // Locale-specific file doesn't exist — skip
+        }
+      }
+      if (localized.soul || localized.identity || localized.agents || localized.user) {
+        files.locales = { ...(files.locales ?? {}), [locale]: localized };
       }
     }
 
