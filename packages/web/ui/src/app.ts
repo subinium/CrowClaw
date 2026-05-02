@@ -153,7 +153,7 @@ export class CrowClawPairingModal extends LitElement {
 
       .modal {
         background: var(--bg-secondary);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         padding: var(--sp-6);
         width: 420px;
         max-width: 92vw;
@@ -191,8 +191,8 @@ export class CrowClawPairingModal extends LitElement {
       .pairing-list { display: flex; flex-direction: column; gap: var(--sp-3); }
 
       .pairing-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         padding: var(--sp-3) var(--sp-4);
         border-radius: var(--radius-md);
       }
@@ -412,7 +412,7 @@ export class CrowClawApp extends LitElement {
       /* Sidebar (delegated to <crowclaw-sidebar>) — only the slotted
          footer-extras need shell-local styles now. The component owns logo,
          nav, and base footer rendering. */
-      .sb-extras { display: flex; flex-direction: column; gap: var(--sp-1); margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--glass-border); }
+      .sb-extras { display: flex; flex-direction: column; gap: var(--sp-1); margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--border); }
       .sb-extras-row { display: flex; align-items: center; gap: var(--sp-2); }
       .sb-extras .ft-stat { font-size: var(--text-xs); color: var(--text-muted); font-family: var(--font-mono); }
 
@@ -421,8 +421,8 @@ export class CrowClawApp extends LitElement {
         font-weight: 600;
         font-family: var(--font-mono);
         color: var(--text-muted);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         padding: 0 4px;
         line-height: 16px;
         border-radius: var(--radius-sm);
@@ -463,7 +463,7 @@ export class CrowClawApp extends LitElement {
         flex-direction: column;
         gap: var(--sp-1);
         padding: var(--sp-2) 0 0;
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         margin-top: var(--sp-1);
       }
 
@@ -492,7 +492,7 @@ export class CrowClawApp extends LitElement {
         justify-content: flex-end;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: var(--bg-secondary);
         flex-shrink: 0;
         min-height: 40px;
@@ -506,7 +506,7 @@ export class CrowClawApp extends LitElement {
 
       .header-select {
         height: 28px;
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         border-radius: var(--radius-sm);
@@ -562,7 +562,7 @@ export class CrowClawApp extends LitElement {
 
       .auth-box {
         background: var(--bg-secondary);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         padding: var(--sp-6);
         width: 100%;
         max-width: 360px;
@@ -626,7 +626,7 @@ export class CrowClawApp extends LitElement {
       .auth-box input {
         width: 100%;
         padding: 10px var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-sm);
@@ -671,7 +671,7 @@ export class CrowClawApp extends LitElement {
 
       .hamburger {
         display: none; position: fixed; top: 12px; left: 12px; z-index: 101;
-        background: var(--bg-tertiary); border: 1px solid var(--glass-border);
+        background: var(--bg-tertiary); border: 1px solid var(--border);
         color: var(--text-primary); font-size: 20px; padding: 6px 10px; cursor: pointer;
         border-radius: var(--radius-sm);
       }

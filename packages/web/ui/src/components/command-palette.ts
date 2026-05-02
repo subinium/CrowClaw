@@ -151,7 +151,7 @@ export class CrowClawCommandPalette extends LitElement {
       display: flex;
       flex-direction: column;
       background: var(--bg-secondary, #13131a);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.10));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.10));
       border-radius: var(--radius-lg, 12px);
       box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
       overflow: hidden;
@@ -162,7 +162,7 @@ export class CrowClawCommandPalette extends LitElement {
       align-items: center;
       gap: var(--sp-3, 12px);
       padding: var(--sp-4, 16px) var(--sp-5, 20px);
-      border-bottom: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
     }
 
     .input-icon {
@@ -189,8 +189,8 @@ export class CrowClawCommandPalette extends LitElement {
       font-size: 10px;
       font-family: var(--font-mono, ui-monospace, monospace);
       color: var(--text-muted, #6e6e76);
-      background: var(--glass-bg, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: 4px;
     }
 
@@ -198,7 +198,7 @@ export class CrowClawCommandPalette extends LitElement {
       display: flex;
       gap: 0;
       padding: 0 var(--sp-3, 12px);
-      border-bottom: 1px solid var(--glass-border, rgba(255, 255, 255, 0.06));
+      border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
       flex-shrink: 0;
     }
     .tab {
@@ -244,7 +244,7 @@ export class CrowClawCommandPalette extends LitElement {
       border-left: 2px solid transparent;
     }
     .row.active {
-      background: var(--glass-bg, rgba(255, 255, 255, 0.04));
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
       border-left-color: var(--accent, #e05545);
     }
     .row .ic {
@@ -256,7 +256,7 @@ export class CrowClawCommandPalette extends LitElement {
       font-size: 11px;
       font-family: var(--font-mono, ui-monospace, monospace);
       color: var(--text-muted, #6e6e76);
-      background: var(--glass-bg, rgba(255, 255, 255, 0.04));
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
       border-radius: 4px;
       flex-shrink: 0;
     }
@@ -294,7 +294,7 @@ export class CrowClawCommandPalette extends LitElement {
       justify-content: space-between;
       align-items: center;
       padding: 8px var(--sp-5, 20px);
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       font-size: 10px;
       color: var(--text-muted, #6e6e76);
       gap: var(--sp-3, 12px);

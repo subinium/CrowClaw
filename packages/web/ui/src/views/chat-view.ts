@@ -120,6 +120,9 @@ const truncateId = (id: string, len = 12): string => {
   return id.slice(0, len) + '...';
 };
 
+const INITIAL_MESSAGE_RENDER_LIMIT = 200;
+const MESSAGE_RENDER_INCREMENT = 200;
+
 @customElement('crowclaw-chat-view')
 export class ChatView extends LitElement {
   static styles = [
@@ -133,7 +136,7 @@ export class ChatView extends LitElement {
       /* Session Sidebar */
       .sess-sb {
         width: 280px;
-        border-right: 1px solid var(--glass-border);
+        border-right: 1px solid var(--border);
         display: flex;
         flex-direction: column;
         background: var(--bg-secondary);
@@ -145,13 +148,13 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: var(--sp-3);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .sess-hdr input {
         flex: 1;
         padding: var(--sp-2) var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-xs);
@@ -168,14 +171,14 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: 0 var(--sp-3) var(--sp-3);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .sess-filter-row select {
         flex: 1;
         min-width: 0;
         padding: var(--sp-1) var(--sp-2);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-radius: var(--radius-sm);
         background: var(--bg-input);
         color: var(--text-primary);
@@ -189,7 +192,7 @@ export class ChatView extends LitElement {
         justify-content: space-between;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-3);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         font-size: var(--text-xs);
         color: var(--text-muted);
       }
@@ -199,7 +202,7 @@ export class ChatView extends LitElement {
       .sess-item {
         padding: var(--sp-3) var(--sp-4);
         cursor: pointer;
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         position: relative;
         transition: background var(--duration-fast);
       }
@@ -266,8 +269,8 @@ export class ChatView extends LitElement {
         min-width: 18px;
         height: 16px;
         padding: 0 4px;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: 8px;
         font-size: 9px;
         font-weight: 600;
@@ -277,7 +280,7 @@ export class ChatView extends LitElement {
 
       .sess-ctx {
         height: 2px;
-        background: var(--glass-border);
+        background: var(--border);
         margin-top: var(--sp-1);
         border-radius: 1px;
         overflow: hidden;
@@ -314,7 +317,7 @@ export class ChatView extends LitElement {
         right: var(--sp-2);
         z-index: 20;
         background: var(--bg-secondary);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-radius: var(--radius-sm);
         box-shadow: var(--shadow-md);
         min-width: 140px;
@@ -351,7 +354,7 @@ export class ChatView extends LitElement {
 
       .sess-toggle-btn {
         background: var(--bg-tertiary);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         color: var(--text-primary);
         cursor: pointer;
         padding: 4px 8px;
@@ -367,7 +370,7 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: var(--bg-secondary);
         flex-wrap: wrap;
       }
@@ -386,8 +389,8 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-1);
         padding: 4px 10px;
-        border: 1px solid var(--glass-border);
-        background: var(--glass-bg);
+        border: 1px solid var(--border);
+        background: var(--surface-1);
         color: var(--text-secondary);
         font-size: var(--text-xs);
         font-weight: 500;
@@ -426,7 +429,7 @@ export class ChatView extends LitElement {
       .ops-sep {
         width: 1px;
         height: 20px;
-        background: var(--glass-border);
+        background: var(--border);
         margin: 0 var(--sp-1);
       }
 
@@ -436,7 +439,7 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: rgba(100, 210, 255, 0.04);
       }
 
@@ -459,7 +462,7 @@ export class ChatView extends LitElement {
          track the chat content rather than pinning to the viewport. */
       .steer-sticky-wrap {
         padding: var(--sp-2) var(--sp-4);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         background: var(--bg-secondary);
         display: flex;
         flex-direction: column;
@@ -498,7 +501,7 @@ export class ChatView extends LitElement {
         flex-direction: column;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: rgba(100, 210, 255, 0.04);
       }
 
@@ -528,7 +531,7 @@ export class ChatView extends LitElement {
       .search-result-item {
         padding: var(--sp-1) var(--sp-2);
         font-size: var(--text-xs);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         cursor: pointer;
       }
 
@@ -549,7 +552,7 @@ export class ChatView extends LitElement {
       /* Checkpoint list overlay */
       .checkpoint-overlay {
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: rgba(100, 210, 255, 0.04);
         max-height: 200px;
         overflow-y: auto;
@@ -573,7 +576,7 @@ export class ChatView extends LitElement {
         align-items: center;
         justify-content: space-between;
         padding: var(--sp-1) var(--sp-2);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         font-size: var(--text-xs);
       }
 
@@ -590,7 +593,7 @@ export class ChatView extends LitElement {
 
       .cp-item .cp-restore {
         padding: 2px 6px;
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: none;
         color: var(--text-secondary);
         font-size: 10px;
@@ -610,14 +613,14 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: rgba(255, 255, 255, 0.02);
       }
 
       .rename-overlay input {
         flex: 1;
         padding: var(--sp-2) var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-xs);
@@ -632,6 +635,28 @@ export class ChatView extends LitElement {
         overflow-y: auto;
         padding: var(--sp-4);
         position: relative;
+      }
+
+      .message-window-control {
+        display: flex;
+        justify-content: center;
+        margin-bottom: var(--sp-3);
+      }
+
+      .message-window-btn {
+        border: 1px solid var(--border);
+        background: var(--surface-1);
+        color: var(--text-secondary);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font: inherit;
+        font-size: var(--text-xs);
+        padding: var(--sp-2) var(--sp-3);
+      }
+
+      .message-window-btn:hover {
+        background: var(--bg-card-hover);
+        color: var(--text-primary);
       }
 
       /* v0.8.1 #241 — chat surface overhaul. Assistant blocks render
@@ -719,7 +744,7 @@ export class ChatView extends LitElement {
         width: 100%;
         min-height: 64px;
         padding: var(--sp-2);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-sm);
@@ -839,7 +864,7 @@ export class ChatView extends LitElement {
         color: var(--text-secondary);
         background: rgba(255,255,255,0.02);
       }
-      .md hr { border: none; border-top: 1px solid var(--glass-border); margin: var(--sp-3) 0; }
+      .md hr { border: none; border-top: 1px solid var(--border); margin: var(--sp-3) 0; }
       .md code.md-inline {
         background: rgba(255,255,255,0.08);
         padding: 1px 5px;
@@ -853,7 +878,7 @@ export class ChatView extends LitElement {
       }
       .md pre.md-pre {
         background: rgba(0,0,0,0.3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         padding: var(--sp-3);
         overflow-x: auto;
         font-family: var(--font-mono);
@@ -868,8 +893,8 @@ export class ChatView extends LitElement {
         font-size: 10px;
         padding: 2px 8px;
         opacity: 0.3;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         color: var(--text-secondary);
         cursor: pointer;
         border-radius: var(--radius-sm);
@@ -889,8 +914,8 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: 6px 12px;
-        border: 1px solid var(--glass-border);
-        background: var(--glass-bg);
+        border: 1px solid var(--border);
+        background: var(--surface-1);
         cursor: pointer;
         font-size: var(--text-xs);
         border-radius: var(--radius-sm);
@@ -973,7 +998,7 @@ export class ChatView extends LitElement {
       /* Chat Input */
       .chat-input {
         padding: var(--sp-3) var(--sp-4);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         display: flex;
         align-items: flex-end;
         gap: var(--sp-2);
@@ -982,7 +1007,7 @@ export class ChatView extends LitElement {
       .chat-input textarea {
         flex: 1;
         padding: var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-sm);
@@ -1059,7 +1084,7 @@ export class ChatView extends LitElement {
         font-size: var(--text-xs);
         font-weight: 600;
         color: var(--text-secondary);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         position: sticky;
         top: 0;
         background: var(--bg-secondary);
@@ -1098,7 +1123,7 @@ export class ChatView extends LitElement {
         text-transform: uppercase;
         letter-spacing: 0.8px;
         padding: var(--sp-2) var(--sp-3) var(--sp-1);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         margin-top: var(--sp-1);
       }
 
@@ -1154,7 +1179,7 @@ export class ChatView extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         background: rgba(255, 69, 58, 0.04);
         font-size: var(--text-xs);
         color: var(--text-secondary);
@@ -1172,8 +1197,8 @@ export class ChatView extends LitElement {
         padding: var(--sp-3) var(--sp-4);
         max-width: 85%;
         margin-bottom: var(--sp-3);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         font-size: var(--text-sm);
         color: var(--text-secondary);
@@ -1271,6 +1296,7 @@ export class ChatView extends LitElement {
   // result so the streaming flush path can decide whether to follow.
   @state() private bottomVisible = true;
   @state() private newMessageCount = 0;
+  @state() private messageRenderLimit = INITIAL_MESSAGE_RENDER_LIMIT;
 
   // v0.8.1 #248 — session-list keyboard focus index (j/k navigation).
   @state() private focusedSessionIndex = -1;
@@ -1563,15 +1589,18 @@ export class ChatView extends LitElement {
     try {
       const data = await api<{ sessionId: string; messages: ChatMessage[]; updatedAt?: string }>(`/api/sessions/${encodeURIComponent(this.currentSessionId!)}/history`);
       this.messages = data.messages || [];
+      this.messageRenderLimit = INITIAL_MESSAGE_RENDER_LIMIT;
       this._scrollToBottom();
     } catch {
       this.messages = [];
+      this.messageRenderLimit = INITIAL_MESSAGE_RENDER_LIMIT;
     }
   }
 
   private _selectSession(id: string) {
     this.currentSessionId = id;
     localStorage.setItem('cc_sid', id);
+    this.messageRenderLimit = INITIAL_MESSAGE_RENDER_LIMIT;
     this.sessions = [...this.sessions];
     this._closeAllOverlays();
     this._loadHistory();
@@ -2260,6 +2289,21 @@ export class ChatView extends LitElement {
     return this._filteredSessions.slice(start, start + this.sessionPageSize);
   }
 
+  private get _messageWindowStart() {
+    return Math.max(0, this.messages.length - this.messageRenderLimit);
+  }
+
+  private get _visibleMessages() {
+    return this.messages.slice(this._messageWindowStart);
+  }
+
+  private _expandMessageWindow() {
+    this.messageRenderLimit = Math.min(
+      this.messages.length,
+      this.messageRenderLimit + MESSAGE_RENDER_INCREMENT,
+    );
+  }
+
   // --- Render ---
 
   render() {
@@ -2360,7 +2404,18 @@ export class ChatView extends LitElement {
               : this.messages.length === 0 && !this.streaming
                 ? html`<div class="empty"><div class="empty-title">New Session</div><div class="empty-subtitle">Type a message to begin.</div></div>`
                 : html`
-                    ${this.messages.map((m, i) => this._renderMessage(m, i))}
+                    ${this._messageWindowStart > 0 ? html`
+                      <div class="message-window-control">
+                        <button
+                          class="message-window-btn"
+                          @click=${this._expandMessageWindow}
+                          aria-label=${`Show ${Math.min(MESSAGE_RENDER_INCREMENT, this._messageWindowStart)} earlier messages`}
+                        >
+                          Show earlier messages (${this._messageWindowStart} hidden)
+                        </button>
+                      </div>
+                    ` : nothing}
+                    ${this._visibleMessages.map((m, i) => this._renderMessage(m, this._messageWindowStart + i))}
                     ${this.streaming && this.thinking ? html`
                       <div class="thinking-indicator" role="status" aria-live="polite">
                         <div class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -2654,11 +2709,17 @@ export class ChatView extends LitElement {
   }
 
   private _scrollToMessage(index: number) {
+    if (index < this._messageWindowStart) {
+      this.messageRenderLimit = this.messages.length - index;
+      this.updateComplete.then(() => this._scrollToMessage(index));
+      return;
+    }
     requestAnimationFrame(() => {
       if (!this.messagesEl) return;
       const msgs = this.messagesEl.querySelectorAll('.msg, .tool-step, .iter-sep');
-      if (msgs[index]) {
-        msgs[index].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const visibleIndex = index - this._messageWindowStart;
+      if (msgs[visibleIndex]) {
+        msgs[visibleIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     });
   }

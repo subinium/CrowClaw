@@ -22,7 +22,7 @@ export class CrowClawSidebar extends LitElement {
       flex-direction: column;
       width: 220px;
       background: var(--bg-secondary, #13131a);
-      border-right: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-right: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       flex-shrink: 0;
       height: 100%;
       font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, 'Inter', sans-serif);
@@ -120,7 +120,7 @@ export class CrowClawSidebar extends LitElement {
     /* ---- Footer ---- */
     .footer {
       padding: var(--sp-3, 12px) var(--sp-4, 16px);
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       font-size: var(--text-xs, 11px);
       color: var(--text-muted, #48484a);
       display: flex;

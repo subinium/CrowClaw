@@ -240,7 +240,7 @@ export class ConnectView extends LitElement {
       .status-list {
         display: flex;
         flex-direction: column;
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         overflow: hidden;
       }
@@ -250,7 +250,7 @@ export class ConnectView extends LitElement {
         align-items: center;
         gap: var(--sp-3);
         padding: var(--sp-3) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         font-size: var(--text-sm);
       }
 
@@ -283,8 +283,8 @@ export class ConnectView extends LitElement {
       }
 
       .provider-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-4) var(--sp-5);
         transition: border-color var(--duration-normal) var(--ease-spring),
@@ -328,7 +328,7 @@ export class ConnectView extends LitElement {
       .provider-form {
         margin-top: var(--sp-3);
         padding-top: var(--sp-3);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
       }
 
       .provider-form .form-group { margin-bottom: var(--sp-3); }
@@ -352,8 +352,8 @@ export class ConnectView extends LitElement {
         align-items: center;
         gap: var(--sp-3);
         padding: var(--sp-3) var(--sp-4);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         transition: border-color var(--duration-fast) var(--ease-spring),
                     background var(--duration-fast) var(--ease-spring);
@@ -389,8 +389,8 @@ export class ConnectView extends LitElement {
 
       /* Add MCP server form */
       .add-form {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-4) var(--sp-5);
         margin-top: var(--sp-3);
@@ -432,8 +432,8 @@ export class ConnectView extends LitElement {
       .env-row input { flex: 1; }
 
       .platform-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-4) var(--sp-5);
         display: flex;
@@ -473,7 +473,7 @@ export class ConnectView extends LitElement {
         color: var(--text-muted);
         margin-bottom: var(--sp-2);
         padding-bottom: var(--sp-1);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .tool-list {
@@ -585,7 +585,7 @@ export class ConnectView extends LitElement {
       }
 
       .platform-expand-panel {
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         padding-top: var(--sp-3);
         margin-top: var(--sp-2);
       }
@@ -618,8 +618,8 @@ export class ConnectView extends LitElement {
 
       .policy-row select {
         flex: 1;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         color: var(--text-primary);
         font-size: var(--text-xs);
         font-family: inherit;
@@ -664,8 +664,8 @@ export class ConnectView extends LitElement {
         align-items: center;
         gap: var(--sp-3);
         padding: var(--sp-2) var(--sp-3);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-sm);
         font-size: var(--text-xs);
       }
@@ -696,8 +696,8 @@ export class ConnectView extends LitElement {
       }
 
       .channel-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         transition: border-color var(--duration-fast) var(--ease-spring),
@@ -723,8 +723,8 @@ export class ConnectView extends LitElement {
         letter-spacing: 0.5px;
         padding: 1px 6px;
         border-radius: var(--radius-sm);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         color: var(--text-secondary);
       }
 
@@ -765,8 +765,8 @@ export class ConnectView extends LitElement {
         align-items: center;
         gap: var(--sp-3);
         padding: var(--sp-3) var(--sp-4);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
       }
 
@@ -810,8 +810,8 @@ export class ConnectView extends LitElement {
         flex-direction: column;
         gap: var(--sp-2);
         padding: var(--sp-3) var(--sp-4);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         font-size: var(--text-xs);
         font-family: var(--font-mono);
@@ -866,7 +866,7 @@ export class ConnectView extends LitElement {
         min-height: 16px;
       }
 
-      /* Inline action row: places a `<crowclaw-button>` row aligned right */
+      /* Inline action row: places a crowclaw-button row aligned right */
       .actions-row {
         display: flex;
         gap: var(--sp-2);

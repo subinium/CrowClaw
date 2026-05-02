@@ -53,7 +53,7 @@ export class CrowClawMemoryStream extends LitElement {
 
     .panel {
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-md, 8px);
       overflow: hidden;
     }
@@ -75,7 +75,7 @@ export class CrowClawMemoryStream extends LitElement {
     }
 
     .panel-header.open {
-      border-bottom-color: var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-bottom-color: var(--border, rgba(255, 255, 255, 0.08));
     }
 
     .chevron {
@@ -126,7 +126,7 @@ export class CrowClawMemoryStream extends LitElement {
       align-items: flex-start;
       gap: var(--sp-2, 8px);
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       animation: pulse-in var(--duration-slow, 300ms) var(--ease-spring, cubic-bezier(0.22, 1, 0.36, 1));
     }
 

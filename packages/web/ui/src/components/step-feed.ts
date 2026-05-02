@@ -25,7 +25,7 @@ export class CrowClawStepFeed extends LitElement {
     /* --- Step row --- */
     .step {
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-md, 8px);
       transition: background var(--duration-fast, 120ms) var(--ease-spring, cubic-bezier(0.22, 1, 0.36, 1));
     }
@@ -126,8 +126,8 @@ export class CrowClawStepFeed extends LitElement {
     }
 
     .result-content {
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-sm, 6px);
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
       font-size: var(--text-xs, 11px);

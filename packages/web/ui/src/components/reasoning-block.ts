@@ -33,7 +33,7 @@ export class CrowClawReasoningBlock extends LitElement {
 
     .wrap {
       background: var(--surface-1, rgba(255, 255, 255, 0.03));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.06));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.06));
       border-radius: var(--radius-md, 8px);
       overflow: hidden;
       transition: border-color var(--duration-fast, 120ms) var(--ease-spring, cubic-bezier(0.22, 1, 0.36, 1));
@@ -115,7 +115,7 @@ export class CrowClawReasoningBlock extends LitElement {
 
     .body {
       padding: 0 var(--sp-3, 12px) var(--sp-3, 12px);
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.06));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.06));
       color: var(--text-secondary, #c0c0c4);
       font-size: var(--text-xs, 12px);
       line-height: 1.55;

@@ -162,8 +162,8 @@ export class AutomateView extends LitElement {
       }
 
       .job-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         padding: var(--sp-4) var(--sp-5);
         transition: background-color var(--duration-normal) var(--ease-spring), border-color var(--duration-normal) var(--ease-spring);
         border-radius: var(--radius-md);
@@ -233,7 +233,7 @@ export class AutomateView extends LitElement {
 
       .form-panel {
         background: var(--bg-secondary);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         padding: var(--sp-6);
         width: 520px;
         max-width: 90vw;
@@ -264,7 +264,7 @@ export class AutomateView extends LitElement {
         gap: var(--sp-2);
         margin-top: var(--sp-5);
         padding-top: var(--sp-4);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
       }
 
       /* Radio group */
@@ -299,8 +299,8 @@ export class AutomateView extends LitElement {
         align-items: center;
         gap: var(--sp-1);
         padding: var(--sp-1) var(--sp-2);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-sm);
         cursor: pointer;
         font-size: var(--text-xs);
@@ -321,7 +321,7 @@ export class AutomateView extends LitElement {
       .form-select {
         width: 100%;
         padding: var(--sp-2) var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-sm);
@@ -349,14 +349,14 @@ export class AutomateView extends LitElement {
         letter-spacing: 0.8px;
         color: var(--text-muted);
         padding: var(--sp-2) var(--sp-3);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .history-table td {
         font-size: var(--text-sm);
         color: var(--text-primary);
         padding: var(--sp-3);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         vertical-align: top;
       }
 
@@ -383,7 +383,7 @@ export class AutomateView extends LitElement {
         display: none;
         padding: var(--sp-3);
         background: rgba(0, 0, 0, 0.2);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-top: none;
         font-family: var(--font-mono);
         font-size: var(--text-xs);
@@ -440,7 +440,7 @@ export class AutomateView extends LitElement {
 
       .history-frame {
         margin-top: var(--sp-3);
-        border-top: 1px solid var(--glass-border);
+        border-top: 1px solid var(--border);
         padding-top: var(--sp-3);
       }
 

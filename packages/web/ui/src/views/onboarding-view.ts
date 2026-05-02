@@ -228,11 +228,11 @@ export class CrowClawOnboarding extends LitElement {
         align-items: center;
         gap: var(--sp-2);
         padding: var(--sp-2) var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         font-size: var(--text-sm);
         color: var(--text-muted);
-        background: var(--glass-bg);
+        background: var(--surface-1);
       }
 
       .step.active {
@@ -253,8 +253,8 @@ export class CrowClawOnboarding extends LitElement {
         align-items: center;
         justify-content: center;
         border-radius: 50%;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         font-family: var(--font-mono);
         font-size: 11px;
       }
@@ -274,13 +274,13 @@ export class CrowClawOnboarding extends LitElement {
       .step-sep {
         width: 32px;
         height: 1px;
-        background: var(--glass-border);
+        background: var(--border);
       }
 
       /* Panel */
       .panel {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-lg);
         padding: var(--sp-6);
       }
@@ -295,8 +295,8 @@ export class CrowClawOnboarding extends LitElement {
 
       .provider-radio {
         cursor: pointer;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         transition: all var(--duration-fast) var(--ease-spring);
@@ -334,8 +334,8 @@ export class CrowClawOnboarding extends LitElement {
 
       .preset-card {
         cursor: pointer;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-4) var(--sp-5);
         transition: all var(--duration-fast) var(--ease-spring);
@@ -373,8 +373,8 @@ export class CrowClawOnboarding extends LitElement {
         font-family: var(--font-mono);
         font-size: 10px;
         padding: 2px 6px;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-sm);
         color: var(--text-muted);
       }
@@ -384,8 +384,8 @@ export class CrowClawOnboarding extends LitElement {
         font-family: var(--font-mono);
         font-size: var(--text-sm);
         color: var(--text-secondary);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         margin-bottom: var(--sp-4);
@@ -395,8 +395,8 @@ export class CrowClawOnboarding extends LitElement {
         white-space: pre-wrap;
         font-size: var(--text-sm);
         color: var(--text-primary);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         margin-bottom: var(--sp-4);

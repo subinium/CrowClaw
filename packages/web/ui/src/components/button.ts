@@ -93,7 +93,7 @@ export class CrowClawButton extends LitElement {
       color: var(--text, var(--text-primary, #ededef));
     }
     button.secondary:hover:not(:disabled) {
-      background: var(--surface-1, var(--glass-bg, rgba(255, 255, 255, 0.06)));
+      background: var(--surface-1, rgba(255, 255, 255, 0.06));
       border-color: var(--border, rgba(255, 255, 255, 0.14));
     }
 
@@ -103,7 +103,7 @@ export class CrowClawButton extends LitElement {
       color: var(--text-muted, #8e8e93);
     }
     button.ghost:hover:not(:disabled) {
-      background: var(--surface-1, var(--glass-bg, rgba(255, 255, 255, 0.04)));
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
       color: var(--text, var(--text-primary, #ededef));
     }
 

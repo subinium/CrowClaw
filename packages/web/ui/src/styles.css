@@ -22,7 +22,7 @@
   --border: #2a2a35;
   --border-strong: #3a3a48;
 
-  /* Legacy surface aliases — kept so views still resolve. Audit & remove in v0.9. */
+  /* Compatibility surface aliases retained for older views. */
   --bg-primary: var(--bg);
   --bg-secondary: var(--surface-1);
   --bg-tertiary: var(--surface-2);
@@ -30,8 +30,6 @@
   --bg-card-hover: var(--surface-2);
   --bg-input: var(--surface-1);
   --bg-overlay: rgba(0, 0, 0, 0.6);
-  --glass-bg: var(--surface-1);
-  --glass-border: var(--border);
 
   /* ----- Brand & Accent ----- */
   /* Brand surface — logo / hero only. Not for interactive UI. */
@@ -181,6 +179,17 @@ a:hover {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* Print stylesheet — minimal */

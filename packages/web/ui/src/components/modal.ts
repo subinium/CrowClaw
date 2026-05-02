@@ -39,7 +39,7 @@ export class CrowClawModal extends LitElement {
     .box {
       width: 90%;
       background: var(--bg-secondary, #13131a);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-lg, 12px);
       box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.5));
       display: flex;
@@ -62,7 +62,7 @@ export class CrowClawModal extends LitElement {
       align-items: center;
       justify-content: space-between;
       padding: var(--sp-5, 20px) var(--sp-6, 24px);
-      border-bottom: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       flex-shrink: 0;
     }
 
@@ -91,7 +91,7 @@ export class CrowClawModal extends LitElement {
 
     .close-btn:hover {
       color: var(--text-primary, #ededef);
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
     }
 
     .body {
@@ -101,7 +101,7 @@ export class CrowClawModal extends LitElement {
     }
 
     .footer {
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       padding: var(--sp-4, 16px) var(--sp-6, 24px);
       flex-shrink: 0;
     }

@@ -1,47 +1,43 @@
-/**
- * v0.8.1 #249 — accessibility test infrastructure (skeleton).
- *
- * The dashboard is a Lit web-component app that runs in a real browser.
- * Full a11y verification therefore needs a Playwright + axe-core run
- * against a live `vite preview` build, which is a separate CI job we
- * have not yet stood up.
- *
- * This file lands the *infrastructure* — the dependency
- * (`@axe-core/playwright`), an entry point in the test suite, and a
- * `.skip`-ped placeholder so the gap is visible in the test report
- * instead of silently absent. When the Playwright harness lands, the
- * skipped block is replaced with a real navigation + `axe.run()` call.
- *
- * In-vitest a11y assertions for the pure aggregation/wiring logic that
- * doesn't need a browser still belong in their own per-feature test
- * files (e.g. tests/v07-status-pill.test.ts) — this file is reserved
- * for the cross-cutting WCAG-AA baseline.
- *
- * See: docs/a11y-plan.md
- */
+import { readFileSync } from 'node:fs';
+import { describe, expect, it } from 'vitest';
 
-import { describe, it, expect } from 'vitest';
+import { DASHBOARD_HTML } from '../packages/web/src/index.js';
 
-describe('a11y baseline (WCAG-AA)', () => {
-  it('placeholder — file exists so the harness has a landing pad', () => {
-    // Asserting `true` keeps vitest happy without weakening any real
-    // assertion. The real coverage arrives with the Playwright harness.
-    expect(true).toBe(true);
+const source = (path: string) => readFileSync(path, 'utf8');
+
+describe('dashboard a11y baseline (WCAG-AA wiring)', () => {
+  const app = source('packages/web/ui/src/app.ts');
+  const chat = source('packages/web/ui/src/views/chat-view.ts');
+  const connect = source('packages/web/ui/src/views/connect-view.ts');
+  const toast = source('packages/web/ui/src/components/toast.ts');
+  const styles = source('packages/web/ui/src/styles.css');
+
+  it('announces transient notifications through semantic live regions', () => {
+    expect(toast).toContain("this.setAttribute('role', 'region')");
+    expect(toast).toContain("this.setAttribute('aria-label', 'Notifications')");
+    expect(toast).toContain("role=${t.type === 'error' ? 'alert' : 'status'}");
+    expect(toast).toContain("aria-live=${t.type === 'error' ? 'assertive' : 'polite'}");
+    expect(toast).toContain('aria-atomic="true"');
   });
 
-  it.skip(
-    'a11y baseline (axe via Playwright — to be wired with E2E harness)',
-    async () => {
-      // TODO(#249-followup): stand up Playwright + axe in a separate CI
-      // job that boots the dashboard via `vite preview` and runs:
-      //
-      //   const results = await new AxeBuilder({ page })
-      //     .withTags(['wcag2a', 'wcag2aa'])
-      //     .analyze();
-      //   expect(results.violations).toEqual([]);
-      //
-      // For now this placeholder ensures the file exists and the deps
-      // (@axe-core/playwright) are installed.
-    },
-  );
+  it('keeps async and streaming surfaces announced without forcing full-page alerts', () => {
+    expect(app).toContain('role="status" aria-live="polite"');
+    expect(chat).toContain('role="log"');
+    expect(chat).toContain('aria-label="Streaming assistant response"');
+    expect(connect).toContain('role="alert" aria-live="polite"');
+  });
+
+  it('provides labels for icon-only and non-text controls used in the shell', () => {
+    expect(DASHBOARD_HTML).toContain('aria-label="Toggle sidebar"');
+    expect(DASHBOARD_HTML).toContain('aria-label="Send message"');
+    expect(DASHBOARD_HTML).toContain('aria-label="Dismiss"');
+    expect(DASHBOARD_HTML).toContain('aria-label="Search sessions"');
+  });
+
+  it('honors reduced-motion preferences at the global reset layer', () => {
+    expect(styles).toContain('@media (prefers-reduced-motion: reduce)');
+    expect(styles).toContain('animation-duration: 0.01ms !important');
+    expect(styles).toContain('transition-duration: 0.01ms !important');
+    expect(styles).toContain('scroll-behavior: auto !important');
+  });
 });
