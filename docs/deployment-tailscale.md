@@ -64,6 +64,9 @@ can read:
 - files under `CROWCLAW_SECRETS_DIR`
 - systemd credentials from `CREDENTIALS_DIRECTORY`
 - 1Password references such as `CROWCLAW_API_KEY=op://Vault/Item/field`
+- SOPS references such as
+  `CROWCLAW_API_KEY=sops:/etc/crowclaw/secrets.yaml#provider.apiKey`
 
 Send `SIGHUP` to the runtime process after rotating file-backed or referenced
 secrets so CrowClaw re-reads the chain without dropping in-flight requests.
+SOPS references use the local `sops` CLI and fail closed if decryption fails.

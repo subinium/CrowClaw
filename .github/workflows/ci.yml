@@ -27,6 +27,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Cloudflare route parity
+        run: node scripts/audit-routes.mjs --check
+
       - name: Test
         run: npm test -- --reporter=verbose 2>&1 | tee test-output.txt
 

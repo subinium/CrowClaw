@@ -221,6 +221,35 @@ interface SkillsResponse {
   skills: BackendSkill[];
 }
 
+interface SkillPreview {
+  name: string;
+  description: string;
+  triggers: string[];
+  tools: string[];
+  categories: string[];
+  instructionPreview: string;
+  instructionChars: number;
+  hashMismatch?: boolean;
+}
+
+interface ToolResultResponse<T = unknown> {
+  ok: boolean;
+  output?: string;
+  metadata?: Record<string, unknown>;
+  error?: string;
+  toolName?: string;
+  runtime?: string;
+}
+
+interface MemorySummary {
+  count: number;
+  totalSizeBytes: number;
+  estimatedTokens: number;
+  sessionCostUsd: number;
+  sessionTokens: number;
+  sessionCalls: number;
+}
+
 interface LearningDashboard {
   drafts: Array<{
     id: string;
@@ -342,6 +371,13 @@ const formatTokens = (n: number): string =>
       ? `${(n / 1_000).toFixed(1)}K`
       : String(n);
 
+const formatBytes = (n: number): string =>
+  n >= 1_048_576
+    ? `${(n / 1_048_576).toFixed(1)}MB`
+    : n >= 1024
+      ? `${(n / 1024).toFixed(1)}KB`
+      : `${n}B`;
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                         */
 /* ------------------------------------------------------------------ */
@@ -373,7 +409,7 @@ export class SettingsView extends LitElement {
         display: flex;
         flex-direction: column;
         gap: 0;
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         margin-bottom: var(--sp-6);
       }
 
@@ -494,8 +530,8 @@ export class SettingsView extends LitElement {
       .summary-card {
         flex: 1;
         min-width: 160px;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         padding: var(--sp-4);
         border-radius: var(--radius-md);
       }
@@ -535,7 +571,7 @@ export class SettingsView extends LitElement {
         align-items: center;
         justify-content: space-between;
         padding: var(--sp-3) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .toggle-row:last-child {
@@ -576,7 +612,7 @@ export class SettingsView extends LitElement {
       .switch .slider {
         position: absolute;
         inset: 0;
-        background: var(--glass-border);
+        background: var(--border);
         border-radius: 10px;
         transition: background var(--duration-fast);
       }
@@ -616,13 +652,13 @@ export class SettingsView extends LitElement {
         color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.6px;
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .data-table td {
         padding: var(--sp-2) var(--sp-3);
         color: var(--text-primary);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .data-table tr:last-child td {
@@ -640,7 +676,7 @@ export class SettingsView extends LitElement {
 
       .filter-row select {
         padding: var(--sp-1) var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-xs);
@@ -667,8 +703,8 @@ export class SettingsView extends LitElement {
       }
 
       .mem-item {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         cursor: pointer;
@@ -715,8 +751,8 @@ export class SettingsView extends LitElement {
 
       .mem-detail {
         margin-top: var(--sp-4);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-4);
       }
@@ -752,6 +788,24 @@ export class SettingsView extends LitElement {
         resize: vertical;
       }
 
+      .warn-box {
+        border: 1px solid rgba(255, 204, 0, 0.35);
+        background: rgba(255, 204, 0, 0.08);
+        color: var(--text-secondary);
+        border-radius: var(--radius-md);
+        padding: var(--sp-3);
+        font-size: var(--text-xs);
+        line-height: 1.5;
+      }
+
+      .preview-box {
+        border: 1px solid var(--border);
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        padding: var(--sp-3);
+        margin-top: var(--sp-3);
+      }
+
       .compact-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -772,7 +826,7 @@ export class SettingsView extends LitElement {
       /* Log output */
       .log-output {
         background: rgba(0, 0, 0, 0.3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3);
         font-family: var(--font-mono);
@@ -809,8 +863,8 @@ export class SettingsView extends LitElement {
 
       /* Section sub-card */
       .sub-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         overflow: hidden;
         margin-bottom: var(--sp-4);
@@ -828,8 +882,8 @@ export class SettingsView extends LitElement {
         font-size: var(--text-xs);
         font-weight: 500;
         color: var(--text-muted);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         cursor: pointer;
         border-radius: var(--radius-sm);
         transition: color var(--duration-fast), border-color var(--duration-fast), background-color var(--duration-fast);
@@ -891,6 +945,9 @@ export class SettingsView extends LitElement {
   @state() private skillMatchQuery = '';
   @state() private skillMatches: Skill[] = [];
   @state() private skillMatching = false;
+  @state() private skillPreviewSlug: string | null = null;
+  @state() private skillPreview: SkillPreview | null = null;
+  @state() private skillPreviewLoading = false;
   @state() private showSkillForm = false;
   @state() private showImportForm = false;
   @state() private editingSkillSlug: string | null = null;
@@ -947,6 +1004,7 @@ export class SettingsView extends LitElement {
   @state() private memoryPinnedOnly = false;
   @state() private selectedMemoryId: string | null = null;
   @state() private memoryEditDraft = '';
+  @state() private memorySummary: MemorySummary | null = null;
 
   // Config previews
   @state() private personaPreview: PersonaPreview | null = null;
@@ -1155,6 +1213,7 @@ export class SettingsView extends LitElement {
   private async _loadMemories() {
     if (!this.memorySessionId) {
       this.memories = [];
+      this.memorySummary = null;
       return;
     }
     try {
@@ -1163,9 +1222,13 @@ export class SettingsView extends LitElement {
       // UI displays capitalized labels. Normalize on the wire.
       if (this.memoryScope !== 'All') params.set('scope', this.memoryScope.toLowerCase());
       const q = params.toString();
-      const data = await api<{ records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }> }>(
+      const data = await api<{
+        records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }>;
+        summary?: MemorySummary;
+      }>(
         `/api/sessions/${this.memorySessionId}/memories${q ? `?${q}` : ''}`,
       );
+      this.memorySummary = data.summary ?? null;
       let records: MemoryRecord[] = (data.records || []).map((r) => ({
         ...r,
         key: r.tags?.[0] ?? r.id?.slice(0, 8) ?? 'memory',
@@ -1193,6 +1256,7 @@ export class SettingsView extends LitElement {
       if (selected) this.memoryEditDraft = selected.value;
     } catch {
       this.memories = [];
+      this.memorySummary = null;
     }
   }
 
@@ -1408,6 +1472,52 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _previewSkill(skill: Skill) {
+    this.skillPreviewSlug = skill.slug;
+    this.skillPreview = null;
+    this.skillPreviewLoading = true;
+    try {
+      const result = await api<ToolResultResponse>('/api/skills/preview', {
+        method: 'POST',
+        body: JSON.stringify({ slug: skill.slug, maxChars: 700 }),
+      });
+      if (!result.ok) {
+        showToast(result.output || result.error || 'Failed to preview skill', 'error');
+        return;
+      }
+      this.skillPreview = JSON.parse(result.output || '{}') as SkillPreview;
+    } catch {
+      this.skillPreview = null;
+      showToast('Failed to preview skill', 'error');
+    } finally {
+      this.skillPreviewLoading = false;
+    }
+  }
+
+  private async _previewImportSkill() {
+    const content = this.importText.trim();
+    if (!content) return;
+    this.skillPreviewSlug = '__import__';
+    this.skillPreview = null;
+    this.skillPreviewLoading = true;
+    try {
+      const result = await api<ToolResultResponse>('/api/skills/preview', {
+        method: 'POST',
+        body: JSON.stringify({ markdown: content, maxChars: 700 }),
+      });
+      if (!result.ok) {
+        showToast(result.output || result.error || 'Failed to preview SKILL.md', 'error');
+        return;
+      }
+      this.skillPreview = JSON.parse(result.output || '{}') as SkillPreview;
+    } catch {
+      this.skillPreview = null;
+      showToast('Failed to preview SKILL.md', 'error');
+    } finally {
+      this.skillPreviewLoading = false;
+    }
+  }
+
   private _editSkill(skill: Skill) {
     this.editingSkillSlug = skill.slug;
     this.formTitle = skill.title;
@@ -1520,6 +1630,8 @@ export class SettingsView extends LitElement {
     this.formTools = '';
     this.showSkillForm = false;
     this.editingSkillSlug = null;
+    this.skillPreviewSlug = null;
+    this.skillPreview = null;
   }
 
   private get _filteredSkills(): Skill[] {
@@ -1647,9 +1759,12 @@ export class SettingsView extends LitElement {
   }
 
   private async _deleteMemory(id: string) {
-    if (!window.confirm('Are you sure you want to delete this memory?')) return;
+    const confirmation = window.prompt(
+      'Delete this memory record? This permanently removes stored recall metadata. Review the entry first: redacted text may still contain sensitive context. Type DELETE to confirm.',
+    );
+    if (confirmation !== 'DELETE') return;
     try {
-      await api(`/api/memories/${id}`, { method: 'DELETE' });
+      await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
       this.memories = this.memories.filter((m) => m.id !== id);
       if (this.selectedMemoryId === id) {
         this.selectedMemoryId = null;
@@ -1663,6 +1778,12 @@ export class SettingsView extends LitElement {
   private async _saveMemory(memory: MemoryRecord) {
     const summary = this.memoryEditDraft.trim();
     if (!summary) return;
+    if (summary !== memory.value) {
+      const ok = window.confirm(
+        'Save edited memory summary? Memory text can contain sensitive context. Confirm you reviewed it for secrets or PII before persisting.',
+      );
+      if (!ok) return;
+    }
     try {
       await api(`/api/memories/${encodeURIComponent(memory.id)}`, {
         method: 'PUT',
@@ -2192,7 +2313,7 @@ export class SettingsView extends LitElement {
           ${enabled ? nothing : html`<span class="tag">Disabled</span>`}
         </div>
         <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${tool.description || 'No description'}</div>
-        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--glass-border)">
+        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--border)">
           <crowclaw-toggle
             .checked=${enabled}
             aria-label="Toggle tool ${tool.name}"
@@ -2211,7 +2332,7 @@ export class SettingsView extends LitElement {
           ${preset.active ? html`<span class="tag" style="color:var(--success)">Active</span>` : nothing}
         </div>
         <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${preset.description || 'No description'}</div>
-        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--glass-border)">
+        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--border)">
           ${preset.active
             ? html`<span class="tag ok">Activated</span>`
             : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
@@ -2315,10 +2436,45 @@ export class SettingsView extends LitElement {
               </div>
             `
           : nothing}
-        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);border-top:1px solid var(--glass-border);padding-top:var(--sp-3)">
+        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);border-top:1px solid var(--border);padding-top:var(--sp-3)">
+          <button class="btn" aria-label="Preview skill execution" @click=${() => this._previewSkill(skill)}>
+            ${this.skillPreviewLoading && this.skillPreviewSlug === skill.slug ? 'Previewing...' : 'Preview'}
+          </button>
           <button class="btn" aria-label="Edit skill" @click=${() => this._editSkill(skill)}>Edit</button>
           <button class="btn btn-danger" aria-label="Delete skill" @click=${() => this._deleteSkill(skill.slug)}>Delete</button>
         </div>
+        ${this.skillPreviewSlug === skill.slug ? this._renderSkillPreview() : nothing}
+      </div>
+    `;
+  }
+
+  private _renderSkillPreview() {
+    if (this.skillPreviewLoading) {
+      return html`<div class="preview-box status-msg">Loading safe preview...</div>`;
+    }
+    const preview = this.skillPreview;
+    if (!preview) return nothing;
+    return html`
+      <div class="preview-box">
+        <div class="kv">
+          <span class="kv-k">Tool</span>
+          <span class="kv-v">skill.preview</span>
+        </div>
+        <div class="kv">
+          <span class="kv-k">Name</span>
+          <span class="kv-v">${preview.name}</span>
+        </div>
+        <div class="kv">
+          <span class="kv-k">Instruction Chars</span>
+          <span class="kv-v">${preview.instructionChars}</span>
+        </div>
+        ${preview.tools.length > 0
+          ? html`<div class="kv"><span class="kv-k">Required Tools</span><span class="kv-v">${preview.tools.join(', ')}</span></div>`
+          : nothing}
+        ${preview.hashMismatch
+          ? html`<div class="warn-box" style="margin-top:var(--sp-2)">Content hash mismatch reported by skill.preview.</div>`
+          : nothing}
+        <div class="mem-detail-body" style="max-height:180px;margin-top:var(--sp-3)">${preview.instructionPreview || preview.description}</div>
       </div>
     `;
   }
@@ -2393,9 +2549,13 @@ export class SettingsView extends LitElement {
                     @input=${(e: InputEvent) => { this.importText = (e.target as HTMLTextAreaElement).value; }}></textarea>
         </div>
         <div class="form-actions">
-          <button class="btn" @click=${() => { this.showImportForm = false; this.importText = ''; }}>Cancel</button>
+          <button class="btn" @click=${() => { this.showImportForm = false; this.importText = ''; this.skillPreviewSlug = null; this.skillPreview = null; }}>Cancel</button>
+          <button class="btn" ?disabled=${this.skillPreviewLoading} @click=${this._previewImportSkill}>
+            ${this.skillPreviewLoading && this.skillPreviewSlug === '__import__' ? 'Previewing...' : 'Preview'}
+          </button>
           <button class="btn btn-p" @click=${this._importSkillMd}>Import</button>
         </div>
+        ${this.skillPreviewSlug === '__import__' ? this._renderSkillPreview() : nothing}
       </div>
     `;
   }
@@ -2932,7 +3092,7 @@ export class SettingsView extends LitElement {
           <div class="form-hint">External URL used by remote clients to connect to this server.</div>
         </div>
 
-        <div class="toggle-row" style="border:1px solid var(--glass-border);border-radius:var(--radius-md);margin-top:var(--sp-3)">
+        <div class="toggle-row" style="border:1px solid var(--border);border-radius:var(--radius-md);margin-top:var(--sp-3)">
           <div class="toggle-info">
             <div class="toggle-name">Trust Proxy</div>
             <div class="toggle-desc">Enable when running behind a reverse proxy (e.g. nginx, Cloudflare).</div>
@@ -3013,6 +3173,7 @@ export class SettingsView extends LitElement {
 
   private _renderMemory() {
     const selected = this.memories.find((m) => m.id === this.selectedMemoryId);
+    const summary = this.memorySummary;
 
     return html`
       <div class="section-block">
@@ -3044,6 +3205,28 @@ export class SettingsView extends LitElement {
 
         ${this.memorySessionId
           ? html`
+              ${summary
+                ? html`
+                    <div class="summary-row" style="margin-bottom:var(--sp-3)">
+                      <div class="summary-card">
+                        <div class="label">Memory Records</div>
+                        <div class="value">${summary.count}</div>
+                      </div>
+                      <div class="summary-card">
+                        <div class="label">Memory Size</div>
+                        <div class="value">${formatBytes(summary.totalSizeBytes)}</div>
+                      </div>
+                      <div class="summary-card">
+                        <div class="label">Memory Tokens</div>
+                        <div class="value">${formatTokens(summary.estimatedTokens)}</div>
+                      </div>
+                      <div class="summary-card">
+                        <div class="label">Session Cost</div>
+                        <div class="value">${formatCost(summary.sessionCostUsd)}</div>
+                      </div>
+                    </div>
+                  `
+                : nothing}
               <input
                 class="srch"
                 type="text"
@@ -3100,7 +3283,7 @@ export class SettingsView extends LitElement {
                               <div class="mem-meta">
                                 ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
                                 <span class="tag">${m.scope}</span>
-                                <span class="tag">${m.sizeBytes ?? 0}b</span>
+                                <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
                                 <span style="font-size:var(--text-xs);color:var(--text-muted)">
                                   ${formatTime(m.timestamp)}
                                 </span>
@@ -3134,12 +3317,19 @@ export class SettingsView extends LitElement {
                                 </button>
                               </div>
                             </div>
+                            <div class="warn-box" style="margin-bottom:var(--sp-3)">
+                              Memory values are stored recall data. Review edits for secrets, credentials, and PII before saving; deletion requires typing DELETE because it permanently removes this recall record.
+                            </div>
                             <textarea
                               class="form-input mem-edit"
                               aria-label="Edit memory summary"
                               .value=${this.memoryEditDraft || selected.value}
                               @input=${(e: InputEvent) => { this.memoryEditDraft = (e.target as HTMLTextAreaElement).value; }}
                             ></textarea>
+                            <div class="kv" style="margin-top:var(--sp-3)">
+                              <span class="kv-k">Size / Tokens</span>
+                              <span class="kv-v">${formatBytes(selected.sizeBytes ?? 0)} / ${formatTokens(Number(selected.metadata?.estimatedTokens ?? 0))}</span>
+                            </div>
                             <div class="kv" style="margin-top:var(--sp-3)">
                               <span class="kv-k">Metadata</span>
                               <span class="kv-v">${JSON.stringify(selected.metadata ?? {})}</span>

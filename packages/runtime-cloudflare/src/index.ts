@@ -99,6 +99,70 @@ function unsupportedOnWorkers(path: string): Response {
   );
 }
 
+// Public Node routes that require a host process, mutable local config, or
+// provider credentials managed outside the Worker environment. Keep this table
+// in sync with scripts/audit-routes.mjs so parity drift is explicit instead of
+// silently falling through to 404.
+const WORKER_UNSUPPORTED_ROUTES = new Set([
+  '/api/acp/info',
+  '/api/acp/prompt',
+  '/api/acp/request',
+  '/api/acp/sessions',
+  '/api/agent/preset',
+  '/api/clarify',
+  '/api/config',
+  '/api/config-presets',
+  '/api/config/agent',
+  '/api/config/provider',
+  '/api/config/provider/test',
+  '/api/context',
+  '/api/events',
+  '/api/feedback',
+  '/api/gateway/activity',
+  '/api/gateway/pairing/approve',
+  '/api/gateway/pairing/reject',
+  '/api/gateway/pairings',
+  '/api/gateway/telegram/webhook',
+  '/api/mcp/catalog',
+  '/api/mcp/connect',
+  '/api/mcp/disconnect',
+  '/api/mcp/presets/status',
+  '/api/mcp/server/request',
+  '/api/mcp/server/tools',
+  '/api/mcp/servers',
+  '/api/mcp/servers/install',
+  '/api/mcp/verify',
+  '/api/metrics',
+  '/api/persona/active',
+  '/api/persona/switch',
+  '/api/personas',
+  '/api/plugins/catalog',
+  '/api/plugins/configure',
+  '/api/plugins/install',
+  '/api/plugins/uninstall',
+  '/api/providers/failover-preview',
+  '/api/providers/failover-simulate',
+  '/api/providers/models',
+  '/api/providers/plan',
+  '/api/providers/pool',
+  '/api/providers/route',
+  '/api/send-message',
+  '/api/skills/import',
+  '/api/skills/install',
+  '/api/skills/preview',
+  '/api/structured-output',
+  '/api/system/preflight',
+  '/api/system/release-check',
+  '/api/system/version',
+  '/api/todo',
+  '/api/toolset/select',
+  '/api/user/profile',
+]);
+
+function maybeUnsupportedOnWorkers(path: string): Response | null {
+  return WORKER_UNSUPPORTED_ROUTES.has(path) ? unsupportedOnWorkers(path) : null;
+}
+
 async function forwardToSystemSession(request: Request, env: RuntimeEnv, url: URL, internalPath: string): Promise<Response> {
   const stub = getSpecialSessionStub(env, '__system__');
   const init: RequestInit = {
@@ -245,6 +309,25 @@ export default {
         method: 'GET',
         headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' }
       }));
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/capabilities') {
+      return Response.json({
+        provider: {
+          status: env.OPENAI_API_KEY ? 'live' : 'disconnected',
+          detail: env.OPENAI_API_KEY ? (env.OPENAI_MODEL ?? 'gpt-4.1-mini') : 'OPENAI_API_KEY is not configured',
+        },
+        chat: { status: env.OPENAI_API_KEY ? 'live' : 'disconnected' },
+        streaming: { status: 'live' },
+        tools: { status: 'live', detail: 'Worker-safe tools' },
+        memory: { status: 'live', detail: 'D1-backed' },
+        skills: { status: 'live' },
+        scheduler: { status: 'live' },
+        gateway: { status: 'live' },
+        mcp: { status: 'simulated', detail: 'Worker-safe MCP subset' },
+        browser: { status: 'live' },
+        workspace: { status: 'live', detail: 'Durable Object workspace' },
+      });
     }
 
     if (request.method === 'GET' && url.pathname === '/api/tools') {
@@ -1337,6 +1420,9 @@ export default {
       const search = url.search || '';
       return stub.fetch(new Request(`https://internal/session/${actionPath}${search}`, init));
     }
+
+    const unsupported = maybeUnsupportedOnWorkers(url.pathname);
+    if (unsupported) return unsupported;
 
     return new Response('Not found', { status: 404 });
   },

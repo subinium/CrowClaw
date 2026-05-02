@@ -79,7 +79,7 @@ import { createDefaultPluginManager, createRuntimePluginCatalog } from './runtim
 import { createRuntimeScheduler } from './runtime-scheduler.js';
 import { configureTelegramWebhookStartup, warnWhenDashboardTokenMissing } from './runtime-startup.js';
 
-export { SecretChain, envSource, filesSource, systemdCredsSource, onePasswordSource, createDefaultSecretChain, resolveSecret } from './secret-loader.js';
+export { SecretChain, envSource, filesSource, systemdCredsSource, sopsSource, onePasswordSource, createDefaultSecretChain, resolveSecret } from './secret-loader.js';
 export {
   MAX_REQUEST_BODY_BYTES,
   RateLimiter,
@@ -440,6 +440,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     agentId: options.agentId ?? 'crowclaw-mcp-server',
     version,
     ownerToken: embeddedMcpOwnerToken,
+    sessionStore: store,
+    toolCatalog: tools,
   });
 
   const { getGatewayAccessPolicy, enforceGatewayAccess } = createGatewayAccessController({

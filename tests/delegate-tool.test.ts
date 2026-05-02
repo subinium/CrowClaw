@@ -81,4 +81,19 @@ describe('delegate tool', () => {
     expect(result.ok).toBe(false);
     expect(result.output).toContain('Maximum delegation depth');
   });
+
+  it('rejects invalid delegation depth metadata', async () => {
+    const { delegateTool } = buildDelegateSetup();
+    const result = await delegateTool.execute(
+      { task: 'Bad depth' },
+      {
+        agentId: 'crowclaw',
+        sessionId: 'parent-invalid-depth',
+        delegateDepth: Number.NaN
+      }
+    );
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('Invalid delegation depth');
+    expect(result.metadata?.validationFailed).toBe(true);
+  });
 });

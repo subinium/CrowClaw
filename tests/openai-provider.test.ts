@@ -445,10 +445,12 @@ describe('OpenAICompatibleProvider', () => {
     expect(result).toMatchObject({ ok: true, value: { answer: 'ok' } });
   });
 
-  it('does not use native non-streaming structured calls when streaming is required', async () => {
+  it('does not use native non-streaming structured calls for requireStream gpt-5 providers', async () => {
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
       expect(body.stream).toBe(true);
+      expect(body).not.toHaveProperty('text');
+      expect(body).not.toHaveProperty('response_format');
       return new Response('data: {"type":"response.output_text.delta","delta":"{\\"answer\\":\\"ok\\"}"}\n\ndata: {"type":"response.completed"}\n\n', {
         status: 200,
       });
@@ -459,7 +461,7 @@ describe('OpenAICompatibleProvider', () => {
       apiKey: 'test-key',
       baseUrl: 'https://api.openai.com/v1',
       endpointPath: '/responses',
-      model: 'o4-mini',
+      model: 'gpt-5.5',
       requireStream: true,
     });
 

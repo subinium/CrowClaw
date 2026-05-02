@@ -13,6 +13,7 @@ import {
   listAgentPresets,
   parseIdentity,
   redactToolOutput,
+  renderSkillFile,
   restoreFromCheckpoint,
   scanCommand,
   validateFetchUrl,
@@ -98,6 +99,51 @@ const BLOCKED_CONFIG_MUTATIONS = new Set([
   'securityPolicy.blockDangerousCommands',
   'securityPolicy.redactCredentials',
 ]);
+
+function memoryMetadata(record) {
+  const sizeBytes = typeof record.metadata?.sizeBytes === 'number'
+    ? record.metadata.sizeBytes
+    : Buffer.byteLength(record.summary ?? '', 'utf8');
+  return {
+    ...(record.metadata ?? {}),
+    sizeBytes,
+    estimatedTokens: typeof record.metadata?.estimatedTokens === 'number'
+      ? record.metadata.estimatedTokens
+      : Math.ceil(sizeBytes / 4),
+  };
+}
+
+function withMemoryMetadata(record) {
+  return {
+    ...record,
+    metadata: memoryMetadata(record),
+  };
+}
+
+function summarizeMemories(records, usageSummary, sessionId) {
+  const totalSizeBytes = records.reduce((sum, record) => {
+    const sizeBytes = typeof record.metadata?.sizeBytes === 'number'
+      ? record.metadata.sizeBytes
+      : Buffer.byteLength(record.summary ?? '', 'utf8');
+    return sum + sizeBytes;
+  }, 0);
+  const sessionUsage = usageSummary.entries
+    .filter((entry) => entry.sessionId === sessionId)
+    .reduce((acc, entry) => {
+      acc.tokens += entry.totalTokens ?? 0;
+      acc.costUsd += entry.costUsd ?? 0;
+      acc.calls += 1;
+      return acc;
+    }, { tokens: 0, costUsd: 0, calls: 0 });
+  return {
+    count: records.length,
+    totalSizeBytes,
+    estimatedTokens: Math.ceil(totalSizeBytes / 4),
+    sessionCostUsd: sessionUsage.costUsd,
+    sessionTokens: sessionUsage.tokens,
+    sessionCalls: sessionUsage.calls,
+  };
+}
 
 export function sanitizeConfigMutation(body: Record<string, unknown>): string | null {
   for (const key of Object.keys(body)) {
@@ -1013,6 +1059,7 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           ...(existing.metadata ?? {}),
           ...(body.metadata ?? {}),
           sizeBytes: Buffer.byteLength(nextSummary, 'utf8'),
+          estimatedTokens: Math.ceil(Buffer.byteLength(nextSummary, 'utf8') / 4),
         };
         const updated = {
           ...existing,
@@ -1023,7 +1070,7 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           metadata,
         };
         await memoryStore.write(updated);
-        return Response.json({ ok: true, record: updated });
+        return Response.json({ ok: true, record: withMemoryMetadata(updated) });
       }
 
       const memoryPinMatch = url.pathname.match(/^\/api\/memories\/([^/]+)\/pin$/);
@@ -1045,10 +1092,11 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             ...(existing.metadata ?? {}),
             pinned,
             sizeBytes: Buffer.byteLength(existing.summary, 'utf8'),
+            estimatedTokens: Math.ceil(Buffer.byteLength(existing.summary, 'utf8') / 4),
           },
         };
         await memoryStore.write(updated);
-        return Response.json({ ok: true, record: updated });
+        return Response.json({ ok: true, record: withMemoryMetadata(updated) });
       }
 
       // Dashboard — serve web UI at root and /dashboard
@@ -1945,6 +1993,42 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           count: resolved.length,
           stats,
         });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/skills/preview') {
+        const body = (await request.json().catch(() => ({}))) as {
+          slug?: string;
+          markdown?: string;
+          content?: string;
+          maxChars?: number;
+        };
+        let content = typeof body.markdown === 'string'
+          ? body.markdown
+          : typeof body.content === 'string'
+            ? body.content
+            : '';
+        if (!content && typeof body.slug === 'string' && body.slug) {
+          const decodedSlug = decodeURIComponent(body.slug);
+          const resolved = skillRegistry.resolveAll();
+          const match = resolved.find((s) => s.skill.manifest.name === decodedSlug);
+          if (!match) {
+            return Response.json({ ok: false, error: 'Skill not found' }, { status: 404 });
+          }
+          content = match.skill.raw?.trim().startsWith('---')
+            ? match.skill.raw
+            : renderSkillFile(match.skill.manifest, match.skill.instructions);
+        }
+        if (!content) {
+          return Response.json({ ok: false, error: 'markdown content or slug is required' }, { status: 400 });
+        }
+        const result = await tools.execute('skill.preview', {
+          content,
+          maxChars: typeof body.maxChars === 'number' ? body.maxChars : 500,
+        }, {
+          agentId: options.agentId ?? 'crowclaw',
+          sessionId: 'skill-preview',
+        });
+        return Response.json(result);
       }
 
       if (request.method === 'GET' && url.pathname === '/api/presets') {
@@ -4015,10 +4099,16 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           const scopeKey = url.searchParams.get('scopeKey') ?? undefined;
           const limitParam = Number(url.searchParams.get('limit') ?? '50');
           const limit = Number.isFinite(limitParam) ? limitParam : 50;
-          const records = scopeParam === 'session' || scopeParam === 'user' || scopeParam === 'workspace'
+          const rawRecords = scopeParam === 'session' || scopeParam === 'user' || scopeParam === 'workspace'
             ? await memoryService.listByScope(scopeParam, limit, scopeKey)
             : await memoryService.list(sessionId, limit);
-          return Response.json({ ok: true, records, ...(scopeParam ? { scope: scopeParam, scopeKey } : { sessionId }) });
+          const records = rawRecords.map(withMemoryMetadata);
+          return Response.json({
+            ok: true,
+            records,
+            summary: summarizeMemories(records, usageTracker.getSummary(), sessionId),
+            ...(scopeParam ? { scope: scopeParam, scopeKey } : { sessionId }),
+          });
         }
         if (parts[3] === 'export') {
           const session = sessionId ? await store.get(sessionId) : null;
@@ -4303,8 +4393,14 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
 
         if (action === 'remember') {
           const body = (await request.json()) as { summary: string; tags?: string[]; metadata?: Record<string, unknown>; scope?: 'session' | 'user' | 'workspace'; scopeKey?: string };
-          const record = await memoryService.remember(sessionId, body.summary, body.tags ?? [], body.metadata, body.scope ?? 'session', body.scopeKey);
-          return Response.json(record);
+          const sizeBytes = Buffer.byteLength(body.summary ?? '', 'utf8');
+          const metadata = {
+            ...(body.metadata ?? {}),
+            sizeBytes,
+            estimatedTokens: Math.ceil(sizeBytes / 4),
+          };
+          const record = await memoryService.remember(sessionId, body.summary, body.tags ?? [], metadata, body.scope ?? 'session', body.scopeKey);
+          return Response.json(withMemoryMetadata(record));
         }
 
         if (action === 'capture') {

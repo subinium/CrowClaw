@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { resolveProviderFromConfig } from '../packages/runtime-node/src/provider-factory.js';
-import { SecretChain, envSource, onePasswordSource } from '../packages/runtime-node/src/secret-loader.js';
+import { SecretChain, envSource, onePasswordSource, sopsSource } from '../packages/runtime-node/src/secret-loader.js';
 import { FileConfigStore, RuntimeConfigStore } from '../packages/runtime-node/src/config-store.js';
 import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider } from '@crowclaw/providers';
 import { writeFile, mkdir, readFile, rm, mkdtemp } from 'node:fs/promises';
@@ -236,6 +236,53 @@ describe('resolveProviderFromConfig', () => {
       secretChain,
       configFileContents: null,
     })).rejects.toThrow('op not signed in');
+  });
+
+  it('resolves SOPS secret references through the secret chain', async () => {
+    const env = {
+      CROWCLAW_API_KEY: 'sops:/run/secrets/crowclaw.yaml#provider.apiKey',
+      CROWCLAW_PROVIDER: 'openai',
+    };
+    const secretChain = new SecretChain([
+      envSource(env),
+      sopsSource({
+        async decrypt(file, extract) {
+          expect(file).toBe('/run/secrets/crowclaw.yaml');
+          expect(extract).toBe(JSON.stringify(['provider', 'apiKey']));
+          return 'sk-from-sops';
+        },
+      }),
+    ]);
+
+    const result = await resolveProviderFromConfig({
+      env,
+      secretChain,
+      configFileContents: null,
+    });
+
+    expect(result.provider).toBeInstanceOf(OpenAICompatibleProvider);
+    expect(result.source).toBe('env');
+  });
+
+  it('fails closed when a SOPS reference cannot be decrypted', async () => {
+    const env = {
+      CROWCLAW_API_KEY: 'sops:/run/secrets/crowclaw.yaml#provider.apiKey',
+      CROWCLAW_PROVIDER: 'openai',
+    };
+    const secretChain = new SecretChain([
+      envSource(env),
+      sopsSource({
+        async decrypt() {
+          throw new Error('sops key unavailable');
+        },
+      }),
+    ]);
+
+    await expect(resolveProviderFromConfig({
+      env,
+      secretChain,
+      configFileContents: null,
+    })).rejects.toThrow('sops key unavailable');
   });
 });
 

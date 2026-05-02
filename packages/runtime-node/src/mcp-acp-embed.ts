@@ -1,5 +1,6 @@
 import { CrowClawMcpServer } from '@crowclaw/mcp-server';
 import { AcpServer } from '@crowclaw/acp';
+import type { SessionState, ToolCatalog } from '@crowclaw/core';
 
 export interface EmbeddedRunResult {
   finalResponse: string;
@@ -17,6 +18,12 @@ export function createEmbeddedProtocolServers(options: {
   agentId: string;
   version: string;
   ownerToken?: string;
+  sessionStore?: {
+    listRecent?(limit?: number): Promise<SessionState[]>;
+    list?(): Promise<SessionState[]>;
+    get?(sessionId: string): Promise<SessionState | null>;
+  };
+  toolCatalog?: ToolCatalog;
 }) {
   const embeddedMcpServer = new CrowClawMcpServer({
     run: async ({ sessionId, userMessage }) => {
@@ -31,6 +38,8 @@ export function createEmbeddedProtocolServers(options: {
     name: options.agentId,
     version: options.version,
     ownerToken: options.ownerToken,
+    sessionStore: options.sessionStore,
+    toolCatalog: options.toolCatalog,
   });
 
   const embeddedAcpServer = new AcpServer({
@@ -49,6 +58,7 @@ export function createEmbeddedProtocolServers(options: {
     agentId: options.agentId.replace(/mcp-server$/, 'acp'),
     displayName: 'CrowClaw ACP',
     version: options.version,
+    toolCatalog: options.toolCatalog,
   });
 
   return { embeddedMcpServer, embeddedAcpServer };

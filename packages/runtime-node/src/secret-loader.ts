@@ -77,6 +77,10 @@ export interface OnePasswordSourceOptions {
   readRef?: (ref: string) => Promise<string | undefined>;
 }
 
+export interface SopsSourceOptions {
+  decrypt?: (file: string, extract?: string) => Promise<string | undefined>;
+}
+
 export function onePasswordSource(options: OnePasswordSourceOptions = {}): SecretReferenceSource {
   return {
     name: '1password',
@@ -98,6 +102,54 @@ export function onePasswordSource(options: OnePasswordSourceOptions = {}): Secre
       if (result.status !== 0) {
         const detail = trimSecret(result.stderr) ?? `exit ${result.status ?? 'unknown'}`;
         throw new Error(`Unable to read 1Password secret reference ${ref}: ${detail}`);
+      }
+      return trimSecret(result.stdout);
+    },
+  };
+}
+
+function parseSopsReference(ref: string): { file: string; extract?: string } {
+  const spec = ref.slice('sops:'.length).trim();
+  if (!spec) throw new Error('SOPS secret reference is missing a file path');
+  const [filePart, selectorPart] = spec.split('#', 2);
+  const file = filePart?.trim();
+  if (!file) throw new Error('SOPS secret reference is missing a file path');
+  const selector = selectorPart?.trim();
+  if (!selector) return { file };
+  if (selector.startsWith('[')) return { file, extract: selector };
+  const path = selector
+    .split('.')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (path.length === 0) return { file };
+  return { file, extract: JSON.stringify(path) };
+}
+
+export function sopsSource(options: SopsSourceOptions = {}): SecretReferenceSource {
+  return {
+    name: 'sops',
+    async load(): Promise<string | undefined> {
+      return undefined;
+    },
+    async loadReference(ref: string): Promise<string | undefined> {
+      if (!ref.startsWith('sops:')) return undefined;
+      const { file, extract } = parseSopsReference(ref);
+      if (options.decrypt) {
+        return trimSecret(await options.decrypt(file, extract));
+      }
+      const args = ['-d'];
+      if (extract) args.push('--extract', extract);
+      args.push(file);
+      const result = spawnSync('sops', args, {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.error) {
+        throw new Error(`Unable to read SOPS secret reference ${ref}: ${result.error.message}`);
+      }
+      if (result.status !== 0) {
+        const detail = trimSecret(result.stderr) ?? `exit ${result.status ?? 'unknown'}`;
+        throw new Error(`Unable to read SOPS secret reference ${ref}: ${detail}`);
       }
       return trimSecret(result.stdout);
     },
@@ -150,9 +202,6 @@ export class SecretChain {
       const resolved = await source.loadReference?.(trimmed, key);
       if (resolved) return resolved;
     }
-    if (trimmed.startsWith('sops:')) {
-      throw new Error(`SOPS secret reference ${trimmed} is not configured in this runtime`);
-    }
     throw new Error(`Unsupported secret reference for ${key}: ${trimmed}`);
   }
 }
@@ -165,6 +214,7 @@ export function createDefaultSecretChain(env: Record<string, string | undefined>
   if (env.CREDENTIALS_DIRECTORY) {
     sources.push(systemdCredsSource(env) as SecretReferenceSource);
   }
+  sources.push(sopsSource());
   sources.push(onePasswordSource());
   return new SecretChain(sources);
 }

@@ -67,6 +67,18 @@ export interface ToolExecutionContext {
   signal?: AbortSignal;
 }
 
+export function normalizeDelegateDepth(delegateDepth: unknown): number {
+  if (delegateDepth === undefined) return 0;
+  if (
+    typeof delegateDepth !== 'number'
+    || !Number.isSafeInteger(delegateDepth)
+    || delegateDepth < 0
+  ) {
+    throw new TypeError('delegateDepth must be a non-negative safe integer.');
+  }
+  return delegateDepth;
+}
+
 /** Env var patterns that should never be exposed to tools. */
 const SENSITIVE_ENV_PATTERNS = [
   /api[_-]?key/i, /secret/i, /token/i, /password/i, /credential/i,
@@ -189,6 +201,8 @@ export interface AgentRunInput {
   systemPrompt?: string;
   workspaceId?: string;
   userId?: string;
+  /** Delegation depth propagated to all tool calls made during this run. */
+  delegateDepth?: number;
   env?: unknown;
   signal?: AbortSignal;
   /** Pre-recalled memories to inject into the system prompt. */
@@ -1150,10 +1164,12 @@ export class AgentLoop {
   }
 
   private async executeToolCall(toolCall: ToolCall, input: AgentRunInput): Promise<ToolExecutionResult> {
+    const delegateDepth = normalizeDelegateDepth(input.delegateDepth);
     const context: ToolExecutionContext = {
       agentId: input.agentId,
       sessionId: input.sessionId,
       workspaceId: input.workspaceId,
+      delegateDepth,
       env: sanitizeEnv(input.env),
       signal: input.signal
     };
@@ -1448,6 +1464,7 @@ export class AgentLoop {
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     // #239: capture run-start so `agent:terminated` carries an honest durationMs.
     const runStartMs = Date.now();
+    normalizeDelegateDepth(input.delegateDepth);
 
     // #239: AbortSignal handling for the 'aborted' termination reason.
     // ensureNotAborted throws synchronously; wrap so we can emit before rethrow.
@@ -2086,10 +2103,12 @@ export class AgentLoop {
   async *runStreaming(input: {
     userMessage: string;
     sessionState: SessionState;
+    delegateDepth?: number;
     signal?: AbortSignal;
     locale?: SupportedLocale;
   }): AsyncGenerator<AgentStreamEvent> {
     const { userMessage, sessionState: session, signal } = input;
+    normalizeDelegateDepth(input.delegateDepth);
     // #239: capture run-start so `agent:terminated` carries an honest durationMs.
     const streamStartMs = Date.now();
 
@@ -2100,6 +2119,7 @@ export class AgentLoop {
         agentId: session.agentId,
         sessionId: session.sessionId,
         userMessage,
+        delegateDepth: input.delegateDepth,
         signal,
         locale: input.locale,
       };
@@ -2514,6 +2534,9 @@ export class AgentLoop {
               const context: ToolExecutionContext = {
                 agentId: session.agentId,
                 sessionId: session.sessionId,
+                workspaceId: session.workspaceId,
+                delegateDepth: normalizeDelegateDepth(input.delegateDepth),
+                signal,
               };
               const approved = this.approvalDecider
                 ? await this.approvalDecider(def!, tc.input, context)
@@ -2565,6 +2588,8 @@ export class AgentLoop {
             const context: ToolExecutionContext = {
               agentId: session.agentId,
               sessionId: session.sessionId,
+              workspaceId: session.workspaceId,
+              delegateDepth: normalizeDelegateDepth(input.delegateDepth),
               signal,
             };
             let toolResult = await this.tools.execute(tc.name, tc.input, context);

@@ -452,6 +452,8 @@ CROWCLAW_TAILNET_ALLOWLIST= # e.g. 100.64.0.0/10,fd7a:115c:a1e0::/48
 CROWCLAW_SECRETS_DIR=      # Directory containing files named CROWCLAW_API_KEY, etc.
 CREDENTIALS_DIRECTORY=     # systemd-creds directory, read automatically when set
 # Secret refs are supported in env values, e.g. CROWCLAW_API_KEY=op://Vault/Item/field
+# SOPS refs are supported when the sops CLI is installed, e.g.
+# CROWCLAW_API_KEY=sops:/etc/crowclaw/secrets.yaml#provider.apiKey
 
 # Gateway (optional)
 CROWCLAW_TELEGRAM_TOKEN=  # From @BotFather

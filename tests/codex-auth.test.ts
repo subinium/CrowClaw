@@ -6,6 +6,7 @@ import { CodexAuthStore, detectCodexChatGPTAuth } from '../packages/runtime-node
 import {
   createOpenAIChatGPTProvider,
   CHATGPT_CODEX_BASE_URL,
+  CHATGPT_CODEX_DEFAULT_MODEL,
 } from '../packages/runtime-node/src/openai-chatgpt-provider.js';
 
 let tempDir: string;
@@ -206,7 +207,7 @@ describe('createOpenAIChatGPTProvider', () => {
     const detected = await detectCodexChatGPTAuth(authPath);
     expect(detected).not.toBeNull();
     const provider = createOpenAIChatGPTProvider(detected!.store);
-    expect(provider.getModel()).toBe('gpt-5.5');
+    expect(provider.getModel()).toBe(CHATGPT_CODEX_DEFAULT_MODEL);
     const cfg = (provider as unknown as {
       config: {
         baseUrl: string;
@@ -214,6 +215,7 @@ describe('createOpenAIChatGPTProvider', () => {
         extraBodyFields: Record<string, unknown>;
         endpointPath: string;
         systemPromptAsInstructions: boolean;
+        requireStream: boolean;
       };
     }).config;
     expect(cfg.baseUrl).toBe(CHATGPT_CODEX_BASE_URL);
@@ -223,5 +225,6 @@ describe('createOpenAIChatGPTProvider', () => {
     expect(cfg.extraHeaders['OpenAI-Beta']).toBe('responses=experimental');
     expect(cfg.extraBodyFields).toEqual({ store: false });
     expect(cfg.systemPromptAsInstructions).toBe(true);
+    expect(cfg.requireStream).toBe(true);
   });
 });

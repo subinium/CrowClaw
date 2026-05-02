@@ -94,6 +94,15 @@ const TERM_ALIASES: Record<string, string[]> = {
   cfg: ['config', 'configuration'],
   authn: ['authentication'],
   authz: ['authorization'],
+  deploy: ['deployment', 'release', 'rollout'],
+  deployed: ['deployment', 'release', 'rollout'],
+  deploying: ['deployment', 'release', 'rollout'],
+  rollout: ['deploy', 'deployment', 'release'],
+  release: ['deploy', 'deployment', 'rollout'],
+  k8s: ['kubernetes'],
+  mem: ['memory'],
+  recall: ['search', 'retrieval'],
+  retrieve: ['recall', 'search', 'retrieval'],
 };
 
 function queryTerms(query: string): string[] {
@@ -105,6 +114,71 @@ function queryTerms(query: string): string[] {
     .flatMap((term) => [term, ...(TERM_ALIASES[term] ?? [])]);
 }
 
+const LOCAL_SEMANTIC_THRESHOLD = 0.08;
+
+const STOP_WORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'in', 'is',
+  'it', 'of', 'on', 'or', 'that', 'the', 'to', 'with',
+]);
+
+function searchableTerms(text: string): string[] {
+  return normalizeNeedle(text)
+    .split(/[^a-z0-9]+/i)
+    .filter((term) => term.length > 1 && !STOP_WORDS.has(term));
+}
+
+function stemTerm(term: string): string {
+  for (const suffix of ['ization', 'ations', 'ation', 'ments', 'ment', 'ing', 'ers', 'ies', 'ed', 'es', 's']) {
+    if (term.length > suffix.length + 3 && term.endsWith(suffix)) {
+      return suffix === 'ies' ? `${term.slice(0, -3)}y` : term.slice(0, -suffix.length);
+    }
+  }
+  return term;
+}
+
+type LocalSemanticVector = Map<string, number>;
+
+function addFeature(vector: LocalSemanticVector, feature: string, weight: number): void {
+  vector.set(feature, (vector.get(feature) ?? 0) + weight);
+}
+
+function localSemanticVector(text: string): LocalSemanticVector {
+  const vector: LocalSemanticVector = new Map();
+  const terms = searchableTerms(text);
+  for (const term of terms) {
+    addFeature(vector, `term:${term}`, 2);
+    const stem = stemTerm(term);
+    if (stem !== term) addFeature(vector, `stem:${stem}`, 1.5);
+    for (const alias of TERM_ALIASES[term] ?? []) {
+      addFeature(vector, `term:${alias}`, 1.25);
+    }
+    if (term.length >= 4) {
+      for (let i = 0; i <= term.length - 3; i++) {
+        addFeature(vector, `tri:${term.slice(i, i + 3)}`, 0.35);
+      }
+    }
+  }
+  return vector;
+}
+
+function cosineSimilarity(left: LocalSemanticVector, right: LocalSemanticVector): number {
+  let dot = 0;
+  let leftMagnitude = 0;
+  let rightMagnitude = 0;
+  for (const value of left.values()) {
+    leftMagnitude += value * value;
+  }
+  for (const value of right.values()) {
+    rightMagnitude += value * value;
+  }
+  const [smaller, larger] = left.size <= right.size ? [left, right] : [right, left];
+  for (const [feature, value] of smaller) {
+    dot += value * (larger.get(feature) ?? 0);
+  }
+  if (leftMagnitude === 0 || rightMagnitude === 0) return 0;
+  return dot / (Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude));
+}
+
 function scoreQuery(record: MemoryRecord, query: string): number {
   const needle = normalizeNeedle(query);
   if (!needle) return 1;
@@ -112,9 +186,25 @@ function scoreQuery(record: MemoryRecord, query: string): number {
   let score = blob.includes(needle) ? 100 : 0;
   const terms = [...new Set(queryTerms(query))];
   for (const term of terms) {
-    if (blob.includes(term)) score += 1;
+    if (blob.includes(term)) score += 4;
   }
+  const semantic = cosineSimilarity(localSemanticVector(query), localSemanticVector(blob));
+  if (semantic >= LOCAL_SEMANTIC_THRESHOLD) score += semantic * 20;
   return score;
+}
+
+function rankMemoryRecords(records: MemoryRecord[], query: string, limit: number): MemoryRecord[] {
+  const out: Array<{ record: MemoryRecord; score: number }> = [];
+  for (const record of records) {
+    const score = scoreQuery(record, query);
+    if (score > 0) {
+      out.push({ record, score });
+    }
+  }
+  return out
+    .sort((left, right) => right.score - left.score || right.record.createdAt.localeCompare(left.record.createdAt))
+    .slice(0, limit)
+    .map((entry) => entry.record);
 }
 
 function sortByNewest(records: MemoryRecord[]): MemoryRecord[] {
@@ -228,17 +318,7 @@ export class InMemoryMemoryStore implements MemoryStore {
     // #105: bucket is already sorted newest-first → no copy+sort on read.
     const bucket = this.store.get(sessionId);
     if (!bucket) return [];
-    const out: Array<{ record: MemoryRecord; score: number }> = [];
-    for (const record of bucket) {
-      const score = scoreQuery(record, query);
-      if (score > 0) {
-        out.push({ record, score });
-      }
-    }
-    return out
-      .sort((left, right) => right.score - left.score || right.record.createdAt.localeCompare(left.record.createdAt))
-      .slice(0, limit)
-      .map((entry) => entry.record);
+    return rankMemoryRecords(bucket, query, limit);
   }
 
   async searchByScope(scope: MemoryRecord['scope'], query: string, limit = 10, scopeKey?: string): Promise<MemoryRecord[]> {
@@ -246,20 +326,14 @@ export class InMemoryMemoryStore implements MemoryStore {
     // Previous implementation ran query filter over every record in every
     // session regardless of scope, then flattened + stringified metadata
     // per-record — catastrophic at 10 sessions × 100 memories.
-    const out: Array<{ record: MemoryRecord; score: number }> = [];
+    const candidates: MemoryRecord[] = [];
     for (const records of this.store.values()) {
       for (const record of records) {
         if (!matchesScope(record, scope, scopeKey)) continue;
-        const score = scoreQuery(record, query);
-        if (score > 0) {
-          out.push({ record, score });
-        }
+        candidates.push(record);
       }
     }
-    return out
-      .sort((left, right) => right.score - left.score || right.record.createdAt.localeCompare(left.record.createdAt))
-      .slice(0, limit)
-      .map((entry) => entry.record);
+    return rankMemoryRecords(candidates, query, limit);
   }
 
   async write(record: MemoryRecord): Promise<void> {
@@ -472,23 +546,7 @@ export class D1MemoryStore implements MemoryStore {
   }
 
   async search(sessionId: string, query: string, limit = 10): Promise<MemoryRecord[]> {
-    const statement = this.db
-      .prepare(
-        `SELECT id, session_id, scope, scope_key, summary, tags_json, created_at, metadata_json
-         FROM memories
-         WHERE session_id = ?1 AND (summary LIKE ?2 OR tags_json LIKE ?2 OR IFNULL(metadata_json, '') LIKE ?2)
-         ORDER BY created_at DESC
-         LIMIT ?3`
-      )
-      .bind(sessionId, `%${query}%`, limit);
-
-    if (statement.all) {
-      const results = await statement.all<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
-      return results.results.map((row) => this.mapRow(row));
-    }
-
-    const row = await statement.first<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
-    return row ? [this.mapRow(row)] : [];
+    return rankMemoryRecords(await this.list(sessionId), query, limit);
   }
 
   async searchByScope(scope: MemoryRecord['scope'], query: string, limit = 10, scopeKey?: string): Promise<MemoryRecord[]> {
@@ -496,20 +554,19 @@ export class D1MemoryStore implements MemoryStore {
       .prepare(
         `SELECT id, session_id, scope, scope_key, summary, tags_json, created_at, metadata_json
          FROM memories
-         WHERE scope = ?1 AND (summary LIKE ?2 OR tags_json LIKE ?2 OR IFNULL(metadata_json, '') LIKE ?2)
-           AND (?4 IS NULL OR scope_key = ?4)
-         ORDER BY created_at DESC
-         LIMIT ?3`
+         WHERE scope = ?1
+           AND (?2 IS NULL OR scope_key = ?2)
+         ORDER BY created_at DESC`
       )
-      .bind(scope, `%${query}%`, limit, scopeKey ?? null);
+      .bind(scope, scopeKey ?? null);
 
     if (statement.all) {
       const results = await statement.all<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
-      return results.results.map((row) => this.mapRow(row));
+      return rankMemoryRecords(results.results.map((row) => this.mapRow(row)), query, limit);
     }
 
     const row = await statement.first<{ id: string; session_id: string; scope: MemoryRecord['scope']; scope_key?: string | null; summary: string; tags_json: string; created_at: string; metadata_json?: string }>();
-    return row ? [this.mapRow(row)] : [];
+    return row ? rankMemoryRecords([this.mapRow(row)], query, limit) : [];
   }
 
   async write(record: MemoryRecord): Promise<void> {

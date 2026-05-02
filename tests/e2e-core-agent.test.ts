@@ -313,7 +313,7 @@ describe('E2E: tool system breadth', () => {
     const delegate = createDelegateTool({ provider, tools, sessions, maxDepth: 1 });
     const result = await delegate.execute(
       { task: 'test' },
-      { agentId: 'a', sessionId: 's', __delegateDepth: 1 } as never
+      { agentId: 'a', sessionId: 's', delegateDepth: 1 }
     );
     expect(result.ok).toBe(false);
     expect(result.output).toContain('Maximum delegation depth');

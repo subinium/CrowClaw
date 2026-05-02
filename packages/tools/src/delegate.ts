@@ -8,7 +8,7 @@ import type {
   ToolExecutor,
   ToolManifest,
 } from '@crowclaw/core';
-import { AgentLoop } from '@crowclaw/core';
+import { AgentLoop, normalizeDelegateDepth } from '@crowclaw/core';
 
 /** Tools denied by default if deniedTools is not explicitly provided. */
 const DEFAULT_DENIED_TOOLS = ['terminal.exec', 'terminal.background'];
@@ -90,8 +90,21 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
       input: Record<string, unknown>,
       context: ToolExecutionContext,
     ): Promise<ToolExecutionResult> {
-      const currentDepth = context.delegateDepth ?? (context as { __delegateDepth?: number }).__delegateDepth ?? 0;
-      if (typeof currentDepth === 'number' && currentDepth >= maxDepth) {
+      let currentDepth: number;
+      try {
+        currentDepth = normalizeDelegateDepth(context.delegateDepth);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          toolName: 'delegate.task',
+          runtime: 'worker',
+          ok: false,
+          output: `Invalid delegation depth: ${message}`,
+          metadata: { validationFailed: true, errorCode: 'TypeError' },
+        };
+      }
+
+      if (currentDepth >= maxDepth) {
         return {
           toolName: 'delegate.task',
           runtime: 'worker',
@@ -140,7 +153,7 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
         effectiveDenied,
       );
 
-      const depth = typeof currentDepth === 'number' ? currentDepth + 1 : 1;
+      const depth = currentDepth + 1;
 
       const runChild = async (childTask: string): Promise<DelegateTaskResult> => {
         const childSessionId = `child-${context.sessionId}-${crypto.randomUUID().slice(0, 8)}`;
@@ -176,21 +189,14 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
         const startTime = Date.now();
 
         try {
-          const childContext: ToolExecutionContext = {
-            agentId: context.agentId,
-            sessionId: childSessionId,
-            workspaceId: context.workspaceId,
-            delegateDepth: depth,
-            env: inheritCredentials ? context.env : undefined,
-            signal: childAbortController.signal,
-          };
-
           const result = await childLoop.run({
             agentId: context.agentId,
             sessionId: childSessionId,
             userMessage: childTask,
             systemPrompt,
             workspaceId: context.workspaceId,
+            delegateDepth: depth,
+            env: inheritCredentials ? context.env : undefined,
             signal: childAbortController.signal,
           });
 

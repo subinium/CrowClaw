@@ -55,7 +55,7 @@ export interface OpenAICompatibleConfig {
   maxTokens?: number;
   /** Default temperature for non-reasoning models. Reasoning models reject this field. */
   temperature?: number;
-  /** OpenAI Responses API reasoning effort for o-series models. */
+  /** OpenAI Responses API reasoning effort for models that accept reasoning controls. */
   reasoningEffort?: 'low' | 'medium' | 'high';
   /** Retry budget for transient 429/5xx provider responses. Default: 2 retries. */
   maxRetries?: number;
@@ -74,9 +74,10 @@ export interface OpenAICompatibleConfig {
    */
   systemPromptAsInstructions?: boolean;
   /**
-   * v0.7.2: When set, `generate()` collects from `generateStream()` instead of
-   * issuing a non-streaming POST. Required by the ChatGPT (Codex) backend,
-   * which rejects `stream: false` calls.
+   * v0.7.2: When set, `generate()` and native structured-output requests
+   * collect from `generateStream()` instead of issuing a non-streaming POST.
+   * Required by the ChatGPT (Codex) backend, which rejects `stream: false`
+   * calls.
    */
   requireStream?: boolean;
   /**
@@ -1761,7 +1762,9 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
    * v0.8.0 Hermes parity (#237): JSON-schema-typed generation. On
    * api.openai.com gpt-4o / gpt-4.1 / gpt-5 / reasoning family models, uses the native
    * `response_format: json_schema` mode (strict). Everything else falls back
-   * to a system-prompt envelope that embeds the schema.
+   * to a system-prompt envelope that embeds the schema. Providers that set
+   * `requireStream` (notably ChatGPT/Codex) also use the envelope path because
+   * native structured-output calls are non-streaming.
    *
    * Failures are surfaced as a typed envelope (`ok: false`) rather than
    * thrown, so route handlers can render a structured error in the dashboard

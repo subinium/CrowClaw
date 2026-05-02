@@ -2611,7 +2611,7 @@ export function createMemorySearchTool(
   if (!options?.recallFn && !warnedMissingSemanticRecall) {
     warnedMissingSemanticRecall = true;
     (options?.logger ?? console).warn(
-      'memory.search semantic recall is not configured; using local substring/tokenized memory search.'
+      'memory.search semantic recall is not configured; using deterministic local semantic memory search.'
     );
   }
   return {
@@ -2661,7 +2661,7 @@ export function createMemorySearchTool(
         runtime: 'worker',
         ok: true,
         output: JSON.stringify(results, null, 2),
-        metadata: { count: results.length, backend: 'substring', ...(scope ? { scope, scopeKey } : {}) }
+        metadata: { count: results.length, backend: 'local-semantic', ...(scope ? { scope, scopeKey } : {}) }
       };
     }
   };
