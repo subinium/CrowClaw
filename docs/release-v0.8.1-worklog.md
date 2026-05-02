@@ -107,5 +107,18 @@ Use this section for the next live batch before editing code:
 - Verification plan: compare `gh issue list --state open` against local code,
   tests, `origin/main` release sweep commits, and `release/v0.8.1` local
   commits; produce a concrete unresolved issue list with file evidence.
-- Result: pending.
+- Result:
+  - Low-number verifier PASS: #73, #74, #82, #90, #96, #155, #160, #163.
+    Focused verifier tests reported 159 passing tests. Residual risks:
+    `runtime-node/src/index.ts` is 628 lines, and `TerminalSession` is a
+    factory/type rather than a class, but both issue goals are functionally
+    satisfied.
+  - #230-#250 verifier PARTIAL. PASS: #230, #231, #232, #233, #234, #235,
+    #236, #237, #238, #239, #240, #241, #242, #244, #246, #247, #248.
+    UNRESOLVED: #243, #245, #249, #250.
+    Patch areas: dashboard highlight.js loading/generated HTML, visual reset
+    glass tokens/styles, accessibility live-region/reduced-motion/test
+    coverage, and chat/perf virtualization or equivalent bounded rendering.
+  - #181-#228 verifier pending.
+  - #253-#288 verifier pending.
 - Commit: pending.
