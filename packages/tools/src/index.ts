@@ -6,7 +6,7 @@ export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js
 import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision.js';
 export { createImageGenerateTool, type ImageGenerationOptions } from './image-gen.js';
 import { createImageGenerateTool as createImageGenerateToolImpl } from './image-gen.js';
-export { createTtsTool, createTranscriptionTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
+export { createTtsTool, createTranscriptionTool, createSttTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
 // v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
 // not registered by `registerCoreTools` and not in the default agent toolset.
@@ -614,10 +614,22 @@ export function createWebFetchTool(): ToolDefinition {
       requiresWorkspace: false,
       requiresNetwork: true,
       dangerLevel: 'medium',
-      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The URL to fetch' } }, required: ['url'] }
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'The URL to fetch' },
+          mode: { type: 'string', enum: ['text', 'reader', 'markdown'], description: 'Return raw text or reader-mode markdown' },
+          maxBytes: { type: 'number', description: 'Maximum response bytes to read before truncating' }
+        },
+        required: ['url']
+      }
     },
     async execute(input, context) {
       const url = typeof input.url === 'string' ? input.url : '';
+      const mode = input.mode === 'reader' || input.mode === 'markdown' ? 'markdown' : 'text';
+      const maxBytes = typeof input.maxBytes === 'number' && Number.isFinite(input.maxBytes)
+        ? Math.max(1, Math.floor(input.maxBytes))
+        : 1_000_000;
       if (!url) {
         return {
           toolName: 'web.fetch',
@@ -633,13 +645,17 @@ export function createWebFetchTool(): ToolDefinition {
       }
 
       const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
-      const text = await response.text();
+      const { text, truncated, bytesRead } = await readResponseTextWithByteCap(response, maxBytes);
+      const contentType = response.headers.get('content-type') ?? '';
+      const output = mode === 'markdown' && /html/i.test(contentType)
+        ? extractReadableMarkdown(text)
+        : text;
       return {
         toolName: 'web.fetch',
         runtime: 'worker',
         ok: response.ok,
-        output: text,
-        metadata: { status: response.status, url }
+        output,
+        metadata: { status: response.status, url, mode, maxBytes, bytesRead, truncated }
       };
     }
   };
@@ -1042,6 +1058,50 @@ function extractTag(html: string, pattern: RegExp): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
+async function readResponseTextWithByteCap(
+  response: Response,
+  maxBytes: number,
+): Promise<{ text: string; bytesRead: number; truncated: boolean }> {
+  const decoder = new TextDecoder();
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const slice = bytes.slice(0, maxBytes);
+    return {
+      text: decoder.decode(slice),
+      bytesRead: slice.byteLength,
+      truncated: bytes.byteLength > maxBytes,
+    };
+  }
+
+  const chunks: Uint8Array[] = [];
+  let bytesRead = 0;
+  let truncated = false;
+  while (bytesRead < maxBytes) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    const remaining = maxBytes - bytesRead;
+    if (value.byteLength > remaining) {
+      chunks.push(value.slice(0, remaining));
+      bytesRead += remaining;
+      truncated = true;
+      await reader.cancel().catch(() => undefined);
+      break;
+    }
+    chunks.push(value);
+    bytesRead += value.byteLength;
+  }
+
+  const merged = new Uint8Array(bytesRead);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: decoder.decode(merged), bytesRead, truncated };
+}
+
 function extractReadableText(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -1054,6 +1114,37 @@ function extractReadableText(html: string): string {
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+}
+
+function extractReadableMarkdown(html: string): string {
+  const body = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ');
+
+  return decodeHtmlEntities(body)
+    .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, '\n# $1\n')
+    .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, '\n## $1\n')
+    .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, '\n### $1\n')
+    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '\n- $1')
+    .replace(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+    .replace(/<\/(p|div|section|article|ul|ol|br)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
     .split('\n')
     .map((line) => line.replace(/\s+/g, ' ').trim())
     .filter(Boolean)

@@ -162,10 +162,22 @@ export interface TranscriptionToolOptions {
 }
 
 export function createTranscriptionTool(options?: TranscriptionToolOptions): ToolDefinition {
+  return createTranscriptionLikeTool('voice.transcribe', 'Transcribes audio from a file path or URL to text.', options);
+}
+
+export function createSttTool(options?: TranscriptionToolOptions): ToolDefinition {
+  return createTranscriptionLikeTool('voice.stt', 'Speech-to-text alias for voice.transcribe.', options);
+}
+
+function createTranscriptionLikeTool(
+  name: 'voice.transcribe' | 'voice.stt',
+  description: string,
+  options?: TranscriptionToolOptions,
+): ToolDefinition {
   return {
     manifest: {
-      name: 'voice.transcribe',
-      description: 'Transcribes audio from a file path or URL to text.',
+      name,
+      description,
       runtime: 'worker',
       streaming: false,
       stateful: false,
@@ -180,7 +192,7 @@ export function createTranscriptionTool(options?: TranscriptionToolOptions): Too
       const model = typeof input.model === 'string' ? input.model : (options?.defaultModel ?? 'whisper-1');
 
       if (!filePath && !url) {
-        return { toolName: 'voice.transcribe', runtime: 'worker', ok: false, output: 'Missing filePath or url parameter.' };
+        return { toolName: name, runtime: 'worker', ok: false, output: 'Missing filePath or url parameter.' };
       }
 
       const apiKey = options?.apiKey;
@@ -188,7 +200,7 @@ export function createTranscriptionTool(options?: TranscriptionToolOptions): Too
 
       if (!apiKey) {
         return {
-          toolName: 'voice.transcribe',
+          toolName: name,
           runtime: 'worker',
           ok: false,
           output: 'Transcription requires an OpenAI-compatible API key.',
@@ -225,7 +237,7 @@ export function createTranscriptionTool(options?: TranscriptionToolOptions): Too
 
         if (!response.ok) {
           return {
-            toolName: 'voice.transcribe',
+            toolName: name,
             runtime: 'worker',
             ok: false,
             output: `Transcription API failed: ${response.status} ${response.statusText}`,
@@ -235,7 +247,7 @@ export function createTranscriptionTool(options?: TranscriptionToolOptions): Too
 
         const result = await response.json() as { text?: string };
         return {
-          toolName: 'voice.transcribe',
+          toolName: name,
           runtime: 'worker',
           ok: true,
           output: result.text ?? '',
@@ -243,7 +255,7 @@ export function createTranscriptionTool(options?: TranscriptionToolOptions): Too
         };
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        return { toolName: 'voice.transcribe', runtime: 'worker', ok: false, output: `Transcription failed: ${msg}` };
+        return { toolName: name, runtime: 'worker', ok: false, output: `Transcription failed: ${msg}` };
       }
     }
   };

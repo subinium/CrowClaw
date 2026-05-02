@@ -24,6 +24,47 @@ describe('tool breadth extensions', () => {
     expect(result.metadata).toMatchObject({ status: 200, url: 'https://example.com' });
   });
 
+  it('fetches reader-mode markdown with a byte cap', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      '<html><body><h1>CrowClaw</h1><p>Readable <a href="/docs">docs</a> content.</p><script>skip()</script></body></html>',
+      { status: 200, headers: { 'content-type': 'text/html' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com',
+      mode: 'reader',
+      maxBytes: 200,
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-reader'
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.output).toContain('# CrowClaw');
+    expect(result.output).toContain('[docs](/docs)');
+    expect(result.output).not.toContain('skip()');
+    expect(result.metadata).toMatchObject({ mode: 'markdown', maxBytes: 200, truncated: false });
+  });
+
+  it('truncates web.fetch output at maxBytes', async () => {
+    const fetchMock = vi.fn(async () => new Response('abcdefghijklmnopqrstuvwxyz', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com',
+      maxBytes: 5,
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-cap'
+    });
+
+    expect(result.output).toBe('abcde');
+    expect(result.metadata).toMatchObject({ bytesRead: 5, truncated: true });
+  });
+
   it('applies deterministic replacements with the text.patch tool', async () => {
     const registry = new ToolRegistry().register(createTextPatchTool());
     const result = await registry.execute('text.patch', {

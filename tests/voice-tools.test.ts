@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createTtsTool, createTranscriptionTool } from '@crowclaw/tools';
+import { createSttTool, createTtsTool, createTranscriptionTool } from '@crowclaw/tools';
 
 describe('voice tools', () => {
   it('voice.tts requires text parameter', async () => {
@@ -39,5 +39,14 @@ describe('voice tools', () => {
   it('voice.transcribe has correct manifest', () => {
     const tool = createTranscriptionTool();
     expect(tool.manifest.name).toBe('voice.transcribe');
+  });
+
+  it('voice.stt is an alias for transcription behavior', async () => {
+    const tool = createSttTool();
+    expect(tool.manifest.name).toBe('voice.stt');
+    const result = await tool.execute({}, { agentId: 'a', sessionId: 's' });
+    expect(result.ok).toBe(false);
+    expect(result.toolName).toBe('voice.stt');
+    expect(result.output).toContain('Missing filePath or url');
   });
 });
