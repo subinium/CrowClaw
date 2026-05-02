@@ -37,11 +37,36 @@ open until this branch is published and merged or closed.
 ### Plugins, memory, tools, and deployment
 - **#90** Memory backends now have a plugin contract, runtime provider
   selection, and a Honcho-compatible reference example.
+- **#184** Memory edit/delete UX now warns about sensitive data and redaction,
+  requires typed delete confirmation, and keeps preview/edit affordances
+  explicit.
+- **#187** Memory records now carry size/token metadata and session memory
+  summaries include estimated memory cost.
+- **#188** The Skills settings UI can preview installed and imported skills
+  through the existing `skill.preview` tool path.
+- **#202-#203** Embedded MCP and ACP protocol servers now receive the live
+  runtime session store and tool registry instead of disconnected defaults.
 - **#204** Korean locale selection now carries into prompt-facing runtime
   context, not only dashboard chrome.
+- **#243, #245, #249, #250** Dashboard markdown, visual reset, accessibility,
+  and chat rendering gaps are closed: highlight.js is no longer eagerly loaded,
+  legacy glass tokens are removed from source/generated UI, toast live regions
+  and reduced-motion coverage are tested, and chat history renders a bounded
+  incremental window.
+- **#255** Cloudflare route parity audit now reads the refactored route handler,
+  records `covered` vs `unsupported_on_workers`, has zero `missing` rows, and
+  runs in CI.
 - **#253-#258, #261-#264** Deployment and Cloudflare parity gaps were closed
   or documented with explicit Worker limitations, Docker hardening, persistent
   audit logs, launchd/self-host runbooks, and vision SSRF protection.
+- **#267** Secret loading now includes a SOPS CLI-backed reference source in
+  addition to env, files, systemd credentials, and 1Password references.
+- **#281** Local `memory.search` fallback now uses deterministic semantic-style
+  sparse ranking instead of relying only on substring matches.
+- **#282** Delegate depth is now typed, validated, and propagated through core
+  run inputs instead of legacy `__delegateDepth` casts.
+- **#287** Codex/OpenAI ChatGPT provider docs, defaults, and structured-output
+  tests now match the actual `gpt-5.5` and `requireStream` behavior.
 - **#268-#288** Provider/tool sweep added or hardened voice STT, web fetch and
   search fallbacks, OpenAI retry/prompt-cache/model-family behavior, Docker/SSH
   terminal planning, memory/learning parity surfaces, migration helpers, image
@@ -49,11 +74,14 @@ open until this branch is published and merged or closed.
 
 ### Verification
 - `npm run typecheck` - clean
-- Focused release tests - 199 passed
-- Provider structured-output/token tests - 74 passed
-- `npm test` - 2,965 / 2,966 (1 skipped)
+- Focused unresolved-gap tests - 132 passed
+- Dashboard a11y/polish tests - 41 passed
+- `npm test` - 2,982 passed
+- `npm run build -- --pretty false` - clean
 - `npm run build:ui --workspace @crowclaw/web` - clean
 - `npm run build:html --workspace @crowclaw/web` - clean
+- `node scripts/audit-routes.mjs --check` - clean
+- `rg` checks for legacy dashboard glass/highlight.js tokens - clean
 - `git diff --check` - clean
 
 ## [0.8.2] - 2026-05-02 - Runtime/security hardening: 9-issue release sweep

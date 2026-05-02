@@ -33,6 +33,54 @@ This file is the interruption-safe working ledger for the local
 
 ## Local Commit Ledger
 
+### `f5ae7e0 feat(dashboard): finish release polish gaps`
+
+- Closed dashboard verifier gaps #243, #245, #249, and #250.
+- Removed eager highlight.js CDN assets from the dashboard shell and generated
+  HTML.
+- Removed legacy `--glass-*` dashboard tokens from UI source and generated
+  HTML.
+- Added toast live-region/reduced-motion accessibility coverage.
+- Added bounded incremental chat history rendering.
+- Verification:
+  - `npm run build:ui --workspace @crowclaw/web`
+  - `npm run build:html --workspace @crowclaw/web`
+  - `npm test -- tests/dashboard-polish.test.ts tests/a11y.test.ts`
+  - `npm test`: 238 files, 2,982 tests
+  - targeted `rg` checks for legacy glass/highlight.js tokens
+  - `git diff --check`
+
+### `1b098d6 feat(runtime): complete remaining release contracts`
+
+- Closed #184, #187, #188, #202, #203, #255, #267, #281, #282, and #287.
+- Memory management now has redaction warnings, typed delete confirmation,
+  size/token metadata, and session cost summaries.
+- Skills preview is wired through `/api/skills/preview` and `skill.preview`.
+- Embedded MCP/ACP servers now use live runtime session/tool registries.
+- Cloudflare route parity audit now follows refactored route handlers, records
+  explicit Worker unsupported routes, has zero `missing` rows, and runs in CI.
+- Secret loading now supports SOPS CLI references in addition to env, file,
+  systemd, and 1Password sources.
+- Local memory search now has deterministic semantic-style sparse ranking.
+- Delegate depth is typed, validated, and propagated without `__delegateDepth`.
+- Codex/OpenAI ChatGPT provider docs/defaults/tests match `gpt-5.5` and
+  `requireStream` structured-output behavior.
+- Verification:
+  - `npm run build -- --pretty false`
+  - `npm run typecheck`
+  - focused unresolved-gap tests: 12 files, 132 tests
+  - `npm test`: 238 files, 2,982 tests
+  - `node scripts/audit-routes.mjs --check`
+  - `git diff --check`
+
+### `858e08f Track unresolved release verifier gaps`
+
+- Recorded final verifier outcomes for the low-number, #181-#228, #230-#250,
+  and #253-#288 audit lanes.
+- Defined the active unresolved-gap implementation batch and file ownership
+  split for parallel work.
+- Verification: `git diff -- docs/release-v0.8.1-worklog.md`.
+
 ### `772e907 docs(changelog): record local 0.8.1 issue sweep`
 
 - Added a CHANGELOG `Unreleased` section for the local 0.8.1 sweep.
@@ -131,7 +179,8 @@ Use this section for the next live batch before editing code:
     Strict-read risks: #255 route parity inventory intentionally still reports
     missing routes, and #267 documents secret-provider options without adding a
     real `sops:` backend.
-- Commit: pending.
+- Commit: `1b098d6`, `f5ae7e0`; final documentation checkpoint records this
+  verification state.
 
 ## Active Batch: unresolved verifier gaps on 2026-05-03
 
@@ -140,15 +189,22 @@ Use this section for the next live batch before editing code:
 - Branch: `release/v0.8.1`
 - Push/PR status: local only; no push, no PR, no remote issue closure.
 - Implementation ownership:
-  - UI memory/skills: #184, #187, #188 in `packages/web/ui/src/views/settings-view.ts`
-    and `packages/runtime-node/src/route-handlers.ts`.
-  - Embedded protocol wiring: #202, #203 in runtime/MCP/ACP embedding code.
-  - Dashboard polish/perf/a11y: #243, #245, #249, #250 in dashboard HTML/CSS,
-    chat/connect/toast components, a11y tests, and generated web HTML.
-  - Semantic memory: #281 in memory/storage/tool recall paths.
-  - Delegate depth: #282 in core delegate metadata/tooling tests.
-  - Codex provider defaults/JSDoc: #287 in provider/runtime provider docs and
-    tests.
+  - Galileo (`019de972-584b-7ca1-b860-465fcd4e0acc`): UI memory/skills
+    #184, #187, #188 in `packages/web/ui/src/views/settings-view.ts` and
+    `packages/runtime-node/src/route-handlers.ts`.
+  - McClintock (`019de972-5d8a-7191-a85d-705b0892eef7`): embedded protocol
+    wiring #202, #203 in runtime/MCP/ACP embedding code.
+  - Maxwell (`019de972-630f-7bf3-b91f-3fd43a22f556`): dashboard polish/perf/a11y
+    #243, #245, #249, #250 in dashboard HTML/CSS, chat/connect/toast components,
+    a11y tests, and generated web HTML.
+  - Russell (`019de972-685e-77a0-9fd1-8c4895663178`): semantic memory #281
+    in memory/storage/tool recall paths.
+  - Euler (`019de972-6ef5-7213-b93d-c83de9839e7a`): delegate depth #282 in
+    core delegate metadata/tooling tests.
+  - Gibbs (`019de972-7637-7620-97c6-6b2dad6e8149`): Codex provider
+    defaults/JSDoc #287 in provider/runtime provider docs and tests.
+  - Leader-local: strict-read review and any small closure needed for #255
+    and #267 because the current app hit its concurrent subagent limit.
 - Verification plan:
   - Focused tests for each touched issue surface.
   - `npm run typecheck`.
@@ -156,5 +212,48 @@ Use this section for the next live batch before editing code:
   - `npm run build:ui --workspace @crowclaw/web`.
   - `npm run build:html --workspace @crowclaw/web`.
   - `git diff --check`.
-- Result: in progress.
-- Commit: pending.
+- Result:
+  - Galileo completed #184, #187, #188. Verification reported:
+    `git diff --check` on owned files, `npx tsc -p packages/runtime-node/tsconfig.json
+    --noEmit --pretty false`, `npm --workspace @crowclaw/web run build:ui`,
+    `npx vitest run tests/runtime-memory-list.test.ts tests/e2e-dashboard-api.test.ts`,
+    and `npx vitest run tests/mcp-skill-crud.test.ts tests/dashboard-contract.test.ts`
+    passed.
+  - McClintock completed #202 and #203. Verification reported:
+    `npx vitest run tests/runtime-mcp-server-routes.test.ts tests/runtime-acp-routes.test.ts`,
+    the broader MCP/ACP focused suite, runtime-node package typecheck, and
+    `git diff --check` passed.
+  - Maxwell completed #243, #245, #249, #250. Verification reported:
+    `npm run build:html --workspace @crowclaw/web`, `npx vitest run tests/a11y.test.ts
+    tests/dashboard-polish.test.ts`, targeted `rg` checks for highlight.js and
+    glass tokens, and `git diff --check` passed.
+  - Russell completed #281. Verification reported:
+    `npx vitest run tests/storage-memory.test.ts tests/storage-d1-memory.test.ts
+    tests/memory-provider.test.ts`, `npx vitest run tests/embedding-memory.test.ts`,
+    storage package typecheck, memory package typecheck, and owned-file
+    `git diff --check` passed.
+  - Euler completed #282. Verification reported:
+    `npm run typecheck`, `npm run build -- --pretty false`,
+    `npm test -- tests/delegate-tool.test.ts tests/delegate-enhanced.test.ts`,
+    `npm test -- tests/e2e-core-agent.test.ts`, and
+    `rg -n "__delegateDepth" . --glob "!node_modules" --glob "!dist"` passed.
+  - Gibbs completed #287. Verification reported:
+    `npm test -- tests/openai-provider.test.ts tests/codex-auth.test.ts`,
+    `npm run typecheck`, and `git diff --check` passed.
+  - Leader-local completed strict-read #255 and #267. #255 now has a refactor-safe
+    route audit, explicit Worker unsupported route table, CI parity check, and
+    zero `missing` rows. #267 now has a SOPS CLI-backed secret reference source
+    with focused provider-factory tests and docs.
+  - Integration verification after all subagent results landed:
+    - `npm run build -- --pretty false` passed.
+    - `npm run typecheck` passed.
+    - focused unresolved-gap test batch passed: 12 files, 132 tests.
+    - `npm run build:ui --workspace @crowclaw/web` passed.
+    - `npm run build:html --workspace @crowclaw/web` passed.
+    - `npm test` passed: 238 files, 2,982 tests.
+    - `node scripts/audit-routes.mjs --check` passed.
+    - `git diff --check` passed.
+    - `rg` checks found no legacy dashboard glass/highlight.js tokens in
+      generated HTML or UI source.
+- Commit: `1b098d6`, `f5ae7e0`; this documentation checkpoint finalizes
+  the batch ledger.
