@@ -17,7 +17,14 @@ describe('SSRF protection', () => {
     expect(isPrivateUrl('http://10.0.0.1')).toBe(true);
     expect(isPrivateUrl('http://172.16.0.1')).toBe(true);
     expect(isPrivateUrl('http://192.168.1.1')).toBe(true);
+    expect(isPrivateUrl('http://192.0.0.1')).toBe(true);
     expect(isPrivateUrl('http://127.0.0.1')).toBe(true);
+  });
+
+  it('blocks IPv6 transition ranges that can tunnel private traffic', () => {
+    expect(validateFetchUrl('http://[2001::1]/admin').safe).toBe(false);
+    expect(validateFetchUrl('http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/admin').safe).toBe(false);
+    expect(validateFetchUrl('http://[2002::1]/admin').safe).toBe(false);
   });
 
   it('allows public URLs', () => {

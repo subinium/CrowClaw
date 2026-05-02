@@ -75,8 +75,8 @@ describe('delegate tool', () => {
       {
         agentId: 'crowclaw',
         sessionId: 'parent-4',
-        __delegateDepth: 2
-      } as never
+        delegateDepth: 2
+      }
     );
     expect(result.ok).toBe(false);
     expect(result.output).toContain('Maximum delegation depth');

@@ -60,6 +60,8 @@ export interface ToolExecutionContext {
   agentId: string;
   sessionId: string;
   workspaceId?: string;
+  /** Delegation depth propagated through child agents and sandboxed tool RPC. */
+  delegateDepth?: number;
   /** Env passed to tools. Use sanitizeEnv() to strip sensitive vars before passing. */
   env?: unknown;
   signal?: AbortSignal;

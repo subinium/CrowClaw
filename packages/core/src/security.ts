@@ -7,6 +7,7 @@ const PRIVATE_IP_PATTERNS = [
   /^10\./,                               // 10.0.0.0/8 RFC1918
   /^172\.(1[6-9]|2\d|3[01])\./,          // 172.16.0.0/12 RFC1918
   /^192\.168\./,                         // 192.168.0.0/16 RFC1918
+  /^192\.0\.0\./,                         // 192.0.0.0/24 IETF protocol assignments
   /^0\./,                                // 0.0.0.0/8 "this network"
   /^169\.254\./,                         // 169.254.0.0/16 link-local (AWS/GCP IMDS)
   /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // 100.64.0.0/10 CGNAT
@@ -16,6 +17,8 @@ const PRIVATE_IP_PATTERNS = [
   /^fc00:/i, /^fd[0-9a-f]{2}:/i,         // fc00::/7 ULA (covers both fc00 and fd00)
   /^fe80:/i,                             // fe80::/10 link-local
   /^ff[0-9a-f]{2}:/i,                    // ff00::/8 multicast
+  /^2001:(?:0{1,4}:|:)/i,                // 2001::/32 Teredo
+  /^2002:/i,                              // 2002::/16 6to4
   /^::ffff:/i,                           // IPv4-mapped IPv6 (::ffff:10.0.0.1 etc.)
   /^0:0:0:0:0:ffff:/i,                   // IPv4-mapped long form
   /^0:0:0:0:0:0:/i,                      // other abbreviated-zero forms

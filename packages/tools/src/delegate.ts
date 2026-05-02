@@ -90,7 +90,7 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
       input: Record<string, unknown>,
       context: ToolExecutionContext,
     ): Promise<ToolExecutionResult> {
-      const currentDepth = (context as unknown as Record<string, unknown>).__delegateDepth ?? 0;
+      const currentDepth = context.delegateDepth ?? 0;
       if (typeof currentDepth === 'number' && currentDepth >= maxDepth) {
         return {
           toolName: 'delegate.task',
@@ -180,11 +180,10 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
             agentId: context.agentId,
             sessionId: childSessionId,
             workspaceId: context.workspaceId,
+            delegateDepth: depth,
             env: inheritCredentials ? context.env : undefined,
             signal: childAbortController.signal,
           };
-          // Attach depth metadata so recursive delegates are blocked
-          (childContext as unknown as Record<string, unknown>).__delegateDepth = depth;
 
           const result = await childLoop.run({
             agentId: context.agentId,

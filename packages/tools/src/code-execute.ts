@@ -54,6 +54,7 @@ interface ExecuteWithToolsRunner {
     sessionId: string;
     agentId?: string;
     workspaceId?: string;
+    delegateDepth?: number;
     policy?: {
       allowedTools: string[];
       timeoutMs: number;
@@ -182,6 +183,7 @@ export function createCodeExecuteTool(deps: CodeExecuteToolDeps): ToolDefinition
         sessionId: context.sessionId,
         agentId: context.agentId,
         workspaceId: context.workspaceId,
+        delegateDepth: context.delegateDepth,
         policy: {
           allowedTools,
           timeoutMs: 30_000,

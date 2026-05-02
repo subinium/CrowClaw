@@ -2073,6 +2073,7 @@ export interface ExecuteWithToolsOptions {
   sessionId: string;
   agentId?: string;
   workspaceId?: string;
+  delegateDepth?: number;
   policy?: Partial<SandboxPolicy>;
   eventBus?: AgentEventEmitter;
   /** Same-path `executeTool` callback — see CreateHostBridgeOptions. */
@@ -2174,6 +2175,7 @@ export async function executeWithTools(
     sessionId: options.sessionId,
     agentId: options.agentId,
     workspaceId: options.workspaceId,
+    delegateDepth: options.delegateDepth,
     policy,
     eventBus: options.eventBus,
     executeTool: options.executeTool,

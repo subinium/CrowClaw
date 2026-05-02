@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { writeFile, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { chmod, writeFile, mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexAuthStore, detectCodexChatGPTAuth } from '../packages/runtime-node/src/codex-auth.js';
@@ -40,6 +40,42 @@ describe('CodexAuthStore', () => {
     await writeFile(authPath, JSON.stringify({ auth_mode: 'apikey', tokens: null }));
     const detected = await detectCodexChatGPTAuth(authPath);
     expect(detected).toBeNull();
+  });
+
+  it('returns null when auth.json has an invalid token schema', async () => {
+    await writeFile(
+      authPath,
+      JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: { access_token: ['not-a-token'], refresh_token: 'rt-test' },
+      })
+    );
+    const store = new CodexAuthStore({ authPath });
+    expect(await store.load()).toBeNull();
+  });
+
+  it('warns when auth.json has group or world-readable permissions', async () => {
+    await writeFile(
+      authPath,
+      JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: {
+          access_token: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+          refresh_token: 'rt-test',
+          account_id: 'acct-123',
+        },
+      })
+    );
+    await chmod(authPath, 0o644);
+    const warnings: Array<{ mode: number; message: string }> = [];
+    const store = new CodexAuthStore({
+      authPath,
+      onPermissionWarning: (warning) => warnings.push(warning),
+    });
+    expect(await store.load()).not.toBeNull();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.mode.toString(8)).toBe('644');
+    expect(warnings[0]!.message).not.toContain('rt-test');
   });
 
   it('returns store + accountId for valid chatgpt auth', async () => {
