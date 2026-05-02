@@ -133,8 +133,9 @@ export class SessionController {
     }
 
     // Separate system prefix from the rest
-    const hasSystemPrefix = messages.length > 0 && messages[0].role === 'system';
-    const systemMessage = hasSystemPrefix ? messages[0] : undefined;
+    const firstMessage = messages[0];
+    const hasSystemPrefix = firstMessage?.role === 'system';
+    const systemMessage = hasSystemPrefix ? firstMessage : undefined;
     const conversationMessages = hasSystemPrefix ? messages.slice(1) : messages;
 
     // If there are not enough non-system messages to compact, return as-is

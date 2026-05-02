@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
+import { DetailedUsageTracker, validateFetchUrl } from '../packages/core/src/index.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,6 +35,12 @@ function setEnvToken(token: string | undefined): void {
     if (proc?.env) {
       delete proc.env.CROWCLAW_DASHBOARD_TOKEN;
     }
+  }
+}
+
+class StubProvider {
+  async generate(request: { messages: Array<{ content: string }> }) {
+    return { assistantMessage: `echo:${request.messages.at(-1)?.content ?? ''}` };
   }
 }
 
@@ -387,6 +394,148 @@ describe('HIGH: SSRF protection on Discord outbound', () => {
     expect(response.status).toBe(403);
     const data = await response.json() as { error: string };
     expect(data.error).toBe('SSRF blocked');
+  });
+});
+
+describe('HIGH: Tailnet SSRF allowlist', () => {
+  it('keeps Tailscale CGNAT blocked when no allowlist is configured', () => {
+    const result = validateFetchUrl('http://100.64.5.5:8123/');
+    expect(result.safe).toBe(false);
+    expect(result.reason).toContain('private/internal');
+  });
+
+  it('allows only configured tailnet CIDRs', () => {
+    const options = { env: { CROWCLAW_TAILNET_ALLOWLIST: '100.64.0.0/10,fd7a:115c:a1e0::/48' } };
+    expect(validateFetchUrl('http://100.64.5.5:8123/', options).safe).toBe(true);
+    expect(validateFetchUrl('http://[fd7a:115c:a1e0::5]:8123/', options).safe).toBe(true);
+    expect(validateFetchUrl('http://10.0.0.1:8123/', options).safe).toBe(false);
+    expect(validateFetchUrl('http://169.254.169.254/latest/meta-data/', options).safe).toBe(false);
+  });
+});
+
+describe('HIGH: Credit-burn rate limits', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setEnvToken('rate-limit-token');
+    process.env.CROWCLAW_CHAT_RATE_LIMIT = '2';
+    process.env.CROWCLAW_WEBHOOK_RATE_LIMIT = '2';
+    delete process.env.CROWCLAW_DAILY_USD_CAP;
+  });
+
+  afterEach(() => {
+    delete process.env.CROWCLAW_CHAT_RATE_LIMIT;
+    delete process.env.CROWCLAW_WEBHOOK_RATE_LIMIT;
+    delete process.env.CROWCLAW_DAILY_USD_CAP;
+  });
+
+  it('rate-limits chat turns by dashboard token hash', async () => {
+    const runtime = createNodeRuntime({
+      hostname: '127.0.0.1',
+      provider: new StubProvider() as never,
+      configStorePath: null,
+      auditLogPath: null,
+    });
+
+    for (let i = 0; i < 2; i += 1) {
+      const response = await runtime.fetch(
+        makeRequest('/api/sessions/chat-rate-limit', {
+          method: 'POST',
+          body: { userMessage: `message ${i}` },
+          headers: { authorization: 'Bearer rate-limit-token' },
+        }),
+      );
+      expect(response.status).toBe(200);
+    }
+
+    const limited = await runtime.fetch(
+      makeRequest('/api/sessions/chat-rate-limit', {
+        method: 'POST',
+        body: { userMessage: 'message 3' },
+        headers: { authorization: 'Bearer rate-limit-token' },
+      }),
+    );
+
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({ code: 'RATE_LIMITED', limit: 2 });
+    expect(runtime.securityAuditLog.getEventsByType('rate_limit_exceeded')).toHaveLength(1);
+  });
+
+  it('rate-limits verified webhook dispatch before invoking the provider', async () => {
+    const runtime = createNodeRuntime({
+      hostname: '127.0.0.1',
+      provider: new StubProvider() as never,
+      configStorePath: null,
+      auditLogPath: null,
+      telegramWebhookSecret: 'tg-secret',
+    });
+    await runtime.fetch(new Request('http://localhost/api/gateway/telegram/policy', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer rate-limit-token' },
+      body: JSON.stringify({ dmPolicy: 'open', groupPolicy: 'open' }),
+    }));
+
+    for (let i = 0; i < 2; i += 1) {
+      const response = await runtime.fetch(
+        makeRequest('/webhooks/telegram', {
+          method: 'POST',
+          body: {
+            update_id: i + 1,
+            message: { message_id: i + 10, date: 1700000000, text: `hello ${i}`, from: { id: 42 }, chat: { id: 99 } },
+          },
+          headers: { 'x-telegram-bot-api-secret-token': 'tg-secret' },
+        }),
+      );
+      expect(response.status).toBe(200);
+    }
+
+    const limited = await runtime.fetch(
+      makeRequest('/webhooks/telegram', {
+        method: 'POST',
+        body: {
+          update_id: 3,
+          message: { message_id: 13, date: 1700000000, text: 'hello 3', from: { id: 42 }, chat: { id: 99 } },
+        },
+        headers: { 'x-telegram-bot-api-secret-token': 'tg-secret' },
+      }),
+    );
+
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({ code: 'RATE_LIMITED', limit: 2 });
+    expect(runtime.securityAuditLog.getEventsByType('rate_limit_exceeded')).toHaveLength(1);
+  });
+
+  it('trips the daily USD budget circuit breaker before chat execution', async () => {
+    process.env.CROWCLAW_DAILY_USD_CAP = '0.01';
+    const tracker = new DetailedUsageTracker();
+    tracker.record({
+      model: 'gpt-4o',
+      provider: 'openai',
+      inputTokens: 1000,
+      outputTokens: 1000,
+      totalTokens: 2000,
+      cachedTokens: 0,
+      costUsd: 0.02,
+      latencyMs: 100,
+    });
+    const runtime = createNodeRuntime({
+      hostname: '127.0.0.1',
+      provider: new StubProvider() as never,
+      usageTracker: tracker,
+      configStorePath: null,
+      auditLogPath: null,
+    });
+
+    const response = await runtime.fetch(
+      makeRequest('/api/sessions/budget-limit', {
+        method: 'POST',
+        body: { userMessage: 'blocked by budget' },
+        headers: { authorization: 'Bearer rate-limit-token' },
+      }),
+    );
+
+    expect(response.status).toBe(429);
+    expect(await response.json()).toMatchObject({ code: 'BUDGET_EXCEEDED' });
+    expect(runtime.securityAuditLog.getEventsByType('rate_limit_exceeded')).toHaveLength(1);
   });
 });
 

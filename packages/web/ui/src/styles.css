@@ -22,7 +22,7 @@
   --border: #2a2a35;
   --border-strong: #3a3a48;
 
-  /* Legacy surface aliases — kept so views still resolve. Audit & remove in v0.9. */
+  /* Compatibility surface aliases retained for older views. */
   --bg-primary: var(--bg);
   --bg-secondary: var(--surface-1);
   --bg-tertiary: var(--surface-2);
@@ -30,8 +30,6 @@
   --bg-card-hover: var(--surface-2);
   --bg-input: var(--surface-1);
   --bg-overlay: rgba(0, 0, 0, 0.6);
-  --glass-bg: var(--surface-1);
-  --glass-border: var(--border);
 
   /* ----- Brand & Accent ----- */
   /* Brand surface — logo / hero only. Not for interactive UI. */
@@ -105,6 +103,29 @@
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
+:root[data-theme='light'] {
+  --bg: #f7f8fb;
+  --surface-1: #ffffff;
+  --surface-2: #eef1f6;
+  --border: #d8dee8;
+  --border-strong: #b8c1cf;
+  --bg-overlay: rgba(15, 23, 42, 0.28);
+  --accent: #255fd5;
+  --accent-hover: #174fbd;
+  --accent-active: #0f3f99;
+  --accent-soft: rgba(37, 95, 213, 0.12);
+  --error: #b42318;
+  --success: #067647;
+  --warn: #b54708;
+  --info: #026aa2;
+  --text: #111827;
+  --text-muted: #4b5563;
+  --text-faint: #6b7280;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.12);
+  --shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.16);
+}
+
 /* Base */
 html,
 body {
@@ -158,6 +179,17 @@ a:hover {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* Print stylesheet — minimal */

@@ -182,6 +182,14 @@ describe('Config Schema', () => {
         expect(field.enum).toEqual(['open', 'disabled', 'allowlist']);
       });
 
+      it('has endpoint policy fields', () => {
+        const policyTier = section.fields.find((f) => f.key === 'policyTier') as ConfigFieldSchema;
+        const allowedEndpoints = section.fields.find((f) => f.key === 'allowedEndpoints') as ConfigFieldSchema;
+        expect(policyTier.type).toBe('enum');
+        expect(policyTier.enum).toEqual(['restricted', 'balanced', 'open']);
+        expect(allowedEndpoints.type).toBe('array');
+      });
+
       it('marks token and webhookSecret as sensitive', () => {
         const token = section.fields.find((f) => f.key === 'token') as ConfigFieldSchema;
         const secret = section.fields.find((f) => f.key === 'webhookSecret') as ConfigFieldSchema;
@@ -306,6 +314,8 @@ describe('Config Schema', () => {
         enabled: true,
         dmPolicy: 'pairing',
         groupPolicy: 'allowlist',
+        policyTier: 'restricted',
+        allowedEndpoints: ['/api/webhooks/*'],
       });
       expect(result.valid).toBe(true);
     });

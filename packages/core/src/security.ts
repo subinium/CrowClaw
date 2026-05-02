@@ -7,6 +7,7 @@ const PRIVATE_IP_PATTERNS = [
   /^10\./,                               // 10.0.0.0/8 RFC1918
   /^172\.(1[6-9]|2\d|3[01])\./,          // 172.16.0.0/12 RFC1918
   /^192\.168\./,                         // 192.168.0.0/16 RFC1918
+  /^192\.0\.0\./,                         // 192.0.0.0/24 IETF protocol assignments
   /^0\./,                                // 0.0.0.0/8 "this network"
   /^169\.254\./,                         // 169.254.0.0/16 link-local (AWS/GCP IMDS)
   /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // 100.64.0.0/10 CGNAT
@@ -16,6 +17,8 @@ const PRIVATE_IP_PATTERNS = [
   /^fc00:/i, /^fd[0-9a-f]{2}:/i,         // fc00::/7 ULA (covers both fc00 and fd00)
   /^fe80:/i,                             // fe80::/10 link-local
   /^ff[0-9a-f]{2}:/i,                    // ff00::/8 multicast
+  /^2001:(?:0{1,4}:|:)/i,                // 2001::/32 Teredo
+  /^2002:/i,                              // 2002::/16 6to4
   /^::ffff:/i,                           // IPv4-mapped IPv6 (::ffff:10.0.0.1 etc.)
   /^0:0:0:0:0:ffff:/i,                   // IPv4-mapped long form
   /^0:0:0:0:0:0:/i,                      // other abbreviated-zero forms
@@ -24,26 +27,136 @@ const PRIVATE_IP_PATTERNS = [
   /^.*\.internal$/i
 ];
 
+export interface UrlSafetyOptions {
+  /**
+   * Comma-separated CIDRs or literal host/IP entries that may bypass the
+   * default private-network SSRF block. Intended for explicit tailnet opt-in
+   * through CROWCLAW_TAILNET_ALLOWLIST.
+   */
+  tailnetAllowlist?: string | string[];
+  env?: Record<string, string | undefined>;
+}
+
+function getRuntimeEnv(): Record<string, string | undefined> {
+  return (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+}
+
+function normalizeAddress(value: string): string {
+  const unwrapped = value.trim().replace(/^\[|\]$/g, '').split('%')[0]!;
+  const mapped = unwrapped.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  return (mapped ? mapped[1]! : unwrapped).toLowerCase();
+}
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    result = (result << 8) | n;
+  }
+  return result >>> 0;
+}
+
+function expandIpv6(address: string): number[] | null {
+  const normalized = normalizeAddress(address);
+  if (!normalized.includes(':')) return null;
+  const [headRaw, tailRaw] = normalized.split('::');
+  if (normalized.indexOf('::') !== normalized.lastIndexOf('::')) return null;
+  const head = headRaw ? headRaw.split(':').filter(Boolean) : [];
+  const tail = tailRaw ? tailRaw.split(':').filter(Boolean) : [];
+  const parseGroup = (group: string): number | null => {
+    if (!/^[0-9a-f]{1,4}$/i.test(group)) return null;
+    return parseInt(group, 16);
+  };
+  if (tailRaw === undefined) {
+    if (head.length !== 8) return null;
+    return head.map(parseGroup).every((v): v is number => v !== null)
+      ? head.map((group) => parseInt(group, 16))
+      : null;
+  }
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return null;
+  const groups = [...head, ...Array.from({ length: missing }, () => '0'), ...tail];
+  const parsed = groups.map(parseGroup);
+  return parsed.every((v): v is number => v !== null) ? parsed : null;
+}
+
+function ipv6MatchesCidr(ip: string, base: string, prefixLength: number): boolean {
+  const target = expandIpv6(ip);
+  const cidrBase = expandIpv6(base);
+  if (!target || !cidrBase || prefixLength < 0 || prefixLength > 128) return false;
+  const fullGroups = Math.floor(prefixLength / 16);
+  const partialBits = prefixLength % 16;
+  for (let i = 0; i < fullGroups; i++) {
+    if (target[i] !== cidrBase[i]) return false;
+  }
+  if (partialBits === 0) return true;
+  const mask = (0xffff << (16 - partialBits)) & 0xffff;
+  return (target[fullGroups]! & mask) === (cidrBase[fullGroups]! & mask);
+}
+
+function matchesAllowlistEntry(value: string, entry: string): boolean {
+  const target = normalizeAddress(value);
+  const candidate = entry.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  if (!candidate) return false;
+  if (!candidate.includes('/')) {
+    return target === normalizeAddress(candidate);
+  }
+  const [base, prefixRaw] = candidate.split('/');
+  const prefixLength = Number(prefixRaw);
+  if (!base || !Number.isInteger(prefixLength)) return false;
+  const target4 = ipv4ToInt(target);
+  const base4 = ipv4ToInt(base);
+  if (target4 !== null && base4 !== null) {
+    if (prefixLength < 0 || prefixLength > 32) return false;
+    const mask = prefixLength === 0 ? 0 : (0xffffffff << (32 - prefixLength)) >>> 0;
+    return (target4 & mask) === (base4 & mask);
+  }
+  return ipv6MatchesCidr(target, base, prefixLength);
+}
+
+function getTailnetAllowlist(options?: UrlSafetyOptions): string[] {
+  const configured = options?.tailnetAllowlist
+    ?? options?.env?.CROWCLAW_TAILNET_ALLOWLIST
+    ?? getRuntimeEnv().CROWCLAW_TAILNET_ALLOWLIST;
+  if (Array.isArray(configured)) {
+    return configured.map((entry) => entry.trim()).filter(Boolean);
+  }
+  return (configured ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
+export function isTailnetAllowlistedAddress(address: string, options?: UrlSafetyOptions): boolean {
+  const allowlist = getTailnetAllowlist(options);
+  if (allowlist.length === 0) return false;
+  return allowlist.some((entry) => matchesAllowlistEntry(address, entry));
+}
+
 /**
  * Check if a bare IP address (already resolved) matches a private/internal range.
  * Separate from isPrivateUrl so DNS-rebinding-aware callers can validate the
  * resolved IP, not just the hostname string.
  */
-export function isPrivateIpAddress(ip: string): boolean {
-  return PRIVATE_IP_PATTERNS.some(p => p.test(ip));
+export function isPrivateIpAddress(ip: string, options?: UrlSafetyOptions): boolean {
+  const normalized = normalizeAddress(ip);
+  if (isTailnetAllowlistedAddress(normalized, options)) return false;
+  return PRIVATE_IP_PATTERNS.some(p => p.test(normalized));
 }
 
-export function isPrivateUrl(url: string): boolean {
+export function isPrivateUrl(url: string, options?: UrlSafetyOptions): boolean {
   try {
     const parsed = new URL(url);
-    const hostname = parsed.hostname.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+    const hostname = normalizeAddress(parsed.hostname); // strip IPv6 brackets/zone ids
+    if (isTailnetAllowlistedAddress(hostname, options)) return false;
     return PRIVATE_IP_PATTERNS.some(p => p.test(hostname));
   } catch {
     return true; // invalid URLs are treated as private
   }
 }
 
-export function validateFetchUrl(url: string): { safe: boolean; reason?: string } {
+export function validateFetchUrl(url: string, options?: UrlSafetyOptions): { safe: boolean; reason?: string } {
   if (!url) return { safe: false, reason: 'Empty URL' };
 
   try {
@@ -51,7 +164,7 @@ export function validateFetchUrl(url: string): { safe: boolean; reason?: string 
     if (!['http:', 'https:'].includes(parsed.protocol)) {
       return { safe: false, reason: `Disallowed protocol: ${parsed.protocol}` };
     }
-    if (isPrivateUrl(url)) {
+    if (isPrivateUrl(url, options)) {
       return { safe: false, reason: 'URL resolves to private/internal network' };
     }
     return { safe: true };
@@ -71,20 +184,21 @@ export function validateFetchUrl(url: string): { safe: boolean; reason?: string 
  */
 export async function resolveAndValidateUrl(
   url: string,
-  resolver: (hostname: string) => Promise<string[]>
+  resolver: (hostname: string) => Promise<string[]>,
+  options?: UrlSafetyOptions
 ): Promise<{ safe: boolean; reason?: string; resolvedIps?: string[] }> {
-  const base = validateFetchUrl(url);
+  const base = validateFetchUrl(url, options);
   if (!base.safe) return base;
   try {
     const parsed = new URL(url);
-    const host = parsed.hostname.replace(/^\[|\]$/g, '');
+    const host = normalizeAddress(parsed.hostname);
     // Literal IPs skip DNS (no rebinding risk).
     if (/^[0-9.]+$/.test(host) || host.includes(':')) {
       return { safe: true, resolvedIps: [host] };
     }
     const ips = await resolver(host);
     if (ips.length === 0) return { safe: false, reason: 'Hostname did not resolve to any IP' };
-    const badIp = ips.find(ip => isPrivateIpAddress(ip));
+    const badIp = ips.find(ip => isPrivateIpAddress(ip, options));
     if (badIp) {
       return { safe: false, reason: `Hostname resolves to private IP: ${badIp}`, resolvedIps: ips };
     }
@@ -545,6 +659,7 @@ export type SecurityEventType =
   | 'command_warned'
   | 'pii_redacted'
   | 'ssrf_blocked'
+  | 'rate_limit_exceeded'
   | 'approval_required'
   | 'approval_denied'
   // v0.8.0 (#234) — `code.execute` pipeline tool. Recorded at the call site
@@ -562,6 +677,10 @@ export interface SecurityEvent {
   severity: SecurityEventSeverity;
   detail: string;
   sessionId?: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  presetId?: string;
 }
 
 export class SecurityAuditLog {
@@ -572,11 +691,16 @@ export class SecurityAuditLog {
     this.maxEvents = maxEvents;
   }
 
-  record(event: Omit<SecurityEvent, 'timestamp'>): void {
+  record(event: Omit<SecurityEvent, 'timestamp'>): SecurityEvent {
     const entry: SecurityEvent = {
       ...event,
       timestamp: new Date().toISOString(),
     };
+    this.recordEntry(entry);
+    return entry;
+  }
+
+  protected recordEntry(entry: SecurityEvent): void {
     this.events.push(entry);
     if (this.events.length > this.maxEvents) {
       this.events = this.events.slice(-this.maxEvents);
@@ -611,6 +735,162 @@ export class SecurityAuditLog {
   clear(): void {
     this.events = [];
   }
+
+  flush(): SecurityEvent[] {
+    const flushed = [...this.events];
+    this.events = [];
+    return flushed;
+  }
+}
+
+function getProcessEnv(name: string): string | undefined {
+  const processRef = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+  return processRef?.env?.[name];
+}
+
+function defaultCrowclawDataDir(): string {
+  return getProcessEnv('CROWCLAW_DATA_DIR')
+    ?? `${getProcessEnv('HOME') ?? '/tmp'}/.crowclaw`;
+}
+
+function dateStamp(timestamp: string): string {
+  return timestamp.slice(0, 10);
+}
+
+export interface FileSecurityAuditLogOptions {
+  baseDir?: string;
+  maxEvents?: number;
+  retentionDays?: number;
+}
+
+interface FsPromisesApi {
+  mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<unknown>;
+  readdir(path: string): Promise<string[]>;
+  readFile(path: string, encoding: 'utf-8'): Promise<string>;
+  appendFile(path: string, data: string, options?: { encoding?: 'utf-8'; mode?: number }): Promise<unknown>;
+  chmod(path: string, mode: number): Promise<unknown>;
+  unlink(path: string): Promise<unknown>;
+}
+
+function loadFsPromises(): Promise<FsPromisesApi> {
+  const processRef = (() => {
+    try {
+      return new Function('return typeof process === "object" ? process : undefined')() as
+        | { getBuiltinModule?: (specifier: string) => unknown }
+        | undefined;
+    } catch {
+      return (globalThis as { process?: { getBuiltinModule?: (specifier: string) => unknown } }).process;
+    }
+  })();
+  const builtin = processRef?.getBuiltinModule?.('node:fs/promises')
+    ?? processRef?.getBuiltinModule?.('fs/promises');
+  if (builtin) return Promise.resolve(builtin as FsPromisesApi);
+
+  const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<FsPromisesApi>;
+  return dynamicImport('node:fs/promises');
+}
+
+export class FileSecurityAuditLog extends SecurityAuditLog {
+  private readonly baseDir: string;
+  private readonly retentionDays: number;
+  private writeQueue: Promise<void> = Promise.resolve();
+  private clearedAt: string | null = null;
+
+  constructor(options: FileSecurityAuditLogOptions = {}) {
+    super(options.maxEvents ?? 500);
+    this.baseDir = options.baseDir ?? `${defaultCrowclawDataDir()}/audit`;
+    const envRetention = Number.parseInt(getProcessEnv('CROWCLAW_AUDIT_RETENTION_DAYS') ?? '', 10);
+    this.retentionDays = options.retentionDays ?? (Number.isFinite(envRetention) && envRetention > 0 ? envRetention : 30);
+  }
+
+  override record(event: Omit<SecurityEvent, 'timestamp'>): SecurityEvent {
+    const entry = super.record(event);
+    this.enqueueWrite(entry);
+    return entry;
+  }
+
+  async readEvents(options: { since?: string; type?: string; severity?: string; limit?: number } = {}): Promise<SecurityEvent[]> {
+    const fs = await loadFsPromises();
+    await fs.mkdir(this.baseDir, { recursive: true, mode: 0o700 });
+    const entries = await fs.readdir(this.baseDir).catch(() => []);
+    const files = entries
+      .filter((name) => /^audit-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+      .sort()
+      .reverse();
+    const sinceTime = options.since ? Date.parse(options.since) : Number.NEGATIVE_INFINITY;
+    const events: SecurityEvent[] = [];
+
+    for (const file of files) {
+      const text = await fs.readFile(`${this.baseDir}/${file}`, 'utf-8').catch(() => '');
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as SecurityEvent;
+          const eventTime = Date.parse(event.timestamp);
+          if (this.clearedAt && eventTime <= Date.parse(this.clearedAt)) continue;
+          if (Number.isFinite(sinceTime) && eventTime < sinceTime) continue;
+          if (options.type && event.type !== options.type) continue;
+          if (options.severity && event.severity !== options.severity) continue;
+          events.push(event);
+        } catch {
+          // Skip malformed historical rows instead of failing the audit API.
+        }
+      }
+    }
+
+    events.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    return options.limit ? events.slice(0, options.limit) : events;
+  }
+
+  async drainWrites(): Promise<void> {
+    await this.writeQueue;
+  }
+
+  override clear(): void {
+    super.clear();
+    this.clearedAt = new Date().toISOString();
+    this.writeQueue = this.writeQueue
+      .then(() => this.deleteAuditFiles())
+      .catch(() => {});
+  }
+
+  private enqueueWrite(entry: SecurityEvent): void {
+    this.writeQueue = this.writeQueue
+      .then(() => this.append(entry))
+      .catch(() => {});
+  }
+
+  private async append(entry: SecurityEvent): Promise<void> {
+    const fs = await loadFsPromises();
+    await fs.mkdir(this.baseDir, { recursive: true, mode: 0o700 });
+    const path = `${this.baseDir}/audit-${dateStamp(entry.timestamp)}.jsonl`;
+    await fs.appendFile(path, JSON.stringify(entry) + '\n', { encoding: 'utf-8', mode: 0o600 });
+    await fs.chmod(path, 0o600).catch(() => {});
+    await this.pruneOldFiles(fs);
+  }
+
+  private async pruneOldFiles(fs: FsPromisesApi): Promise<void> {
+    if (this.retentionDays <= 0) return;
+    const cutoff = Date.now() - this.retentionDays * 24 * 60 * 60 * 1000;
+    const entries = await fs.readdir(this.baseDir).catch(() => []);
+    await Promise.all(entries.map(async (name) => {
+      const match = name.match(/^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/);
+      if (!match) return;
+      const date = match[1];
+      if (!date) return;
+      if (Date.parse(date) >= cutoff) return;
+      await fs.unlink(`${this.baseDir}/${name}`).catch(() => {});
+    }));
+  }
+
+  private async deleteAuditFiles(): Promise<void> {
+    const fs = await loadFsPromises();
+    const entries = await fs.readdir(this.baseDir).catch(() => []);
+    await Promise.all(entries.map(async (name) => {
+      if (!/^audit-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)) return;
+      await fs.unlink(`${this.baseDir}/${name}`).catch(() => {});
+    }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +910,10 @@ export class SecurityAuditLog {
 
 export interface CodeExecuteAuditPayload {
   sessionId: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  presetId?: string;
   language: 'js' | 'ts' | 'python';
   code: string;
   /** Bytes of `code` to keep in the audit row before truncation. Defaults to 4 KB. */
@@ -664,6 +948,10 @@ export function recordCodeExecuteAudit(
     type: 'tool.code-execute',
     severity,
     sessionId: payload.sessionId,
+    ...(payload.agentId ? { agentId: payload.agentId } : {}),
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.provider ? { provider: payload.provider } : {}),
+    ...(payload.presetId ? { presetId: payload.presetId } : {}),
     detail: `code.execute language=${payload.language} allowedTools=[${allowedList}]\n----- source -----\n${truncated}\n----- end source -----`,
   });
 }

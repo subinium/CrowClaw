@@ -15,6 +15,18 @@ Cloudflare is one of the runtime adapters implemented for CrowClaw. Node.js (`pa
 - D1 for structured storage and search
 - R2 for artifacts and large blobs
 
+## D1 setup
+Create the D1 database before deploying and replace the `wrangler.jsonc`
+`database_id` placeholder with the UUID returned by Wrangler:
+
+```bash
+npx wrangler d1 create crowclaw
+npx wrangler d1 migrations apply crowclaw
+```
+
+`scripts/sync-versions.mjs` keeps `__CROWCLAW_VERSION__` in `wrangler.jsonc`
+aligned with `package.json`. Run it as part of every release version bump.
+
 ## Current runtime flow
 1. Worker receives a request
 2. Worker routes to an Agent Durable Object

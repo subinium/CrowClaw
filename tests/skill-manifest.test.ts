@@ -6,11 +6,14 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseSkillFile,
+  loadSkillsFromDirectory,
+  computeSkillInstructionsHash,
   renderSkillFile,
   validateSkillManifest,
   checkSkillGates,
   filterAndBudgetSkills,
   matchSkillManifests,
+  localizeSkillFile,
 } from '../packages/core/src/skill-manifest.js';
 
 // --- Phase B fixtures -------------------------------------------------------
@@ -173,6 +176,40 @@ describe('parseSkillFile — legacy + new format', () => {
     expect(parsed!.instructions).toContain('# Deploy to Vercel');
   });
 
+  it('parses and resolves localized skill metadata and instructions', () => {
+    const parsed = parseSkillFile(`---
+name: deploy-vercel
+description: Deploy a web app to Vercel
+triggers:
+  - deploy to vercel
+i18n:
+  ko:
+    name: vercel-deploy
+    description: Vercel에 웹 앱 배포
+    triggers:
+      - vercel 배포
+---
+
+# Deploy to Vercel
+
+Default instructions.
+
+<!-- i18n:ko -->
+# Vercel 배포
+
+한국어 지침.
+<!-- /i18n:ko -->
+`)!;
+    const localized = localizeSkillFile(parsed, 'ko');
+
+    expect(localized.name).toBe('vercel-deploy');
+    expect(localized.description).toBe('Vercel에 웹 앱 배포');
+    expect(localized.triggers).toContain('vercel 배포');
+    expect(localized.instructions).toContain('한국어 지침');
+    expect(parsed.instructions).toContain('Default instructions.');
+    expect(parsed.instructions).not.toContain('한국어 지침');
+  });
+
   it('returns null for files without YAML frontmatter', () => {
     expect(parseSkillFile(NO_FRONTMATTER)).toBeNull();
   });
@@ -211,6 +248,72 @@ describe('parseSkillFile — published skill fixtures (3 spec-compliant samples)
     expect(parsed!.manifest.author).toBe('docops@example.org');
     expect(parsed!.manifest.config_requirements).toBeUndefined();
     expect(parsed!.manifest.platforms).toBeUndefined();
+  });
+});
+
+describe('content_hash integrity checks', () => {
+  it('loads a skill cleanly when content_hash matches the instruction body', async () => {
+    const body = '# Pinned Skill\n\nFollow the pinned instructions.';
+    const hash = await computeSkillInstructionsHash(body);
+    const skill = `---
+name: pinned-skill
+description: Skill with integrity pin
+triggers:
+  - pinned
+content_hash: ${hash}
+---
+
+${body}`;
+    const warnings: string[] = [];
+    const loaded = await loadSkillsFromDirectory('/skills', {
+      async readDir() {
+        return [{ name: 'pinned.md', isDirectory: false }];
+      },
+      async readFile() {
+        return skill;
+      },
+      joinPath(...segments: string[]) {
+        return segments.join('/');
+      },
+    }, { logger: { warn: (message) => warnings.push(message) } });
+
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.hashMismatch).toBe(false);
+    expect(loaded[0]?.manifest.content_hash).toBe(hash);
+    expect(warnings).toEqual([]);
+  });
+
+  it('warns on content_hash mismatch and rejects it in strict mode', async () => {
+    const skill = `---
+name: pinned-skill
+description: Skill with bad integrity pin
+triggers:
+  - pinned
+content_hash: sha256:${'0'.repeat(64)}
+---
+
+# Pinned Skill
+
+Tampered instructions.`;
+    const fs = {
+      async readDir() {
+        return [{ name: 'pinned.md', isDirectory: false }];
+      },
+      async readFile() {
+        return skill;
+      },
+      joinPath(...segments: string[]) {
+        return segments.join('/');
+      },
+    };
+    const warnings: string[] = [];
+    const loaded = await loadSkillsFromDirectory('/skills', fs, { logger: { warn: (message) => warnings.push(message) } });
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.hashMismatch).toBe(true);
+    expect(warnings.some((warning) => warning.includes('content_hash mismatch'))).toBe(true);
+
+    const strict = await loadSkillsFromDirectory('/skills', fs, { strict: true, logger: { warn: () => undefined } });
+    expect(strict).toEqual([]);
   });
 });
 

@@ -1,6 +1,7 @@
 // Standalone ACP server — not auto-started by runtime
 
 import { createInterface } from 'node:readline';
+import type { ToolCatalog } from '@crowclaw/core';
 
 // ---------------------------------------------------------------------------
 // ACP message types (JSON-RPC 2.0 over stdio)
@@ -110,6 +111,7 @@ export class AcpServer {
        * `error` field rather than failing the request.
        */
       tools?: () => AcpToolInfo[] | Promise<AcpToolInfo[]>;
+      toolCatalog?: ToolCatalog;
     },
   ) {}
 
@@ -204,11 +206,18 @@ export class AcpServer {
         case 'tools/list': {
           // Issue #148: surface the registry callback when wired; otherwise
           // signal availability=false so clients can route through MCP.
-          if (!this.options?.tools) {
+          const listTools = this.options?.tools ?? (this.options?.toolCatalog
+            ? () => this.options!.toolCatalog!.list().map((tool) => ({
+                name: tool.name,
+                description: tool.description,
+                inputSchema: tool.inputSchema,
+              }))
+            : undefined);
+          if (!listTools) {
             return this.respondOk(id, { tools: [], available: false });
           }
           try {
-            const tools = await this.options.tools();
+            const tools = await listTools();
             return this.respondOk(id, { tools, available: true });
           } catch (error: unknown) {
             const message = error instanceof Error ? error.message : String(error);

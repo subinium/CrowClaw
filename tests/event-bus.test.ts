@@ -1,7 +1,12 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '@crowclaw/runtime-node/event-bus';
+import { setTelemetryHooks, type TelemetrySpan } from '@crowclaw/core';
 
 describe('EventBus', () => {
+  afterEach(() => {
+    setTelemetryHooks(null);
+  });
+
   it('emits events to subscribers', () => {
     const bus = new EventBus();
     const received: unknown[] = [];
@@ -112,5 +117,59 @@ describe('EventBus', () => {
     // (Set iteration snapshot behavior — for-of over Set sees additions)
     // This tests the actual behavior, whatever it is
     expect(typeof lateReceived.length).toBe('number');
+  });
+
+  it('emits telemetry spans with stable runtime span names', () => {
+    const ended: string[] = [];
+    const spans: Array<{ name: string; attributes: Record<string, string | number | boolean> }> = [];
+    setTelemetryHooks({
+      startSpan(name, attributes) {
+        const record = { name, attributes: { ...(attributes ?? {}) } };
+        spans.push(record);
+        return {
+          setAttribute(key, value) {
+            record.attributes[key] = value;
+          },
+          end() {
+            ended.push(name);
+          },
+        } satisfies TelemetrySpan;
+      },
+    });
+
+    const bus = new EventBus();
+    bus.emit('chat:message', { sessionId: 's1' });
+    bus.emit('context:assemble_start', { sessionId: 's1' });
+    bus.emit('context:assemble_end', { sessionId: 's1', memoryCount: 2, durationMs: 7 });
+    bus.emit('iteration:start', { sessionId: 's1', iteration: 0 });
+    bus.emit('tool:start', { sessionId: 's1', callId: 'c1', toolName: 'web.fetch' });
+    bus.emit('tool:complete', { callId: 'c1', ok: true, durationMs: 12 });
+    bus.emit('iteration:end', { sessionId: 's1', iteration: 0, toolCount: 1 });
+    bus.emit('gateway:outbound', { platform: 'slack', contentLength: 42 });
+    bus.emit('chat:complete', { sessionId: 's1' });
+
+    expect(spans.map((span) => span.name)).toEqual([
+      'crowclaw.harness.run',
+      'crowclaw.context.assemble',
+      'crowclaw.tool.loop',
+      'crowclaw.exec',
+      'crowclaw.outbound.deliver',
+    ]);
+    expect(spans[1]?.attributes).toMatchObject({
+      'crowclaw.context.memory_count': 2,
+      'crowclaw.context.duration_ms': 7,
+    });
+    expect(spans[3]?.attributes).toMatchObject({
+      'crowclaw.tool.name': 'web.fetch',
+      'crowclaw.tool.ok': true,
+      'crowclaw.tool.duration_ms': 12,
+    });
+    expect(ended).toEqual([
+      'crowclaw.context.assemble',
+      'crowclaw.exec',
+      'crowclaw.tool.loop',
+      'crowclaw.outbound.deliver',
+      'crowclaw.harness.run',
+    ]);
   });
 });

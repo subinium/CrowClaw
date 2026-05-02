@@ -59,6 +59,44 @@ describe('storage and memory services', () => {
     expect(scopedSearch[0]?.id).toBe('m3');
   });
 
+  it('matches tokenized memory queries when contiguous substring search would miss', async () => {
+    const memories = new InMemoryMemoryStore();
+    await memories.write({
+      id: 'migration',
+      sessionId: 'session-token',
+      scope: 'session',
+      summary: 'database migration checklist for release',
+      tags: [],
+      createdAt: '2026-01-01T00:00:00.000Z'
+    });
+
+    const results = await memories.search('session-token', 'db migration', 5);
+    expect(results.map((record) => record.id)).toEqual(['migration']);
+  });
+
+  it('recalls semantically related local memories without substring overlap', async () => {
+    const memories = new InMemoryMemoryStore();
+    await memories.write({
+      id: 'billing',
+      sessionId: 'session-semantic',
+      scope: 'session',
+      summary: 'newer invoice reconciliation note',
+      tags: ['finance'],
+      createdAt: '2026-01-02T00:00:00.000Z'
+    });
+    await memories.write({
+      id: 'kubernetes-deploy',
+      sessionId: 'session-semantic',
+      scope: 'session',
+      summary: 'Kubernetes canary deployment strategy',
+      tags: ['cluster'],
+      createdAt: '2026-01-01T00:00:00.000Z'
+    });
+
+    const results = await memories.search('session-semantic', 'k8s rollout', 5);
+    expect(results.map((record) => record.id)).toEqual(['kubernetes-deploy']);
+  });
+
   it('exposes session and memory search as worker tools', async () => {
     const sessions = new InMemorySessionStore();
     await sessions.put({
@@ -94,6 +132,7 @@ describe('storage and memory services', () => {
       sessionId: 'session-b'
     });
     expect(recall.output).toContain('Persisted note');
+    expect(recall.metadata).toMatchObject({ backend: 'local-semantic' });
 
     const scopeRecall = await registry.execute('memory.search', { query: 'cloudflare', scope: 'workspace', scopeKey: 'workspace-a' }, {
       agentId: 'crowclaw',

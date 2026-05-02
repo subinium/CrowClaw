@@ -1,0 +1,69 @@
+services:
+  crowclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: crowclaw:0.8.2
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      CROWCLAW_DATA_DIR: /data
+      CROWCLAW_PUBLIC_URL: ${CROWCLAW_PUBLIC_URL:?set CROWCLAW_PUBLIC_URL}
+      CROWCLAW_DASHBOARD_TOKEN: ${CROWCLAW_DASHBOARD_TOKEN:?set CROWCLAW_DASHBOARD_TOKEN}
+      CROWCLAW_TRUSTED_PROXIES: ${CROWCLAW_TRUSTED_PROXIES:-172.16.0.0/12}
+      CROWCLAW_API_KEY: ${CROWCLAW_API_KEY:-}
+      CROWCLAW_PROVIDER: ${CROWCLAW_PROVIDER:-openai}
+      CROWCLAW_BASE_URL: ${CROWCLAW_BASE_URL:-https://api.openai.com/v1}
+      CROWCLAW_MODEL: ${CROWCLAW_MODEL:-gpt-4o}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-sonnet-4}
+    volumes:
+      - crowclaw-data:/data
+    expose:
+      - "8787"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8787/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      crowclaw:
+        condition: service_healthy
+    environment:
+      CROWCLAW_DOMAIN: ${CROWCLAW_DOMAIN:?set CROWCLAW_DOMAIN}
+      CROWCLAW_ACME_EMAIL: ${CROWCLAW_ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  crowclaw-data:
+  caddy-data:
+  caddy-config:

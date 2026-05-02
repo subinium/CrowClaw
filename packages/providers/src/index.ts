@@ -51,6 +51,22 @@ export interface OpenAICompatibleConfig {
    * ChatGPT (Codex) backend, which requires `store: false` on every call.
    */
   extraBodyFields?: Record<string, unknown>;
+  /** Default token cap for provider requests when a request does not supply one. */
+  maxTokens?: number;
+  /** Default temperature for non-reasoning models. Reasoning models reject this field. */
+  temperature?: number;
+  /** OpenAI Responses API reasoning effort for models that accept reasoning controls. */
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  /** Retry budget for transient 429/5xx provider responses. Default: 2 retries. */
+  maxRetries?: number;
+  /** Base delay for exponential backoff retries. Default: 250ms. Tests can set 0. */
+  retryBaseDelayMs?: number;
+  /** Dependency-injected sleep for retry tests. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Optional OpenAI prompt cache routing key. When omitted CrowClaw derives a stable prefix key. */
+  promptCacheKey?: string;
+  /** OpenAI prompt cache retention policy when supported by the endpoint. */
+  promptCacheRetention?: 'in-memory' | '24h';
   /**
    * v0.7.2: When the Responses API is in use, route the system prompt to the
    * top-level `instructions` field instead of injecting a `developer` message
@@ -58,9 +74,10 @@ export interface OpenAICompatibleConfig {
    */
   systemPromptAsInstructions?: boolean;
   /**
-   * v0.7.2: When set, `generate()` collects from `generateStream()` instead of
-   * issuing a non-streaming POST. Required by the ChatGPT (Codex) backend,
-   * which rejects `stream: false` calls.
+   * v0.7.2: When set, `generate()` and native structured-output requests
+   * collect from `generateStream()` instead of issuing a non-streaming POST.
+   * Required by the ChatGPT (Codex) backend, which rejects `stream: false`
+   * calls.
    */
   requireStream?: boolean;
   /**
@@ -141,6 +158,9 @@ interface ChatCompletionsResponse {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -685,15 +705,50 @@ function countMessageChars(messages: ConversationMessage[]): number {
   return chars;
 }
 
+function getOpenAIEncodingFamily(model: string): 'o200k' | 'cl100k' {
+  const id = model.toLowerCase();
+  return /^(?:gpt-4o|gpt-5|o1|o3|o4|codex)/.test(id) ? 'o200k' : 'cl100k';
+}
+
+function countEncodedTextTokens(text: string, family: 'o200k' | 'cl100k'): number {
+  if (!text) return 0;
+  const chunks = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[A-Za-z]+|\d+|[^\s]/gu) ?? [];
+  let total = 0;
+  for (const chunk of chunks) {
+    if (/^[A-Za-z]+$/.test(chunk)) {
+      total += Math.max(1, Math.ceil(chunk.length / (family === 'o200k' ? 4 : 3.5)));
+    } else if (/^\d+$/.test(chunk)) {
+      total += Math.max(1, Math.ceil(chunk.length / 3));
+    } else {
+      total += 1;
+    }
+  }
+  return total;
+}
+
+function countOpenAIMessageTokens(messages: ConversationMessage[], model: string): number {
+  const family = getOpenAIEncodingFamily(model);
+  let total = 0;
+  for (const msg of messages) {
+    total += 3; // role/message framing overhead used by OpenAI chat encodings.
+    total += countEncodedTextTokens(msg.role, family);
+    total += countEncodedTextTokens(msg.content, family);
+    if (msg.name) total += countEncodedTextTokens(msg.name, family);
+  }
+  return total;
+}
+
 function extractOpenAIUsage(payload: ChatCompletionsResponse): ProviderResponseUsage | undefined {
   const u = payload.usage;
   if (!u) return undefined;
   const inputTokens = u.prompt_tokens ?? 0;
   const outputTokens = u.completion_tokens ?? 0;
+  const cachedTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
   return {
     inputTokens,
     outputTokens,
     totalTokens: u.total_tokens ?? (inputTokens + outputTokens),
+    ...(cachedTokens > 0 ? { cachedTokens } : {}),
   };
 }
 
@@ -756,13 +811,148 @@ function checkRateLimitHeaders(headers: Headers, pool: CredentialPool, key: stri
 /**
  * Detect whether the configured (baseUrl, model) combination supports
  * OpenAI's native `response_format: json_schema` mode. We restrict the native
- * path to api.openai.com gpt-4o / gpt-4.1 family to avoid 400s from
+ * path to api.openai.com gpt-4o / gpt-4.1 / gpt-5 / reasoning families to avoid 400s from
  * OpenAI-compatible backends (OpenRouter, NVIDIA, vLLM) that don't honour the
  * field. Everything else falls back to the schema-block envelope.
  */
 function supportsNativeJsonSchema(baseUrl: string, model: string): boolean {
   if (!/api\.openai\.com/i.test(baseUrl)) return false;
-  return /^gpt-4o|^gpt-4\.1/i.test(model);
+  return /^(?:gpt-4o|gpt-4\.1|gpt-5|o1|o3|o4)/i.test(model);
+}
+
+function isReasoningModel(model: string): boolean {
+  return /^(?:o1|o3|o4)/i.test(model);
+}
+
+function isOpenAIHosted(baseUrl: string): boolean {
+  return /api\.openai\.com/i.test(baseUrl);
+}
+
+function stablePrefixHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+function stableToolsForPromptCache(availableTools: ToolManifest[]): ToolManifest[] {
+  return [...availableTools].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function applyPromptCacheFields(
+  body: Record<string, unknown>,
+  config: OpenAICompatibleConfig,
+  request: ProviderRequest,
+): void {
+  if (!isOpenAIHosted(config.baseUrl)) return;
+  const staticPrefix = JSON.stringify({
+    model: config.model,
+    systemPrompt: request.systemPrompt ?? '',
+    tools: stableToolsForPromptCache(request.availableTools).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      schema: tool.inputSchema ?? null,
+    })),
+  });
+  body.prompt_cache_key = (config.promptCacheKey ?? `crowclaw-${stablePrefixHash(staticPrefix)}`).slice(0, 512);
+  if (config.promptCacheRetention) {
+    body.prompt_cache_retention = config.promptCacheRetention;
+  }
+}
+
+function applyOpenAITokenAndSamplingFields(
+  body: Record<string, unknown>,
+  options: {
+    model: string;
+    isResponsesApi: boolean;
+    maxTokens?: number;
+    temperature?: number;
+    reasoningEffort?: 'low' | 'medium' | 'high';
+  },
+): void {
+  const reasoning = isReasoningModel(options.model);
+  const maxTokens = options.maxTokens ?? 16384;
+
+  if (options.isResponsesApi) {
+    body.max_output_tokens = maxTokens;
+    if (reasoning && options.reasoningEffort) {
+      body.reasoning_effort = options.reasoningEffort;
+    }
+  } else if (reasoning) {
+    body.max_completion_tokens = maxTokens;
+  } else {
+    body.max_tokens = maxTokens;
+  }
+
+  if (reasoning) {
+    delete body.temperature;
+    return;
+  }
+
+  if (options.temperature !== undefined) {
+    body.temperature = options.temperature;
+  }
+}
+
+function shouldRetryProviderStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function parseRetryAfterMs(headers: Headers): number | null {
+  const retryAfter = headers.get('retry-after');
+  if (!retryAfter) return null;
+  const seconds = Number.parseFloat(retryAfter);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const retryDate = new Date(retryAfter).getTime();
+  if (!Number.isNaN(retryDate)) return Math.max(0, retryDate - Date.now());
+  return null;
+}
+
+function disableSameKeyRetryForCredentialPool(
+  config: OpenAICompatibleConfig,
+  pool?: CredentialPool,
+): OpenAICompatibleConfig {
+  return pool ? { ...config, maxRetries: 0 } : config;
+}
+
+async function fetchOpenAIWithRetry(
+  fetcher: () => Promise<Response>,
+  config: OpenAICompatibleConfig,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const maxRetries = config.maxRetries ?? 2;
+  const baseDelayMs = config.retryBaseDelayMs ?? 250;
+  const sleep = config.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let attempt = 0;
+
+  while (true) {
+    const response = await fetcher();
+    if (!shouldRetryProviderStatus(response.status) || attempt >= maxRetries || signal?.aborted) {
+      return response;
+    }
+    const retryAfterMs = parseRetryAfterMs(response.headers);
+    const exponentialMs = baseDelayMs * 2 ** attempt;
+    const jitterMs = baseDelayMs === 0 ? 0 : Math.floor(Math.random() * Math.max(1, baseDelayMs));
+    await sleep(retryAfterMs ?? (exponentialMs + jitterMs));
+    attempt += 1;
+  }
+}
+
+function extractResponsesOutputText(payload: Record<string, unknown>): string {
+  const output = payload.output;
+  if (!Array.isArray(output)) return '';
+  let text = '';
+  for (const item of output as Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>) {
+    if (item.type !== 'message' || !Array.isArray(item.content)) continue;
+    for (const part of item.content) {
+      if (part.type === 'output_text' && part.text) {
+        text += part.text;
+      }
+    }
+  }
+  return text;
 }
 
 /**
@@ -1058,10 +1248,9 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     return `${base}/chat/completions`;
   }
 
-  /** Estimate token count for messages (~4 chars per token for OpenAI models) */
+  /** Estimate token count using the model's OpenAI encoding family. */
   countTokens(messages: ConversationMessage[]): number {
-    const chars = countMessageChars(messages);
-    return Math.ceil(chars / 4);
+    return countOpenAIMessageTokens(messages, this.config.model);
   }
 
   /**
@@ -1109,6 +1298,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     if (!apiKey) {
       return new EchoProvider().generate(request);
     }
+    let activeApiKey = apiKey;
 
     const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
     // Issue #56: Strip stale budget warnings before sending to model.
@@ -1131,6 +1321,14 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       model: this.config.model,
       ...(this.config.extraBodyFields ?? {}),
     };
+    applyOpenAITokenAndSamplingFields(body, {
+      model: this.config.model,
+      isResponsesApi,
+      maxTokens: request.maxTokens ?? this.config.maxTokens,
+      temperature: request.temperature ?? this.config.temperature,
+      reasoningEffort: this.config.reasoningEffort,
+    });
+    applyPromptCacheFields(body, this.config, request);
 
     if (isResponsesApi) {
       const useInstructions = !!this.config.systemPromptAsInstructions;
@@ -1151,9 +1349,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     if (request.availableTools.length > 0) {
+      const stableTools = stableToolsForPromptCache(request.availableTools);
       body.tools = isResponsesApi
-        ? buildResponsesApiTools(request.availableTools)
-        : buildOpenAITools(request.availableTools);
+        ? buildResponsesApiTools(stableTools)
+        : buildOpenAITools(stableTools);
       body.tool_choice = 'auto';
     }
 
@@ -1169,27 +1368,28 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         signal: request.signal,
       });
 
-    let response = await performFetch(apiKey);
+    const retryConfig = disableSameKeyRetryForCredentialPool(this.config, pool);
+    let response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
 
     if (response.status === 401 && this.config.onAuthFailure) {
       const refreshed = await this.config.onAuthFailure();
       if (refreshed && tokenProvider) {
-        apiKey = await tokenProvider();
-        response = await performFetch(apiKey);
+        activeApiKey = await tokenProvider();
+        response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
       }
     }
 
     if (!response.ok) {
       if (pool) {
-        pool.reportFailure(apiKey, response.status);
+        pool.reportFailure(activeApiKey, response.status);
       }
       const errBody = await response.text().catch(() => '');
       throw new Error(`Provider request failed: ${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}`);
     }
 
     if (pool) {
-      pool.reportSuccess(apiKey);
-      checkRateLimitHeaders(response.headers, pool, apiKey);
+      pool.reportSuccess(activeApiKey);
+      checkRateLimitHeaders(response.headers, pool, activeApiKey);
     }
 
     const rawPayload = (await response.json()) as Record<string, unknown>;
@@ -1218,6 +1418,9 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         inputTokens: rawUsage.input_tokens ?? 0,
         outputTokens: rawUsage.output_tokens ?? 0,
         totalTokens: (rawUsage.input_tokens ?? 0) + (rawUsage.output_tokens ?? 0),
+        ...(((rawPayload.usage as { input_tokens_details?: { cached_tokens?: number } }).input_tokens_details?.cached_tokens ?? 0) > 0
+          ? { cachedTokens: (rawPayload.usage as { input_tokens_details?: { cached_tokens?: number } }).input_tokens_details!.cached_tokens }
+          : {}),
       } : undefined;
       // v0.8.0 (#231 / #236): scan the full assistant turn for reasoning
       // blocks and Hermes-style `<tool_call>` spans. Native function_call
@@ -1297,6 +1500,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       yield* echo.generateStream(request);
       return;
     }
+    let activeApiKey = apiKey;
 
     const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
     // Issue #56: Strip stale budget warnings before sending to model.
@@ -1319,6 +1523,14 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       stream: true,
       ...(this.config.extraBodyFields ?? {}),
     };
+    applyOpenAITokenAndSamplingFields(body, {
+      model: this.config.model,
+      isResponsesApi,
+      maxTokens: request.maxTokens ?? this.config.maxTokens,
+      temperature: request.temperature ?? this.config.temperature,
+      reasoningEffort: this.config.reasoningEffort,
+    });
+    applyPromptCacheFields(body, this.config, request);
 
     if (isResponsesApi) {
       const useInstructions = !!this.config.systemPromptAsInstructions;
@@ -1339,9 +1551,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     if (request.availableTools.length > 0) {
+      const stableTools = stableToolsForPromptCache(request.availableTools);
       body.tools = isResponsesApi
-        ? buildResponsesApiTools(request.availableTools)
-        : buildOpenAITools(request.availableTools);
+        ? buildResponsesApiTools(stableTools)
+        : buildOpenAITools(stableTools);
       body.tool_choice = 'auto';
     }
 
@@ -1357,19 +1570,20 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         signal: request.signal,
       });
 
-    let response = await performFetch(apiKey);
+    const retryConfig = disableSameKeyRetryForCredentialPool(this.config, pool);
+    let response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
 
     if (response.status === 401 && this.config.onAuthFailure) {
       const refreshed = await this.config.onAuthFailure();
       if (refreshed && tokenProvider) {
-        apiKey = await tokenProvider();
-        response = await performFetch(apiKey);
+        activeApiKey = await tokenProvider();
+        response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
       }
     }
 
     if (!response.ok) {
       if (pool) {
-        pool.reportFailure(apiKey, response.status);
+        pool.reportFailure(activeApiKey, response.status);
       }
       const errBody = await response.text().catch(() => '');
       yield { type: 'error', error: `Provider request failed: ${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}` };
@@ -1377,8 +1591,8 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     }
 
     if (pool) {
-      pool.reportSuccess(apiKey);
-      checkRateLimitHeaders(response.headers, pool, apiKey);
+      pool.reportSuccess(activeApiKey);
+      checkRateLimitHeaders(response.headers, pool, activeApiKey);
     }
 
     if (!response.body) {
@@ -1546,9 +1760,11 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
 
   /**
    * v0.8.0 Hermes parity (#237): JSON-schema-typed generation. On
-   * api.openai.com gpt-4o / gpt-4.1 family models, uses the native
+   * api.openai.com gpt-4o / gpt-4.1 / gpt-5 / reasoning family models, uses the native
    * `response_format: json_schema` mode (strict). Everything else falls back
-   * to a system-prompt envelope that embeds the schema.
+   * to a system-prompt envelope that embeds the schema. Providers that set
+   * `requireStream` (notably ChatGPT/Codex) also use the envelope path because
+   * native structured-output calls are non-streaming.
    *
    * Failures are surfaced as a typed envelope (`ok: false`) rather than
    * thrown, so route handlers can render a structured error in the dashboard
@@ -1557,7 +1773,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
   async generateStructured<T = unknown>(req: StructuredOutputRequest<T>): Promise<StructuredOutputResponse<T>> {
     const useNativeJsonSchema = supportsNativeJsonSchema(this.config.baseUrl, this.config.model);
 
-    if (useNativeJsonSchema) {
+    if (useNativeJsonSchema && !this.config.requireStream) {
       try {
         return await this.callNativeStructured<T>(req);
       } catch (err) {
@@ -1585,7 +1801,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     return finalizeStructuredResponse<T>(response.assistantMessage ?? '', req);
   }
 
-  /** Native /chat/completions json_schema path for OpenAI gpt-4o / gpt-4.1 family. */
+  /** Native json_schema path for OpenAI gpt-4o / gpt-4.1 / gpt-5 / reasoning families. */
   private async callNativeStructured<T>(req: StructuredOutputRequest<T>): Promise<StructuredOutputResponse<T>> {
     const pool = this.config.credentialPool;
     const tokenProvider = this.config.tokenProvider;
@@ -1615,21 +1831,48 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         : message.content,
     }));
 
-    const body = {
+    const isResponsesApi = this.getEndpointUrl().endsWith('/responses');
+    const body: Record<string, unknown> = {
       model: this.config.model,
-      messages: mappedMessages,
-      response_format: {
+      ...(this.config.extraBodyFields ?? {}),
+    };
+
+    applyOpenAITokenAndSamplingFields(body, {
+      model: this.config.model,
+      isResponsesApi,
+      maxTokens: this.config.maxTokens,
+      temperature: this.config.temperature,
+      reasoningEffort: this.config.reasoningEffort,
+    });
+    applyPromptCacheFields(body, this.config, {
+      messages: req.messages,
+      systemPrompt: req.messages.find((message) => message.role === 'system')?.content,
+      availableTools: [],
+    });
+
+    if (isResponsesApi) {
+      body.input = mappedMessages;
+      body.text = {
+        format: {
+          type: 'json_schema',
+          name: 'output',
+          schema: req.schema,
+          strict: true,
+        },
+      };
+    } else {
+      body.messages = mappedMessages;
+      body.response_format = {
         type: 'json_schema',
         json_schema: {
           name: 'output',
           schema: req.schema,
           strict: true,
         },
-      },
-      ...(this.config.extraBodyFields ?? {}),
-    };
+      };
+    }
 
-    const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    const response = await fetch(this.getEndpointUrl(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -1644,8 +1887,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       return { ok: false, error: 'provider', details: `${response.status} ${response.statusText}${errBody ? ` — ${errBody.slice(0, 200)}` : ''}` };
     }
 
-    const payload = (await response.json()) as ChatCompletionsResponse;
-    const text = normalizeOpenAIMessageContent(payload.choices?.[0]?.message?.content) ?? '';
+    const payload = (await response.json()) as Record<string, unknown>;
+    const text = isResponsesApi
+      ? extractResponsesOutputText(payload)
+      : normalizeOpenAIMessageContent((payload as ChatCompletionsResponse).choices?.[0]?.message?.content) ?? '';
     return finalizeStructuredResponse<T>(text, req);
   }
 }

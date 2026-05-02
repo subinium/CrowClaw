@@ -28,6 +28,52 @@ describe('Dashboard UX Polish', () => {
       expect(DASHBOARD_HTML).toContain('var(--error)');
       expect(DASHBOARD_HTML).toContain('var(--success)');
     });
+
+    it('does not ship legacy glass reset tokens in the generated dashboard', () => {
+      expect(DASHBOARD_HTML).not.toContain('--glass-bg');
+      expect(DASHBOARD_HTML).not.toContain('--glass-border');
+    });
+
+    it('does not define legacy glass reset tokens in the global stylesheet', () => {
+      const rootStyle = DASHBOARD_HTML.match(/:root\{[^}]+\}/)?.[0] ?? '';
+      expect(rootStyle).not.toContain('--glass-bg');
+      expect(rootStyle).not.toContain('--glass-border');
+    });
+
+    it('keeps owned dashboard sources off legacy glass tokens', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const ownedSources = await Promise.all([
+        readFile('packages/web/ui/src/styles.css', 'utf8'),
+        readFile('packages/web/ui/src/app.ts', 'utf8'),
+        readFile('packages/web/ui/src/views/chat-view.ts', 'utf8'),
+        readFile('packages/web/ui/src/views/connect-view.ts', 'utf8'),
+        readFile('packages/web/ui/src/components/toast.ts', 'utf8'),
+      ]);
+
+      for (const src of ownedSources) {
+        expect(src).not.toContain('glass-bg');
+        expect(src).not.toContain('glass-border');
+      }
+    });
+  });
+
+  describe('Markdown Performance', () => {
+    it('does not eagerly load highlight.js from the dashboard shell', () => {
+      expect(DASHBOARD_HTML).not.toContain('cdnjs.cloudflare.com/ajax/libs/highlight.js');
+    });
+  });
+
+  describe('Chat Rendering Performance', () => {
+    it('renders chat history through a bounded incremental message window', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const chatView = await readFile('packages/web/ui/src/views/chat-view.ts', 'utf8');
+
+      expect(chatView).toContain('INITIAL_MESSAGE_RENDER_LIMIT');
+      expect(chatView).toContain('MESSAGE_RENDER_INCREMENT');
+      expect(chatView).toContain('_visibleMessages');
+      expect(chatView).toContain('Show earlier messages');
+      expect(chatView).not.toContain('this.messages.map((m, i) => this._renderMessage(m, i))');
+    });
   });
 
   describe('Session Management', () => {
@@ -92,9 +138,10 @@ describe('Dashboard UX Polish', () => {
       expect(DASHBOARD_HTML).toContain('/api/auth/check');
     });
 
-    it('uses Bearer token for authorization', () => {
-      expect(DASHBOARD_HTML).toContain('Bearer');
-      expect(DASHBOARD_HTML).toContain('Authorization');
+    it('uses cookie-backed dashboard authorization', () => {
+      expect(DASHBOARD_HTML).toContain('credentials:`same-origin`');
+      expect(DASHBOARD_HTML).toContain('/api/auth/logout');
+      expect(DASHBOARD_HTML).not.toContain('Bearer');
     });
   });
 

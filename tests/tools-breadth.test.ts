@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
+import { ToolRegistry, createClarifyTool, createDefaultWorkerRegistry, createImageGenerateTool, createSendMessageTool, createSkillPreviewTool, createTerminalSession, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '../packages/tools/src/index.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe('tool breadth extensions', () => {
@@ -22,6 +24,81 @@ describe('tool breadth extensions', () => {
     expect(result.ok).toBe(true);
     expect(result.output).toBe('hello from web');
     expect(result.metadata).toMatchObject({ status: 200, url: 'https://example.com' });
+  });
+
+  it('fetches reader-mode markdown with a byte cap', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      '<html><body><h1>CrowClaw</h1><p>Readable <a href="/docs">docs</a> content.</p><script>skip()</script></body></html>',
+      { status: 200, headers: { 'content-type': 'text/html' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com',
+      format: 'markdown',
+      maxBytes: 200,
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-reader'
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.output).toContain('# CrowClaw');
+    expect(result.output).toContain('[docs](/docs)');
+    expect(result.output).not.toContain('skip()');
+    expect(result.metadata).toMatchObject({ mode: 'markdown', maxBytes: 200, truncated: false });
+  });
+
+  it('defaults web.fetch to a 200KB byte cap', async () => {
+    const fetchMock = vi.fn(async () => new Response('x'.repeat(250_000), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com/large',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-default-cap'
+    });
+
+    expect(result.output).toHaveLength(200_000);
+    expect(result.metadata).toMatchObject({ maxBytes: 200_000, truncated: true, format: 'raw' });
+  });
+
+  it('truncates web.fetch output at maxBytes', async () => {
+    const fetchMock = vi.fn(async () => new Response('abcdefghijklmnopqrstuvwxyz', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com',
+      maxBytes: 5,
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-cap'
+    });
+
+    expect(result.output).toBe('abcde');
+    expect(result.metadata).toMatchObject({ bytesRead: 5, truncated: true });
+  });
+
+  it('respects web.fetch response charset', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      new Uint8Array([0x63, 0x61, 0x66, 0xe9]),
+      { status: 200, headers: { 'content-type': 'text/plain; charset=windows-1252' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com/latin1',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-charset'
+    });
+
+    expect(result.output).toBe('café');
   });
 
   it('applies deterministic replacements with the text.patch tool', async () => {
@@ -90,6 +167,40 @@ describe('tool breadth extensions', () => {
     expect(result.ok).toBe(true);
     expect(result.output).toContain('CrowClaw Result A');
     expect(result.output).toContain('https://example.com/a');
+    expect(result.metadata).toMatchObject({ provider: 'duckduckgo' });
+  });
+
+  it('falls back across structured web.search providers', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/brave')) {
+        return new Response('rate limited', { status: 429 });
+      }
+      if (url.includes('/tavily')) {
+        return new Response(JSON.stringify({
+          results: [{ title: 'Tavily Result', url: 'https://example.com/tavily', content: 'structured snippet' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebSearchTool());
+    const result = await registry.execute('web.search', {
+      query: 'crowclaw',
+      providers: [
+        { name: 'brave', baseUrl: 'https://example.com/brave', apiKey: 'brave-key' },
+        { name: 'tavily', baseUrl: 'https://example.com/tavily', apiKey: 'tavily-key' },
+      ],
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'search-fallback'
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.metadata).toMatchObject({ provider: 'tavily', count: 1 });
+    expect(result.output).toContain('Tavily Result');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('crawls linked pages with the web.crawl tool', async () => {
@@ -220,15 +331,58 @@ describe('tool breadth extensions', () => {
     expect(image.output).toContain('"size": "512x512"');
   });
 
+  it('auto-selects Gemini and Replicate from environment keys', async () => {
+    vi.stubEnv('GOOGLE_API_KEY', 'google-key');
+    vi.stubEnv('REPLICATE_API_TOKEN', 'replicate-key');
+    vi.stubEnv('OPENAI_API_KEY', '');
+
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('generativelanguage.googleapis.com')) {
+        return new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'Gemini analysis' }] } }]
+        }), { status: 200 });
+      }
+      if (url.includes('api.replicate.com')) {
+        return new Response(JSON.stringify({ output: ['https://example.com/replicate.png'] }), { status: 200 });
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry()
+      .register(createVisionAnalyzeTool())
+      .register(createImageGenerateTool());
+
+    const vision = await registry.execute('vision.analyze', {
+      url: 'data:image/png;base64,ZmFrZQ==',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'vision-env'
+    });
+    expect(vision.ok).toBe(true);
+    expect(vision.metadata).toMatchObject({ provider: 'gemini', model: 'gemini-1.5-flash' });
+
+    const image = await registry.execute('image.generate', {
+      prompt: 'a fallback image',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'image-env'
+    });
+    expect(image.ok).toBe(true);
+    expect(image.metadata).toMatchObject({ provider: 'replicate' });
+  });
+
   it('supports local terminal exec/background/processes/kill foundations', async () => {
+    const terminalSession = createTerminalSession();
     const registry = new ToolRegistry()
       .register(createTerminalExecTool())
-      .register(createTerminalBackgroundTool())
+      .register(createTerminalBackgroundTool({ terminalSession }))
       .register(createTerminalBackendsTool())
       .register(createTerminalBackendStatusTool())
       .register(createTerminalProbeTool())
-      .register(createTerminalProcessesTool())
-      .register(createTerminalKillTool());
+      .register(createTerminalProcessesTool({ terminalSession }))
+      .register(createTerminalKillTool({ terminalSession }));
 
     const backends = await registry.execute('terminal.backends', {}, {
       agentId: 'crowclaw',
@@ -284,7 +438,7 @@ describe('tool breadth extensions', () => {
     });
     expect(dockerPlan.ok).toBe(true);
     // #129/#70/#71 — container quoted, --user pinned to non-root uid:gid.
-    expect(dockerPlan.output).toContain("docker exec --user 1000:1000 'app'");
+    expect(dockerPlan.output).toContain("docker exec --user 65534:65534 'app'");
 
     const sshPlan = await registry.execute('terminal.exec', { backend: 'ssh', target: 'demo@example.com', command: 'uname -a', planOnly: true }, {
       agentId: 'crowclaw',
@@ -313,5 +467,75 @@ describe('tool breadth extensions', () => {
     });
     expect(kill.ok).toBe(true);
     expect(kill.output).toContain('"killed"');
+  });
+
+  it('shares terminal background process tracking through an explicit terminal session', async () => {
+    const terminalSession = createTerminalSession();
+    const registry = new ToolRegistry()
+      .register(createTerminalBackgroundTool({ terminalSession }))
+      .register(createTerminalProcessesTool({ terminalSession }))
+      .register(createTerminalKillTool({ terminalSession }));
+
+    const started = await registry.execute('terminal.background', { command: 'sleep 5', __approvalGranted: true }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-a'
+    });
+    expect(started.ok).toBe(true);
+    const payload = JSON.parse(started.output) as { pid: number };
+
+    const sameSession = await registry.execute('terminal.processes', {}, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-a'
+    });
+    expect(sameSession.output).toContain(String(payload.pid));
+
+    const otherContext = await registry.execute('terminal.processes', {}, {
+      agentId: 'crowclaw',
+      sessionId: 'term-session-b'
+    });
+    expect(otherContext.output).toContain(String(payload.pid));
+
+    await registry.execute('terminal.kill', { pid: payload.pid }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-a'
+    });
+  });
+
+  it('does not share terminal background process state across default registries', async () => {
+    const registryA = createDefaultWorkerRegistry();
+    const registryB = createDefaultWorkerRegistry();
+    const context = {
+      agentId: 'crowclaw',
+      sessionId: 'term-default-registry-isolation',
+    };
+
+    const started = await registryA.execute('terminal.background', { command: 'sleep 5', __approvalGranted: true }, context);
+    expect(started.ok).toBe(true);
+    const payload = JSON.parse(started.output) as { pid: number };
+
+    const registryAProcesses = await registryA.execute('terminal.processes', {}, context);
+    expect(registryAProcesses.output).toContain(String(payload.pid));
+
+    const registryBProcesses = await registryB.execute('terminal.processes', {}, context);
+    expect(registryBProcesses.output).not.toContain(String(payload.pid));
+
+    await registryA.execute('terminal.kill', { pid: payload.pid }, context);
+  });
+
+  it('previews skill manifests without installing or executing them', async () => {
+    const registry = new ToolRegistry().register(createSkillPreviewTool());
+    const result = await registry.execute('skill.preview', {
+      content: `---\nname: demo-skill\ndescription: Demo skill\ntriggers:\n  - demo\ntools:\n  - workspace.read\n---\nUse this skill to inspect a workspace safely.`,
+      maxChars: 20,
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'skill-preview'
+    });
+
+    expect(result.ok).toBe(true);
+    const preview = JSON.parse(result.output) as { name: string; tools: string[]; instructionPreview: string };
+    expect(preview.name).toBe('demo-skill');
+    expect(preview.tools).toEqual(['workspace.read']);
+    expect(preview.instructionPreview.length).toBeLessThanOrEqual(20);
   });
 });

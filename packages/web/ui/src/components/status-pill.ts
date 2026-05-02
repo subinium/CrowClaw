@@ -230,7 +230,7 @@ export class CrowClawStatusPill extends LitElement {
       padding: 4px 10px;
       border-radius: 999px;
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       cursor: pointer;
       font-size: var(--text-xs, 11px);
       color: var(--text-secondary, #8e8e93);
@@ -273,7 +273,7 @@ export class CrowClawStatusPill extends LitElement {
       right: 0;
       min-width: 280px;
       background: var(--bg-secondary, #13131a);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-md, 8px);
       box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.5));
       padding: 12px;
@@ -292,7 +292,7 @@ export class CrowClawStatusPill extends LitElement {
       align-items: flex-start;
       gap: 8px;
       padding: 6px 0;
-      border-bottom: 1px solid var(--glass-border, rgba(255, 255, 255, 0.06));
+      border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.06));
       font-size: var(--text-xs, 11px);
     }
 
@@ -336,7 +336,7 @@ export class CrowClawStatusPill extends LitElement {
       flex-direction: column;
       gap: 4px;
       padding-top: 8px;
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
     }
 
     .action-btn {
@@ -348,7 +348,7 @@ export class CrowClawStatusPill extends LitElement {
       font-family: inherit;
       color: var(--text-primary, #ededef);
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-sm, 6px);
       cursor: pointer;
       transition: background var(--duration-fast, 120ms) ease;

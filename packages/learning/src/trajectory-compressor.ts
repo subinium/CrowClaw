@@ -65,6 +65,9 @@ function compressKeyTurns(turns: TrajectoryTurn[]): TrajectoryTurn[] {
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
+    if (!turn) {
+      continue;
+    }
 
     // Always keep user messages
     if (turn.role === 'user') {

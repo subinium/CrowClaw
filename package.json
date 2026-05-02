@@ -1,6 +1,6 @@
 {
   "name": "crowclaw",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "description": "A self-improving TypeScript agent framework that learns from every conversation.",
   "bin": {
@@ -27,7 +27,8 @@
     "preflight": "npm run typecheck && npm test",
     "release:check": "npm run preflight",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "deploy:vps": "docker compose up -d --build"
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.8.9"

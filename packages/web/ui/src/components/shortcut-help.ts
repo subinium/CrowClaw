@@ -116,7 +116,7 @@ export class CrowClawShortcutHelp extends LitElement {
     }
     .close:hover {
       color: var(--text, var(--text-primary, #ededef));
-      background: var(--surface-1, var(--glass-bg, rgba(255, 255, 255, 0.04)));
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
     }
     .close:focus { outline: none; }
     .close:focus-visible {
@@ -190,7 +190,7 @@ export class CrowClawShortcutHelp extends LitElement {
       min-width: 22px;
       height: 22px;
       padding: 0 6px;
-      background: var(--surface-1, var(--glass-bg, rgba(255, 255, 255, 0.04)));
+      background: var(--surface-1, rgba(255, 255, 255, 0.04));
       border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-sm, 6px);
       font-family: var(--font-mono, ui-monospace, monospace);

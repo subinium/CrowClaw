@@ -1,4 +1,5 @@
-import type { ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
+import type { ParsedSkillFile, SkillManifest, ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
+import { parseSkillFile } from '@crowclaw/core';
 import { resolveAndValidateUrl, validateFetchUrl } from '@crowclaw/core';
 
 export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
@@ -6,7 +7,7 @@ export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js
 import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision.js';
 export { createImageGenerateTool, type ImageGenerationOptions } from './image-gen.js';
 import { createImageGenerateTool as createImageGenerateToolImpl } from './image-gen.js';
-export { createTtsTool, createTranscriptionTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
+export { createTtsTool, createTranscriptionTool, createSttTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
 // v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
 // not registered by `registerCoreTools` and not in the default agent toolset.
@@ -29,10 +30,10 @@ import { createScheduledAgentJob } from '@crowclaw/scheduler';
 import type { MemoryRecord, MemoryStore, SessionSearchStore } from '@crowclaw/storage';
 import type { WorkspaceStore } from '@crowclaw/workspace';
 
-type BackgroundProcessRecord = {
+export type BackgroundProcessRecord = {
   pid: number;
   command: string;
-  backend: 'local' | 'docker' | 'ssh';
+  backend: 'local' | 'docker' | 'ssh' | 'singularity';
   resolvedCommand: string;
   cwd?: string;
   startedAt: string;
@@ -44,9 +45,39 @@ type BackgroundProcessRecord = {
   };
 };
 
-const backgroundProcesses = new Map<number, BackgroundProcessRecord>();
+export type BackgroundProcessStore = Map<number, BackgroundProcessRecord>;
 
-type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'modal' | 'daytona';
+export type TerminalSession = {
+  backgroundProcesses: BackgroundProcessStore;
+};
+
+export function createTerminalSession(backgroundProcesses: BackgroundProcessStore = new Map()): TerminalSession {
+  return { backgroundProcesses };
+}
+
+export type TerminalSessionOptions = {
+  terminalSession?: TerminalSession;
+  backgroundProcesses?: BackgroundProcessStore;
+};
+
+function resolveTerminalBackgroundProcessStore(options?: TerminalSessionOptions): BackgroundProcessStore {
+  return options?.backgroundProcesses ?? options?.terminalSession?.backgroundProcesses ?? new Map();
+}
+
+function getBackgroundProcessStore(
+  context: ToolExecutionContext,
+  fallbackStore: BackgroundProcessStore,
+): BackgroundProcessStore {
+  const contextWithStore = context as ToolExecutionContext & {
+    backgroundProcesses?: BackgroundProcessStore;
+  };
+  if (contextWithStore.backgroundProcesses) {
+    return contextWithStore.backgroundProcesses;
+  }
+  return fallbackStore;
+}
+
+type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'singularity' | 'modal' | 'daytona';
 
 type TerminalBackendDescriptor = {
   backend: TerminalBackendKind;
@@ -84,6 +115,13 @@ const TERMINAL_BACKENDS: TerminalBackendDescriptor[] = [
     requires: ['target']
   },
   {
+    backend: 'singularity',
+    status: 'available',
+    execution: 'wrapped',
+    description: 'Wraps commands through Singularity/Apptainer exec for HPC container execution.',
+    requires: ['image']
+  },
+  {
     backend: 'modal',
     status: 'planned',
     execution: 'descriptor',
@@ -100,7 +138,7 @@ const TERMINAL_BACKENDS: TerminalBackendDescriptor[] = [
 ];
 
 function normalizeTerminalBackend(input: unknown): TerminalBackendKind {
-  return input === 'docker' || input === 'ssh' || input === 'modal' || input === 'daytona'
+  return input === 'docker' || input === 'ssh' || input === 'singularity' || input === 'modal' || input === 'daytona'
     ? input
     : 'local';
 }
@@ -120,6 +158,7 @@ const DOCKER_IMAGE_RE = /^[a-zA-Z0-9._/:@-]+$/;
 const DOCKER_CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 // SSH target: [user@]host[:port]; allow the same as the issue spec.
 const SSH_TARGET_RE = /^[a-zA-Z0-9._@:-]+$/;
+const SINGULARITY_IMAGE_RE = /^[a-zA-Z0-9._/:@-]+$/;
 
 function isValidDockerImage(value: string): boolean {
   return value.length > 0 && value.length <= 255 && DOCKER_IMAGE_RE.test(value);
@@ -133,13 +172,16 @@ function isValidSshTarget(value: string): boolean {
   return value.length > 0 && value.length <= 255 && SSH_TARGET_RE.test(value);
 }
 
+function isValidSingularityImage(value: string): boolean {
+  return value.length > 0 && value.length <= 255 && SINGULARITY_IMAGE_RE.test(value);
+}
+
 // #70 / NemoClaw CVE-2026-32048 — required hardening flags for any docker
 // run/exec invocation. no-new-privileges blocks setuid escalation; cap-drop
 // ALL strips Linux capabilities (NET_ADMIN, SYS_ADMIN, etc.); --user pins a
-// non-root uid:gid (#71 — set uid/gid on copies into sandbox) so processes
-// crossing the host→container boundary cannot run as root inside the
-// container.
-const DOCKER_HARDENING_FLAGS = '--security-opt no-new-privileges --cap-drop ALL --user 1000:1000';
+// non-root nobody uid:gid (#273) and the default run path has no network,
+// read-only rootfs, bounded CPU/memory, and a small writable /tmp.
+const DOCKER_HARDENING_FLAGS = '--read-only --security-opt no-new-privileges --cap-drop ALL --user 65534:65534 --network none --memory 256m --cpus 0.5 --tmpfs /tmp:rw,size=64m';
 
 function resolveTerminalCommandPlan(input: Record<string, unknown>): {
   ok: boolean;
@@ -188,7 +230,7 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
     // allowlist above. #70 — every docker invocation gets the hardening
     // flags so a compromised agent cannot get a privileged shell.
     const resolvedCommand = container
-      ? `docker exec --user 1000:1000 ${quoteShell(container)} /bin/sh -lc ${quoteShell(wrappedCommand)}`
+      ? `docker exec --user 65534:65534 ${quoteShell(container)} /bin/sh -lc ${quoteShell(wrappedCommand)}`
       : `docker run --rm ${DOCKER_HARDENING_FLAGS} ${quoteShell(image)} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
     return {
       ok: true,
@@ -218,6 +260,26 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
       cwd,
       resolvedCommand,
       metadata: { backend, target, mode: 'wrapped', cwd }
+    };
+  }
+
+  if (backend === 'singularity') {
+    const image = typeof input.image === 'string' ? input.image.trim() : '';
+    if (!image) {
+      return { ok: false, backend, command, output: 'Singularity backend requires image.' };
+    }
+    if (!isValidSingularityImage(image)) {
+      return { ok: false, backend, command, output: `Singularity image rejected: invalid characters or format (${image}).` };
+    }
+    const wrappedCommand = cwd ? `cd ${quoteShell(cwd)} && ${command}` : command;
+    const resolvedCommand = `singularity exec --contain --cleanenv ${quoteShell(image)} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
+    return {
+      ok: true,
+      backend,
+      command,
+      cwd,
+      resolvedCommand,
+      metadata: { backend, image, mode: 'wrapped', cwd, contained: true }
     };
   }
 
@@ -327,6 +389,17 @@ async function probeTerminalBackends(): Promise<TerminalBackendStatus[]> {
         installed,
         command: 'ssh',
         details: installed ? 'ssh client detected for remote execution wrapping.' : 'ssh client not detected on PATH.'
+      });
+      continue;
+    }
+    if (descriptor.backend === 'singularity') {
+      const singularityInstalled = await isCommandInstalled('singularity');
+      const apptainerInstalled = await isCommandInstalled('apptainer');
+      results.push({
+        ...descriptor,
+        installed: singularityInstalled || apptainerInstalled,
+        command: singularityInstalled ? 'singularity' : apptainerInstalled ? 'apptainer' : 'singularity',
+        details: singularityInstalled || apptainerInstalled ? 'Singularity/Apptainer CLI detected for HPC container execution.' : 'Singularity/Apptainer CLI not detected on PATH.'
       });
       continue;
     }
@@ -555,6 +628,95 @@ export class ToolRegistry implements ToolCatalog, ToolExecutor {
   }
 }
 
+export interface SkillPreview {
+  name: string;
+  description: string;
+  triggers: string[];
+  tools: string[];
+  categories: string[];
+  instructionPreview: string;
+  instructionChars: number;
+  requires?: SkillManifest['requires'];
+  configRequirements?: SkillManifest['config_requirements'];
+  hashMismatch?: boolean;
+}
+
+function normalizePreviewText(value: string, maxChars: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+export function buildSkillPreview(skill: ParsedSkillFile, maxChars = 400): SkillPreview {
+  const manifest = skill.manifest;
+  return {
+    name: manifest.name,
+    description: manifest.description,
+    triggers: manifest.triggers ?? [],
+    tools: manifest.tools ?? [],
+    categories: manifest.categories ?? (manifest.category ? [manifest.category] : []),
+    instructionPreview: normalizePreviewText(skill.instructions, maxChars),
+    instructionChars: skill.instructions.length,
+    requires: manifest.requires,
+    configRequirements: manifest.config_requirements,
+    hashMismatch: skill.hashMismatch,
+  };
+}
+
+export function previewSkillMarkdown(content: string, options: { filePath?: string; maxChars?: number } = {}): SkillPreview {
+  const parsed = parseSkillFile(content, options.filePath);
+  if (!parsed) {
+    throw new Error('Invalid skill manifest: missing YAML frontmatter or name.');
+  }
+  return buildSkillPreview(parsed, options.maxChars);
+}
+
+export function createSkillPreviewTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'skill.preview',
+      description: 'Parses a SKILL.md document and returns a safe manifest/instruction preview without installing or executing it.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'Full SKILL.md markdown content with YAML frontmatter.' },
+          filePath: { type: 'string', description: 'Optional path used only for diagnostics/hash checks.' },
+          maxChars: { type: 'number', description: 'Maximum instruction preview characters.' },
+        },
+        required: ['content'],
+      },
+    },
+    async execute(input) {
+      const content = typeof input.content === 'string' ? input.content : '';
+      if (!content) {
+        return { toolName: 'skill.preview', runtime: 'worker', ok: false, output: 'Missing content.' };
+      }
+      try {
+        const preview = previewSkillMarkdown(content, {
+          filePath: typeof input.filePath === 'string' ? input.filePath : undefined,
+          maxChars: typeof input.maxChars === 'number' ? input.maxChars : undefined,
+        });
+        return {
+          toolName: 'skill.preview',
+          runtime: 'worker',
+          ok: true,
+          output: JSON.stringify(preview, null, 2),
+          metadata: { name: preview.name, tools: preview.tools, triggers: preview.triggers },
+        };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { toolName: 'skill.preview', runtime: 'worker', ok: false, output: message };
+      }
+    },
+  };
+}
+
 export function createEchoTool(): ToolDefinition {
   return {
     manifest: {
@@ -614,10 +776,28 @@ export function createWebFetchTool(): ToolDefinition {
       requiresWorkspace: false,
       requiresNetwork: true,
       dangerLevel: 'medium',
-      inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The URL to fetch' } }, required: ['url'] }
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'The URL to fetch' },
+          format: { type: 'string', enum: ['raw', 'text', 'markdown'], description: 'Return raw text, readable text, or reader-mode markdown' },
+          mode: { type: 'string', enum: ['text', 'reader', 'markdown'], description: 'Deprecated alias for format' },
+          maxBytes: { type: 'number', description: 'Maximum response bytes to read before truncating' }
+        },
+        required: ['url']
+      }
     },
     async execute(input, context) {
       const url = typeof input.url === 'string' ? input.url : '';
+      const rawFormat = typeof input.format === 'string' ? input.format : typeof input.mode === 'string' ? input.mode : 'raw';
+      const format = rawFormat === 'reader' || rawFormat === 'markdown'
+        ? 'markdown'
+        : rawFormat === 'text'
+          ? 'text'
+          : 'raw';
+      const maxBytes = typeof input.maxBytes === 'number' && Number.isFinite(input.maxBytes)
+        ? Math.max(1, Math.floor(input.maxBytes))
+        : 200_000;
       if (!url) {
         return {
           toolName: 'web.fetch',
@@ -633,13 +813,20 @@ export function createWebFetchTool(): ToolDefinition {
       }
 
       const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
-      const text = await response.text();
+      const { text, truncated, bytesRead } = await readResponseTextWithByteCap(response, maxBytes);
+      const contentType = response.headers.get('content-type') ?? '';
+      const isHtml = /html/i.test(contentType);
+      const output = format === 'markdown' && isHtml
+        ? extractReadableMarkdown(text)
+        : format === 'text' && isHtml
+          ? extractReadableText(text)
+          : text;
       return {
         toolName: 'web.fetch',
         runtime: 'worker',
         ok: response.ok,
-        output: text,
-        metadata: { status: response.status, url }
+        output,
+        metadata: { status: response.status, url, mode: format, format, maxBytes, bytesRead, truncated }
       };
     }
   };
@@ -661,9 +848,9 @@ export function createTerminalExecTool(): ToolDefinition {
         properties: {
           command: { type: 'string', description: 'The shell command to execute' },
           raw: { type: 'string', description: 'Alias for command' },
-          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, modal, daytona)' },
+          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, singularity, modal, daytona)' },
           container: { type: 'string', description: 'Docker container name (for docker backend)' },
-          image: { type: 'string', description: 'Docker image name (for docker backend)' },
+          image: { type: 'string', description: 'Docker/Singularity image name (for container backends)' },
           target: { type: 'string', description: 'SSH target host (for ssh backend)' },
           cwd: { type: 'string', description: 'Working directory for the command' },
           timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds for local execution' },
@@ -746,7 +933,8 @@ export function createTerminalExecTool(): ToolDefinition {
   };
 }
 
-export function createTerminalBackgroundTool(): ToolDefinition {
+export function createTerminalBackgroundTool(options?: TerminalSessionOptions): ToolDefinition {
+  const backgroundProcesses = resolveTerminalBackgroundProcessStore(options);
   return {
     manifest: {
       name: 'terminal.background',
@@ -762,9 +950,9 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         properties: {
           command: { type: 'string', description: 'The shell command to run in the background' },
           raw: { type: 'string', description: 'Alias for command' },
-          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, modal, daytona)' },
+          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, singularity, modal, daytona)' },
           container: { type: 'string', description: 'Docker container name (for docker backend)' },
-          image: { type: 'string', description: 'Docker image name (for docker backend)' },
+          image: { type: 'string', description: 'Docker/Singularity image name (for container backends)' },
           target: { type: 'string', description: 'SSH target host (for ssh backend)' },
           cwd: { type: 'string', description: 'Working directory for the background command' },
           planOnly: { type: 'boolean', description: 'If true, return the resolved command plan without executing' }
@@ -830,7 +1018,7 @@ export function createTerminalBackgroundTool(): ToolDefinition {
       const record: BackgroundProcessRecord = {
         pid,
         command: plan.command,
-        backend: plan.backend === 'local' || plan.backend === 'docker' || plan.backend === 'ssh' ? plan.backend : 'local',
+        backend: plan.backend === 'local' || plan.backend === 'docker' || plan.backend === 'ssh' || plan.backend === 'singularity' ? plan.backend : 'local',
         resolvedCommand,
         cwd,
         startedAt: new Date().toISOString(),
@@ -841,7 +1029,7 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         record.status = record.status === 'killed' ? 'killed' : 'exited';
         record.exitCode = code;
       });
-      backgroundProcesses.set(pid, record);
+      getBackgroundProcessStore(context, backgroundProcesses).set(pid, record);
       return {
         toolName: 'terminal.background',
         runtime: 'worker',
@@ -933,7 +1121,9 @@ export function createTerminalProbeTool(): ToolDefinition {
           ? 'docker --version'
           : backend === 'ssh'
             ? 'ssh -V'
-            : '';
+            : backend === 'singularity'
+              ? 'singularity --version'
+              : '';
       if (!probeCommand) {
         return {
           toolName: 'terminal.probe',
@@ -962,7 +1152,8 @@ export function createTerminalProbeTool(): ToolDefinition {
   };
 }
 
-export function createTerminalProcessesTool(): ToolDefinition {
+export function createTerminalProcessesTool(options?: TerminalSessionOptions): ToolDefinition {
+  const backgroundProcesses = resolveTerminalBackgroundProcessStore(options);
   return {
     manifest: {
       name: 'terminal.processes',
@@ -975,8 +1166,8 @@ export function createTerminalProcessesTool(): ToolDefinition {
       dangerLevel: 'low',
       inputSchema: { type: 'object', properties: {}, required: [] }
     },
-    async execute() {
-      const processes = [...backgroundProcesses.values()].map((record) => ({
+    async execute(_input, context) {
+      const processes = [...getBackgroundProcessStore(context, backgroundProcesses).values()].map((record) => ({
         pid: record.pid,
         command: record.command,
         backend: record.backend,
@@ -996,7 +1187,8 @@ export function createTerminalProcessesTool(): ToolDefinition {
   };
 }
 
-export function createTerminalKillTool(): ToolDefinition {
+export function createTerminalKillTool(options?: TerminalSessionOptions): ToolDefinition {
+  const backgroundProcesses = resolveTerminalBackgroundProcessStore(options);
   return {
     manifest: {
       name: 'terminal.kill',
@@ -1015,17 +1207,19 @@ export function createTerminalKillTool(): ToolDefinition {
         required: ['pid']
       }
     },
-    async execute(input) {
+    async execute(input, context) {
       const pid = typeof input.pid === 'number' ? input.pid : Number(input.pid);
       if (!pid || Number.isNaN(pid)) {
         return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: 'Missing pid.' };
       }
-      const record = backgroundProcesses.get(pid);
+      const store = getBackgroundProcessStore(context, backgroundProcesses);
+      const record = store.get(pid);
       if (!record) {
         return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: `Unknown pid: ${pid}` };
       }
       record.handle.kill('SIGTERM');
       record.status = 'killed';
+      store.delete(pid);
       return {
         toolName: 'terminal.kill',
         runtime: 'worker',
@@ -1042,6 +1236,57 @@ function extractTag(html: string, pattern: RegExp): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
+async function readResponseTextWithByteCap(
+  response: Response,
+  maxBytes: number,
+): Promise<{ text: string; bytesRead: number; truncated: boolean }> {
+  const contentType = response.headers.get('content-type') ?? '';
+  const charset = contentType.match(/charset=([^;\s]+)/i)?.[1]?.trim().replace(/^["']|["']$/g, '');
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset || 'utf-8');
+  } catch {
+    decoder = new TextDecoder();
+  }
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const slice = bytes.slice(0, maxBytes);
+    return {
+      text: decoder.decode(slice),
+      bytesRead: slice.byteLength,
+      truncated: bytes.byteLength > maxBytes,
+    };
+  }
+
+  const chunks: Uint8Array[] = [];
+  let bytesRead = 0;
+  let truncated = false;
+  while (bytesRead < maxBytes) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    const remaining = maxBytes - bytesRead;
+    if (value.byteLength > remaining) {
+      chunks.push(value.slice(0, remaining));
+      bytesRead += remaining;
+      truncated = true;
+      await reader.cancel().catch(() => undefined);
+      break;
+    }
+    chunks.push(value);
+    bytesRead += value.byteLength;
+  }
+
+  const merged = new Uint8Array(bytesRead);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: decoder.decode(merged), bytesRead, truncated };
+}
+
 function extractReadableText(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -1054,6 +1299,37 @@ function extractReadableText(html: string): string {
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+}
+
+function extractReadableMarkdown(html: string): string {
+  const body = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ');
+
+  return decodeHtmlEntities(body)
+    .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, '\n# $1\n')
+    .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, '\n## $1\n')
+    .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, '\n### $1\n')
+    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '\n- $1')
+    .replace(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+    .replace(/<\/(p|div|section|article|ul|ol|br)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
     .split('\n')
     .map((line) => line.replace(/\s+/g, ' ').trim())
     .filter(Boolean)
@@ -1178,7 +1454,10 @@ export function createWebExtractLinksTool(): ToolDefinition {
       const html = await response.text();
       const hrefs = [...new Set(
         [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
-          .map((match) => resolveHref(url, match[1]))
+          .map((match) => {
+            const href = match[1];
+            return href ? resolveHref(url, href) : null;
+          })
           .filter((href): href is string => Boolean(href))
       )];
       return {
@@ -1235,6 +1514,179 @@ export function createWebExtractTextTool(): ToolDefinition {
   };
 }
 
+interface WebSearchProviderConfig {
+  name: 'brave' | 'tavily' | 'duckduckgo' | 'exa';
+  baseUrl?: string;
+  apiKey?: string;
+}
+
+interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+  provider: string;
+  rank: number;
+}
+
+function envValue(name: string): string | undefined {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+}
+
+function normalizeSearchProviders(input: Record<string, unknown>): WebSearchProviderConfig[] {
+  if (typeof input.providerBaseUrl === 'string') {
+    return [{ name: 'duckduckgo', baseUrl: input.providerBaseUrl }];
+  }
+  if (Array.isArray(input.providers)) {
+    return input.providers
+      .map((entry): WebSearchProviderConfig | null => {
+        if (typeof entry === 'string' && ['brave', 'tavily', 'duckduckgo', 'exa'].includes(entry)) {
+          return { name: entry as WebSearchProviderConfig['name'] };
+        }
+        if (!entry || typeof entry !== 'object') return null;
+        const obj = entry as Record<string, unknown>;
+        const name = String(obj.name ?? '').toLowerCase();
+        if (!['brave', 'tavily', 'duckduckgo', 'exa'].includes(name)) return null;
+        return {
+          name: name as WebSearchProviderConfig['name'],
+          baseUrl: typeof obj.baseUrl === 'string' ? obj.baseUrl : undefined,
+          apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : undefined,
+        };
+      })
+      .filter((provider): provider is WebSearchProviderConfig => provider !== null);
+  }
+
+  const providers: WebSearchProviderConfig[] = [];
+  const braveKey = envValue('BRAVE_SEARCH_API_KEY') ?? envValue('BRAVE_API_KEY');
+  const tavilyKey = envValue('TAVILY_API_KEY');
+  const exaKey = envValue('EXA_API_KEY');
+  if (braveKey) providers.push({ name: 'brave', apiKey: braveKey });
+  if (tavilyKey) providers.push({ name: 'tavily', apiKey: tavilyKey });
+  providers.push({ name: 'duckduckgo' });
+  if (exaKey) providers.push({ name: 'exa', apiKey: exaKey });
+  return providers;
+}
+
+async function fetchSearchProvider(
+  provider: WebSearchProviderConfig,
+  query: string,
+  limit: number,
+  signal?: AbortSignal
+): Promise<{ status: number; results: WebSearchResult[] }> {
+  if (provider.name === 'brave') {
+    const url = new URL(provider.baseUrl ?? 'https://api.search.brave.com/res/v1/web/search');
+    url.searchParams.set('q', query);
+    url.searchParams.set('count', String(limit));
+    const response = await safeSearchFetch(url, signal, provider.apiKey ? { 'X-Subscription-Token': provider.apiKey } : {});
+    const json = await response.json() as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+    return { status: response.status, results: normalizeJsonSearchResults(provider.name, json.web?.results ?? [], limit) };
+  }
+
+  if (provider.name === 'tavily') {
+    const url = new URL(provider.baseUrl ?? 'https://api.tavily.com/search');
+    const response = await safeSearchFetch(url, signal, provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {}, {
+      method: 'POST',
+      body: JSON.stringify({ query, max_results: limit, api_key: provider.apiKey }),
+    });
+    const json = await response.json() as { results?: Array<{ title?: string; url?: string; content?: string; snippet?: string }> };
+    return { status: response.status, results: normalizeJsonSearchResults(provider.name, json.results ?? [], limit) };
+  }
+
+  if (provider.name === 'exa') {
+    const url = new URL(provider.baseUrl ?? 'https://api.exa.ai/search');
+    const response = await safeSearchFetch(url, signal, provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {}, {
+      method: 'POST',
+      body: JSON.stringify({ query, numResults: limit }),
+    });
+    const json = await response.json() as { results?: Array<{ title?: string; url?: string; text?: string; highlights?: string[] }> };
+    return { status: response.status, results: normalizeJsonSearchResults(provider.name, json.results ?? [], limit) };
+  }
+
+  const url = new URL(provider.baseUrl ?? 'https://duckduckgo.com/html/');
+  url.searchParams.set('q', query);
+  const response = await safeSearchFetch(url, signal);
+  const html = await response.text();
+  return { status: response.status, results: parseDuckDuckGoResults(url.toString(), html, limit, provider.name) };
+}
+
+async function safeSearchFetch(
+  url: URL,
+  signal?: AbortSignal,
+  headers: Record<string, string> = {},
+  init: RequestInit = {}
+): Promise<Response> {
+  const searchUrlCheck = await safeFetchPreflight(url.toString());
+  if (!searchUrlCheck.safe) {
+    throw new Error(`URL blocked: ${searchUrlCheck.reason}`);
+  }
+  const response = await fetch(url, {
+    ...init,
+    signal,
+    redirect: 'manual',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; CrowClaw/0.1; +https://github.com/subinium/CrowClaw)',
+      ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...headers,
+      ...(init.headers as Record<string, string> | undefined),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response;
+}
+
+function normalizeJsonSearchResults(
+  provider: string,
+  rows: Array<Record<string, unknown>>,
+  limit: number
+): WebSearchResult[] {
+  return rows
+    .map((row, index) => {
+      const title = String(row.title ?? row.url ?? '').trim();
+      const url = String(row.url ?? '').trim();
+      const snippet = String(row.description ?? row.content ?? row.snippet ?? row.text ?? (Array.isArray(row.highlights) ? row.highlights[0] : '') ?? title).trim();
+      return title && url ? { title, url, snippet, provider, rank: index + 1 } : null;
+    })
+    .filter((result): result is WebSearchResult => result !== null)
+    .slice(0, limit);
+}
+
+function parseDuckDuckGoResults(searchUrl: string, html: string, limit: number, provider: string): WebSearchResult[] {
+  const ddgResults: WebSearchResult[] = [];
+  const resultBlockRegex = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
+  for (const block of html.matchAll(resultBlockRegex)) {
+    const content = block[1];
+    if (!content) continue;
+    const linkMatch = content.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    const snippetMatch = content.match(/<(?:a|td|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|span)>/i);
+    if (linkMatch) {
+      const rawHref = linkMatch[1];
+      const rawTitle = linkMatch[2];
+      if (!rawHref || !rawTitle) continue;
+      const href = resolveHref(searchUrl, rawHref) ?? rawHref;
+      const title = rawTitle.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const snippetSource = snippetMatch?.[1];
+      const snippet = snippetSource
+        ? snippetSource.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+        : title;
+      if (href && title) ddgResults.push({ title, url: href, snippet, provider, rank: ddgResults.length + 1 });
+    }
+  }
+  const results = ddgResults.length > 0
+    ? ddgResults
+    : [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
+        .map((match, index) => {
+          const rawHref = match[1];
+          const rawTitle = match[2];
+          if (!rawHref || !rawTitle) return null;
+          const href = resolveHref(searchUrl, rawHref) ?? rawHref;
+          const title = rawTitle.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          return href && title ? { title, url: href, snippet: title, provider, rank: index + 1 } : null;
+        })
+        .filter((value): value is WebSearchResult => Boolean(value));
+  return results.slice(0, limit);
+}
+
 export function createWebSearchTool(): ToolDefinition {
   return {
     manifest: {
@@ -1251,9 +1703,6 @@ export function createWebSearchTool(): ToolDefinition {
     async execute(input, context) {
       const query = typeof input.query === 'string' ? input.query : '';
       const limit = typeof input.limit === 'number' ? input.limit : 5;
-      const providerBaseUrl = typeof input.providerBaseUrl === 'string'
-        ? input.providerBaseUrl
-        : 'https://duckduckgo.com/html/';
       if (!query) {
         return {
           toolName: 'web.search',
@@ -1263,61 +1712,33 @@ export function createWebSearchTool(): ToolDefinition {
         };
       }
 
-      const searchUrl = new URL(providerBaseUrl);
-      searchUrl.searchParams.set('q', query);
-      const searchUrlCheck = await safeFetchPreflight(searchUrl.toString());
-      if (!searchUrlCheck.safe) {
-        return { toolName: 'web.search', runtime: 'worker', ok: false, output: `URL blocked: ${searchUrlCheck.reason}` };
-      }
-
-      // #138 — `redirect: 'manual'` so a 30x to a private host can't bypass
-      // the SSRF preflight. The previous `redirect: 'follow'` was the SSRF
-      // hole the audit flagged.
-      const response = await fetch(searchUrl, {
-        signal: context.signal,
-        redirect: 'manual',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CrowClaw/0.1; +https://github.com/subinium/CrowClaw)' },
-      });
-      if (!response.ok) {
-        return { toolName: 'web.search', runtime: 'worker', ok: false, output: `Search request failed: HTTP ${response.status}` };
-      }
-      const html = await response.text();
-
-      // Pass 1: Parse DuckDuckGo structured results (class="result" containers with snippets)
-      const ddgResults: Array<{ title: string; url: string; snippet: string }> = [];
-      const resultBlockRegex = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
-      for (const block of html.matchAll(resultBlockRegex)) {
-        const content = block[1];
-        const linkMatch = content.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
-        const snippetMatch = content.match(/<(?:a|td|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|span)>/i);
-        if (linkMatch) {
-          const href = resolveHref(searchUrl.toString(), linkMatch[1]) ?? linkMatch[1];
-          const title = linkMatch[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-          const snippet = snippetMatch
-            ? snippetMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
-            : title;
-          if (href && title) ddgResults.push({ title, url: href, snippet });
+      const providers = normalizeSearchProviders(input);
+      const errors: string[] = [];
+      for (const provider of providers) {
+        try {
+          const { status, results } = await fetchSearchProvider(provider, query, limit, context.signal);
+          if (results.length === 0) {
+            errors.push(`${provider.name}: no results`);
+            continue;
+          }
+          return {
+            toolName: 'web.search',
+            runtime: 'worker',
+            ok: true,
+            output: JSON.stringify(results, null, 2),
+            metadata: { status, query, count: results.length, provider: provider.name, attemptedProviders: providers.map((p) => p.name) }
+          };
+        } catch (error: unknown) {
+          errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-
-      // Pass 2: Fallback to generic <a> parsing if DDG structure not found
-      const results = ddgResults.length > 0
-        ? ddgResults.slice(0, limit)
-        : [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
-            .map((match) => {
-              const href = resolveHref(searchUrl.toString(), match[1]) ?? match[1];
-              const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-              return href && title ? { title, url: href, snippet: title } : null;
-            })
-            .filter((value): value is { title: string; url: string; snippet: string } => Boolean(value))
-            .slice(0, limit);
 
       return {
         toolName: 'web.search',
         runtime: 'worker',
-        ok: response.ok,
-        output: JSON.stringify(results, null, 2),
-        metadata: { status: response.status, query, count: results.length, providerBaseUrl }
+        ok: false,
+        output: `Search request failed: ${errors.join('; ')}`,
+        metadata: { query, count: 0, attemptedProviders: providers.map((p) => p.name), errors }
       };
     }
   };
@@ -1372,7 +1793,10 @@ export function createWebCrawlTool(): ToolDefinition {
         const text = extractReadableText(html);
         const links = [...new Set(
           [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
-            .map((match) => resolveHref(current, match[1]))
+            .map((match) => {
+              const href = match[1];
+              return href ? resolveHref(current, href) : null;
+            })
             .filter((href): href is string => Boolean(href))
             .filter((href) => !sameOriginOnly || new URL(href).origin === origin)
         )];
@@ -2175,10 +2599,21 @@ export function createMemoryRememberTool(memoryStore: MemoryStore): ToolDefiniti
   };
 }
 
+let warnedMissingSemanticRecall = false;
+
 export function createMemorySearchTool(
   memoryStore: MemoryStore,
-  options?: { recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]> }
+  options?: {
+    recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]>;
+    logger?: { warn(message: string): void };
+  }
 ): ToolDefinition {
+  if (!options?.recallFn && !warnedMissingSemanticRecall) {
+    warnedMissingSemanticRecall = true;
+    (options?.logger ?? console).warn(
+      'memory.search semantic recall is not configured; using deterministic local semantic memory search.'
+    );
+  }
   return {
     manifest: {
       name: 'memory.search',
@@ -2212,7 +2647,7 @@ export function createMemorySearchTool(
           runtime: 'worker' as const,
           ok: true,
           output: JSON.stringify(results, null, 2),
-          metadata: { count: results.length }
+          metadata: { count: results.length, backend: 'embedding' }
         };
       }
 
@@ -2226,7 +2661,7 @@ export function createMemorySearchTool(
         runtime: 'worker',
         ok: true,
         output: JSON.stringify(results, null, 2),
-        metadata: { count: results.length, ...(scope ? { scope, scopeKey } : {}) }
+        metadata: { count: results.length, backend: 'local-semantic', ...(scope ? { scope, scopeKey } : {}) }
       };
     }
   };
@@ -3141,16 +3576,17 @@ export function registerSchedulerTools(
   return registry;
 }
 
-export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
+export function registerCoreTools(registry: ToolRegistry, options?: TerminalSessionOptions): ToolRegistry {
+  const terminalSession = options?.terminalSession ?? createTerminalSession(options?.backgroundProcesses);
   registry.register(createEchoTool());
   registry.register(createTimeTool());
   registry.register(createTerminalExecTool());
-  registry.register(createTerminalBackgroundTool());
+  registry.register(createTerminalBackgroundTool({ terminalSession }));
   registry.register(createTerminalBackendsTool());
   registry.register(createTerminalBackendStatusTool());
   registry.register(createTerminalProbeTool());
-  registry.register(createTerminalProcessesTool());
-  registry.register(createTerminalKillTool());
+  registry.register(createTerminalProcessesTool({ terminalSession }));
+  registry.register(createTerminalKillTool({ terminalSession }));
   registry.register(createTodoTool());
   registry.register(createClarifyTool());
   registry.register(createSendMessageTool());
@@ -3162,6 +3598,7 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createWebCrawlTool());
   registry.register(createVisionAnalyzeToolImpl());
   registry.register(createImageGenerateToolImpl());
+  registry.register(createSkillPreviewTool());
   registry.register(createTextPatchTool());
   registry.register(createLinePatchTool());
   registry.register(createGitStatusTool());
@@ -3217,8 +3654,13 @@ export function createDefaultWorkerRegistry(options?: {
   recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]>;
   schedulerStore?: SchedulerStore;
   autonomousScheduler?: { start: () => void; isRunning: () => boolean };
+  terminalSession?: TerminalSession;
+  backgroundProcesses?: BackgroundProcessStore;
 }): ToolRegistry {
-  const registry = registerCoreTools(new ToolRegistry());
+  const registry = registerCoreTools(new ToolRegistry(), {
+    terminalSession: options?.terminalSession,
+    backgroundProcesses: options?.backgroundProcesses,
+  });
   if (options?.sessionSearchStore && options.memoryStore) {
     registerSearchAndMemoryTools(registry, options.sessionSearchStore, options.memoryStore, {
       recallFn: options.recallFn

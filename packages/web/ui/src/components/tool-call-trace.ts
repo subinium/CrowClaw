@@ -58,7 +58,7 @@ export class CrowClawToolCallTrace extends LitElement {
 
     .trace {
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-md, 8px);
       transition: border-color var(--duration-fast, 120ms) var(--ease-spring, cubic-bezier(0.22, 1, 0.36, 1));
       overflow: hidden;
@@ -154,7 +154,7 @@ export class CrowClawToolCallTrace extends LitElement {
     .body {
       display: none;
       padding: 0 var(--sp-3, 12px) var(--sp-3, 12px);
-      border-top: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
     }
 
     .body.open {
@@ -177,8 +177,8 @@ export class CrowClawToolCallTrace extends LitElement {
     pre {
       margin: 0;
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-sm, 6px);
       font-family: var(--font-mono, 'SF Mono', 'JetBrains Mono', monospace);
       font-size: var(--text-xs, 11px);
@@ -202,8 +202,8 @@ export class CrowClawToolCallTrace extends LitElement {
       font-family: var(--font-sans, inherit);
       font-size: var(--text-xs, 11px);
       padding: var(--sp-1, 4px) var(--sp-3, 12px);
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-sm, 6px);
       color: var(--text-secondary, #8e8e93);
       cursor: pointer;

@@ -83,6 +83,7 @@ export interface CreateHostBridgeOptions {
   sessionId: string;
   agentId?: string;
   workspaceId?: string;
+  delegateDepth?: number;
   policy: SandboxPolicy;
   eventBus?: AgentEventEmitter;
   /**
@@ -292,6 +293,7 @@ export function createHostBridge(opts: CreateHostBridgeOptions): HostBridge {
       agentId: opts.agentId ?? 'sandbox',
       sessionId: opts.sessionId,
       workspaceId: opts.workspaceId,
+      delegateDepth: opts.delegateDepth,
       env: opts.env,
       signal: opts.signal,
     };

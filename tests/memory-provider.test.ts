@@ -9,11 +9,14 @@ import { describe, expect, it } from 'vitest';
 import {
   InMemoryMemoryProvider,
   MemoryService,
+  memoryProviderFromPluginRegistry,
   type MemoryProvider,
   type MemoryScope,
   type ProviderMemoryRecord,
 } from '@crowclaw/memory';
+import { createMemoryBackendPlugin, PluginManager } from '@crowclaw/plugins';
 import { InMemoryMemoryStore } from '@crowclaw/storage';
+import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
 // ---------------------------------------------------------------------------
 // InMemoryMemoryProvider — parity with the legacy MemoryService cases
@@ -31,6 +34,22 @@ describe('InMemoryMemoryProvider', () => {
     const results = await provider.recall('session-1', 'cloudflare', 5);
     expect(results).toHaveLength(1);
     expect(results[0]?.summary).toContain('cloudflare');
+  });
+
+  it('uses llmSummarize for semantic session summaries when provided', async () => {
+    const store = new InMemoryMemoryStore();
+    const provider = new InMemoryMemoryProvider(store, {
+      llmSummarize: async () => 'Semantic summary: deployment decision and auth migration risk.',
+    });
+
+    const captured = await provider.captureSessionSummary!('session-llm', [
+      { role: 'user', content: 'chat transcript with less useful wording', createdAt: new Date().toISOString() },
+    ]);
+
+    expect(captured?.summary).toBe('Semantic summary: deployment decision and auth migration risk.');
+    const recalled = await provider.recall('session-llm', 'auth migration', 5);
+    expect(recalled[0]?.summary).toContain('Semantic summary');
+    expect(recalled[0]?.tags).toContain('semantic-summary');
   });
 
   it('store() persists and returns a record with id+createdAt populated', async () => {
@@ -100,6 +119,104 @@ describe('InMemoryMemoryProvider', () => {
     const start = Date.now();
     await provider.shutdown!();
     expect(Date.now() - start).toBeLessThan(50);
+  });
+});
+
+describe('memoryProviderFromPluginRegistry', () => {
+  it('adapts the first registered memory backend plugin', async () => {
+    const calls: Array<{ sessionId: string; query: string; limit: number; scope?: string; scopeKey?: string }> = [];
+    const provider = memoryProviderFromPluginRegistry({
+      list: () => [
+        { name: 'ordinary-plugin' },
+        {
+          name: 'custom-memory',
+          kind: 'memory-backend',
+          manifest: { name: 'custom-memory', memoryBackend: true },
+          provider: {
+            async recall(sessionId: string, query: string, limit: number, scope?: string, scopeKey?: string) {
+              calls.push({ sessionId, query, limit, scope, scopeKey });
+              return [{
+                id: 'plugin-record',
+                sessionId,
+                scope: scope ?? 'session',
+                scopeKey,
+                summary: `plugin memory for ${query}`,
+                tags: ['plugin'],
+                createdAt: '2026-01-01T00:00:00.000Z',
+              }];
+            },
+            async store(record: Record<string, unknown>) {
+              return { ...record, id: 'stored-by-plugin', createdAt: '2026-01-01T00:00:00.000Z' };
+            },
+            async delete() {
+              return true;
+            },
+            async list() {
+              return [];
+            },
+          },
+        },
+      ],
+    });
+
+    expect(provider).toBeTruthy();
+    const recalled = await provider!.recall('session-plugin', 'registry', 3, 'workspace', 'repo');
+
+    expect(calls).toEqual([{
+      sessionId: 'session-plugin',
+      query: 'registry',
+      limit: 3,
+      scope: 'workspace',
+      scopeKey: 'repo',
+    }]);
+    expect(recalled[0]?.summary).toBe('plugin memory for registry');
+    expect(await provider!.store({
+      sessionId: 'session-plugin',
+      scope: 'session',
+      summary: 'save through plugin',
+      tags: [],
+    })).toMatchObject({ id: 'stored-by-plugin', summary: 'save through plugin' });
+  });
+
+  it('returns undefined when the registry has no memory backend plugin', () => {
+    expect(memoryProviderFromPluginRegistry({ list: () => [{ name: 'ordinary-plugin' }] })).toBeUndefined();
+  });
+
+  it('runtime-node selects a registered memory backend plugin by default', async () => {
+    const plugin = createMemoryBackendPlugin({
+      name: 'runtime-memory',
+      provider: {
+        async recall(sessionId: string, query: string) {
+          return [{
+            id: 'runtime-plugin-record',
+            sessionId,
+            scope: 'session',
+            summary: `runtime plugin handled ${query}`,
+            tags: ['runtime'],
+            createdAt: '2026-01-01T00:00:00.000Z',
+          }];
+        },
+        async store(record: Record<string, unknown>) {
+          return { ...record, id: 'runtime-stored', createdAt: '2026-01-01T00:00:00.000Z' };
+        },
+        async delete() {
+          return true;
+        },
+        async list() {
+          return [];
+        },
+      },
+    });
+    const runtime = createNodeRuntime({
+      configStorePath: null,
+      plugins: new PluginManager().register(plugin),
+    });
+
+    const recalled = await runtime.memoryProvider.recall('runtime-session', 'registry', 1);
+
+    expect(recalled[0]?.id).toBe('runtime-plugin-record');
+    expect(recalled[0]?.summary).toBe('runtime plugin handled registry');
+    await runtime.shutdown();
   });
 });
 
@@ -176,6 +293,35 @@ describe('MemoryService facade with injected provider', () => {
     // Unblock so the test cleans up.
     syncResolve();
     await blocked;
+  });
+
+  it('MemoryService captureSessionSummary uses provider llmSummarize without breaking fallback', async () => {
+    const store = new InMemoryMemoryStore();
+    const fakeProvider: MemoryProvider = {
+      async recall() {
+        return [];
+      },
+      async store() {
+        throw new Error('not used');
+      },
+      async delete() {
+        return false;
+      },
+      async list() {
+        return [];
+      },
+      async llmSummarize() {
+        return 'Semantic service summary for cross-session recall.';
+      },
+    };
+    const service = new MemoryService(store, undefined, fakeProvider);
+
+    const captured = await service.captureSessionSummary('session-service-llm', [
+      { role: 'user', content: 'raw words', createdAt: new Date().toISOString() },
+    ]);
+
+    expect(captured?.summary).toBe('Semantic service summary for cross-session recall.');
+    expect(captured?.tags).toContain('semantic-summary');
   });
 
   it('prefetch on the facade prefers provider.prefetch when defined', async () => {

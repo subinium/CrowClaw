@@ -83,7 +83,7 @@ export class CrowClawCheckpointPanel extends LitElement {
       bottom: 0;
       width: 320px;
       background: var(--bg-secondary, #13131a);
-      border-left: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-left: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.5));
       display: flex;
       flex-direction: column;
@@ -101,7 +101,7 @@ export class CrowClawCheckpointPanel extends LitElement {
       align-items: center;
       justify-content: space-between;
       padding: var(--sp-3, 12px) var(--sp-4, 16px);
-      border-bottom: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       flex-shrink: 0;
     }
 
@@ -132,21 +132,21 @@ export class CrowClawCheckpointPanel extends LitElement {
 
     .close-btn:hover {
       color: var(--text-primary, #ededef);
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
     }
 
     .save-row {
       display: flex;
       gap: var(--sp-2, 8px);
       padding: var(--sp-3, 12px) var(--sp-4, 16px);
-      border-bottom: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       flex-shrink: 0;
     }
 
     .save-row input {
       flex: 1;
       padding: 6px 10px;
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       background: var(--bg-input, rgba(255, 255, 255, 0.04));
       color: var(--text-primary, #ededef);
       font-size: var(--text-xs, 11px);
@@ -194,8 +194,8 @@ export class CrowClawCheckpointPanel extends LitElement {
 
     .cp-row {
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
       border-radius: var(--radius-sm, 6px);
       margin-bottom: var(--sp-2, 8px);
     }
@@ -227,7 +227,7 @@ export class CrowClawCheckpointPanel extends LitElement {
       font-family: var(--font-mono, 'SF Mono', monospace);
       color: var(--text-secondary, #8e8e93);
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: 8px;
       text-transform: uppercase;
       letter-spacing: 0.4px;
@@ -249,7 +249,7 @@ export class CrowClawCheckpointPanel extends LitElement {
     .cp-actions button {
       flex: 1;
       padding: 3px 6px;
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       background: transparent;
       color: var(--text-secondary, #8e8e93);
       font-size: 10px;

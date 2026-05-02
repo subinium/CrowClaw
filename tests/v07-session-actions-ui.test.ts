@@ -235,16 +235,16 @@ describe('runtime route contract — sanity checks', () => {
     const { routePaths } = await import('../packages/runtime-node/src/route-paths.js');
     // Only steer + fork are mounted on the route-paths mirror; checkpoint /
     // restore / replay live on the same `:id/:action` dispatch but aren't
-    // on the typed manifest. We therefore cross-check those via the
-    // runtime source string.
+    // on the typed manifest. Runtime-node now keeps the dispatch ladder in
+    // route-handlers.ts, so cross-check that source string.
     expect(routePaths.sessions.steer).toBe('/api/sessions/:id/steer');
     expect(routePaths.sessions.fork).toBe('/api/sessions/:id/fork');
-    const runtimeSrc = readFileSync(
-      resolve(__dirname, '..', 'packages', 'runtime-node', 'src', 'index.ts'),
+    const routeHandlersSrc = readFileSync(
+      resolve(__dirname, '..', 'packages', 'runtime-node', 'src', 'route-handlers.ts'),
       'utf-8',
     );
-    expect(runtimeSrc).toMatch(/action === 'checkpoint'/);
-    expect(runtimeSrc).toMatch(/action === 'restore'/);
-    expect(runtimeSrc).toMatch(/action === 'replay'/);
+    expect(routeHandlersSrc).toMatch(/action === 'checkpoint'/);
+    expect(routeHandlersSrc).toMatch(/action === 'restore'/);
+    expect(routeHandlersSrc).toMatch(/action === 'replay'/);
   });
 });

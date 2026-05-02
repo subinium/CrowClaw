@@ -20,21 +20,23 @@ function createBuiltInProvider(name: string): BuiltInMemoryProvider {
  * Minimal in-memory MemoryProvider for testing multi-provider scenarios
  * without depending on the storage layer.
  */
-function createFakeProvider(name: string): MemoryProvider & { records: Map<string, ManagerMemoryRecord> } {
+function createFakeProvider(name: string, acceptedScopes?: Array<'session' | 'user' | 'workspace'>): MemoryProvider & { records: Map<string, ManagerMemoryRecord> } {
   const records = new Map<string, ManagerMemoryRecord>();
   return {
     name,
+    acceptedScopes,
     records,
-    async store(key: string, content: string, metadata?: Record<string, unknown>): Promise<void> {
+    async store(key: string, content: string, metadata?: Record<string, unknown>, scope?: 'session' | 'user' | 'workspace'): Promise<void> {
       records.set(key, {
         key,
         content,
-        metadata,
+        metadata: { ...metadata, ...(scope ? { scope } : {}) },
         createdAt: new Date().toISOString(),
       });
     },
-    async recall(query: string, limit = 10): Promise<ManagerMemoryRecord[]> {
+    async recall(query: string, limit = 10, scope?: 'session' | 'user' | 'workspace'): Promise<ManagerMemoryRecord[]> {
       const matches = [...records.values()]
+        .filter((r) => !scope || r.metadata?.scope === scope)
         .filter((r) => r.content.toLowerCase().includes(query.toLowerCase()))
         .slice(0, limit);
       return matches;
@@ -238,5 +240,55 @@ describe('MemoryManager', () => {
     const contents = results.map((r) => r.content);
     expect(contents).toContain('search optimization techniques');
     expect(contents).toContain('search ranking algorithms');
+  });
+
+  it('routes scoped writes and recalls only to providers that accept the scope', async () => {
+    const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+    const manager = new MemoryManager({
+      eventBus: {
+        emit(type, data) {
+          events.push({ type, data });
+        },
+      },
+    });
+    const sessionProvider = createFakeProvider('session-provider', ['session']);
+    const workspaceProvider = createFakeProvider('workspace-provider', ['workspace']);
+    manager.addProvider(sessionProvider);
+    manager.addProvider(workspaceProvider);
+
+    await manager.store('deploy-note', 'workspace deployment note', { scope: 'workspace' });
+
+    expect(sessionProvider.records.has('deploy-note')).toBe(false);
+    expect(workspaceProvider.records.has('deploy-note')).toBe(true);
+    expect(events).toEqual([
+      { type: 'memory:scoped_write', data: { provider: 'workspace-provider', key: 'deploy-note', scope: 'workspace' } },
+    ]);
+
+    const results = await manager.recall('deployment', 5, 'workspace');
+    expect(results).toHaveLength(1);
+    expect(results[0]?.key).toBe('deploy-note');
+  });
+
+  it('consolidates registered dream memory stores during shutdown', async () => {
+    let consolidateCalls = 0;
+    const manager = new MemoryManager({
+      dreamMemory: {
+        async addLive() {},
+        async consolidate() {
+          consolidateCalls++;
+          return [];
+        },
+        async getLongTerm() {
+          return [];
+        },
+        async formatForPrompt() {
+          return '';
+        },
+      },
+    });
+    manager.addProvider(createFakeProvider('provider'));
+
+    await manager.shutdown('session-1', [{ role: 'user', content: 'hello' }]);
+    expect(consolidateCalls).toBe(1);
   });
 });

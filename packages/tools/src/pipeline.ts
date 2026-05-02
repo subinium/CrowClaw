@@ -58,6 +58,9 @@ export async function executePipeline(
 
   for (let i = 0; i < pipeline.steps.length; i++) {
     const step = pipeline.steps[i];
+    if (!step) {
+      continue;
+    }
     const condition = step.condition ?? 'always';
 
     // Check condition

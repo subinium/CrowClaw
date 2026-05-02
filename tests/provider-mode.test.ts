@@ -6,6 +6,7 @@ import {
   listApiModes,
   getRequestShape,
 } from '../packages/providers/src/api-mode.js';
+import { FALLBACK_MANIFEST } from '../packages/providers/src/model-catalog.js';
 import type { ApiModeCapabilities } from '../packages/providers/src/api-mode.js';
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,11 @@ describe('modelSupports', () => {
 
   it('returns true for Claude + caching', () => {
     expect(modelSupports('claude-sonnet-4-20250514', 'caching')).toBe(true);
+  });
+
+  it('returns true for OpenAI Chat/Responses prompt caching', () => {
+    expect(modelSupports('gpt-4o', 'caching')).toBe(true);
+    expect(modelSupports('o1-mini', 'caching')).toBe(true);
   });
 
   it('returns false for GPT-4o + reasoning', () => {
@@ -275,5 +281,13 @@ describe('capabilities structure', () => {
     const b = resolveApiMode('claude-3-haiku');
     a.capabilities.streaming = false;
     expect(b.capabilities.streaming).toBe(true);
+  });
+});
+
+describe('fallback model catalog', () => {
+  it('includes gpt-5 family models for offline context lookup', () => {
+    const ids = FALLBACK_MANIFEST.models.map((model) => model.id);
+    expect(ids).toContain('gpt-5');
+    expect(ids).toContain('gpt-5.5');
   });
 });

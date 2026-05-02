@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseIdentity, buildPersonaPrompt, loadPersonaFiles, getDefaultPersonaPrompt, buildSystemPrompt } from '@crowclaw/core';
+import { parseIdentity, buildPersonaPrompt, loadPersonaFiles, getDefaultPersonaPrompt, buildSystemPrompt } from '../packages/core/src/index.js';
 
 describe('persona', () => {
   describe('parseIdentity', () => {
@@ -88,6 +88,22 @@ describe('persona', () => {
       expect(prompt).not.toContain('<persona-identity>');
       expect(prompt).not.toContain('<persona-procedures>');
       expect(prompt).not.toContain('<persona-user>');
+    });
+
+    it('uses locale-specific persona files when requested', () => {
+      const prompt = buildPersonaPrompt({
+        identity: '- **Name:** CrowClaw',
+        locales: {
+          ko: {
+            identity: '- **Name:** 크로우클로',
+            soul: '## 핵심 가치',
+          },
+        },
+      }, 'ko');
+
+      expect(prompt).toContain('- **Name:** 크로우클로');
+      expect(prompt).toContain('## 핵심 가치');
+      expect(prompt).not.toContain('- **Name:** CrowClaw');
     });
 
     it('returns empty string when no files provided', () => {

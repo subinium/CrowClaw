@@ -3,6 +3,8 @@
  * Ported from vanilla JS sndStream() + handleStreamEvent().
  */
 
+import { getCurrentLocale } from './i18n.js';
+
 export interface StreamEvent {
   type:
     | 'text-delta'
@@ -86,7 +88,10 @@ export const streamMessage = (
 
   fetch(`${location.origin}/api/sessions/${sessionId}/stream`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-crowclaw-locale': getCurrentLocale(),
+    },
     credentials: 'same-origin',
     body: JSON.stringify({ message }),
     signal: controller.signal,

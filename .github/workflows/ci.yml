@@ -27,8 +27,32 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Cloudflare route parity
+        run: node scripts/audit-routes.mjs --check
+
       - name: Test
         run: npm test -- --reporter=verbose 2>&1 | tee test-output.txt
+
+      - name: Docker smoke
+        run: |
+          docker build -t crowclaw-ci .
+          cid=$(docker run -d -p 8787:8787 --name crowclaw-ci -e CROWCLAW_DASHBOARD_TOKEN=ci-smoke-token crowclaw-ci)
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 20); do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo false)" != "true" ]; then
+              docker logs "$cid" || true
+              docker ps -a
+              exit 1
+            fi
+            if curl -fsS http://127.0.0.1:8787/healthz; then
+              docker stop --time 10 "$cid"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs "$cid" || true
+          docker ps -a
+          exit 1
 
       - name: Test Summary
         if: always()

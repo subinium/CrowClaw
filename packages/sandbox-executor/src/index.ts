@@ -282,6 +282,51 @@ export interface DockerExecutorOptions {
   defaultTimeoutMs?: number;
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+export function buildDockerRunCommand(
+  dockerOptions: DockerExecutorOptions,
+  command: string,
+  cwd?: string
+): string {
+  const args: string[] = [
+    'docker',
+    'run',
+    '--rm',
+    '--read-only',
+    '--security-opt',
+    'no-new-privileges',
+    '--cap-drop',
+    'ALL',
+    '--user',
+    '65534:65534',
+    '--network',
+    dockerOptions.networkMode ?? 'none',
+    '--memory',
+    dockerOptions.memoryLimit ?? '256m',
+    '--cpus',
+    dockerOptions.cpuLimit ?? '0.5',
+    '--tmpfs',
+    '/tmp:rw,size=64m',
+  ];
+
+  if (dockerOptions.containerName) {
+    args.push('--name', dockerOptions.containerName);
+  }
+  const workDir = cwd ?? dockerOptions.workDir;
+  if (workDir) {
+    args.push('-w', workDir);
+  }
+
+  args.push(dockerOptions.image, 'sh', '-c', command);
+
+  return args
+    .map((arg) => /[\s"']/.test(arg) ? shellQuote(arg) : arg)
+    .join(' ');
+}
+
 export class DockerExecutor implements SandboxClient {
   private readonly local: LocalProcessExecutor;
 
@@ -296,33 +341,47 @@ export class DockerExecutor implements SandboxClient {
     cwd?: string,
     options?: { timeoutMs?: number }
   ): Promise<SandboxCommandResult> {
-    const args: string[] = ['docker', 'run', '--rm'];
+    return this.local.executeCommand(buildDockerRunCommand(this.options, command, cwd), undefined, options);
+  }
+}
 
-    if (this.options.containerName) {
-      args.push('--name', this.options.containerName);
-    }
-    if (this.options.memoryLimit) {
-      args.push('--memory', this.options.memoryLimit);
-    }
-    if (this.options.cpuLimit) {
-      args.push('--cpus', this.options.cpuLimit);
-    }
-    if (this.options.networkMode) {
-      args.push('--network', this.options.networkMode);
-    }
+// ---------------------------------------------------------------------------
+// SingularityExecutor — runs commands inside Singularity/Apptainer images
+// ---------------------------------------------------------------------------
 
-    const workDir = cwd ?? this.options.workDir;
-    if (workDir) {
-      args.push('-w', workDir);
-    }
+export interface SingularityExecutorOptions {
+  image: string;
+  workDir?: string;
+  defaultTimeoutMs?: number;
+  binary?: 'singularity' | 'apptainer';
+}
 
-    args.push(this.options.image, 'sh', '-c', command);
+export function buildSingularityExecCommand(
+  singularityOptions: SingularityExecutorOptions,
+  command: string,
+  cwd?: string
+): string {
+  const workDir = cwd ?? singularityOptions.workDir;
+  const wrapped = workDir ? `cd ${shellQuote(workDir)} && ${command}` : command;
+  const binary = singularityOptions.binary ?? 'singularity';
+  return `${binary} exec --contain --cleanenv ${shellQuote(singularityOptions.image)} /bin/sh -lc ${shellQuote(wrapped)}`;
+}
 
-    const dockerCommand = args
-      .map((a) => (a.includes(' ') || a.includes('"') ? JSON.stringify(a) : a))
-      .join(' ');
+export class SingularityExecutor implements SandboxClient {
+  private readonly local: LocalProcessExecutor;
 
-    return this.local.executeCommand(dockerCommand, undefined, options);
+  constructor(private readonly options: SingularityExecutorOptions) {
+    this.local = new LocalProcessExecutor({
+      defaultTimeoutMs: options.defaultTimeoutMs ?? 60_000,
+    });
+  }
+
+  async executeCommand(
+    command: string,
+    cwd?: string,
+    options?: { timeoutMs?: number }
+  ): Promise<SandboxCommandResult> {
+    return this.local.executeCommand(buildSingularityExecCommand(this.options, command, cwd), undefined, options);
   }
 }
 
@@ -2073,6 +2132,7 @@ export interface ExecuteWithToolsOptions {
   sessionId: string;
   agentId?: string;
   workspaceId?: string;
+  delegateDepth?: number;
   policy?: Partial<SandboxPolicy>;
   eventBus?: AgentEventEmitter;
   /** Same-path `executeTool` callback — see CreateHostBridgeOptions. */
@@ -2174,6 +2234,7 @@ export async function executeWithTools(
     sessionId: options.sessionId,
     agentId: options.agentId,
     workspaceId: options.workspaceId,
+    delegateDepth: options.delegateDepth,
     policy,
     eventBus: options.eventBus,
     executeTool: options.executeTool,

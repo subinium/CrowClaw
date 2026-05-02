@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { ProviderAdapter, ToolDefinition, ToolExecutionContext } from '@crowclaw/core';
 import { createDelegateTool, type DelegationResult } from '@crowclaw/tools';
 import { EchoProvider } from '@crowclaw/providers';
 import { InMemorySessionStore } from '@crowclaw/storage';
@@ -328,6 +329,65 @@ describe('delegate.task - enriched result metadata', () => {
     expect(typeof parsed.durationMs).toBe('number');
     expect(parsed.toolsUsed).toEqual([]);
     expect(parsed.response).toContain('Provider exploded');
+  });
+});
+
+describe('delegate.task - depth propagation', () => {
+  it('passes typed delegateDepth into child tool calls', async () => {
+    const observedDepths: Array<ToolExecutionContext['delegateDepth']> = [];
+    let calls = 0;
+    const provider: ProviderAdapter = {
+      async generate() {
+        calls++;
+        if (calls === 1) {
+          return {
+            toolCalls: [{ name: 'depth.record', input: {} }],
+          };
+        }
+        return { assistantMessage: 'done' };
+      },
+    };
+
+    const tools = new ToolRegistry();
+    const depthRecordTool: ToolDefinition = {
+      manifest: {
+        name: 'depth.record',
+        description: 'Records delegate depth for tests.',
+        runtime: 'worker',
+        streaming: false,
+        stateful: false,
+        requiresWorkspace: false,
+        requiresNetwork: false,
+        dangerLevel: 'low',
+      },
+      async execute(_input, context) {
+        observedDepths.push(context.delegateDepth);
+        return {
+          toolName: 'depth.record',
+          runtime: 'worker',
+          ok: true,
+          output: 'recorded',
+        };
+      },
+    };
+    tools.register(depthRecordTool);
+    const sessions = new InMemorySessionStore();
+
+    const delegateTool = createDelegateTool({
+      provider,
+      tools,
+      sessions,
+      maxIterations: 3,
+      blockedTools: ['delegate.task'],
+    });
+
+    const result = await delegateTool.execute(
+      { task: 'Record child delegate depth' },
+      baseContext,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(observedDepths).toEqual([1]);
   });
 });
 

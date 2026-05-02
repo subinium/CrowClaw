@@ -9,14 +9,14 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#5-minute-quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#packages"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-2856%20passed-brightgreen.svg" alt="Tests" />
-    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.5.0-blue.svg" alt="Changelog" /></a>
+    <img src="https://img.shields.io/badge/tests-2982%20passed-brightgreen.svg" alt="Tests" />
+    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.8.2-blue.svg" alt="Changelog" /></a>
   </p>
 </p>
 
 ---
 
-> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2,856 tests as of v0.8.1, five-agent cross-audit, 10-issue v0.8.1 dashboard overhaul + 11-issue v0.8.0 Hermes parity sweep + 18-issue v0.7.1 dashboard audit + 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
+> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2,982 tests as of v0.8.2, 53-issue v0.8.2 audit + parity sweep + 10-issue v0.8.1 dashboard overhaul + 11-issue v0.8.0 Hermes parity sweep + 18-issue v0.7.1 dashboard audit + 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
 
 CrowClaw gives you an agent loop, 50+ tools, skill learning, scheduled jobs, multi-channel webhooks, and a dashboard — without wiring the whole stack yourself.
 
@@ -234,6 +234,8 @@ CrowClaw is built around small interfaces. Bring your own implementation when yo
 
 Most of these have an `InMemory*` default and a file- or D1-backed concrete; you only implement one when you want a different backend.
 
+Memory tiers map directly to the three CrowClaw scopes: `session` is episodic turn/session recall, `user` is durable personal memory, and `workspace` is project-level memory. Embedding-backed providers can declare `acceptedScopes` to serve semantic recall for the tiers they own; providers without that declaration continue to receive all scopes for backward compatibility. This mirrors the NeMo-style split between short-term, long-term, and semantic memory without forcing a new backend.
+
 ## Tool families
 
 The 50+ built-in tools are grouped:
@@ -255,7 +257,14 @@ Local terminal backends (local/docker/ssh) are available today. Other backend de
 | Runtime | Status | Notes |
 |---|---|---|
 | **Node.js 22+** | Primary | Full feature surface — local SKILL.md loading, persona dirs, all execution backends |
+| **Docker (Node runtime)** | Supported packaging | Multi-stage image, non-root UID/GID 10001, `tini`, `/healthz`, `/data` via `CROWCLAW_DATA_DIR` |
 | **Cloudflare Workers** | Early adapter | Functional, narrower override surface — local SKILL.md / persona dirs are Node-only. Active-preset persistence + scheduler persistence + 7 lifecycle endpoints landed in v0.5.0 |
+
+See [docs/deployment-docker.md](./docs/deployment-docker.md) for the Docker
+image's runtime and hardening defaults.
+
+See [docs/deployment-tailscale.md](./docs/deployment-tailscale.md) for a
+tailnet-only self-host pattern that keeps CrowClaw off the public internet.
 
 See [docs/deployment-cloudflare.md](./docs/deployment-cloudflare.md) for the Cloudflare adapter's current scope and limits.
 
@@ -263,13 +272,13 @@ See [docs/deployment-cloudflare.md](./docs/deployment-cloudflare.md) for the Clo
 
 Security is wired into the agent loop, not bolted on:
 
-- **SSRF protection** — every outbound `fetch()` validates against private/CGNAT/ULA/IPv4-mapped IPv6 ranges before resolving
+- **SSRF protection** — every outbound `fetch()` validates against private/CGNAT/ULA/IPv4-mapped IPv6 ranges before resolving; tailnet ranges require explicit `CROWCLAW_TAILNET_ALLOWLIST`
 - **Prompt-injection scanning** — pattern-based (fast, not ML); detected payloads from tool output are wrapped in `<untrusted-content>` so the LLM reads them as data
 - **Tool output redaction** — credentials, PII, and secrets stripped from tool output before it re-enters the model context
 - **Command risk scanning** — destructive commands gated by approval; a hardline blocklist short-circuits unrecoverable ones (`rm -rf /` and friends) without prompting
 - **Sanitized child-process env** — child shells get a stripped env (no `KEY|TOKEN|SECRET|...` vars)
 - **Webhook signature verification** — Slack HMAC, Telegram secret token, Discord Ed25519, generic HMAC; deny-by-default
-- **Auth** — HttpOnly cookie derived from `CROWCLAW_DASHBOARD_TOKEN`, timing-safe comparison, per-IP + global rate limit on `/api/auth/verify`
+- **Auth** — HttpOnly cookie derived from `CROWCLAW_DASHBOARD_TOKEN`, timing-safe comparison, per-IP + global rate limit on `/api/auth/verify`, cost-aware chat/webhook rate limits
 - **MCP owner-only enforcement** — privileged tools (`crowclaw.chat`, sessions list/get, memories search) require an owner token
 - **Audit log** — every redaction, scan, and block decision recorded; dashboard exposes a security grade (A-F)
 
@@ -431,6 +440,20 @@ ANTHROPIC_API_KEY=        # Anthropic-specific path
 # Dashboard auth — required when binding to non-localhost
 CROWCLAW_DASHBOARD_TOKEN= # Bearer token; HttpOnly cookie derived from this
 CROWCLAW_TRUSTED_PROXIES= # CIDR list (e.g. 10.0.0.0/24,fe80::/10) for X-Forwarded-For trust
+CROWCLAW_CHAT_RATE_LIMIT=30 # Chat turns per token/IP per minute
+CROWCLAW_WEBHOOK_RATE_LIMIT=10 # Webhook dispatches per platform sender per minute
+CROWCLAW_DAILY_USD_CAP=   # Optional circuit breaker for daily LLM spend
+
+# Tailnet-only self-hosting (optional)
+CROWCLAW_BIND_TAILNET_ONLY= # 1 to bind serve to `tailscale ip -4`
+CROWCLAW_TAILNET_ALLOWLIST= # e.g. 100.64.0.0/10,fd7a:115c:a1e0::/48
+
+# Secret management (optional)
+CROWCLAW_SECRETS_DIR=      # Directory containing files named CROWCLAW_API_KEY, etc.
+CREDENTIALS_DIRECTORY=     # systemd-creds directory, read automatically when set
+# Secret refs are supported in env values, e.g. CROWCLAW_API_KEY=op://Vault/Item/field
+# SOPS refs are supported when the sops CLI is installed, e.g.
+# CROWCLAW_API_KEY=sops:/etc/crowclaw/secrets.yaml#provider.apiKey
 
 # Gateway (optional)
 CROWCLAW_TELEGRAM_TOKEN=  # From @BotFather
@@ -457,7 +480,7 @@ npm test             # vitest run
 npm run preflight    # both
 ```
 
-Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2,856 tests** as of v0.8.1.
+Coverage spans agent loop, providers, tools, memory, gateway (normalization + access policy), MCP, ACP, CLI, security (SSRF, auth rate limit, cookie hardening, CSP, hardline blocklist, MCP owner-only), browser, delegation, learning, plugins, scheduler, workspace, configuration API, and end-to-end wiring. **2,864 tests** as of v0.8.2.
 
 ## Packages
 

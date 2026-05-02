@@ -76,6 +76,20 @@ export const FALLBACK_MANIFEST: ModelManifest = {
       supportsStreaming: true,
     },
     {
+      id: 'gpt-5',
+      contextLength: 400_000,
+      supportsTools: true,
+      supportsImages: true,
+      supportsStreaming: true,
+    },
+    {
+      id: 'gpt-5.5',
+      contextLength: 400_000,
+      supportsTools: true,
+      supportsImages: true,
+      supportsStreaming: true,
+    },
+    {
       id: 'o3',
       contextLength: 200_000,
       supportsTools: true,

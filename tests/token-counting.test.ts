@@ -21,12 +21,11 @@ describe('OpenAICompatibleProvider.countTokens', () => {
     model: 'gpt-4o',
   });
 
-  it('estimates tokens for simple text messages (~4 chars per token)', () => {
+  it('estimates tokens for simple text messages with model encoding overhead', () => {
     const messages: ConversationMessage[] = [
       { role: 'user', content: 'Hello world', createdAt: now },
     ];
-    // "Hello world" = 11 chars -> ceil(11/4) = 3 tokens
-    expect(provider.countTokens(messages)).toBe(3);
+    expect(provider.countTokens(messages)).toBe(8);
   });
 
   it('estimates tokens for multiple messages', () => {
@@ -34,16 +33,14 @@ describe('OpenAICompatibleProvider.countTokens', () => {
       { role: 'user', content: 'Hello world', createdAt: now },
       { role: 'assistant', content: 'Hi there! How can I help you today?', createdAt: now },
     ];
-    // 11 + 35 = 46 chars -> ceil(46/4) = 12
-    expect(provider.countTokens(messages)).toBe(12);
+    expect(provider.countTokens(messages)).toBe(26);
   });
 
   it('counts tool result content', () => {
     const messages: ConversationMessage[] = [
       { role: 'tool', content: 'Result of running command', createdAt: now, name: 'terminal.exec' },
     ];
-    // content: 25 chars + name: 13 chars = 38 chars -> ceil(38/4) = 10
-    expect(provider.countTokens(messages)).toBe(10);
+    expect(provider.countTokens(messages)).toBe(15);
   });
 
   it('returns 0 for empty messages', () => {
@@ -63,6 +60,23 @@ describe('OpenAICompatibleProvider.countTokens', () => {
     const count = provider.countTokens(messages);
     expect(count).toBeGreaterThan(0);
   });
+
+  it('uses different encoding families for older OpenAI-compatible models', () => {
+    const older = new OpenAICompatibleProvider({
+      apiKey: 'test',
+      baseUrl: 'https://api.example.com/v1',
+      model: 'gpt-3.5-turbo',
+    });
+    const newer = new OpenAICompatibleProvider({
+      apiKey: 'test',
+      baseUrl: 'https://api.example.com/v1',
+      model: 'gpt-5.5',
+    });
+    const messages: ConversationMessage[] = [
+      { role: 'user', content: 'antidisestablishmentarianism', createdAt: now },
+    ];
+    expect(older.countTokens(messages)).toBeGreaterThan(newer.countTokens(messages));
+  });
 });
 
 describe('AnthropicProvider.countTokens', () => {
@@ -80,7 +94,7 @@ describe('AnthropicProvider.countTokens', () => {
     expect(provider.countTokens(messages)).toBe(4);
   });
 
-  it('produces higher token counts than OpenAI for the same text', () => {
+  it('keeps Anthropic and OpenAI token estimates provider-specific', () => {
     const openai = new OpenAICompatibleProvider({
       apiKey: 'test',
       baseUrl: 'https://api.example.com/v1',
@@ -91,8 +105,9 @@ describe('AnthropicProvider.countTokens', () => {
       { role: 'user', content: 'A moderately long message to compare token estimation across providers.', createdAt: now },
     ];
 
-    // Anthropic uses 3.5 chars/token vs OpenAI 4 chars/token -> Anthropic count >= OpenAI count
-    expect(provider.countTokens(messages)).toBeGreaterThanOrEqual(openai.countTokens(messages));
+    expect(provider.countTokens(messages)).toBeGreaterThan(0);
+    expect(openai.countTokens(messages)).toBeGreaterThan(0);
+    expect(provider.countTokens(messages)).not.toBe(openai.countTokens(messages));
   });
 
   it('returns 0 for empty messages', () => {

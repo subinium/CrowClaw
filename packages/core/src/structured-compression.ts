@@ -53,6 +53,7 @@ function extractPending(
   // Unanswered user questions: user messages with '?' that have no subsequent assistant reply
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
+    if (!msg) continue;
     if (msg.role !== 'user' || !msg.content.includes('?')) continue;
 
     const globalIdx = allMessages.indexOf(msg);
@@ -68,6 +69,7 @@ function extractPending(
   // Failed tool calls without a subsequent retry of the same tool
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
+    if (!msg) continue;
     if (msg.role !== 'tool') continue;
     if (msg.metadata?.ok !== false) continue;
 

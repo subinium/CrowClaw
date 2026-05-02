@@ -7,6 +7,7 @@ import type { ProviderAdapter } from '@crowclaw/core';
 import { EchoProvider, OpenAICompatibleProvider, AnthropicProvider, CredentialPool, resolveApiMode } from '@crowclaw/providers';
 import type { ProviderConfig, ProviderSlot } from './config-store.js';
 import { tryCreateOpenAIChatGPTProvider } from './openai-chatgpt-provider.js';
+import { createDefaultSecretChain, type SecretChain } from './secret-loader.js';
 
 export interface CrowClawFileConfig {
   provider: string;
@@ -53,10 +54,14 @@ function parseConfigFile(contents: string | null): CrowClawFileConfig | null {
  * Collect numbered API keys from env (e.g., CROWCLAW_API_KEY_2, CROWCLAW_API_KEY_3).
  * Returns all keys found (including the primary key).
  */
-function collectNumberedKeys(env: Record<string, string | undefined>, prefix: string, primaryKey: string): string[] {
+async function collectNumberedKeys(
+  prefix: string,
+  primaryKey: string,
+  secretChain: SecretChain,
+): Promise<string[]> {
   const keys = [primaryKey];
   for (let i = 2; i <= 10; i++) {
-    const numbered = env[`${prefix}_${i}`];
+    const numbered = await secretChain.resolve(`${prefix}_${i}`);
     if (numbered) {
       keys.push(numbered);
     }
@@ -113,6 +118,8 @@ export interface ResolveProviderOptions {
   configFilePath?: string;
   /** Logger for warnings */
   logger?: { warn: (msg: string) => void };
+  /** Secret chain override for tests or embedded runtimes. */
+  secretChain?: SecretChain;
 }
 
 /**
@@ -130,12 +137,13 @@ export async function resolveProviderFromConfig(
 ): Promise<ResolvedProvider> {
   const env = options.env ?? process.env;
   const logger = options.logger ?? console;
+  const secretChain = options.secretChain ?? createDefaultSecretChain(env);
 
   // Collect all available API keys for credential pooling
   const allCrowclawKeys: string[] = [];
-  const crowclawKey = env.CROWCLAW_API_KEY;
+  const crowclawKey = await secretChain.resolve('CROWCLAW_API_KEY');
   if (crowclawKey) {
-    allCrowclawKeys.push(...collectNumberedKeys(env, 'CROWCLAW_API_KEY', crowclawKey));
+    allCrowclawKeys.push(...await collectNumberedKeys('CROWCLAW_API_KEY', crowclawKey, secretChain));
   }
 
   // 1. CROWCLAW_API_KEY — explicit framework key, highest priority
@@ -151,9 +159,9 @@ export async function resolveProviderFromConfig(
   }
 
   // 2. ANTHROPIC_API_KEY
-  const anthropicKey = env.ANTHROPIC_API_KEY;
+  const anthropicKey = await secretChain.resolve('ANTHROPIC_API_KEY');
   if (anthropicKey) {
-    const anthropicKeys = collectNumberedKeys(env, 'ANTHROPIC_API_KEY', anthropicKey);
+    const anthropicKeys = await collectNumberedKeys('ANTHROPIC_API_KEY', anthropicKey, secretChain);
     const pool = maybeCreatePool(anthropicKeys);
     return {
       provider: new AnthropicProvider({
@@ -167,9 +175,9 @@ export async function resolveProviderFromConfig(
   }
 
   // 3. OPENAI_API_KEY
-  const openaiKey = env.OPENAI_API_KEY;
+  const openaiKey = await secretChain.resolve('OPENAI_API_KEY');
   if (openaiKey) {
-    const openaiKeys = collectNumberedKeys(env, 'OPENAI_API_KEY', openaiKey);
+    const openaiKeys = await collectNumberedKeys('OPENAI_API_KEY', openaiKey, secretChain);
     const pool = maybeCreatePool(openaiKeys);
     return {
       provider: new OpenAICompatibleProvider({
@@ -201,9 +209,9 @@ export async function resolveProviderFromConfig(
   }
 
   // 4. OPENROUTER_API_KEY — same shape as OpenAI (chat completions API)
-  const openrouterKey = env.OPENROUTER_API_KEY;
+  const openrouterKey = await secretChain.resolve('OPENROUTER_API_KEY');
   if (openrouterKey) {
-    const openrouterKeys = collectNumberedKeys(env, 'OPENROUTER_API_KEY', openrouterKey);
+    const openrouterKeys = await collectNumberedKeys('OPENROUTER_API_KEY', openrouterKey, secretChain);
     const pool = maybeCreatePool(openrouterKeys);
     return {
       provider: new OpenAICompatibleProvider({
@@ -234,10 +242,11 @@ export async function resolveProviderFromConfig(
 
   const fileConfig = parseConfigFile(configContents ?? null);
   if (fileConfig && fileConfig.apiKey) {
+    const fileApiKey = await secretChain.resolveValue(fileConfig.apiKey, 'config-file apiKey');
     return {
       provider: createProviderFromType(
         fileConfig.provider,
-        fileConfig.apiKey,
+        fileApiKey,
         fileConfig.baseUrl,
         fileConfig.model
       ),

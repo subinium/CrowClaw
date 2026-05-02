@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/core",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -21,6 +21,14 @@
   "files": [
     "dist"
   ],
+  "peerDependencies": {
+    "@opentelemetry/api": "^1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
+  },
   "publishConfig": {
     "access": "public"
   },

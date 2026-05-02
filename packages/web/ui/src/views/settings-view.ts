@@ -33,14 +33,21 @@ interface AgentConfig {
 }
 
 interface ProviderSlot {
+  name?: string;
   provider?: string;
   model?: string;
   apiKey?: string;
+  baseUrl?: string;
 }
 
 interface ProvidersConfig {
   primary?: ProviderSlot;
   fallback?: ProviderSlot;
+  vision?: ProviderSlot;
+  compression?: ProviderSlot;
+  embedding?: ProviderSlot;
+  slots?: Record<string, ProviderSlot | null | undefined>;
+  config?: Record<string, ProviderSlot | null | undefined> | null;
   [key: string]: unknown;
 }
 
@@ -64,12 +71,15 @@ interface SecurityEvent {
   type: string;
   severity: 'info' | 'warning' | 'critical';
   detail: string;
+  sessionId?: string;
 }
 
 interface UsageEntry {
   timestamp: string;
   model: string;
   provider: string;
+  sessionId?: string;
+  toolName?: string;
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
@@ -86,6 +96,9 @@ interface UsageData {
   avgLatencyMs: number;
   entries: UsageEntry[];
   byModel: Record<string, { tokens: number; cost: number; calls: number }>;
+  byProvider?: Record<string, { tokens: number; cost: number; calls: number }>;
+  bySession?: Record<string, { tokens: number; cost: number; calls: number }>;
+  byTool?: Record<string, { tokens: number; cost: number; calls: number }>;
 }
 
 interface MemoryRecord {
@@ -97,6 +110,8 @@ interface MemoryRecord {
   tags: string[];
   createdAt: string;
   metadata?: Record<string, unknown>;
+  pinned?: boolean;
+  sizeBytes?: number;
   // Computed aliases for UI compatibility
   key: string;
   value: string;
@@ -157,7 +172,13 @@ interface PresetsResponse {
 }
 
 interface PersonasResponse {
-  personas: Array<{ name: string; active: boolean }>;
+  personas: Array<{ name: string; active: boolean; identity?: Record<string, unknown>; promptPreview?: string }>;
+}
+
+interface PersonaPreview {
+  name: string;
+  identity?: Record<string, unknown>;
+  promptPreview?: string;
 }
 
 interface ToolEntry {
@@ -192,10 +213,78 @@ interface Skill {
   triggers: string[];
   steps: string[];
   tools: string[];
+  matchReasons?: string[];
+  score?: number;
 }
 
 interface SkillsResponse {
   skills: BackendSkill[];
+}
+
+interface SkillPreview {
+  name: string;
+  description: string;
+  triggers: string[];
+  tools: string[];
+  categories: string[];
+  instructionPreview: string;
+  instructionChars: number;
+  hashMismatch?: boolean;
+}
+
+interface ToolResultResponse<T = unknown> {
+  ok: boolean;
+  output?: string;
+  metadata?: Record<string, unknown>;
+  error?: string;
+  toolName?: string;
+  runtime?: string;
+}
+
+interface MemorySummary {
+  count: number;
+  totalSizeBytes: number;
+  estimatedTokens: number;
+  sessionCostUsd: number;
+  sessionTokens: number;
+  sessionCalls: number;
+}
+
+interface LearningDashboard {
+  drafts: Array<{
+    id: string;
+    slug?: string;
+    title: string;
+    summary: string;
+    triggerPhrases?: string[];
+    status: string;
+    recurrenceCount?: number;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  metrics: {
+    totalDrafts: number;
+    pendingDrafts: number;
+    publishedDrafts: number;
+    helpfulRatings?: number;
+    unhelpfulRatings?: number;
+  };
+}
+
+interface ConfigDiffEntry {
+  path?: string;
+  key?: string;
+  before?: unknown;
+  after?: unknown;
+  type?: string;
+}
+
+interface ConfigDiffResult {
+  changes?: ConfigDiffEntry[];
+  added?: ConfigDiffEntry[];
+  removed?: ConfigDiffEntry[];
+  modified?: ConfigDiffEntry[];
+  [key: string]: unknown;
 }
 
 type IdentityTab = 'personas' | 'toolsets';
@@ -282,6 +371,13 @@ const formatTokens = (n: number): string =>
       ? `${(n / 1_000).toFixed(1)}K`
       : String(n);
 
+const formatBytes = (n: number): string =>
+  n >= 1_048_576
+    ? `${(n / 1_048_576).toFixed(1)}MB`
+    : n >= 1024
+      ? `${(n / 1024).toFixed(1)}KB`
+      : `${n}B`;
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                         */
 /* ------------------------------------------------------------------ */
@@ -313,7 +409,7 @@ export class SettingsView extends LitElement {
         display: flex;
         flex-direction: column;
         gap: 0;
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
         margin-bottom: var(--sp-6);
       }
 
@@ -434,8 +530,8 @@ export class SettingsView extends LitElement {
       .summary-card {
         flex: 1;
         min-width: 160px;
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         padding: var(--sp-4);
         border-radius: var(--radius-md);
       }
@@ -475,7 +571,7 @@ export class SettingsView extends LitElement {
         align-items: center;
         justify-content: space-between;
         padding: var(--sp-3) var(--sp-4);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .toggle-row:last-child {
@@ -516,7 +612,7 @@ export class SettingsView extends LitElement {
       .switch .slider {
         position: absolute;
         inset: 0;
-        background: var(--glass-border);
+        background: var(--border);
         border-radius: 10px;
         transition: background var(--duration-fast);
       }
@@ -556,13 +652,13 @@ export class SettingsView extends LitElement {
         color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.6px;
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .data-table td {
         padding: var(--sp-2) var(--sp-3);
         color: var(--text-primary);
-        border-bottom: 1px solid var(--glass-border);
+        border-bottom: 1px solid var(--border);
       }
 
       .data-table tr:last-child td {
@@ -580,7 +676,7 @@ export class SettingsView extends LitElement {
 
       .filter-row select {
         padding: var(--sp-1) var(--sp-3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         background: var(--bg-input);
         color: var(--text-primary);
         font-size: var(--text-xs);
@@ -588,6 +684,11 @@ export class SettingsView extends LitElement {
         outline: none;
         border-radius: var(--radius-sm);
         cursor: pointer;
+      }
+
+      .filter-row input {
+        min-width: 180px;
+        flex: 1;
       }
 
       .filter-row select:focus {
@@ -602,8 +703,8 @@ export class SettingsView extends LitElement {
       }
 
       .mem-item {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3) var(--sp-4);
         cursor: pointer;
@@ -650,8 +751,8 @@ export class SettingsView extends LitElement {
 
       .mem-detail {
         margin-top: var(--sp-4);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-4);
       }
@@ -681,10 +782,51 @@ export class SettingsView extends LitElement {
         overflow-y: auto;
       }
 
+      .mem-edit {
+        width: 100%;
+        min-height: 120px;
+        resize: vertical;
+      }
+
+      .warn-box {
+        border: 1px solid rgba(255, 204, 0, 0.35);
+        background: rgba(255, 204, 0, 0.08);
+        color: var(--text-secondary);
+        border-radius: var(--radius-md);
+        padding: var(--sp-3);
+        font-size: var(--text-xs);
+        line-height: 1.5;
+      }
+
+      .preview-box {
+        border: 1px solid var(--border);
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        padding: var(--sp-3);
+        margin-top: var(--sp-3);
+      }
+
+      .compact-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: var(--sp-3);
+      }
+
+      .diff-box {
+        font-family: var(--font-mono);
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 220px;
+        overflow: auto;
+        padding: var(--sp-3);
+      }
+
       /* Log output */
       .log-output {
         background: rgba(0, 0, 0, 0.3);
-        border: 1px solid var(--glass-border);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         padding: var(--sp-3);
         font-family: var(--font-mono);
@@ -721,8 +863,8 @@ export class SettingsView extends LitElement {
 
       /* Section sub-card */
       .sub-card {
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         border-radius: var(--radius-md);
         overflow: hidden;
         margin-bottom: var(--sp-4);
@@ -740,8 +882,8 @@ export class SettingsView extends LitElement {
         font-size: var(--text-xs);
         font-weight: 500;
         color: var(--text-muted);
-        background: var(--glass-bg);
-        border: 1px solid var(--glass-border);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
         cursor: pointer;
         border-radius: var(--radius-sm);
         transition: color var(--duration-fast), border-color var(--duration-fast), background-color var(--duration-fast);
@@ -800,6 +942,12 @@ export class SettingsView extends LitElement {
   @state() private skills: Skill[] = [];
   @state() private skillsLoading = true;
   @state() private skillSearch = '';
+  @state() private skillMatchQuery = '';
+  @state() private skillMatches: Skill[] = [];
+  @state() private skillMatching = false;
+  @state() private skillPreviewSlug: string | null = null;
+  @state() private skillPreview: SkillPreview | null = null;
+  @state() private skillPreviewLoading = false;
   @state() private showSkillForm = false;
   @state() private showImportForm = false;
   @state() private editingSkillSlug: string | null = null;
@@ -820,9 +968,13 @@ export class SettingsView extends LitElement {
   @state() private securityEvents: SecurityEvent[] = [];
   @state() private secEventTypeFilter = '';
   @state() private secEventSeverityFilter = '';
+  @state() private secEventSearch = '';
 
   // Usage
   @state() private usageData: UsageData | null = null;
+
+  // Learning
+  @state() private learningDashboard: LearningDashboard | null = null;
 
   // System
   @state() private systemConfig: Record<string, string> = {};
@@ -849,7 +1001,18 @@ export class SettingsView extends LitElement {
   @state() private memories: MemoryRecord[] = [];
   @state() private memorySearch = '';
   @state() private memoryScope = 'All';
+  @state() private memoryPinnedOnly = false;
   @state() private selectedMemoryId: string | null = null;
+  @state() private memoryEditDraft = '';
+  @state() private memorySummary: MemorySummary | null = null;
+
+  // Config previews
+  @state() private personaPreview: PersonaPreview | null = null;
+  @state() private providerTestSlot: string | null = null;
+  @state() private providerTestResults: Record<string, string> = {};
+  @state() private configDiffBefore = '';
+  @state() private configDiffAfter = '';
+  @state() private configDiffResult: ConfigDiffResult | null = null;
 
   /* ---------------------------------------------------------------- */
   /*  Lifecycle                                                       */
@@ -875,6 +1038,7 @@ export class SettingsView extends LitElement {
       case 'agent':
         this._loadAgentConfig();
         this._loadProvidersConfig();
+        this._loadPersonaPreview();
         this._fetchPresets();
         this._fetchPersonas();
         this._fetchTools();
@@ -887,6 +1051,7 @@ export class SettingsView extends LitElement {
         this._loadUsage();
         this._loadMemorySessions();
         this._loadFeedback();
+        this._loadLearningDashboard();
         break;
       case 'system':
         this._loadSystem();
@@ -921,10 +1086,18 @@ export class SettingsView extends LitElement {
 
   private async _loadProvidersConfig() {
     try {
-      const data = await api<ProvidersConfig>('/api/providers/config');
-      this.providersConfig = data;
+      const data = await api<{ slots?: ProvidersConfig; config?: ProvidersConfig | null }>('/api/providers/config');
+      this.providersConfig = data.slots ?? data.config ?? null;
     } catch {
       this.providersConfig = null;
+    }
+  }
+
+  private async _loadPersonaPreview() {
+    try {
+      this.personaPreview = await api<PersonaPreview>('/api/persona/active');
+    } catch {
+      this.personaPreview = null;
     }
   }
 
@@ -942,6 +1115,7 @@ export class SettingsView extends LitElement {
       const params = new URLSearchParams({ limit: '50' });
       if (this.secEventTypeFilter) params.set('type', this.secEventTypeFilter);
       if (this.secEventSeverityFilter) params.set('severity', this.secEventSeverityFilter);
+      if (this.secEventSearch) params.set('q', this.secEventSearch);
       const data = await api<{ events: SecurityEvent[] }>(
         `/api/security/events?${params.toString()}`,
       );
@@ -960,9 +1134,19 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _loadLearningDashboard() {
+    try {
+      this.learningDashboard = await api<LearningDashboard>('/api/learning/dashboard');
+    } catch {
+      this.learningDashboard = null;
+    }
+  }
+
   private async _loadSystem() {
     try {
       const data = await api<Record<string, unknown>>('/api/config/snapshot');
+      if (!this.configDiffBefore) this.configDiffBefore = JSON.stringify(data, null, 2);
+      if (!this.configDiffAfter) this.configDiffAfter = JSON.stringify(data, null, 2);
       // Capture active profile fields for the human-readable summary
       const presetName = data['activePresetName'];
       const toolsetName = data['activeToolsetName'];
@@ -1029,6 +1213,7 @@ export class SettingsView extends LitElement {
   private async _loadMemories() {
     if (!this.memorySessionId) {
       this.memories = [];
+      this.memorySummary = null;
       return;
     }
     try {
@@ -1037,15 +1222,26 @@ export class SettingsView extends LitElement {
       // UI displays capitalized labels. Normalize on the wire.
       if (this.memoryScope !== 'All') params.set('scope', this.memoryScope.toLowerCase());
       const q = params.toString();
-      const data = await api<{ records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }> }>(
+      const data = await api<{
+        records: Array<{ id: string; sessionId: string; scope: string; scopeKey?: string; summary: string; tags: string[]; createdAt: string; metadata?: Record<string, unknown> }>;
+        summary?: MemorySummary;
+      }>(
         `/api/sessions/${this.memorySessionId}/memories${q ? `?${q}` : ''}`,
       );
+      this.memorySummary = data.summary ?? null;
       let records: MemoryRecord[] = (data.records || []).map((r) => ({
         ...r,
         key: r.tags?.[0] ?? r.id?.slice(0, 8) ?? 'memory',
         value: r.summary ?? '',
         timestamp: r.createdAt ?? '',
+        pinned: r.metadata?.pinned === true,
+        sizeBytes: typeof r.metadata?.sizeBytes === 'number'
+          ? r.metadata.sizeBytes
+          : new TextEncoder().encode(r.summary ?? '').length,
       }));
+      if (this.memoryPinnedOnly) {
+        records = records.filter((m) => m.pinned);
+      }
       // Client-side search filter
       if (this.memorySearch) {
         const term = this.memorySearch.toLowerCase();
@@ -1056,8 +1252,11 @@ export class SettingsView extends LitElement {
         );
       }
       this.memories = records;
+      const selected = this.memories.find((m) => m.id === this.selectedMemoryId);
+      if (selected) this.memoryEditDraft = selected.value;
     } catch {
       this.memories = [];
+      this.memorySummary = null;
     }
   }
 
@@ -1221,6 +1420,104 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _matchSkills() {
+    const query = this.skillMatchQuery.trim();
+    if (!query) {
+      this.skillMatches = [];
+      return;
+    }
+    this.skillMatching = true;
+    try {
+      const result = await api<unknown>('/api/learning/match', {
+        method: 'POST',
+        body: JSON.stringify({ query, limit: 5 }),
+      });
+      const matches = Array.isArray(result)
+        ? result
+        : Array.isArray((result as { matches?: unknown[] }).matches)
+          ? (result as { matches: unknown[] }).matches
+          : Array.isArray((result as { skills?: unknown[] }).skills)
+            ? (result as { skills: unknown[] }).skills
+            : [];
+      this.skillMatches = matches.map((item) => {
+        const raw = item as Record<string, unknown>;
+        const skill = (raw.skill && typeof raw.skill === 'object' ? raw.skill : raw) as Record<string, unknown>;
+        const slug = String(skill.slug ?? skill.name ?? skill.title ?? 'match');
+        return {
+          slug,
+          title: String(skill.title ?? skill.name ?? slug),
+          summary: String(skill.summary ?? skill.description ?? ''),
+          triggers: Array.isArray(skill.triggerPhrases)
+            ? skill.triggerPhrases as string[]
+            : Array.isArray(skill.triggers)
+              ? skill.triggers as string[]
+              : [],
+          steps: [],
+          tools: Array.isArray(skill.requiredTools) ? skill.requiredTools as string[] : [],
+          matchReasons: Array.isArray(raw.reasons)
+            ? raw.reasons as string[]
+            : Array.isArray(raw.matchReasons)
+              ? raw.matchReasons as string[]
+              : typeof raw.reason === 'string'
+                ? [raw.reason]
+                : [],
+          score: typeof raw.score === 'number' ? raw.score : undefined,
+        };
+      });
+    } catch {
+      this.skillMatches = [];
+      showToast('Failed to match skills', 'error');
+    } finally {
+      this.skillMatching = false;
+    }
+  }
+
+  private async _previewSkill(skill: Skill) {
+    this.skillPreviewSlug = skill.slug;
+    this.skillPreview = null;
+    this.skillPreviewLoading = true;
+    try {
+      const result = await api<ToolResultResponse>('/api/skills/preview', {
+        method: 'POST',
+        body: JSON.stringify({ slug: skill.slug, maxChars: 700 }),
+      });
+      if (!result.ok) {
+        showToast(result.output || result.error || 'Failed to preview skill', 'error');
+        return;
+      }
+      this.skillPreview = JSON.parse(result.output || '{}') as SkillPreview;
+    } catch {
+      this.skillPreview = null;
+      showToast('Failed to preview skill', 'error');
+    } finally {
+      this.skillPreviewLoading = false;
+    }
+  }
+
+  private async _previewImportSkill() {
+    const content = this.importText.trim();
+    if (!content) return;
+    this.skillPreviewSlug = '__import__';
+    this.skillPreview = null;
+    this.skillPreviewLoading = true;
+    try {
+      const result = await api<ToolResultResponse>('/api/skills/preview', {
+        method: 'POST',
+        body: JSON.stringify({ markdown: content, maxChars: 700 }),
+      });
+      if (!result.ok) {
+        showToast(result.output || result.error || 'Failed to preview SKILL.md', 'error');
+        return;
+      }
+      this.skillPreview = JSON.parse(result.output || '{}') as SkillPreview;
+    } catch {
+      this.skillPreview = null;
+      showToast('Failed to preview SKILL.md', 'error');
+    } finally {
+      this.skillPreviewLoading = false;
+    }
+  }
+
   private _editSkill(skill: Skill) {
     this.editingSkillSlug = skill.slug;
     this.formTitle = skill.title;
@@ -1333,6 +1630,8 @@ export class SettingsView extends LitElement {
     this.formTools = '';
     this.showSkillForm = false;
     this.editingSkillSlug = null;
+    this.skillPreviewSlug = null;
+    this.skillPreview = null;
   }
 
   private get _filteredSkills(): Skill[] {
@@ -1348,6 +1647,15 @@ export class SettingsView extends LitElement {
 
   private get _identityLoading(): boolean {
     return this.identityTab === 'personas' ? this.personasLoading : this.presetsLoading;
+  }
+
+  private get _providerSlots(): Array<[string, ProviderSlot]> {
+    const source = this.providersConfig?.slots ?? this.providersConfig?.config ?? this.providersConfig ?? {};
+    return Object.entries(source as Record<string, ProviderSlot | null | undefined>)
+      .filter((entry): entry is [string, ProviderSlot] => {
+        const slot = entry[1];
+        return !!slot && typeof slot === 'object' && slot.provider !== 'none' && !!slot.model;
+      });
   }
 
   /* ---------------------------------------------------------------- */
@@ -1451,9 +1759,12 @@ export class SettingsView extends LitElement {
   }
 
   private async _deleteMemory(id: string) {
-    if (!window.confirm('Are you sure you want to delete this memory?')) return;
+    const confirmation = window.prompt(
+      'Delete this memory record? This permanently removes stored recall metadata. Review the entry first: redacted text may still contain sensitive context. Type DELETE to confirm.',
+    );
+    if (confirmation !== 'DELETE') return;
     try {
-      await api(`/api/memories/${id}`, { method: 'DELETE' });
+      await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
       this.memories = this.memories.filter((m) => m.id !== id);
       if (this.selectedMemoryId === id) {
         this.selectedMemoryId = null;
@@ -1461,6 +1772,78 @@ export class SettingsView extends LitElement {
       showToast('Memory deleted.', 'success');
     } catch {
       /* ignore */
+    }
+  }
+
+  private async _saveMemory(memory: MemoryRecord) {
+    const summary = this.memoryEditDraft.trim();
+    if (!summary) return;
+    if (summary !== memory.value) {
+      const ok = window.confirm(
+        'Save edited memory summary? Memory text can contain sensitive context. Confirm you reviewed it for secrets or PII before persisting.',
+      );
+      if (!ok) return;
+    }
+    try {
+      await api(`/api/memories/${encodeURIComponent(memory.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          summary,
+          tags: memory.tags,
+          metadata: memory.metadata ?? {},
+        }),
+      });
+      await this._loadMemories();
+      showToast('Memory updated.', 'success');
+    } catch {
+      showToast('Failed to update memory.', 'error');
+    }
+  }
+
+  private async _toggleMemoryPin(memory: MemoryRecord) {
+    try {
+      await api(`/api/memories/${encodeURIComponent(memory.id)}/pin`, {
+        method: 'POST',
+        body: JSON.stringify({ pinned: !memory.pinned }),
+      });
+      await this._loadMemories();
+    } catch {
+      showToast('Failed to update pin.', 'error');
+    }
+  }
+
+  private async _testProviderSlot(slot: string, provider: ProviderSlot) {
+    this.providerTestSlot = slot;
+    try {
+      const result = await api<{ ok: boolean; error?: string; response?: string }>('/api/providers/test', {
+        method: 'POST',
+        body: JSON.stringify({ slot, provider: provider.provider, model: provider.model }),
+      });
+      this.providerTestResults = {
+        ...this.providerTestResults,
+        [slot]: result.ok ? (result.response ?? 'ok') : (result.error ?? 'failed'),
+      };
+    } catch (error: unknown) {
+      this.providerTestResults = {
+        ...this.providerTestResults,
+        [slot]: error instanceof Error ? error.message : 'failed',
+      };
+    } finally {
+      this.providerTestSlot = null;
+    }
+  }
+
+  private async _previewConfigDiff() {
+    try {
+      const before = JSON.parse(this.configDiffBefore || '{}') as Record<string, unknown>;
+      const after = JSON.parse(this.configDiffAfter || '{}') as Record<string, unknown>;
+      this.configDiffResult = await api<ConfigDiffResult>('/api/config/diff', {
+        method: 'POST',
+        body: JSON.stringify({ before, after }),
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof SyntaxError ? 'Config diff JSON is invalid.' : 'Failed to preview config diff.';
+      showToast(msg, 'error');
     }
   }
 
@@ -1539,6 +1922,7 @@ export class SettingsView extends LitElement {
     return html`
       ${this._renderUsage()}
       ${this._renderMemory()}
+      ${this._renderLearningDashboard()}
       ${this._renderFeedback()}
     `;
   }
@@ -1767,7 +2151,54 @@ export class SettingsView extends LitElement {
         </div>
       </div>
 
+      ${this._renderProviderSlotsPreview()}
       ${this._renderIdentitySection()}
+    `;
+  }
+
+  private _renderProviderSlotsPreview() {
+    const slots = this._providerSlots;
+    return html`
+      <div class="section-block">
+        <div class="actions-row">
+          <div class="section-header" style="border:none;padding:0;margin:0">Provider Slots</div>
+          <a href="#connect" style="font-size:var(--text-xs)">Edit in Connect</a>
+        </div>
+        ${slots.length === 0
+          ? html`<div class="status-msg" style="color:var(--text-muted)">No provider slots configured.</div>`
+          : html`
+              <div class="compact-grid">
+                ${slots.map(([slot, provider]) => html`
+                  <div class="sub-card" style="padding:var(--sp-3)">
+                    <div class="kv">
+                      <span class="kv-k">${slot}</span>
+                      <span class="kv-v">${provider.provider ?? '--'}</span>
+                    </div>
+                    <div class="kv">
+                      <span class="kv-k">Model</span>
+                      <span class="kv-v">${provider.model ?? '--'}</span>
+                    </div>
+                    <div class="kv">
+                      <span class="kv-k">Key</span>
+                      <span class="kv-v">${provider.apiKey ? 'configured' : 'missing'}</span>
+                    </div>
+                    ${this.providerTestResults[slot]
+                      ? html`<div class="status-msg">${this.providerTestResults[slot]}</div>`
+                      : nothing}
+                    <div class="form-actions">
+                      <button
+                        class="btn"
+                        ?disabled=${this.providerTestSlot === slot}
+                        @click=${() => this._testProviderSlot(slot, provider)}
+                      >
+                        ${this.providerTestSlot === slot ? 'Testing...' : 'Test'}
+                      </button>
+                    </div>
+                  </div>
+                `)}
+              </div>
+            `}
+      </div>
     `;
   }
 
@@ -1804,6 +2235,7 @@ export class SettingsView extends LitElement {
   }
 
   private _renderPersonasPanel() {
+    const preview = this.personaPreview;
     if (this.personas.length === 0) {
       return html`<crowclaw-empty
         icon="memory"
@@ -1814,6 +2246,22 @@ export class SettingsView extends LitElement {
       ></crowclaw-empty>`;
     }
     return html`
+      ${preview
+        ? html`
+            <div class="sub-card" style="padding:var(--sp-3);margin-bottom:var(--sp-3)">
+              <div class="kv">
+                <span class="kv-k">Active persona preview</span>
+                <span class="kv-v">${preview.name}</span>
+              </div>
+              ${preview.identity
+                ? html`<div class="diff-box">${JSON.stringify(preview.identity, null, 2)}</div>`
+                : nothing}
+              ${preview.promptPreview
+                ? html`<div class="mem-detail-body" style="max-height:160px">${preview.promptPreview}</div>`
+                : nothing}
+            </div>
+          `
+        : nothing}
       <div class="grid">
         ${this.personas.map((p) => this._renderPresetCard(p))}
       </div>
@@ -1865,7 +2313,7 @@ export class SettingsView extends LitElement {
           ${enabled ? nothing : html`<span class="tag">Disabled</span>`}
         </div>
         <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${tool.description || 'No description'}</div>
-        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--glass-border)">
+        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--border)">
           <crowclaw-toggle
             .checked=${enabled}
             aria-label="Toggle tool ${tool.name}"
@@ -1884,7 +2332,7 @@ export class SettingsView extends LitElement {
           ${preset.active ? html`<span class="tag" style="color:var(--success)">Active</span>` : nothing}
         </div>
         <div class="card-desc" style="font-size:var(--text-xs);color:var(--text-secondary);line-height:1.5;margin-bottom:var(--sp-3)">${preset.description || 'No description'}</div>
-        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--glass-border)">
+        <div class="card-footer" style="display:flex;justify-content:flex-end;margin-top:var(--sp-3);padding-top:var(--sp-3);border-top:1px solid var(--border)">
           ${preset.active
             ? html`<span class="tag ok">Activated</span>`
             : html`<button class="btn btn-p" @click=${() => this._activatePreset(preset)}>Activate</button>`}
@@ -1900,6 +2348,34 @@ export class SettingsView extends LitElement {
       <div class="section-block">
         <div class="section-header">Skills</div>
         <p class="hint">Reusable skill definitions that map trigger phrases to tool execution steps.</p>
+
+        <div class="sub-card" style="padding:var(--sp-3)">
+          <div class="filter-row" style="margin-bottom:0">
+            <input
+              class="srch"
+              type="text"
+              placeholder="Test skill matching reasons..."
+              aria-label="Test skill matching reasons"
+              .value=${this.skillMatchQuery}
+              @input=${(e: InputEvent) => { this.skillMatchQuery = (e.target as HTMLInputElement).value; }}
+            />
+            <button class="btn" ?disabled=${this.skillMatching} @click=${this._matchSkills}>
+              ${this.skillMatching ? 'Matching...' : 'Match'}
+            </button>
+          </div>
+          ${this.skillMatches.length > 0
+            ? html`
+                <div style="display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-3)">
+                  ${this.skillMatches.map((m) => html`
+                    <div class="kv">
+                      <span class="kv-k">${m.title}</span>
+                      <span class="kv-v">${m.matchReasons?.join('; ') || (m.score == null ? 'matched' : `score ${m.score}`)}</span>
+                    </div>
+                  `)}
+                </div>
+              `
+            : nothing}
+        </div>
 
         <div class="filter-row">
           <input class="srch"
@@ -1960,10 +2436,45 @@ export class SettingsView extends LitElement {
               </div>
             `
           : nothing}
-        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);border-top:1px solid var(--glass-border);padding-top:var(--sp-3)">
+        <div style="display:flex;gap:var(--sp-2);margin-top:var(--sp-3);border-top:1px solid var(--border);padding-top:var(--sp-3)">
+          <button class="btn" aria-label="Preview skill execution" @click=${() => this._previewSkill(skill)}>
+            ${this.skillPreviewLoading && this.skillPreviewSlug === skill.slug ? 'Previewing...' : 'Preview'}
+          </button>
           <button class="btn" aria-label="Edit skill" @click=${() => this._editSkill(skill)}>Edit</button>
           <button class="btn btn-danger" aria-label="Delete skill" @click=${() => this._deleteSkill(skill.slug)}>Delete</button>
         </div>
+        ${this.skillPreviewSlug === skill.slug ? this._renderSkillPreview() : nothing}
+      </div>
+    `;
+  }
+
+  private _renderSkillPreview() {
+    if (this.skillPreviewLoading) {
+      return html`<div class="preview-box status-msg">Loading safe preview...</div>`;
+    }
+    const preview = this.skillPreview;
+    if (!preview) return nothing;
+    return html`
+      <div class="preview-box">
+        <div class="kv">
+          <span class="kv-k">Tool</span>
+          <span class="kv-v">skill.preview</span>
+        </div>
+        <div class="kv">
+          <span class="kv-k">Name</span>
+          <span class="kv-v">${preview.name}</span>
+        </div>
+        <div class="kv">
+          <span class="kv-k">Instruction Chars</span>
+          <span class="kv-v">${preview.instructionChars}</span>
+        </div>
+        ${preview.tools.length > 0
+          ? html`<div class="kv"><span class="kv-k">Required Tools</span><span class="kv-v">${preview.tools.join(', ')}</span></div>`
+          : nothing}
+        ${preview.hashMismatch
+          ? html`<div class="warn-box" style="margin-top:var(--sp-2)">Content hash mismatch reported by skill.preview.</div>`
+          : nothing}
+        <div class="mem-detail-body" style="max-height:180px;margin-top:var(--sp-3)">${preview.instructionPreview || preview.description}</div>
       </div>
     `;
   }
@@ -2038,9 +2549,13 @@ export class SettingsView extends LitElement {
                     @input=${(e: InputEvent) => { this.importText = (e.target as HTMLTextAreaElement).value; }}></textarea>
         </div>
         <div class="form-actions">
-          <button class="btn" @click=${() => { this.showImportForm = false; this.importText = ''; }}>Cancel</button>
+          <button class="btn" @click=${() => { this.showImportForm = false; this.importText = ''; this.skillPreviewSlug = null; this.skillPreview = null; }}>Cancel</button>
+          <button class="btn" ?disabled=${this.skillPreviewLoading} @click=${this._previewImportSkill}>
+            ${this.skillPreviewLoading && this.skillPreviewSlug === '__import__' ? 'Previewing...' : 'Preview'}
+          </button>
           <button class="btn btn-p" @click=${this._importSkillMd}>Import</button>
         </div>
+        ${this.skillPreviewSlug === '__import__' ? this._renderSkillPreview() : nothing}
       </div>
     `;
   }
@@ -2127,10 +2642,11 @@ export class SettingsView extends LitElement {
                             title="SSRF protection is enforced at the code level and cannot be disabled at runtime."
                             aria-label="SSRF protection is enforced at the code level and cannot be disabled at runtime."
                           >Always on (enforced)</span>`
-                        : html`<label class="switch">
+                        : html`<label class="switch" title=${p.description ?? `${p.name} protection`}>
                             <input
                               type="checkbox"
                               .checked=${p.enabled}
+                              aria-label="${p.name}: ${p.description ?? 'security protection'}"
                               @change=${(e: Event) =>
                                 this._toggleProtection(
                                   p.key,
@@ -2155,6 +2671,17 @@ export class SettingsView extends LitElement {
         </div>
 
         <div class="filter-row">
+          <input
+            class="srch"
+            type="text"
+            placeholder="Search event detail..."
+            aria-label="Search security audit log"
+            .value=${this.secEventSearch}
+            @input=${(e: InputEvent) => {
+              this.secEventSearch = (e.target as HTMLInputElement).value;
+              this._loadSecurityEvents();
+            }}
+          />
           <select
             aria-label="Filter events by type"
             @change=${(e: Event) => {
@@ -2165,7 +2692,7 @@ export class SettingsView extends LitElement {
             <option value="">All Types</option>
             <option value="injection">Injection</option>
             <option value="auth">Auth</option>
-            <option value="rate_limit">Rate Limit</option>
+            <option value="rate_limit_exceeded">Rate Limit</option>
             <option value="policy">Policy</option>
           </select>
           <select
@@ -2262,38 +2789,21 @@ export class SettingsView extends LitElement {
 
               <!-- Per-model breakdown -->
               <div class="sec-h">Per-Model Breakdown</div>
-              ${Object.keys(usage.byModel).length > 0
-                ? html`
-                    <div class="sub-card" style="overflow-x:auto;margin-bottom:var(--sp-5)">
-                      <table class="data-table">
-                        <thead>
-                          <tr>
-                            <th>Model</th>
-                            <th>Tokens</th>
-                            <th>Cost</th>
-                            <th>Calls</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          ${Object.entries(usage.byModel).map(
-                            ([model, stats]) => html`
-                              <tr>
-                                <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
-                                  ${model}
-                                </td>
-                                <td>${formatTokens(stats.tokens)}</td>
-                                <td>${formatCost(stats.cost)}</td>
-                                <td>${stats.calls}</td>
-                              </tr>
-                            `,
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  `
-                : html`<div class="status-msg" style="color:var(--text-muted)">
-                    No model data yet.
-                  </div>`}
+              ${this._renderUsageBreakdown('Model', usage.byModel)}
+              <div class="compact-grid">
+                <div>
+                  <div class="sec-h">Per-Provider Breakdown</div>
+                  ${this._renderUsageBreakdown('Provider', usage.byProvider ?? this._groupUsageEntries('provider'))}
+                </div>
+                <div>
+                  <div class="sec-h">Per-Session Breakdown</div>
+                  ${this._renderUsageBreakdown('Session', usage.bySession ?? this._groupUsageEntries('sessionId'))}
+                </div>
+                <div>
+                  <div class="sec-h">Per-Tool Breakdown</div>
+                  ${this._renderUsageBreakdown('Tool', usage.byTool ?? this._groupUsageEntries('toolName'))}
+                </div>
+              </div>
 
               <!-- Recent entries -->
               <div class="sec-h">Recent Entries</div>
@@ -2304,6 +2814,9 @@ export class SettingsView extends LitElement {
                         <thead>
                           <tr>
                             <th>Time</th>
+                            <th>Session</th>
+                            <th>Tool</th>
+                            <th>Provider</th>
                             <th>Model</th>
                             <th>Input</th>
                             <th>Output</th>
@@ -2319,6 +2832,13 @@ export class SettingsView extends LitElement {
                                 <td style="white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs)">
                                   ${formatTime(e.timestamp)}
                                 </td>
+                                <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                                  ${e.sessionId ?? '--'}
+                                </td>
+                                <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                                  ${e.toolName ?? '--'}
+                                </td>
+                                <td>${e.provider}</td>
                                 <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
                                   ${e.model}
                                 </td>
@@ -2344,6 +2864,119 @@ export class SettingsView extends LitElement {
                   ></crowclaw-empty>`}
             `
           : html`<div class="status-msg">Loading usage data...</div>`}
+      </div>
+    `;
+  }
+
+  private _groupUsageEntries(key: 'provider' | 'sessionId' | 'toolName'): Record<string, { tokens: number; cost: number; calls: number }> {
+    const out: Record<string, { tokens: number; cost: number; calls: number }> = {};
+    for (const entry of this.usageData?.entries ?? []) {
+      const label = entry[key] || 'unattributed';
+      const current = out[label] ?? { tokens: 0, cost: 0, calls: 0 };
+      current.tokens += entry.totalTokens;
+      current.cost += entry.costUsd;
+      current.calls += 1;
+      out[label] = current;
+    }
+    return out;
+  }
+
+  private _renderUsageBreakdown(label: string, rows: Record<string, { tokens: number; cost: number; calls: number }>) {
+    const entries = Object.entries(rows);
+    if (entries.length === 0) {
+      return html`<div class="status-msg" style="color:var(--text-muted)">No ${label.toLowerCase()} data yet.</div>`;
+    }
+    return html`
+      <div class="sub-card" style="overflow-x:auto;margin-bottom:var(--sp-5)">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>${label}</th>
+              <th>Tokens</th>
+              <th>Cost</th>
+              <th>Calls</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${entries.map(
+              ([name, stats]) => html`
+                <tr>
+                  <td style="font-family:var(--font-mono);font-size:var(--text-xs)">${name}</td>
+                  <td>${formatTokens(stats.tokens)}</td>
+                  <td>${formatCost(stats.cost)}</td>
+                  <td>${stats.calls}</td>
+                </tr>
+              `,
+            )}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  private _renderLearningDashboard() {
+    const learning = this.learningDashboard;
+    return html`
+      <div class="section-block">
+        <div class="actions-row">
+          <div class="section-header" style="border:none;padding:0;margin:0">Learning Loop</div>
+          <button class="btn" @click=${this._loadLearningDashboard}>Refresh</button>
+        </div>
+        ${learning
+          ? html`
+              <div class="summary-row">
+                <div class="summary-card">
+                  <div class="label">Drafts</div>
+                  <div class="value">${learning.metrics.totalDrafts}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Pending</div>
+                  <div class="value">${learning.metrics.pendingDrafts}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Published</div>
+                  <div class="value">${learning.metrics.publishedDrafts}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Ratings</div>
+                  <div class="value">${learning.metrics.helpfulRatings ?? 0}/${learning.metrics.unhelpfulRatings ?? 0}</div>
+                </div>
+              </div>
+              ${learning.drafts.length > 0
+                ? html`
+                    <div class="sub-card" style="overflow-x:auto">
+                      <table class="data-table">
+                        <thead>
+                          <tr>
+                            <th>Draft</th>
+                            <th>Status</th>
+                            <th>Triggers</th>
+                            <th>Updated</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${learning.drafts.slice(0, 10).map((draft) => html`
+                            <tr>
+                              <td>
+                                <div style="font-weight:600">${draft.title}</div>
+                                <div style="font-size:var(--text-xs);color:var(--text-muted)">${draft.summary}</div>
+                              </td>
+                              <td><span class="tag">${draft.status}</span></td>
+                              <td>${(draft.triggerPhrases ?? []).slice(0, 3).join(', ') || '--'}</td>
+                              <td>${formatTime(draft.updatedAt)}</td>
+                            </tr>
+                          `)}
+                        </tbody>
+                      </table>
+                    </div>
+                  `
+                : html`<crowclaw-empty
+                    icon="skills"
+                    title="No learning drafts"
+                    description="Draft skill suggestions appear here after repeated useful patterns are captured."
+                  ></crowclaw-empty>`}
+            `
+          : html`<div class="status-msg">Loading learning metrics...</div>`}
       </div>
     `;
   }
@@ -2389,8 +3022,43 @@ export class SettingsView extends LitElement {
             </div>`}
       </div>
 
+      ${this._renderConfigDiff()}
       ${this._renderRemoteAccess()}
       ${this._renderDiagnostics()}
+    `;
+  }
+
+  private _renderConfigDiff() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Config Diff</div>
+        <div class="compact-grid">
+          <div class="form-group">
+            <label class="form-label">Before JSON</label>
+            <textarea
+              class="form-input"
+              rows="8"
+              .value=${this.configDiffBefore}
+              @input=${(e: InputEvent) => { this.configDiffBefore = (e.target as HTMLTextAreaElement).value; }}
+            ></textarea>
+          </div>
+          <div class="form-group">
+            <label class="form-label">After JSON</label>
+            <textarea
+              class="form-input"
+              rows="8"
+              .value=${this.configDiffAfter}
+              @input=${(e: InputEvent) => { this.configDiffAfter = (e.target as HTMLTextAreaElement).value; }}
+            ></textarea>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn" @click=${this._previewConfigDiff}>Preview Diff</button>
+        </div>
+        ${this.configDiffResult
+          ? html`<div class="sub-card diff-box">${JSON.stringify(this.configDiffResult, null, 2)}</div>`
+          : nothing}
+      </div>
     `;
   }
 
@@ -2424,7 +3092,7 @@ export class SettingsView extends LitElement {
           <div class="form-hint">External URL used by remote clients to connect to this server.</div>
         </div>
 
-        <div class="toggle-row" style="border:1px solid var(--glass-border);border-radius:var(--radius-md);margin-top:var(--sp-3)">
+        <div class="toggle-row" style="border:1px solid var(--border);border-radius:var(--radius-md);margin-top:var(--sp-3)">
           <div class="toggle-info">
             <div class="toggle-name">Trust Proxy</div>
             <div class="toggle-desc">Enable when running behind a reverse proxy (e.g. nginx, Cloudflare).</div>
@@ -2505,6 +3173,7 @@ export class SettingsView extends LitElement {
 
   private _renderMemory() {
     const selected = this.memories.find((m) => m.id === this.selectedMemoryId);
+    const summary = this.memorySummary;
 
     return html`
       <div class="section-block">
@@ -2536,6 +3205,28 @@ export class SettingsView extends LitElement {
 
         ${this.memorySessionId
           ? html`
+              ${summary
+                ? html`
+                    <div class="summary-row" style="margin-bottom:var(--sp-3)">
+                      <div class="summary-card">
+                        <div class="label">Memory Records</div>
+                        <div class="value">${summary.count}</div>
+                      </div>
+                      <div class="summary-card">
+                        <div class="label">Memory Size</div>
+                        <div class="value">${formatBytes(summary.totalSizeBytes)}</div>
+                      </div>
+                      <div class="summary-card">
+                        <div class="label">Memory Tokens</div>
+                        <div class="value">${formatTokens(summary.estimatedTokens)}</div>
+                      </div>
+                      <div class="summary-card">
+                        <div class="label">Session Cost</div>
+                        <div class="value">${formatCost(summary.sessionCostUsd)}</div>
+                      </div>
+                    </div>
+                  `
+                : nothing}
               <input
                 class="srch"
                 type="text"
@@ -2563,6 +3254,15 @@ export class SettingsView extends LitElement {
                     </button>
                   `,
                 )}
+                <button
+                  class="scope-btn ${this.memoryPinnedOnly ? 'active' : ''}"
+                  @click=${() => {
+                    this.memoryPinnedOnly = !this.memoryPinnedOnly;
+                    this._loadMemories();
+                  }}
+                >
+                  Pinned only
+                </button>
               </div>
 
               ${this.memories.length > 0
@@ -2573,14 +3273,17 @@ export class SettingsView extends LitElement {
                           <div
                             class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
                             @click=${() => {
-                              this.selectedMemoryId =
-                                this.selectedMemoryId === m.id ? null : m.id;
+                              const next = this.selectedMemoryId === m.id ? null : m.id;
+                              this.selectedMemoryId = next;
+                              this.memoryEditDraft = next ? m.value : '';
                             }}
                           >
                             <div class="mem-header">
                               <span class="mem-key">${m.key}</span>
                               <div class="mem-meta">
+                                ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
                                 <span class="tag">${m.scope}</span>
+                                <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
                                 <span style="font-size:var(--text-xs);color:var(--text-muted)">
                                   ${formatTime(m.timestamp)}
                                 </span>
@@ -2601,15 +3304,39 @@ export class SettingsView extends LitElement {
                           <div class="mem-detail">
                             <div class="mem-detail-header">
                               <span class="mem-detail-key">${selected.key}</span>
-                              <button
-                                class="btn btn-danger"
-                                aria-label="Delete memory record"
-                                @click=${() => this._deleteMemory(selected.id)}
-                              >
-                                Delete
-                              </button>
+                              <div style="display:flex;gap:var(--sp-2)">
+                                <button class="btn" @click=${() => this._toggleMemoryPin(selected)}>
+                                  ${selected.pinned ? 'Unpin' : 'Pin'}
+                                </button>
+                                <button
+                                  class="btn btn-danger"
+                                  aria-label="Delete memory record"
+                                  @click=${() => this._deleteMemory(selected.id)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
                             </div>
-                            <div class="mem-detail-body">${selected.value}</div>
+                            <div class="warn-box" style="margin-bottom:var(--sp-3)">
+                              Memory values are stored recall data. Review edits for secrets, credentials, and PII before saving; deletion requires typing DELETE because it permanently removes this recall record.
+                            </div>
+                            <textarea
+                              class="form-input mem-edit"
+                              aria-label="Edit memory summary"
+                              .value=${this.memoryEditDraft || selected.value}
+                              @input=${(e: InputEvent) => { this.memoryEditDraft = (e.target as HTMLTextAreaElement).value; }}
+                            ></textarea>
+                            <div class="kv" style="margin-top:var(--sp-3)">
+                              <span class="kv-k">Size / Tokens</span>
+                              <span class="kv-v">${formatBytes(selected.sizeBytes ?? 0)} / ${formatTokens(Number(selected.metadata?.estimatedTokens ?? 0))}</span>
+                            </div>
+                            <div class="kv" style="margin-top:var(--sp-3)">
+                              <span class="kv-k">Metadata</span>
+                              <span class="kv-v">${JSON.stringify(selected.metadata ?? {})}</span>
+                            </div>
+                            <div class="form-actions">
+                              <button class="btn btn-p" @click=${() => this._saveMemory(selected)}>Save Memory</button>
+                            </div>
                           </div>
                         `
                       : nothing}

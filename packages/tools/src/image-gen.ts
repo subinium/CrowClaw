@@ -5,6 +5,140 @@ export interface ImageGenerationOptions {
   apiKey?: string;
   model?: string;
   defaultSize?: string;
+  provider?: 'openai' | 'gemini' | 'replicate';
+  fallbackProviders?: ImageProviderConfig[];
+}
+
+export interface ImageProviderConfig {
+  provider: 'openai' | 'gemini' | 'replicate';
+  providerBaseUrl?: string;
+  apiKey?: string;
+  model?: string;
+}
+
+function readEnv(name: string): string | undefined {
+  const env = globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } };
+  const value = env.process?.env?.[name];
+  return value && value.trim() ? value : undefined;
+}
+
+function normalizeImageProviders(input: Record<string, unknown>, options?: ImageGenerationOptions): ImageProviderConfig[] {
+  const fromInput = Array.isArray(input.providers)
+    ? input.providers
+        .map((entry): ImageProviderConfig | null => {
+          if (!entry || typeof entry !== 'object') return null;
+          const obj = entry as Record<string, unknown>;
+          const provider = String(obj.provider ?? obj.name ?? '').toLowerCase();
+          if (provider !== 'openai' && provider !== 'gemini' && provider !== 'replicate') return null;
+          return {
+            provider,
+            providerBaseUrl: typeof obj.providerBaseUrl === 'string' ? obj.providerBaseUrl : typeof obj.baseUrl === 'string' ? obj.baseUrl : undefined,
+            apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : undefined,
+            model: typeof obj.model === 'string' ? obj.model : undefined,
+          };
+        })
+        .filter((provider): provider is ImageProviderConfig => provider !== null)
+    : [];
+  if (fromInput.length > 0) return fromInput;
+
+  const primaryKey = (typeof input.apiKey === 'string' ? input.apiKey : undefined) ?? options?.apiKey;
+  const providers: ImageProviderConfig[] = [];
+  if (primaryKey) {
+    providers.push({
+      provider: options?.provider ?? 'openai',
+      apiKey: primaryKey,
+      providerBaseUrl: (typeof input.providerBaseUrl === 'string' ? input.providerBaseUrl : undefined) ?? options?.providerBaseUrl,
+      model: (typeof input.model === 'string' ? input.model : undefined) ?? options?.model,
+    });
+  }
+  providers.push(...(options?.fallbackProviders ?? []));
+  if (providers.length === 0) {
+    const openaiKey = readEnv('OPENAI_API_KEY');
+    if (openaiKey) {
+      providers.push({
+        provider: 'openai',
+        apiKey: openaiKey,
+        providerBaseUrl: readEnv('LLM_BASE_URL') ?? readEnv('OPENAI_BASE_URL'),
+      });
+    }
+  }
+  const replicateKey = readEnv('REPLICATE_API_TOKEN');
+  if (replicateKey && !providers.some((provider) => provider.provider === 'replicate')) {
+    providers.push({ provider: 'replicate', apiKey: replicateKey });
+  }
+  return providers;
+}
+
+async function callImageProvider(
+  provider: ImageProviderConfig,
+  input: { prompt: string; size: string; quality: string; n: number },
+  signal?: AbortSignal
+): Promise<{ urls: string[]; revisedPrompt?: string; metadata: Record<string, unknown> }> {
+  if (!provider.apiKey) throw new Error('missing apiKey');
+
+  if (provider.provider === 'replicate') {
+    const model = provider.model ?? 'black-forest-labs/flux-schnell';
+    const baseUrl = provider.providerBaseUrl ?? 'https://api.replicate.com/v1';
+    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/predictions`, {
+      method: 'POST',
+      headers: { Authorization: `Token ${provider.apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: model, input: { prompt: input.prompt, aspect_ratio: input.size } }),
+      signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json() as { output?: string | string[]; urls?: { get?: string } };
+    const urls = Array.isArray(payload.output) ? payload.output : payload.output ? [payload.output] : payload.urls?.get ? [payload.urls.get] : [];
+    return { urls, metadata: { provider: 'replicate', model, predictionUrl: payload.urls?.get } };
+  }
+
+  if (provider.provider === 'gemini') {
+    const model = provider.model ?? 'gemini-2.0-flash-preview-image-generation';
+    const baseUrl = provider.providerBaseUrl ?? 'https://generativelanguage.googleapis.com/v1beta';
+    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(provider.apiKey)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: input.prompt }] }],
+        generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
+      }),
+      signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string; inlineData?: { mimeType?: string; data?: string } }> } }> };
+    const parts = payload.candidates?.[0]?.content?.parts ?? [];
+    const urls = parts
+      .map((part) => part.inlineData?.data ? `data:${part.inlineData.mimeType ?? 'image/png'};base64,${part.inlineData.data}` : null)
+      .filter((url): url is string => Boolean(url));
+    const revisedPrompt = parts.map((part) => part.text ?? '').join('').trim() || undefined;
+    return { urls, revisedPrompt, metadata: { provider: 'gemini', model } };
+  }
+
+  const model = provider.model ?? 'dall-e-3';
+  const baseUrl = provider.providerBaseUrl ?? 'https://api.openai.com/v1';
+  const response = await fetch(`${baseUrl.replace(/\/$/, '')}/images/generations`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${provider.apiKey}`,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      model,
+      prompt: input.prompt,
+      size: input.size,
+      quality: input.quality,
+      n: input.n,
+      response_format: 'url'
+    }),
+    signal
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const payload = await response.json() as { data?: Array<{ url?: string; revised_prompt?: string }> };
+  const images = payload.data ?? [];
+  return {
+    urls: images.map((img) => img.url).filter((url): url is string => Boolean(url)),
+    revisedPrompt: images[0]?.revised_prompt,
+    metadata: { provider: 'openai', model },
+  };
 }
 
 export function createImageGenerateTool(options?: ImageGenerationOptions): ToolDefinition {
@@ -69,81 +203,60 @@ export function createImageGenerateTool(options?: ImageGenerationOptions): ToolD
         };
       }
 
-      const apiKey = (typeof input.apiKey === 'string' ? input.apiKey : undefined) ?? options?.apiKey;
-      const baseUrl = (typeof input.providerBaseUrl === 'string' ? input.providerBaseUrl : undefined) ?? options?.providerBaseUrl ?? 'https://api.openai.com/v1';
-      const model = (typeof input.model === 'string' ? input.model : undefined) ?? options?.model ?? 'dall-e-3';
-
-      if (!apiKey) {
+      const providers = normalizeImageProviders(input, options);
+      if (providers.length === 0) {
         return {
           toolName: 'image.generate',
           runtime: 'worker',
           ok: false,
-          output: `Image generation requires an API key. Prompt: "${prompt}"\nConfigure an image generation API key to enable this feature.`,
-          metadata: { prompt, size, quality, simulated: true }
+          output: 'Image generation requires OPENAI_API_KEY or REPLICATE_API_TOKEN.',
+          metadata: { prompt, size, quality, provider: 'none' }
         };
       }
 
-      try {
-        const response = await fetch(`${baseUrl.replace(/\/$/, '')}/images/generations`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'content-type': 'application/json'
-          },
-          body: JSON.stringify({
-            model,
-            prompt,
-            size,
-            quality,
-            n,
-            response_format: 'url'
-          }),
-          signal: context.signal
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          return {
-            toolName: 'image.generate',
-            runtime: 'worker',
-            ok: false,
-            output: `Image generation failed: ${response.status} ${response.statusText}\n${errorText}`,
-            metadata: { prompt, size, model, status: response.status }
-          };
-        }
-
-        const payload = await response.json() as {
-          data?: Array<{ url?: string; revised_prompt?: string }>;
-        };
-        const images = payload.data ?? [];
-        const urls = images.map(img => img.url).filter(Boolean);
-        const revisedPrompt = images[0]?.revised_prompt;
-
+      const errors: string[] = [];
+      for (const provider of providers) {
+        try {
+          const result = await callImageProvider(provider, { prompt, size, quality, n }, context.signal);
+          const model = result.metadata.model;
         return {
           toolName: 'image.generate',
           runtime: 'worker',
           ok: true,
           output: JSON.stringify({
-            urls,
-            revisedPrompt,
+              urls: result.urls,
+              revisedPrompt: result.revisedPrompt,
             prompt,
             model,
             size,
             quality,
-            count: urls.length
+              count: result.urls.length
           }, null, 2),
-          metadata: { prompt, model, size, quality, count: urls.length, revisedPrompt }
+            metadata: { prompt, model, size, quality, count: result.urls.length, revisedPrompt: result.revisedPrompt, attemptedProviders: providers.map((entry) => entry.provider), ...result.metadata }
         };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
+        } catch (error: unknown) {
+          errors.push(`${provider.provider}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (providers.length === 1) {
+        const detail = errors[0]?.replace(/^[^:]+:\s*/, '') ?? 'unknown error';
         return {
           toolName: 'image.generate',
           runtime: 'worker',
           ok: false,
-          output: `Image generation failed: ${message}`,
-          metadata: { prompt, model }
+          output: detail.startsWith('HTTP ')
+            ? `Image generation failed: ${detail.slice('HTTP '.length)}`
+            : `Image generation failed: ${detail}`,
+          metadata: { prompt, size, quality, attemptedProviders: providers.map((entry) => entry.provider), errors }
         };
       }
+      return {
+        toolName: 'image.generate',
+        runtime: 'worker',
+        ok: false,
+        output: `Image generation failed: ${errors.join('; ')}`,
+        metadata: { prompt, size, quality, attemptedProviders: providers.map((entry) => entry.provider), errors }
+      };
     }
   };
 }

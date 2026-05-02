@@ -19,6 +19,7 @@ describe('vision.analyze tool', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it('builds correct multimodal message format with image_url + text', async () => {
@@ -60,14 +61,14 @@ describe('vision.analyze tool', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const tool = createVisionAnalyzeTool({ apiKey: 'test-key' });
-    const result = await tool.execute({ url: 'https://images.example.com/cat.png' }, makeContext());
+    const result = await tool.execute({ url: 'https://example.com/cat.png' }, makeContext());
 
     expect(result.ok).toBe(true);
     expect(result.output).toBe('URL image analysis');
 
     // Verify the URL was passed through directly
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
-    expect(body.messages[0].content[0].image_url.url).toBe('https://images.example.com/cat.png');
+    expect(body.messages[0].content[0].image_url.url).toBe('https://example.com/cat.png');
   });
 
   it('handles base64 images by wrapping in data URI', async () => {
@@ -151,6 +152,33 @@ describe('vision.analyze tool', () => {
     expect(result.toolName).toBe('vision.analyze');
   });
 
+  it('falls back to the next configured vision provider on primary failure', async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('openai.local')) {
+        return new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 });
+      }
+      if (href.includes('generativelanguage.googleapis.com')) {
+        return new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'Gemini fallback analysis' }] } }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tool = createVisionAnalyzeTool({
+      apiKey: 'openai-key',
+      providerBaseUrl: 'https://openai.local/v1',
+      fallbackProviders: [{ provider: 'gemini', apiKey: 'gemini-key' }],
+    });
+    const result = await tool.execute({ url: 'https://example.com/image.png' }, makeContext());
+
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe('Gemini fallback analysis');
+    expect(result.metadata).toMatchObject({ provider: 'gemini' });
+  });
+
   it('handles network error gracefully without throwing', async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error('Network connection refused');
@@ -165,24 +193,25 @@ describe('vision.analyze tool', () => {
   });
 
   it('falls back to metadata when no API key is provided', async () => {
-    const fetchMock = vi.fn(async () => {
-      return new Response('', {
-        status: 200,
-        headers: {
-          'content-type': 'image/jpeg',
-          'content-length': '51200'
-        }
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
     const tool = createVisionAnalyzeTool(); // no apiKey
     const result = await tool.execute({ url: 'https://example.com/image.jpg' }, makeContext());
 
-    expect(result.ok).toBe(true);
-    expect(result.output).toContain('Image metadata');
-    expect(result.output).toContain('Content-Type: image/jpeg');
-    expect(result.metadata).toMatchObject({ simulated: true });
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('OPENAI_API_KEY');
+    expect(result.output).toContain('GOOGLE_API_KEY');
+    expect(result.metadata).toMatchObject({ provider: 'none' });
+  });
+
+  it('blocks private image URLs before any fetch', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tool = createVisionAnalyzeTool();
+    const result = await tool.execute({ url: 'http://169.254.169.254/latest/meta-data/' }, makeContext());
+
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('URL blocked:');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('returns error when url parameter is missing', async () => {
@@ -228,6 +257,31 @@ describe('vision.analyze tool', () => {
 describe('image.generate tool', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('falls back to Replicate when OpenAI-compatible image generation fails', async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('openai.local')) {
+        return new Response('rate limited', { status: 429 });
+      }
+      if (href.includes('api.replicate.com')) {
+        return new Response(JSON.stringify({ output: ['https://example.com/replicate.png'] }), { status: 200 });
+      }
+      throw new Error(`unexpected url ${href}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tool = createImageGenerateTool({
+      apiKey: 'openai-key',
+      providerBaseUrl: 'https://openai.local/v1',
+      fallbackProviders: [{ provider: 'replicate', apiKey: 'replicate-key' }],
+    });
+    const result = await tool.execute({ prompt: 'a fallback image' }, makeContext());
+
+    expect(result.ok).toBe(true);
+    expect(result.metadata).toMatchObject({ provider: 'replicate', count: 1 });
+    expect(result.output).toContain('https://example.com/replicate.png');
   });
 
   afterEach(() => {
@@ -286,7 +340,8 @@ describe('image.generate tool', () => {
     const result = await tool.execute({ prompt: 'a logo' }, makeContext());
 
     expect(result.ok).toBe(false);
-    expect(result.output).toContain('requires an API key');
+    expect(result.output).toContain('OPENAI_API_KEY');
+    expect(result.output).toContain('REPLICATE_API_TOKEN');
   });
 
   it('handles API error gracefully', async () => {

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CrowClawMcpServer } from '@crowclaw/mcp-server';
+import { InMemoryMemoryStore, InMemorySessionStore } from '@crowclaw/storage';
+import { ToolRegistry, createEchoTool } from '@crowclaw/tools';
 
 describe('MCP server', () => {
   function createTestServer() {
@@ -97,6 +99,56 @@ describe('MCP server', () => {
     const tools = server.getToolDefinitions();
     expect(tools.length).toBeGreaterThanOrEqual(1);
     expect(tools.every(t => t.inputSchema.type === 'object')).toBe(true);
+  });
+
+  it('uses wired runtime stores for sessions, memories, and tool catalog', async () => {
+    const sessionStore = new InMemorySessionStore();
+    const memoryStore = new InMemoryMemoryStore();
+    const toolCatalog = new ToolRegistry().register(createEchoTool());
+    await sessionStore.put({
+      agentId: 'crowclaw',
+      sessionId: 'mcp-real-session',
+      updatedAt: '2026-05-02T00:00:00.000Z',
+      messages: [
+        { role: 'user', content: 'remember runtime data', createdAt: '2026-05-02T00:00:00.000Z' },
+      ],
+    });
+    await memoryStore.write({
+      id: 'mem-1',
+      sessionId: 'mcp-real-session',
+      scope: 'session',
+      summary: 'runtime memory result',
+      tags: ['runtime'],
+      createdAt: '2026-05-02T00:00:00.000Z',
+    });
+
+    const server = new CrowClawMcpServer({
+      run: async (input) => ({ finalResponse: `Reply: ${input.userMessage}` })
+    }, { sessionStore, memoryStore, toolCatalog });
+
+    const sessions = await server.handleRequest({
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'tools/call',
+      params: { name: 'crowclaw.sessions.list', arguments: {} },
+    });
+    expect(JSON.parse((sessions.result as { content: Array<{ text: string }> }).content[0]!.text).sessions[0].sessionId).toBe('mcp-real-session');
+
+    const memories = await server.handleRequest({
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: { name: 'crowclaw.memories.search', arguments: { query: 'runtime' } },
+    });
+    expect((memories.result as { content: Array<{ text: string }> }).content[0]!.text).toContain('runtime memory result');
+
+    const tools = await server.handleRequest({
+      jsonrpc: '2.0',
+      id: 12,
+      method: 'tools/call',
+      params: { name: 'crowclaw.tools.list', arguments: {} },
+    });
+    expect(JSON.parse((tools.result as { content: Array<{ text: string }> }).content[0]!.text).tools).toEqual(['echo']);
   });
 
   // ------------------------------------------------------------------------

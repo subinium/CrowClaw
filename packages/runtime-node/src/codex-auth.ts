@@ -47,6 +47,14 @@ export interface CodexAuthStoreOptions {
   fetchImpl?: typeof fetch;
   /** Override for tests. */
   now?: () => number;
+  /** Receives non-fatal file permission warnings without exposing token values. */
+  onPermissionWarning?: (warning: CodexAuthPermissionWarning) => void;
+}
+
+export interface CodexAuthPermissionWarning {
+  authPath: string;
+  mode: number;
+  message: string;
 }
 
 const DEFAULT_AUTH_PATH = join(homedir(), '.codex', 'auth.json');
@@ -82,6 +90,7 @@ export class CodexAuthStore {
   private readonly proactiveRefreshMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private readonly onPermissionWarning?: (warning: CodexAuthPermissionWarning) => void;
   private cached: CodexAuthFile | null = null;
   private inflightRefresh: Promise<string> | null = null;
 
@@ -92,6 +101,7 @@ export class CodexAuthStore {
     this.proactiveRefreshMs = options.proactiveRefreshMs ?? 60_000;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => Date.now());
+    this.onPermissionWarning = options.onPermissionWarning;
   }
 
   /**
@@ -101,11 +111,13 @@ export class CodexAuthStore {
    */
   async load(): Promise<CodexAuthFile | null> {
     try {
+      await this.warnOnLoosePermissions();
       const raw = await fs.readFile(this.authPath, 'utf-8');
-      const parsed = JSON.parse(raw) as CodexAuthFile;
-      if (!parsed || typeof parsed !== 'object') return null;
-      this.cached = parsed;
-      return parsed;
+      const parsed = JSON.parse(raw) as unknown;
+      const authFile = parseCodexAuthFile(parsed);
+      if (!authFile) return null;
+      this.cached = authFile;
+      return authFile;
     } catch {
       return null;
     }
@@ -160,6 +172,26 @@ export class CodexAuthStore {
     if (expSec === null) return false;
     const expiresAtMs = expSec * 1000;
     return expiresAtMs - this.now() <= this.proactiveRefreshMs;
+  }
+
+  private async warnOnLoosePermissions(): Promise<void> {
+    try {
+      const stats = await fs.stat(this.authPath);
+      const mode = stats.mode & 0o777;
+      if ((mode & 0o077) === 0) return;
+      const warning: CodexAuthPermissionWarning = {
+        authPath: this.authPath,
+        mode,
+        message: `Codex auth file permissions are too broad (${mode.toString(8)}); run chmod 600 on the file.`,
+      };
+      if (this.onPermissionWarning) {
+        this.onPermissionWarning(warning);
+      } else {
+        console.warn(warning.message);
+      }
+    } catch {
+      // Missing/unstatable files are handled by load() itself.
+    }
   }
 
   private async doRefresh(): Promise<string> {
@@ -219,6 +251,47 @@ export class CodexAuthStore {
 
     return payload.access_token;
   }
+}
+
+function isNullableString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === 'string';
+}
+
+function parseCodexTokens(value: unknown): CodexTokens | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.access_token !== 'string' || typeof raw.refresh_token !== 'string') {
+    return null;
+  }
+  if (!isNullableString(raw.id_token) || !isNullableString(raw.account_id)) {
+    return null;
+  }
+  return {
+    id_token: raw.id_token ?? null,
+    access_token: raw.access_token,
+    refresh_token: raw.refresh_token,
+    account_id: raw.account_id ?? null,
+  };
+}
+
+export function parseCodexAuthFile(value: unknown): CodexAuthFile | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (!isNullableString(raw.auth_mode)) return null;
+  if (!isNullableString(raw.OPENAI_API_KEY)) return null;
+  if (!isNullableString(raw.last_refresh)) return null;
+
+  const tokens = raw.tokens === undefined || raw.tokens === null
+    ? null
+    : parseCodexTokens(raw.tokens);
+  if (raw.tokens !== undefined && raw.tokens !== null && !tokens) return null;
+
+  return {
+    auth_mode: raw.auth_mode ?? undefined,
+    OPENAI_API_KEY: raw.OPENAI_API_KEY ?? null,
+    tokens,
+    last_refresh: raw.last_refresh ?? null,
+  };
 }
 
 /**

@@ -285,4 +285,191 @@ describe('OpenAICompatibleProvider', () => {
 
     await expect(provider.generate(baseRequest)).rejects.toThrow('Provider request failed: 503 Service Unavailable');
   });
+
+  it('retries transient 429/5xx responses with backoff', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('rate limited', {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: { 'retry-after': '0' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok after retry' } }],
+      }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.example.com/v1',
+      model: 'gpt-test',
+      retryBaseDelayMs: 0,
+    });
+
+    const result = await provider.generate(baseRequest);
+    expect(result.assistantMessage).toBe('ok after retry');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('adds stable OpenAI prompt cache fields and sorted tool prefix', async () => {
+    let body: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'cached' } }],
+        usage: {
+          prompt_tokens: 1200,
+          completion_tokens: 10,
+          total_tokens: 1210,
+          prompt_tokens_details: { cached_tokens: 1024 },
+        },
+      }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-5.5',
+      promptCacheRetention: '24h',
+    });
+
+    const result = await provider.generate({
+      ...baseRequest,
+      availableTools: [
+        { ...baseRequest.availableTools[0]!, name: 'z.tool' },
+        { ...baseRequest.availableTools[0]!, name: 'a.tool' },
+      ],
+    });
+
+    expect(body.prompt_cache_key).toMatch(/^crowclaw-/);
+    expect(body.prompt_cache_retention).toBe('24h');
+    expect((body.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name)).toEqual(['a_tool', 'z_tool']);
+    expect(result.usage?.cachedTokens).toBe(1024);
+  });
+
+  it('sets token fields per OpenAI endpoint family', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const responsesProvider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'o4-mini',
+      reasoningEffort: 'high',
+      temperature: 0.2,
+    });
+
+    await responsesProvider.generate({ ...baseRequest, availableTools: [], maxTokens: 2048 });
+    expect(bodies[0]).toMatchObject({
+      max_output_tokens: 2048,
+      reasoning_effort: 'high',
+    });
+    expect(bodies[0]).not.toHaveProperty('temperature');
+
+    const chatProvider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o',
+      temperature: 0,
+    });
+    vi.mocked(fetchMock).mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 }));
+
+    await chatProvider.generate({ ...baseRequest, availableTools: [], maxTokens: 1024 });
+    const chatBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(chatBody).toMatchObject({
+      max_tokens: 1024,
+      temperature: 0,
+    });
+  });
+
+  it('uses Responses API text.format for native structured outputs on o-series', async () => {
+    let calledUrl = '';
+    let body: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calledUrl = url;
+      body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        output: [{ type: 'message', content: [{ type: 'output_text', text: '{"answer":"ok"}' }] }],
+      }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.openai.com/v1',
+      endpointPath: '/responses',
+      model: 'o4-mini',
+    });
+
+    const result = await provider.generateStructured<{ answer: string }>({
+      messages: [{ role: 'user', content: 'answer', createdAt: new Date().toISOString() }],
+      schema: { type: 'object', required: ['answer'], properties: { answer: { type: 'string' } } },
+    });
+
+    expect(calledUrl).toBe('https://api.openai.com/v1/responses');
+    expect((body.text as { format?: { type?: string } }).format?.type).toBe('json_schema');
+    expect(body).not.toHaveProperty('response_format');
+    expect(result).toMatchObject({ ok: true, value: { answer: 'ok' } });
+  });
+
+  it('uses native structured outputs for gpt-5 family models', async () => {
+    let calledUrl = '';
+    let body: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calledUrl = url;
+      body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"answer":"ok"}' } }],
+      }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-5.5',
+    });
+
+    const result = await provider.generateStructured<{ answer: string }>({
+      messages: [{ role: 'user', content: 'answer', createdAt: new Date().toISOString() }],
+      schema: { type: 'object', required: ['answer'], properties: { answer: { type: 'string' } } },
+    });
+
+    expect(calledUrl).toBe('https://api.openai.com/v1/chat/completions');
+    expect((body.response_format as { type?: string }).type).toBe('json_schema');
+    expect(result).toMatchObject({ ok: true, value: { answer: 'ok' } });
+  });
+
+  it('does not use native non-streaming structured calls for requireStream gpt-5 providers', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.stream).toBe(true);
+      expect(body).not.toHaveProperty('text');
+      expect(body).not.toHaveProperty('response_format');
+      return new Response('data: {"type":"response.output_text.delta","delta":"{\\"answer\\":\\"ok\\"}"}\n\ndata: {"type":"response.completed"}\n\n', {
+        status: 200,
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://api.openai.com/v1',
+      endpointPath: '/responses',
+      model: 'gpt-5.5',
+      requireStream: true,
+    });
+
+    await provider.generateStructured({
+      messages: [{ role: 'user', content: 'answer', createdAt: new Date().toISOString() }],
+      schema: { type: 'object', properties: { answer: { type: 'string' } } },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

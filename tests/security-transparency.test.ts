@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { SecurityAuditLog, type SecurityEvent } from '../packages/core/src/security.js';
 import { DASHBOARD_HTML } from '../packages/web/src/index.js';
 
@@ -207,29 +210,34 @@ describe('Security API endpoint shapes', () => {
       },
     };
     const { createNodeRuntime } = await import('../packages/runtime-node/src/index.js');
-    const runtime = createNodeRuntime({ configStorePath: null });
+    const dir = await mkdtemp(join(tmpdir(), 'crowclaw-security-events-'));
+    try {
+      const runtime = createNodeRuntime({ configStorePath: null, dataDir: dir });
 
-    runtime.securityAuditLog.record({ type: 'credential_redacted', severity: 'info', detail: 'test' });
+      runtime.securityAuditLog.record({ type: 'credential_redacted', severity: 'info', detail: 'test' });
 
-    let res = await runtime.fetch(new Request('http://localhost/api/security/events', {
-      headers: { 'authorization': `Bearer ${token}` },
-    }));
-    let data = (await res.json()) as { events: unknown[] };
-    expect(data.events.length).toBeGreaterThan(0);
+      let res = await runtime.fetch(new Request('http://localhost/api/security/events', {
+        headers: { 'authorization': `Bearer ${token}` },
+      }));
+      let data = (await res.json()) as { events: unknown[] };
+      expect(data.events.length).toBeGreaterThan(0);
 
-    res = await runtime.fetch(new Request('http://localhost/api/security/events/clear', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
-      body: '{}',
-    }));
-    const clearResult = (await res.json()) as { ok: boolean };
-    expect(clearResult.ok).toBe(true);
+      res = await runtime.fetch(new Request('http://localhost/api/security/events/clear', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
+        body: '{}',
+      }));
+      const clearResult = (await res.json()) as { ok: boolean };
+      expect(clearResult.ok).toBe(true);
 
-    res = await runtime.fetch(new Request('http://localhost/api/security/events', {
-      headers: { 'authorization': `Bearer ${token}` },
-    }));
-    data = (await res.json()) as { events: unknown[] };
-    expect(data.events).toHaveLength(0);
+      res = await runtime.fetch(new Request('http://localhost/api/security/events', {
+        headers: { 'authorization': `Bearer ${token}` },
+      }));
+      data = (await res.json()) as { events: unknown[] };
+      expect(data.events).toHaveLength(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -37,7 +37,7 @@ export class CrowClawToast extends LitElement {
       max-width: 380px;
       padding: var(--sp-3, 12px) var(--sp-4, 16px);
       background: var(--bg-secondary, #13131a);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, #2a2a35);
       border-radius: var(--radius-md, 8px);
       box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.5));
       font-size: var(--text-sm, 13px);
@@ -138,6 +138,8 @@ export class CrowClawToast extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    this.setAttribute('role', 'region');
+    this.setAttribute('aria-label', 'Notifications');
     containerInstance = this;
   }
 
@@ -152,8 +154,13 @@ export class CrowClawToast extends LitElement {
     return html`
       ${this._toasts.map(
         (t) => html`
-          <div class="toast ${t.type} ${t.dismissing ? 'dismissing' : ''}">
-            <span class="indicator"></span>
+          <div
+            class="toast ${t.type} ${t.dismissing ? 'dismissing' : ''}"
+            role=${t.type === 'error' ? 'alert' : 'status'}
+            aria-live=${t.type === 'error' ? 'assertive' : 'polite'}
+            aria-atomic="true"
+          >
+            <span class="indicator" aria-hidden="true"></span>
             <span class="message">${t.message}</span>
             <button
               class="dismiss-btn"

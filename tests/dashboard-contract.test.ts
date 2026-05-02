@@ -126,6 +126,28 @@ describe('Dashboard contract: agent-view.ts', () => {
   });
 });
 
+describe('Dashboard contract: settings/chat/connect cleanup batch', () => {
+  it('generated dashboard contains gateway cleanup controls', async () => {
+    const { DASHBOARD_HTML } = await import('../packages/web/src/index.js');
+    expect(DASHBOARD_HTML).toContain('Setup Wizard');
+    expect(DASHBOARD_HTML).toContain('Gateway Security');
+    expect(DASHBOARD_HTML).toContain('Rotate Secret');
+    expect(DASHBOARD_HTML).toContain('Gateway Activity');
+    expect(DASHBOARD_HTML).toContain('Reject');
+    expect(DASHBOARD_HTML).toContain('Revoke');
+  });
+
+  it('generated dashboard contains theme, locale, release, and session transfer controls', async () => {
+    const { DASHBOARD_HTML } = await import('../packages/web/src/index.js');
+    expect(DASHBOARD_HTML).toContain('crowclaw:theme');
+    expect(DASHBOARD_HTML).toContain('crowclaw:locale');
+    expect(DASHBOARD_HTML).toContain('/api/system/release-check');
+    expect(DASHBOARD_HTML).toContain('Export JSON');
+    expect(DASHBOARD_HTML).toContain('Import JSON');
+    expect(DASHBOARD_HTML).toContain('Debug Trace');
+  });
+});
+
 describe('Dashboard contract: settings-view.ts', () => {
   it('GET /api/config/agent returns {config: AgentConfig} wrapper', async () => {
     const runtime = createNodeRuntime({ configStorePath: null });
@@ -169,6 +191,34 @@ describe('Dashboard contract: settings-view.ts', () => {
     for (const event of data.events) {
       expect(event.severity).toBe('critical');
     }
+  });
+
+  it('GET /api/security/events accepts q search filter', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const res = await runtime.fetch(get('/api/security/events?q=dashboard'));
+    expect(res.ok).toBe(true);
+    const data = await res.json() as { events: unknown[] };
+    expect(Array.isArray(data.events)).toBe(true);
+  });
+
+  it('GET /api/learning/dashboard returns draft metrics', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const res = await runtime.fetch(get('/api/learning/dashboard'));
+    expect(res.ok).toBe(true);
+    const data = await res.json() as { drafts: unknown[]; metrics: { totalDrafts: number; pendingDrafts: number; publishedDrafts: number } };
+    expect(Array.isArray(data.drafts)).toBe(true);
+    expect(typeof data.metrics.totalDrafts).toBe('number');
+    expect(typeof data.metrics.pendingDrafts).toBe('number');
+    expect(typeof data.metrics.publishedDrafts).toBe('number');
+  });
+
+  it('GET /api/persona/active includes a promptPreview for persona preview UI', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const res = await runtime.fetch(get('/api/persona/active'));
+    expect(res.ok).toBe(true);
+    const data = await res.json() as { name: string; promptPreview: string };
+    expect(typeof data.name).toBe('string');
+    expect(typeof data.promptPreview).toBe('string');
   });
 });
 

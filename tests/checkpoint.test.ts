@@ -7,6 +7,8 @@ import {
   createReplaySession,
   InMemoryCheckpointStore,
 } from '@crowclaw/core';
+import { InMemorySessionStore } from '@crowclaw/storage';
+import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
 function makeSession(overrides: Partial<SessionState> = {}): SessionState {
   return {
@@ -289,6 +291,119 @@ describe('restoreFromCheckpoint', () => {
 
     const restored = restoreFromCheckpoint(cp, session);
     expect(restored.loopState).toBeUndefined();
+  });
+});
+
+describe('runtime checkpoint auto-resume', () => {
+  it('restores in_progress checkpoints during runtime startup', async () => {
+    const sessionStore = new InMemorySessionStore();
+    const checkpointStore = new InMemoryCheckpointStore();
+    const checkpointSession = makeSession({
+      sessionId: 'startup-resume-session',
+      messages: [
+        { role: 'user', content: 'before restart', createdAt: '2026-01-01T00:00:00.000Z' },
+        { role: 'assistant', content: 'checkpointed startup response', createdAt: '2026-01-01T00:00:01.000Z' },
+      ],
+    });
+    const liveSession = makeSession({
+      sessionId: 'startup-resume-session',
+      messages: [
+        ...checkpointSession.messages,
+        { role: 'assistant', content: 'uncheckpointed startup text', createdAt: '2026-01-01T00:00:02.000Z' },
+      ],
+    });
+    const checkpoint = createCheckpoint(checkpointSession, [], 2, 'iteration', 'in_progress');
+    await sessionStore.put(liveSession);
+    await checkpointStore.save(checkpoint);
+
+    const runtime = createNodeRuntime({
+      sessionStore,
+      checkpointStore,
+      schedulerStorePath: null,
+      configStorePath: null,
+    });
+    const events: string[] = [];
+    runtime.eventBus.subscribe((event) => {
+      if (event.type === 'session:resumed') events.push(String(event.data.checkpointId));
+    });
+    await runtime.autoResumeStartupReady;
+
+    const restored = await sessionStore.get('startup-resume-session');
+    expect(restored?.messages.some((message) => message.content === 'uncheckpointed startup text')).toBe(false);
+    expect(events).toContain(checkpoint.id);
+    await runtime.shutdown();
+  });
+
+  it('skips startup auto-resume when autoResumeCheckpoints is false', async () => {
+    const sessionStore = new InMemorySessionStore();
+    const checkpointStore = new InMemoryCheckpointStore();
+    const checkpointSession = makeSession({
+      sessionId: 'startup-no-resume-session',
+      messages: [
+        { role: 'user', content: 'before restart', createdAt: '2026-01-01T00:00:00.000Z' },
+      ],
+    });
+    const liveSession = makeSession({
+      sessionId: 'startup-no-resume-session',
+      messages: [
+        ...checkpointSession.messages,
+        { role: 'assistant', content: 'keep in-flight text', createdAt: '2026-01-01T00:00:02.000Z' },
+      ],
+    });
+    await sessionStore.put(liveSession);
+    await checkpointStore.save(createCheckpoint(checkpointSession, [], 1, 'iteration', 'in_progress'));
+
+    const runtime = createNodeRuntime({
+      sessionStore,
+      checkpointStore,
+      autoResumeCheckpoints: false,
+      schedulerStorePath: null,
+      configStorePath: null,
+    });
+    await runtime.autoResumeStartupReady;
+
+    const restored = await sessionStore.get('startup-no-resume-session');
+    expect(restored?.messages.some((message) => message.content === 'keep in-flight text')).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('restores the latest in_progress checkpoint before the next turn', async () => {
+    const sessionStore = new InMemorySessionStore();
+    const checkpointStore = new InMemoryCheckpointStore();
+    const checkpointSession = makeSession({
+      sessionId: 'resume-session',
+      messages: [
+        { role: 'user', content: 'before crash', createdAt: '2026-01-01T00:00:00.000Z' },
+        { role: 'assistant', content: 'checkpointed response', createdAt: '2026-01-01T00:00:01.000Z' },
+      ],
+    });
+    const liveSession = makeSession({
+      sessionId: 'resume-session',
+      messages: [
+        ...checkpointSession.messages,
+        { role: 'assistant', content: 'uncheckpointed in-flight text', createdAt: '2026-01-01T00:00:02.000Z' },
+      ],
+    });
+    await sessionStore.put(liveSession);
+    await checkpointStore.save(createCheckpoint(checkpointSession, [], 1, 'iteration', 'in_progress'));
+
+    const runtime = createNodeRuntime({
+      sessionStore,
+      checkpointStore,
+      schedulerStorePath: null,
+      configStorePath: null,
+    });
+    const response = await runtime.fetch(new Request('http://localhost/api/sessions/resume-session', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userMessage: 'continue' }),
+    }));
+    expect(response.status).toBe(200);
+
+    const restored = await sessionStore.get('resume-session');
+    expect(restored?.messages.some((message) => message.content === 'uncheckpointed in-flight text')).toBe(false);
+    expect(restored?.messages.some((message) => message.content === 'continue')).toBe(true);
+    await runtime.shutdown();
   });
 });
 

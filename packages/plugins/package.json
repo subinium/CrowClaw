@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/plugins",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -8,16 +8,21 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./contracts": {
+      "types": "./src/contracts.ts",
+      "import": "./dist/contracts.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "examples"
   ],
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.8.1"
+    "@crowclaw/core": "0.8.2"
   },
   "repository": {
     "type": "git",

@@ -95,9 +95,14 @@ export class ConversationTree {
     let shared = 0;
     const minLen = Math.min(a.messages.length, b.messages.length);
     for (let i = 0; i < minLen; i++) {
+      const messageA = a.messages[i];
+      const messageB = b.messages[i];
+      if (!messageA || !messageB) {
+        break;
+      }
       if (
-        a.messages[i].content === b.messages[i].content &&
-        a.messages[i].role === b.messages[i].role
+        messageA.content === messageB.content &&
+        messageA.role === messageB.role
       ) {
         shared++;
       } else {
@@ -178,8 +183,12 @@ export class ConversationTree {
 
 function findLastAssistantMessage(messages: ConversationMessage[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'assistant') {
-      return messages[i].content;
+    const message = messages[i];
+    if (!message) {
+      continue;
+    }
+    if (message.role === 'assistant') {
+      return message.content;
     }
   }
   return undefined;

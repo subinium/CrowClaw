@@ -147,7 +147,7 @@ describe('SSE streaming chat', () => {
     it('contains streaming-related CSS', () => {
       expect(DASHBOARD_HTML).toContain('.cursor-blink');
       expect(DASHBOARD_HTML).toContain('@keyframes blink');
-      expect(DASHBOARD_HTML).toContain('@keyframes spin');
+      expect(DASHBOARD_HTML).toContain('@keyframes cc-btn-spin');
     });
 
     it('contains crowclaw-chat-view for streaming', () => {

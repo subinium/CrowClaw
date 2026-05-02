@@ -81,6 +81,21 @@ describe('prompt builder', () => {
     expect(prompt).not.toContain('Relevant Memories');
   });
 
+  it('adds locale response guidance when locale is provided', () => {
+    const koPrompt = buildSystemPrompt({
+      basePrompt: 'You are CrowClaw.',
+      locale: 'ko',
+    });
+    const enPrompt = buildSystemPrompt({
+      basePrompt: 'You are CrowClaw.',
+      locale: 'en',
+    });
+
+    expect(koPrompt).toContain('Response language:');
+    expect(koPrompt).toContain('Respond in Korean by default.');
+    expect(enPrompt).toContain('Respond in English by default.');
+  });
+
   it('system prompt has no memory section even with memories passed', () => {
     const prompt = buildSystemPrompt({
       basePrompt: 'You are CrowClaw.',

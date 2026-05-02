@@ -56,48 +56,33 @@ class FakeD1Database implements D1DatabaseLike {
     let results = [...this.rows];
 
     if (query.includes('WHERE session_id = ?1')) {
-      const [sessionId, likeValue, limit] = values;
-      const needle = String(likeValue).replaceAll('%', '').toLowerCase();
+      const [sessionId] = values;
       results = results
         .filter((row) => row.session_id === String(sessionId))
-        .filter((row) => this.matchesNeedle(row, needle))
-        .sort((a, b) => b.created_at.localeCompare(a.created_at))
-        .slice(0, Number(limit));
+        .sort((a, b) => b.created_at.localeCompare(a.created_at));
       return results;
     }
 
     if (query.includes('WHERE scope = ?1')) {
-      if (query.includes('summary LIKE ?2')) {
-        const [scope, likeValue, limit, scopeKey] = values;
-        const needle = String(likeValue).replaceAll('%', '').toLowerCase();
+      if (query.includes('LIMIT ?2')) {
+        const [scope, limit, scopeKey] = values;
         results = results
           .filter((row) => row.scope === scope)
           .filter((row) => scopeKey == null || row.scope_key === String(scopeKey))
-          .filter((row) => this.matchesNeedle(row, needle))
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
           .slice(0, Number(limit));
         return results;
       }
 
-      const [scope, limit, scopeKey] = values;
+      const [scope, scopeKey] = values;
       results = results
         .filter((row) => row.scope === scope)
         .filter((row) => scopeKey == null || row.scope_key === String(scopeKey))
-        .sort((a, b) => b.created_at.localeCompare(a.created_at))
-        .slice(0, Number(limit));
+        .sort((a, b) => b.created_at.localeCompare(a.created_at));
       return results;
     }
 
     return [];
-  }
-
-  private matchesNeedle(row: MemoryRow, needle: string): boolean {
-    if (!needle) {
-      return true;
-    }
-    return row.summary.toLowerCase().includes(needle)
-      || row.tags_json.toLowerCase().includes(needle)
-      || String(row.metadata_json ?? '').toLowerCase().includes(needle);
   }
 }
 
@@ -151,5 +136,35 @@ describe('D1MemoryStore', () => {
 
     const scopedList = await store.listByScope('workspace', 10, 'workspace-a');
     expect(scopedList.map((record) => record.id)).toEqual(['m3', 'm1']);
+  });
+
+  it('uses deterministic local semantic ranking for session and scoped search', async () => {
+    const db = new FakeD1Database();
+    const store = new D1MemoryStore(db);
+
+    await store.write({
+      id: 'finance',
+      sessionId: 'semantic-d1',
+      scope: 'workspace',
+      scopeKey: 'workspace-a',
+      summary: 'newer invoice reconciliation note',
+      tags: ['finance'],
+      createdAt: '2026-01-02T00:00:00.000Z'
+    });
+    await store.write({
+      id: 'kubernetes-deploy',
+      sessionId: 'semantic-d1',
+      scope: 'workspace',
+      scopeKey: 'workspace-a',
+      summary: 'Kubernetes canary deployment strategy',
+      tags: ['cluster'],
+      createdAt: '2026-01-01T00:00:00.000Z'
+    });
+
+    const sessionSearch = await store.search('semantic-d1', 'k8s rollout', 5);
+    expect(sessionSearch.map((record) => record.id)).toEqual(['kubernetes-deploy']);
+
+    const scopedSearch = await store.searchByScope('workspace', 'k8s rollout', 5, 'workspace-a');
+    expect(scopedSearch.map((record) => record.id)).toEqual(['kubernetes-deploy']);
   });
 });

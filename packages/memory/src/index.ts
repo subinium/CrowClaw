@@ -87,7 +87,22 @@ export class MemoryService {
       return null;
     }
 
-    const note = this.summarize(messages, scope);
+    const fallbackNote = this.summarize(messages, scope);
+    let semanticSummary = '';
+    if (this.provider?.llmSummarize) {
+      try {
+        semanticSummary = (await this.provider.llmSummarize(messages)).trim();
+      } catch {
+        semanticSummary = '';
+      }
+    }
+    const note: MemoryNote = semanticSummary
+      ? {
+          ...fallbackNote,
+          summary: semanticSummary,
+          tags: uniqueTags([...fallbackNote.tags, 'semantic-summary']),
+        }
+      : fallbackNote;
     const record: MemoryRecord = {
       id: crypto.randomUUID(),
       sessionId,
@@ -380,5 +395,5 @@ export {
 // v0.8.0 Hermes parity (#233) — pluggable MemoryProvider ABC.
 export type { MemoryProvider } from './provider.js';
 export type { MemoryScope } from './types.js';
-export { InMemoryMemoryProvider } from './provider.js';
+export { InMemoryMemoryProvider, PluginMemoryProvider, memoryProviderFromPluginRegistry } from './provider.js';
 export type { MemoryRecord as ProviderMemoryRecord, ConversationMessage as ProviderConversationMessage } from './types.js';

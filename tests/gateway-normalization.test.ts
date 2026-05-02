@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  channels,
   buildEmailDispatch,
   buildMatrixDispatch,
   buildSmsDispatch,
@@ -23,6 +24,28 @@ import {
 } from '@crowclaw/gateway';
 
 describe('gateway normalization', () => {
+  it('registers WhatsApp and Signal as first-class channels', () => {
+    expect(channels.names()).toEqual(expect.arrayContaining(['whatsapp', 'signal']));
+    const whatsapp = channels.normalizeAny({
+      entry: [{
+        changes: [{
+          value: {
+            metadata: { phone_number_id: 'wa-phone-1' },
+            messages: [{ id: 'wamid-1', from: 'sender-1', timestamp: '1700000000', text: { body: 'hello from whatsapp' } }]
+          }
+        }]
+      }]
+    });
+    expect(whatsapp?.channel).toBe('whatsapp');
+    expect(whatsapp?.message.text).toBe('hello from whatsapp');
+
+    const signal = channels.normalizeAny({
+      envelope: { sourceNumber: '+15550001', timestamp: 1_700_000_000_000, dataMessage: { message: 'hello from signal' } }
+    });
+    expect(signal?.channel).toBe('signal');
+    expect(channels.buildOutbound('signal', '+15550001', 'reply')).toEqual({ recipient: '+15550001', message: 'reply' });
+  });
+
   it('normalizes generic webhook payloads', () => {
     const message = normalizeGenericWebhook({ chatId: 'chat-1', userId: 'user-1', text: 'hello' });
     expect(message.platform).toBe('webhook');

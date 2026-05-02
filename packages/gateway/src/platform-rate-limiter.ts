@@ -33,7 +33,11 @@ export class PlatformRateLimiter {
    */
   private pruneExpired(arr: number[], cutoff: number): void {
     let i = 0;
-    while (i < arr.length && arr[i] <= cutoff) i++;
+    while (i < arr.length) {
+      const value = arr[i];
+      if (value === undefined || value > cutoff) break;
+      i++;
+    }
     if (i > 0) arr.splice(0, i);
   }
 

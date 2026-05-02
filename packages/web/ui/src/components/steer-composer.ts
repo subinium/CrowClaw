@@ -38,7 +38,7 @@ export class CrowClawSteerComposer extends LitElement {
 
     /* The panel is rendered in a sticky bottom-of-stream position by the
        parent view. The slide animation is purely visual — actual DOM
-       presence is governed by the `open` property. */
+       presence is governed by the "open" property. */
     .panel {
       border: 1px solid rgba(255, 214, 10, 0.25);
       background: rgba(255, 214, 10, 0.05);
@@ -89,7 +89,7 @@ export class CrowClawSteerComposer extends LitElement {
       min-height: 48px;
       max-height: 120px;
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       background: var(--bg-input, rgba(255, 255, 255, 0.04));
       color: var(--text-primary, #ededef);
       font-size: var(--text-sm, 13px);
@@ -122,8 +122,8 @@ export class CrowClawSteerComposer extends LitElement {
 
     button {
       padding: 4px 10px;
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
       color: var(--text-secondary, #8e8e93);
       font-size: var(--text-xs, 11px);
       font-weight: 500;

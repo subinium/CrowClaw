@@ -268,6 +268,25 @@ function gatewaySection(): ConfigSectionSchema {
         section: 'gateway',
       },
       {
+        key: 'policyTier',
+        type: 'enum',
+        label: 'Policy Tier',
+        description: 'Endpoint policy tier for outbound gateway HTTP calls.',
+        required: false,
+        enum: ['restricted', 'balanced', 'open'],
+        default: 'balanced',
+        section: 'gateway',
+      },
+      {
+        key: 'allowedEndpoints',
+        type: 'array',
+        label: 'Allowed Endpoints',
+        description: 'Optional allowlist of outbound endpoint paths or full URL prefixes.',
+        required: false,
+        default: [],
+        section: 'gateway',
+      },
+      {
         key: 'dmPolicy',
         type: 'enum',
         label: 'DM Policy',
@@ -573,7 +592,7 @@ function collectChanges(
     const newVal = after[key];
 
     // Determine section from the top-level key
-    const section = prefix ? prefix.split('.')[0] : key;
+    const section = prefix ? prefix.split('.')[0] ?? key : key;
 
     if (oldVal === newVal) {
       continue;

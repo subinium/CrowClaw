@@ -39,6 +39,26 @@ describe('Dashboard Usage panel', () => {
   });
 });
 
+describe('Dashboard UX issue batch surface', () => {
+  it('contains the focused settings panels and endpoints', () => {
+    expect(DASHBOARD_HTML).toContain('Learning Loop');
+    expect(DASHBOARD_HTML).toContain('Provider Slots');
+    expect(DASHBOARD_HTML).toContain('Config Diff');
+    expect(DASHBOARD_HTML).toContain('Pinned only');
+    expect(DASHBOARD_HTML).toContain('Per-Session Breakdown');
+    expect(DASHBOARD_HTML).toContain('/api/learning/dashboard');
+    expect(DASHBOARD_HTML).toContain('/api/config/diff');
+    expect(DASHBOARD_HTML).toContain('/api/learning/match');
+  });
+
+  it('contains session list filter and pagination controls for issue 192', () => {
+    expect(DASHBOARD_HTML).toContain('Filter sessions');
+    expect(DASHBOARD_HTML).toContain('Active only');
+    expect(DASHBOARD_HTML).toContain('Inactive only');
+    expect(DASHBOARD_HTML).toContain('Page ');
+  });
+});
+
 describe('/api/usage endpoint', () => {
   it('GET /api/usage returns proper JSON shape with empty tracker', async () => {
     const tracker = new DetailedUsageTracker();
@@ -53,6 +73,9 @@ describe('/api/usage endpoint', () => {
     expect(data).toHaveProperty('avgLatencyMs', 0);
     expect(data).toHaveProperty('entries');
     expect(data).toHaveProperty('byModel');
+    expect(data).toHaveProperty('byProvider');
+    expect(data).toHaveProperty('bySession');
+    expect(data).toHaveProperty('byTool');
     expect(Array.isArray(data.entries)).toBe(true);
   });
 
@@ -89,6 +112,7 @@ describe('/api/usage endpoint', () => {
       avgLatencyMs: number;
       entries: Array<{ model: string }>;
       byModel: Record<string, { calls: number; tokens: number; cost: number }>;
+      byProvider: Record<string, { calls: number; tokens: number; cost: number }>;
     };
 
     expect(data.totalInputTokens).toBe(3000);
@@ -99,6 +123,8 @@ describe('/api/usage endpoint', () => {
     expect(data.entries).toHaveLength(2);
     expect(data.byModel['gpt-4.1']).toEqual({ calls: 1, tokens: 1500, cost: 0.006 });
     expect(data.byModel['claude-opus-4']).toEqual({ calls: 1, tokens: 2800, cost: 0.09 });
+    expect(data.byProvider.openai).toEqual({ calls: 1, tokens: 1500, cost: 0.006 });
+    expect(data.byProvider.anthropic).toEqual({ calls: 1, tokens: 2800, cost: 0.09 });
   });
 
   it('POST /api/usage/reset clears the tracker', async () => {

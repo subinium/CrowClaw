@@ -81,6 +81,8 @@ export interface GatewayPlatformConfig {
   token?: string;
   webhookSecret?: string;
   extra?: Record<string, string>;
+  policyTier?: 'restricted' | 'balanced' | 'open';
+  allowedEndpoints?: string[];
   // Access policy (OpenClaw-inspired)
   dmPolicy?: 'pairing' | 'allowlist' | 'open' | 'disabled';
   groupPolicy?: 'open' | 'disabled' | 'allowlist';
@@ -102,7 +104,9 @@ export interface McpServerConfig {
   args: string[];
   env?: Record<string, string>;
   description?: string;
-  custom: true;
+  custom: boolean;
+  catalogSlug?: string;
+  repo?: string;
 }
 
 export interface SecurityPolicyConfig {

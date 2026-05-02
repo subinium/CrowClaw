@@ -18,7 +18,7 @@ import { customElement, property } from 'lit/decorators.js';
 const SHARED_STYLES = css`
   :host {
     display: block;
-    --cc-skel-base: var(--surface-2, var(--glass-bg, rgba(255, 255, 255, 0.04)));
+    --cc-skel-base: var(--surface-2, rgba(255, 255, 255, 0.04));
     --cc-skel-hi: var(--surface-1, rgba(255, 255, 255, 0.08));
   }
 

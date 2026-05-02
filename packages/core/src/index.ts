@@ -13,8 +13,8 @@ export type {
   PreToolCallVeto,
   ToolResultTransform,
 } from './plugins.js';
-import { buildSystemPrompt, buildMemoryPrefix, type PromptBuilderInput } from './prompt-builder.js';
-import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
+import { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
+import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, localizeSkillFile, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
 import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
@@ -60,9 +60,23 @@ export interface ToolExecutionContext {
   agentId: string;
   sessionId: string;
   workspaceId?: string;
+  /** Delegation depth propagated through child agents and sandboxed tool RPC. */
+  delegateDepth?: number;
   /** Env passed to tools. Use sanitizeEnv() to strip sensitive vars before passing. */
   env?: unknown;
   signal?: AbortSignal;
+}
+
+export function normalizeDelegateDepth(delegateDepth: unknown): number {
+  if (delegateDepth === undefined) return 0;
+  if (
+    typeof delegateDepth !== 'number'
+    || !Number.isSafeInteger(delegateDepth)
+    || delegateDepth < 0
+  ) {
+    throw new TypeError('delegateDepth must be a non-negative safe integer.');
+  }
+  return delegateDepth;
 }
 
 /** Env var patterns that should never be exposed to tools. */
@@ -115,6 +129,10 @@ export interface ProviderRequest {
   messages: ConversationMessage[];
   availableTools: ToolManifest[];
   signal?: AbortSignal;
+  /** Optional provider-level generation cap. Providers map this to their API-specific token field. */
+  maxTokens?: number;
+  /** Optional sampling temperature. Providers may drop it for models that reject temperature. */
+  temperature?: number;
 }
 
 export interface ProviderResponseUsage {
@@ -183,10 +201,14 @@ export interface AgentRunInput {
   systemPrompt?: string;
   workspaceId?: string;
   userId?: string;
+  /** Delegation depth propagated to all tool calls made during this run. */
+  delegateDepth?: number;
   env?: unknown;
   signal?: AbortSignal;
   /** Pre-recalled memories to inject into the system prompt. */
   memories?: string[];
+  /** Preferred UI/user locale for dynamic system prompt language. */
+  locale?: SupportedLocale;
 }
 
 /**
@@ -685,6 +707,25 @@ export class AgentLoop {
     this.toolFailureStreakLimit = options.toolFailureStreakLimit ?? 3;
   }
 
+  private auditProvenance(input?: { agentId?: string; sessionId?: string }): {
+    agentId?: string;
+    sessionId?: string;
+    model?: string;
+    provider?: string;
+    presetId?: string;
+  } {
+    const providerWithModel = this.provider as ProviderAdapter & { getModel?: () => string };
+    const model = typeof providerWithModel.getModel === 'function' ? providerWithModel.getModel() : undefined;
+    const presetId = this.agentPreset?.role;
+    return {
+      ...(input?.agentId ? { agentId: input.agentId } : {}),
+      ...(input?.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(model ? { model } : {}),
+      ...(this.providerName ? { provider: this.providerName } : {}),
+      ...(presetId ? { presetId } : {}),
+    };
+  }
+
   /**
    * #54: Mid-run course correction. Operator submits guidance via the control
    * channel (WS / REST); the next loop iteration drains pending steers and
@@ -862,6 +903,7 @@ export class AgentLoop {
     agentPreset?: { role: string; goal: string; backstory?: string };
     personaPrompt?: string;
     memories?: string[];
+    locale?: SupportedLocale;
   }): string | undefined {
     // #79: When contextInjection is 'never', the caller owns the whole prompt
     // lifecycle. We strip the runtime/workspace/tools bootstrap that
@@ -874,6 +916,7 @@ export class AgentLoop {
           personaPrompt: promptParams.personaPrompt,
           agentPreset: promptParams.agentPreset,
           matchedSkills: promptParams.matchedSkills,
+          locale: promptParams.locale,
           // No runtimeName/sessionId/workspaceId/userId/availableTools/memories.
           // No reasoningGuidance (suppressed by absence of availableTools).
         }
@@ -1016,7 +1059,7 @@ export class AgentLoop {
   }
 
   /** Scan a command string in tool input for dangerous patterns */
-  private scanToolCommandInput(toolCall: ToolCall): { blocked: boolean; warnings: string[] } {
+  private scanToolCommandInput(toolCall: ToolCall, input?: { agentId?: string; sessionId?: string }): { blocked: boolean; warnings: string[] } {
     if (!this.securityPolicy.scanCommands) return { blocked: false, warnings: [] };
 
     const commandFields = ['command', 'cmd', 'script', 'code', 'shell', 'exec'];
@@ -1042,13 +1085,14 @@ export class AgentLoop {
         type: blocked ? 'command_blocked' : 'command_warned',
         severity: blocked ? 'critical' : 'warning',
         detail: warnings.join('; '),
+        ...this.auditProvenance(input),
       });
     }
     return { blocked, warnings };
   }
 
   /** Apply redaction to tool output if security policy requires it */
-  private redactToolResult(result: ToolExecutionResult): ToolExecutionResult {
+  private redactToolResult(result: ToolExecutionResult, input?: { agentId?: string; sessionId?: string }): ToolExecutionResult {
     if (!this.securityPolicy.redactToolOutput) return result;
     let output = result.output;
     let mutated = false;
@@ -1061,6 +1105,7 @@ export class AgentLoop {
         type: 'credential_redacted',
         severity: 'info',
         detail: `Credentials/PII redacted in output from tool "${result.toolName}"`,
+        ...this.auditProvenance(input),
       });
     }
     // Second-order prompt-injection scan. Indirect injection (malicious HTML
@@ -1081,6 +1126,7 @@ export class AgentLoop {
         type: 'injection_detected',
         severity: threatCount >= 3 ? 'critical' : 'warning',
         detail: `Prompt injection in output from tool "${result.toolName}" (threats=${threatCount}: ${topThreats})`,
+        ...this.auditProvenance(input),
       });
     }
     if (!mutated) return result;
@@ -1118,10 +1164,12 @@ export class AgentLoop {
   }
 
   private async executeToolCall(toolCall: ToolCall, input: AgentRunInput): Promise<ToolExecutionResult> {
+    const delegateDepth = normalizeDelegateDepth(input.delegateDepth);
     const context: ToolExecutionContext = {
       agentId: input.agentId,
       sessionId: input.sessionId,
       workspaceId: input.workspaceId,
+      delegateDepth,
       env: sanitizeEnv(input.env),
       signal: input.signal
     };
@@ -1158,7 +1206,7 @@ export class AgentLoop {
           type: 'command_blocked',
           severity: 'warning',
           detail: `plugin-veto: ${verdict.reason ?? 'no reason given'}`,
-          sessionId: input.sessionId,
+          ...this.auditProvenance(input),
         });
         const def = this.tools.get(toolCall.name);
         return {
@@ -1187,7 +1235,7 @@ export class AgentLoop {
         type: 'command_blocked',
         severity: 'critical',
         detail: `hardline-blocked: ${hardline.description} (pattern: ${hardline.pattern})`,
-        sessionId: input.sessionId,
+        ...this.auditProvenance(input),
       });
       return {
         toolName: definition.manifest.name,
@@ -1203,7 +1251,7 @@ export class AgentLoop {
     }
 
     // Command scanning: check tool input for dangerous commands
-    const commandScan = this.scanToolCommandInput(toolCall);
+    const commandScan = this.scanToolCommandInput(toolCall, input);
     if (commandScan.blocked) {
       return {
         toolName: definition.manifest.name,
@@ -1222,7 +1270,7 @@ export class AgentLoop {
         type: 'approval_required',
         severity: 'warning',
         detail: `Approval required for tool "${definition.manifest.name}" (danger: ${definition.manifest.dangerLevel})`,
-        sessionId: input.sessionId,
+        ...this.auditProvenance(input),
       });
       const approved = this.approvalDecider
         ? await this.approvalDecider(definition, toolCall.input, context)
@@ -1233,7 +1281,7 @@ export class AgentLoop {
           type: 'approval_denied',
           severity: 'critical',
           detail: `Approval denied for tool "${definition.manifest.name}"`,
-          sessionId: input.sessionId,
+          ...this.auditProvenance(input),
         });
         return {
           toolName: definition.manifest.name,
@@ -1270,7 +1318,7 @@ export class AgentLoop {
     rawResult: ToolExecutionResult,
     input: AgentRunInput,
   ): Promise<ToolExecutionResult> {
-    const redacted = this.redactToolResult(rawResult);
+    const redacted = this.redactToolResult(rawResult, input);
     if (!this.plugins) return redacted;
 
     const transformed = await this.plugins.transformToolResult({
@@ -1416,6 +1464,7 @@ export class AgentLoop {
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     // #239: capture run-start so `agent:terminated` carries an honest durationMs.
     const runStartMs = Date.now();
+    normalizeDelegateDepth(input.delegateDepth);
 
     // #239: AbortSignal handling for the 'aborted' termination reason.
     // ensureNotAborted throws synchronously; wrap so we can emit before rethrow.
@@ -1485,7 +1534,7 @@ export class AgentLoop {
           type: 'injection_detected',
           severity: injectionScan.threats.some(t => t.severity === 'high') ? 'critical' : 'warning',
           detail: threatSummary,
-          sessionId: input.sessionId,
+          ...this.auditProvenance(input),
         });
       }
     }
@@ -1506,12 +1555,15 @@ export class AgentLoop {
     if (this.skills.length > 0) {
       const skillMatches = matchSkillManifests(input.userMessage, this.skills, 3);
       if (skillMatches.length > 0) {
-        matchedSkills = skillMatches.map(({ skill }) => ({
-          name: skill.manifest.name,
-          description: skill.manifest.description,
-          instructions: skill.instructions,
-          tools: skill.manifest.tools,
-        }));
+        matchedSkills = skillMatches.map(({ skill }) => {
+          const localized = localizeSkillFile(skill, normalizeLocale(input.locale));
+          return {
+            name: localized.name,
+            description: localized.description,
+            instructions: localized.instructions,
+            tools: skill.manifest.tools,
+          };
+        });
 
         // Warn about required tools that aren't registered
         const registeredToolNames = new Set(toolList.map(t => t.name));
@@ -1579,6 +1631,7 @@ export class AgentLoop {
       matchedSkills,
       agentPreset: this.agentPreset,
       memories: input.memories,
+      locale: input.locale,
     });
 
     // Track 2.3: Use prompt caching-aware system prompt builder
@@ -1634,6 +1687,7 @@ export class AgentLoop {
     let toolErrorTerminal = false;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
+      this.eventBus?.emit('iteration:start', { sessionId: input.sessionId, agentId: input.agentId, iteration });
       try {
         ensureNotAborted(input.signal);
       } catch (err) {
@@ -1660,11 +1714,13 @@ export class AgentLoop {
       if (budgetCheck.exceeded) {
         tokenBudgetExceeded = true;
         finalResponse = currentResponse.assistantMessage ?? 'Token budget exceeded.';
+        this.eventBus?.emit('iteration:end', { sessionId: input.sessionId, agentId: input.agentId, iteration, toolCount: 0 });
         break;
       }
 
       if (!currentResponse.toolCalls || currentResponse.toolCalls.length === 0) {
         finalResponse = currentResponse.assistantMessage ?? finalResponse;
+        this.eventBus?.emit('iteration:end', { sessionId: input.sessionId, agentId: input.agentId, iteration, toolCount: 0 });
         break;
       }
 
@@ -1771,6 +1827,12 @@ export class AgentLoop {
       if (iterationResults.length > 0) {
         session.lastToolActivityAt = Date.now();
       }
+      this.eventBus?.emit('iteration:end', {
+        sessionId: input.sessionId,
+        agentId: input.agentId,
+        iteration,
+        toolCount: iterationResults.length,
+      });
 
       const iterationWarning = budgetStatus(iteration + 1, this.maxToolIterations, this.budgetWarningThreshold, this.budgetCriticalThreshold);
 
@@ -1838,8 +1900,8 @@ export class AgentLoop {
       // Reset streak for any tool that succeeded in this iteration. This is
       // intentional per-tool: a different tool failing keeps its own streak.
       for (const k of Array.from(toolFailureStreak.keys())) {
-        const [toolName] = k.split('|');
-        if (successfulToolNamesThisIter.has(toolName)) {
+        const toolName = k.split('|')[0];
+        if (toolName && successfulToolNamesThisIter.has(toolName)) {
           toolFailureStreak.delete(k);
         }
       }
@@ -2041,9 +2103,12 @@ export class AgentLoop {
   async *runStreaming(input: {
     userMessage: string;
     sessionState: SessionState;
+    delegateDepth?: number;
     signal?: AbortSignal;
+    locale?: SupportedLocale;
   }): AsyncGenerator<AgentStreamEvent> {
     const { userMessage, sessionState: session, signal } = input;
+    normalizeDelegateDepth(input.delegateDepth);
     // #239: capture run-start so `agent:terminated` carries an honest durationMs.
     const streamStartMs = Date.now();
 
@@ -2054,7 +2119,9 @@ export class AgentLoop {
         agentId: session.agentId,
         sessionId: session.sessionId,
         userMessage,
+        delegateDepth: input.delegateDepth,
         signal,
+        locale: input.locale,
       };
       try {
         const result = await this.run(runInput);
@@ -2091,6 +2158,7 @@ export class AgentLoop {
           type: 'injection_detected',
           severity: injectionScan.threats.some(t => t.severity === 'high') ? 'critical' : 'warning',
           detail: threatSummary,
+          ...this.auditProvenance(session),
         });
       }
     }
@@ -2107,12 +2175,15 @@ export class AgentLoop {
     if (this.skills.length > 0) {
       const skillMatches = matchSkillManifests(userMessage, this.skills, 3);
       if (skillMatches.length > 0) {
-        matchedSkills = skillMatches.map(({ skill }) => ({
-          name: skill.manifest.name,
-          description: skill.manifest.description,
-          instructions: skill.instructions,
-          tools: skill.manifest.tools,
-        }));
+        matchedSkills = skillMatches.map(({ skill }) => {
+          const localized = localizeSkillFile(skill, normalizeLocale(input.locale));
+          return {
+            name: localized.name,
+            description: localized.description,
+            instructions: localized.instructions,
+            tools: skill.manifest.tools,
+          };
+        });
 
         // Warn about required tools that aren't registered
         const registeredToolNames = new Set(streamToolList.map(t => t.name));
@@ -2158,6 +2229,7 @@ export class AgentLoop {
       availableTools: streamToolList,
       matchedSkills,
       agentPreset: this.agentPreset,
+      locale: input.locale,
     });
 
     let streamErrorReflectionCount = 0;
@@ -2173,6 +2245,7 @@ export class AgentLoop {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
         ensureNotAborted(signal);
         yield { type: 'iteration-start', iteration };
+        this.eventBus?.emit('iteration:start', { sessionId: session.sessionId, agentId: session.agentId, iteration });
 
         // #54: drain pending /steer guidance for this turn (streaming path).
         const streamSteers = this.drainPendingSteers(session.sessionId);
@@ -2206,7 +2279,7 @@ export class AgentLoop {
         let streamConsumed = false;
         for (let providerIdx = 0; providerIdx < streamProviderCandidates.length; providerIdx++) {
           const candidateProvider = streamProviderCandidates[providerIdx];
-          if (!candidateProvider.generateStream) continue;
+          if (!candidateProvider || !candidateProvider.generateStream) continue;
 
           try {
             const rawStream = candidateProvider.generateStream(request);
@@ -2280,6 +2353,7 @@ export class AgentLoop {
           // #239: surface token-budget exhaustion to the soft-landing path.
           streamTokenBudgetExceeded = true;
           yield { type: 'iteration-end', iteration };
+          this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: 0 });
           break;
         }
 
@@ -2287,6 +2361,7 @@ export class AgentLoop {
         if (streamToolCalls.length === 0) {
           lastStreamHadToolCalls = false;
           yield { type: 'iteration-end', iteration };
+          this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: 0 });
           break;
         }
 
@@ -2328,10 +2403,10 @@ export class AgentLoop {
                 // #235: validation gate before each parallel tool call.
                 safetyPartition.parallel.map((tc) => this.runToolCallWithValidation(tc, runInput))
               );
-              for (let i = 0; i < settled.length; i++) {
-                const tc = safetyPartition.parallel[i];
-                const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
+              for (const [i, tc] of safetyPartition.parallel.entries()) {
                 const s = settled[i];
+                if (!s) continue;
+                const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
                 const rawResult: ToolExecutionResult = s.status === 'fulfilled'
                   ? s.value
                   : {
@@ -2375,10 +2450,10 @@ export class AgentLoop {
               // #235: validation gate before each tool call.
               streamToolCalls.map((tc) => this.runToolCallWithValidation(tc, runInput))
             );
-            for (let i = 0; i < settled.length; i++) {
-              const tc = streamToolCalls[i];
-              const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
+            for (const [i, tc] of streamToolCalls.entries()) {
               const s = settled[i];
+              if (!s) continue;
+              const toolCallId = resolvedIds.get(tc) ?? `tc-${tc.name}`;
               const rawResult: ToolExecutionResult = s.status === 'fulfilled'
                 ? s.value
                 : {
@@ -2409,7 +2484,7 @@ export class AgentLoop {
                 type: 'command_blocked',
                 severity: 'critical',
                 detail: `hardline-blocked: ${streamHardline.description} (pattern: ${streamHardline.pattern})`,
-                sessionId: session.sessionId,
+                ...this.auditProvenance(session),
               });
               const blockedResult: ToolExecutionResult = {
                 toolName: tc.name,
@@ -2429,7 +2504,7 @@ export class AgentLoop {
             }
 
             // Security: command scanning in streaming path
-            const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input });
+            const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input }, session);
             if (streamCmdScan.blocked) {
               const blockedResult: ToolExecutionResult = {
                 toolName: tc.name,
@@ -2459,6 +2534,9 @@ export class AgentLoop {
               const context: ToolExecutionContext = {
                 agentId: session.agentId,
                 sessionId: session.sessionId,
+                workspaceId: session.workspaceId,
+                delegateDepth: normalizeDelegateDepth(input.delegateDepth),
+                signal,
               };
               const approved = this.approvalDecider
                 ? await this.approvalDecider(def!, tc.input, context)
@@ -2510,6 +2588,8 @@ export class AgentLoop {
             const context: ToolExecutionContext = {
               agentId: session.agentId,
               sessionId: session.sessionId,
+              workspaceId: session.workspaceId,
+              delegateDepth: normalizeDelegateDepth(input.delegateDepth),
               signal,
             };
             let toolResult = await this.tools.execute(tc.name, tc.input, context);
@@ -2520,7 +2600,7 @@ export class AgentLoop {
             }
 
             // Security: redact tool output in streaming path
-            toolResult = this.redactToolResult(toolResult);
+            toolResult = this.redactToolResult(toolResult, session);
 
             // #235: structured envelope on failure.
             toolResult = this.wrapFailureAsEnvelope(toolResult);
@@ -2537,6 +2617,7 @@ export class AgentLoop {
               } else if (this.stopOnToolError) {
                 finalResponse = 'Stopped after tool failure.';
                 yield { type: 'iteration-end', iteration };
+                this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
                 streamTerminationReason = 'tool_error_terminal';
                 this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
                 yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
@@ -2577,8 +2658,8 @@ export class AgentLoop {
           }
         }
         for (const k of Array.from(streamToolFailureStreak.keys())) {
-          const [toolName] = k.split('|');
-          if (successfulStreamToolNames.has(toolName)) {
+          const toolName = k.split('|')[0];
+          if (toolName && successfulStreamToolNames.has(toolName)) {
             streamToolFailureStreak.delete(k);
           }
         }
@@ -2587,6 +2668,7 @@ export class AgentLoop {
           streamTerminationReason = 'tool_error_terminal';
           finalResponse = 'Stopped after tool failure (3 consecutive identical errors).';
           yield { type: 'iteration-end', iteration };
+          this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
           this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
           yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
           return;
@@ -2608,6 +2690,7 @@ export class AgentLoop {
           } else if (this.stopOnToolError) {
             finalResponse = 'Stopped after tool failure.';
             yield { type: 'iteration-end', iteration };
+            this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
             streamTerminationReason = 'tool_error_terminal';
             this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
             yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
@@ -2622,6 +2705,7 @@ export class AgentLoop {
 
         streamIterationsCompleted = iteration + 1;
         yield { type: 'iteration-end', iteration };
+        this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
       }
 
       // #239 (streaming, Hermes parity): graceful soft-landing on budget
@@ -2820,7 +2904,7 @@ export function isToolAllowedForFork(session: SessionState, toolName: string): b
   return whitelist.some((entry) => entry === toolName || toolName.startsWith(`${entry}.`));
 }
 
-export { buildSystemPrompt, buildMemoryPrefix, type MatchedSkill, type PromptBuilderInput } from './prompt-builder.js';
+export { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type MatchedSkill, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
 
 export {
   isPrivateUrl,
@@ -2843,9 +2927,11 @@ export {
   type CommandRisk,
   type CommandScanResult,
   SecurityAuditLog,
+  FileSecurityAuditLog,
   type SecurityEvent,
   type SecurityEventType,
   type SecurityEventSeverity,
+  type FileSecurityAuditLogOptions,
   // v0.8.0 (#234) — code.execute audit hook. The helper appends a
   // `tool.code-execute` entry tagged with the truncated source + allowed-tool
   // list. Called from packages/tools/src/code-execute.ts at the call site so
@@ -2856,9 +2942,10 @@ export {
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';
 export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usage-tracker.js';
+export { setTelemetryHooks, getTelemetryHooks, type TelemetryHooks, type TelemetrySpan } from './telemetry.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
-export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';
+export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, localizeSkillFile, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';
 
 export { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames, type AgentPreset } from './agent-presets.js';
 

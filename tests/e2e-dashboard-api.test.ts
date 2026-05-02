@@ -119,6 +119,33 @@ describe('E2E dashboard: usage endpoints', () => {
   });
 });
 
+describe('E2E dashboard: memory edit and pin endpoints', () => {
+  it('updates, pins, and unpins a remembered memory', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const rememberedRes = await runtime.fetch(post('/api/sessions/memory-ux/remember', {
+      summary: 'initial memory summary',
+      tags: ['dashboard'],
+    }));
+    expect(rememberedRes.status).toBe(200);
+    const remembered = await rememberedRes.json() as { id: string };
+
+    const updateRes = await runtime.fetch(new Request(`http://localhost/api/memories/${remembered.id}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ summary: 'edited memory summary', tags: ['dashboard', 'edited'] }),
+    }));
+    expect(updateRes.status).toBe(200);
+    const updated = await updateRes.json() as { record: { summary: string; metadata?: Record<string, unknown> } };
+    expect(updated.record.summary).toBe('edited memory summary');
+    expect(typeof updated.record.metadata?.sizeBytes).toBe('number');
+
+    const pinRes = await runtime.fetch(post(`/api/memories/${remembered.id}/pin`, { pinned: true }));
+    expect(pinRes.status).toBe(200);
+    const pinned = await pinRes.json() as { record: { metadata?: Record<string, unknown> } };
+    expect(pinned.record.metadata?.pinned).toBe(true);
+  });
+});
+
 // ============================================================================
 // 3. GET /api/personas + POST /api/persona/switch
 // ============================================================================

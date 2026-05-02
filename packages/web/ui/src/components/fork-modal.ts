@@ -48,7 +48,7 @@ export class CrowClawForkModal extends LitElement {
 
     .parent-card {
       background: var(--bg-card, rgba(255, 255, 255, 0.04));
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       border-radius: var(--radius-sm, 6px);
       padding: var(--sp-3, 12px);
       margin-bottom: var(--sp-4, 16px);
@@ -105,7 +105,7 @@ export class CrowClawForkModal extends LitElement {
       width: 100%;
       min-height: 80px;
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
       background: var(--bg-input, rgba(255, 255, 255, 0.04));
       color: var(--text-primary, #ededef);
       font-size: var(--text-sm, 13px);
@@ -128,8 +128,8 @@ export class CrowClawForkModal extends LitElement {
 
     .chip {
       padding: 4px 10px;
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
       color: var(--text-secondary, #8e8e93);
       font-size: var(--text-xs, 11px);
       cursor: pointer;
@@ -163,8 +163,8 @@ export class CrowClawForkModal extends LitElement {
 
     .footer-actions button {
       padding: 6px 14px;
-      border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
-      background: var(--glass-bg, rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+      background: var(--surface-1, rgba(255, 255, 255, 0.03));
       color: var(--text-secondary, #8e8e93);
       font-size: var(--text-sm, 13px);
       font-weight: 500;

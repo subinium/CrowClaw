@@ -17,7 +17,7 @@ export const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 export const CHATGPT_CODEX_DEFAULT_MODEL = 'gpt-5.5';
 
 export interface CreateOpenAIChatGPTProviderOptions {
-  /** Override model. Defaults to gpt-5-codex (Codex CLI default as of 2026-02). */
+  /** Override model. Defaults to CHATGPT_CODEX_DEFAULT_MODEL (`gpt-5.5`). */
   model?: string;
   /** Override base URL — useful for tests / proxies. */
   baseUrl?: string;
