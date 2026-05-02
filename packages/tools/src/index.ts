@@ -1,4 +1,5 @@
-import type { ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
+import type { ParsedSkillFile, SkillManifest, ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
+import { parseSkillFile } from '@crowclaw/core';
 import { resolveAndValidateUrl, validateFetchUrl } from '@crowclaw/core';
 
 export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
@@ -44,7 +45,27 @@ type BackgroundProcessRecord = {
   };
 };
 
-const backgroundProcesses = new Map<number, BackgroundProcessRecord>();
+const backgroundProcessStores = new Map<string, Map<number, BackgroundProcessRecord>>();
+
+function backgroundProcessStoreKey(context: ToolExecutionContext): string {
+  return `${context.agentId || 'unknown-agent'}:${context.sessionId || 'unknown-session'}`;
+}
+
+function getBackgroundProcessStore(context: ToolExecutionContext): Map<number, BackgroundProcessRecord> {
+  const contextWithStore = context as ToolExecutionContext & {
+    backgroundProcesses?: Map<number, BackgroundProcessRecord>;
+  };
+  if (contextWithStore.backgroundProcesses) {
+    return contextWithStore.backgroundProcesses;
+  }
+  const key = backgroundProcessStoreKey(context);
+  let store = backgroundProcessStores.get(key);
+  if (!store) {
+    store = new Map<number, BackgroundProcessRecord>();
+    backgroundProcessStores.set(key, store);
+  }
+  return store;
+}
 
 type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'singularity' | 'modal' | 'daytona';
 
@@ -598,6 +619,95 @@ export class ToolRegistry implements ToolCatalog, ToolExecutor {
   }
 }
 
+export interface SkillPreview {
+  name: string;
+  description: string;
+  triggers: string[];
+  tools: string[];
+  categories: string[];
+  instructionPreview: string;
+  instructionChars: number;
+  requires?: SkillManifest['requires'];
+  configRequirements?: SkillManifest['config_requirements'];
+  hashMismatch?: boolean;
+}
+
+function normalizePreviewText(value: string, maxChars: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+export function buildSkillPreview(skill: ParsedSkillFile, maxChars = 400): SkillPreview {
+  const manifest = skill.manifest;
+  return {
+    name: manifest.name,
+    description: manifest.description,
+    triggers: manifest.triggers ?? [],
+    tools: manifest.tools ?? [],
+    categories: manifest.categories ?? (manifest.category ? [manifest.category] : []),
+    instructionPreview: normalizePreviewText(skill.instructions, maxChars),
+    instructionChars: skill.instructions.length,
+    requires: manifest.requires,
+    configRequirements: manifest.config_requirements,
+    hashMismatch: skill.hashMismatch,
+  };
+}
+
+export function previewSkillMarkdown(content: string, options: { filePath?: string; maxChars?: number } = {}): SkillPreview {
+  const parsed = parseSkillFile(content, options.filePath);
+  if (!parsed) {
+    throw new Error('Invalid skill manifest: missing YAML frontmatter or name.');
+  }
+  return buildSkillPreview(parsed, options.maxChars);
+}
+
+export function createSkillPreviewTool(): ToolDefinition {
+  return {
+    manifest: {
+      name: 'skill.preview',
+      description: 'Parses a SKILL.md document and returns a safe manifest/instruction preview without installing or executing it.',
+      runtime: 'worker',
+      streaming: false,
+      stateful: false,
+      requiresWorkspace: false,
+      requiresNetwork: false,
+      dangerLevel: 'low',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'Full SKILL.md markdown content with YAML frontmatter.' },
+          filePath: { type: 'string', description: 'Optional path used only for diagnostics/hash checks.' },
+          maxChars: { type: 'number', description: 'Maximum instruction preview characters.' },
+        },
+        required: ['content'],
+      },
+    },
+    async execute(input) {
+      const content = typeof input.content === 'string' ? input.content : '';
+      if (!content) {
+        return { toolName: 'skill.preview', runtime: 'worker', ok: false, output: 'Missing content.' };
+      }
+      try {
+        const preview = previewSkillMarkdown(content, {
+          filePath: typeof input.filePath === 'string' ? input.filePath : undefined,
+          maxChars: typeof input.maxChars === 'number' ? input.maxChars : undefined,
+        });
+        return {
+          toolName: 'skill.preview',
+          runtime: 'worker',
+          ok: true,
+          output: JSON.stringify(preview, null, 2),
+          metadata: { name: preview.name, tools: preview.tools, triggers: preview.triggers },
+        };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { toolName: 'skill.preview', runtime: 'worker', ok: false, output: message };
+      }
+    },
+  };
+}
+
 export function createEchoTool(): ToolDefinition {
   return {
     manifest: {
@@ -900,7 +1010,7 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         record.status = record.status === 'killed' ? 'killed' : 'exited';
         record.exitCode = code;
       });
-      backgroundProcesses.set(pid, record);
+      getBackgroundProcessStore(context).set(pid, record);
       return {
         toolName: 'terminal.background',
         runtime: 'worker',
@@ -1036,8 +1146,8 @@ export function createTerminalProcessesTool(): ToolDefinition {
       dangerLevel: 'low',
       inputSchema: { type: 'object', properties: {}, required: [] }
     },
-    async execute() {
-      const processes = [...backgroundProcesses.values()].map((record) => ({
+    async execute(_input, context) {
+      const processes = [...getBackgroundProcessStore(context).values()].map((record) => ({
         pid: record.pid,
         command: record.command,
         backend: record.backend,
@@ -1076,17 +1186,19 @@ export function createTerminalKillTool(): ToolDefinition {
         required: ['pid']
       }
     },
-    async execute(input) {
+    async execute(input, context) {
       const pid = typeof input.pid === 'number' ? input.pid : Number(input.pid);
       if (!pid || Number.isNaN(pid)) {
         return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: 'Missing pid.' };
       }
-      const record = backgroundProcesses.get(pid);
+      const store = getBackgroundProcessStore(context);
+      const record = store.get(pid);
       if (!record) {
         return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: `Unknown pid: ${pid}` };
       }
       record.handle.kill('SIGTERM');
       record.status = 'killed';
+      store.delete(pid);
       return {
         toolName: 'terminal.kill',
         runtime: 'worker',
@@ -1314,7 +1426,10 @@ export function createWebExtractLinksTool(): ToolDefinition {
       const html = await response.text();
       const hrefs = [...new Set(
         [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
-          .map((match) => resolveHref(url, match[1]))
+          .map((match) => {
+            const href = match[1];
+            return href ? resolveHref(url, href) : null;
+          })
           .filter((href): href is string => Boolean(href))
       )];
       return {
@@ -1513,13 +1628,18 @@ function parseDuckDuckGoResults(searchUrl: string, html: string, limit: number, 
   const resultBlockRegex = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
   for (const block of html.matchAll(resultBlockRegex)) {
     const content = block[1];
+    if (!content) continue;
     const linkMatch = content.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
     const snippetMatch = content.match(/<(?:a|td|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|span)>/i);
     if (linkMatch) {
-      const href = resolveHref(searchUrl, linkMatch[1]) ?? linkMatch[1];
-      const title = linkMatch[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-      const snippet = snippetMatch
-        ? snippetMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+      const rawHref = linkMatch[1];
+      const rawTitle = linkMatch[2];
+      if (!rawHref || !rawTitle) continue;
+      const href = resolveHref(searchUrl, rawHref) ?? rawHref;
+      const title = rawTitle.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const snippetSource = snippetMatch?.[1];
+      const snippet = snippetSource
+        ? snippetSource.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
         : title;
       if (href && title) ddgResults.push({ title, url: href, snippet, provider, rank: ddgResults.length + 1 });
     }
@@ -1528,8 +1648,11 @@ function parseDuckDuckGoResults(searchUrl: string, html: string, limit: number, 
     ? ddgResults
     : [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
         .map((match, index) => {
-          const href = resolveHref(searchUrl, match[1]) ?? match[1];
-          const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          const rawHref = match[1];
+          const rawTitle = match[2];
+          if (!rawHref || !rawTitle) return null;
+          const href = resolveHref(searchUrl, rawHref) ?? rawHref;
+          const title = rawTitle.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
           return href && title ? { title, url: href, snippet: title, provider, rank: index + 1 } : null;
         })
         .filter((value): value is WebSearchResult => Boolean(value));
@@ -1642,7 +1765,10 @@ export function createWebCrawlTool(): ToolDefinition {
         const text = extractReadableText(html);
         const links = [...new Set(
           [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/gi)]
-            .map((match) => resolveHref(current, match[1]))
+            .map((match) => {
+              const href = match[1];
+              return href ? resolveHref(current, href) : null;
+            })
             .filter((href): href is string => Boolean(href))
             .filter((href) => !sameOriginOnly || new URL(href).origin === origin)
         )];
@@ -3443,6 +3569,7 @@ export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
   registry.register(createWebCrawlTool());
   registry.register(createVisionAnalyzeToolImpl());
   registry.register(createImageGenerateToolImpl());
+  registry.register(createSkillPreviewTool());
   registry.register(createTextPatchTool());
   registry.register(createLinePatchTool());
   registry.register(createGitStatusTool());

@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline';
 import { timingSafeEqual } from 'node:crypto';
+import type { SessionState, ToolCatalog } from '@crowclaw/core';
 
 // ---------------------------------------------------------------------------
 // MCP protocol types
@@ -95,6 +96,16 @@ export interface CrowClawMcpServerOptions {
    * exposing the bridge to remote clients MUST set this.
    */
   ownerToken?: string;
+  sessionStore?: {
+    listRecent?(limit?: number): Promise<SessionState[]>;
+    list?(): Promise<SessionState[]>;
+    get?(sessionId: string): Promise<SessionState | null>;
+  };
+  memoryStore?: {
+    search?(sessionId: string, query: string, limit?: number): Promise<unknown[]>;
+    searchByScope?(scope: 'session' | 'user' | 'workspace', query: string, limit?: number, scopeKey?: string): Promise<unknown[]>;
+  };
+  toolCatalog?: ToolCatalog;
 }
 
 export class CrowClawMcpServer {
@@ -305,6 +316,26 @@ export class CrowClawMcpServer {
       }
 
       case 'crowclaw.sessions.list':
+        if (this.options?.sessionStore?.listRecent || this.options?.sessionStore?.list) {
+          const sessions = this.options.sessionStore.listRecent
+            ? await this.options.sessionStore.listRecent(50)
+            : await this.options.sessionStore.list!();
+          return this.respondOk(id, {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  sessions: sessions.map((session) => ({
+                    sessionId: session.sessionId,
+                    agentId: session.agentId,
+                    messageCount: session.messages.length,
+                    updatedAt: session.updatedAt,
+                  })),
+                }, null, 2),
+              },
+            ],
+          });
+        }
         return this.respondOk(id, {
           content: [
             {
@@ -322,6 +353,27 @@ export class CrowClawMcpServer {
             INVALID_PARAMS,
             'crowclaw.sessions.get requires sessionId (string)',
           );
+        }
+        if (this.options?.sessionStore?.get) {
+          const session = await this.options.sessionStore.get(sessionId);
+          return this.respondOk(id, {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(session ? {
+                  sessionId: session.sessionId,
+                  agentId: session.agentId,
+                  updatedAt: session.updatedAt,
+                  messages: session.messages.map((message) => ({
+                    role: message.role,
+                    content: message.content,
+                    createdAt: message.createdAt,
+                    name: message.name,
+                  })),
+                } : { sessionId, found: false, messages: [] }, null, 2),
+              },
+            ],
+          });
         }
         return this.respondOk(id, {
           content: [
@@ -345,7 +397,11 @@ export class CrowClawMcpServer {
             {
               type: 'text',
               text: JSON.stringify(
-                { tools: this.getVisibleTools(callerToken).map((t) => t.name) },
+                {
+                  tools: this.options?.toolCatalog
+                    ? this.options.toolCatalog.list().map((t) => t.name)
+                    : this.getVisibleTools(callerToken).map((t) => t.name),
+                },
                 null,
                 2,
               ),
@@ -361,6 +417,21 @@ export class CrowClawMcpServer {
             INVALID_PARAMS,
             'crowclaw.memories.search requires query (string)',
           );
+        }
+        if (this.options?.memoryStore?.searchByScope || this.options?.memoryStore?.search) {
+          const limit = typeof args['limit'] === 'number' ? args['limit'] : 10;
+          const sessionId = typeof args['sessionId'] === 'string' ? args['sessionId'] : '';
+          const results = this.options.memoryStore.searchByScope
+            ? await this.options.memoryStore.searchByScope('session', query, limit)
+            : await this.options.memoryStore.search!(sessionId, query, limit);
+          return this.respondOk(id, {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ query, results }, null, 2),
+              },
+            ],
+          });
         }
         return this.respondOk(id, {
           content: [

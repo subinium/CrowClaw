@@ -114,6 +114,14 @@ export class PluginManager {
     return [...this.plugins.values()];
   }
 
+  get(name: string): Plugin | undefined {
+    return this.plugins.get(name);
+  }
+
+  unregister(name: string): boolean {
+    return this.plugins.delete(name);
+  }
+
   async emit<K extends PluginHookName>(hook: K, payload: PluginHookPayloads[K], context: PluginContext): Promise<void> {
     for (const plugin of this.plugins.values()) {
       await plugin.on?.(hook, payload, context);

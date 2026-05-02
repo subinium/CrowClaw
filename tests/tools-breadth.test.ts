@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
+import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createSkillPreviewTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -388,5 +388,53 @@ describe('tool breadth extensions', () => {
     });
     expect(kill.ok).toBe(true);
     expect(kill.output).toContain('"killed"');
+  });
+
+  it('isolates terminal background process tracking by session', async () => {
+    const registry = new ToolRegistry()
+      .register(createTerminalBackgroundTool())
+      .register(createTerminalProcessesTool())
+      .register(createTerminalKillTool());
+
+    const started = await registry.execute('terminal.background', { command: 'sleep 5', __approvalGranted: true }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-a'
+    });
+    expect(started.ok).toBe(true);
+    const payload = JSON.parse(started.output) as { pid: number };
+
+    const sameSession = await registry.execute('terminal.processes', {}, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-a'
+    });
+    expect(sameSession.output).toContain(String(payload.pid));
+
+    const otherSession = await registry.execute('terminal.processes', {}, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-b'
+    });
+    expect(otherSession.output).not.toContain(String(payload.pid));
+
+    await registry.execute('terminal.kill', { pid: payload.pid }, {
+      agentId: 'crowclaw',
+      sessionId: 'term-isolated-a'
+    });
+  });
+
+  it('previews skill manifests without installing or executing them', async () => {
+    const registry = new ToolRegistry().register(createSkillPreviewTool());
+    const result = await registry.execute('skill.preview', {
+      content: `---\nname: demo-skill\ndescription: Demo skill\ntriggers:\n  - demo\ntools:\n  - workspace.read\n---\nUse this skill to inspect a workspace safely.`,
+      maxChars: 20,
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'skill-preview'
+    });
+
+    expect(result.ok).toBe(true);
+    const preview = JSON.parse(result.output) as { name: string; tools: string[]; instructionPreview: string };
+    expect(preview.name).toBe('demo-skill');
+    expect(preview.tools).toEqual(['workspace.read']);
+    expect(preview.instructionPreview.length).toBeLessThanOrEqual(20);
   });
 });

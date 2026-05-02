@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { MemoryCapturePlugin, PluginManager } from '../packages/plugins/src/index.js';
+import {
+  MemoryCapturePlugin,
+  PluginCatalog,
+  PluginManager,
+  ReferencePreToolCallPlugin,
+  ReferenceToolResultPlugin,
+  createMemoryBackendPlugin,
+  validatePluginManifest,
+} from '../packages/plugins/src/index.js';
 
 describe('plugin foundation', () => {
   it('registers plugins and emits lifecycle hooks', async () => {
@@ -127,5 +135,58 @@ describe('plugin foundation', () => {
     });
 
     expect(plugin.seen).toEqual([{ hook: 'tool:error', sessionId: 'plugin-5' }]);
+  });
+
+  it('validates plugin manifests without allowing raw command execution requests', () => {
+    expect(validatePluginManifest({
+      name: 'safe-plugin',
+      hooks: ['tool:preExecute'],
+      permissions: { tools: ['workspace.read'], memory: 'read' },
+    }).valid).toBe(true);
+
+    const unsafe = validatePluginManifest({
+      name: 'unsafe-plugin',
+      permissions: { tools: ['terminal.exec'] },
+    });
+    expect(unsafe.valid).toBe(false);
+    expect(unsafe.errors.join('\n')).toContain('terminal.exec');
+  });
+
+  it('registers plugin catalog entries and memory backend plugin references', () => {
+    const provider = {
+      recall: async () => [],
+      store: async (record: Record<string, unknown>) => record,
+      delete: async () => true,
+      list: async () => [],
+    };
+    const plugin = createMemoryBackendPlugin({ name: 'memory-test', provider });
+    const catalog = new PluginCatalog();
+    const result = catalog.register(plugin.manifest, plugin);
+
+    expect(result.valid).toBe(true);
+    expect(catalog.get('memory-test')?.plugin).toBe(plugin);
+    expect(catalog.list()[0]?.memoryBackend).toBe(true);
+  });
+
+  it('provides reference pre-tool-call and tool-result plugins', async () => {
+    const pre = new ReferencePreToolCallPlugin('deny-shell', ['terminal.exec']);
+    expect(pre.preToolCall!({ toolName: 'terminal.exec', input: {}, sessionId: 's', agentId: 'a' }, {
+      runtime: 'node',
+      sessionId: 's',
+      agentId: 'a',
+    })).toMatchObject({ veto: true });
+
+    const transform = new ReferenceToolResultPlugin('tagger');
+    expect(transform.transformToolResult!({
+      toolName: 'echo',
+      input: {},
+      result: { toolName: 'echo', ok: true, output: 'ok' },
+      sessionId: 's',
+      agentId: 'a',
+    }, {
+      runtime: 'node',
+      sessionId: 's',
+      agentId: 'a',
+    })).toEqual({ metadata: { transformedBy: 'tagger' } });
   });
 });
