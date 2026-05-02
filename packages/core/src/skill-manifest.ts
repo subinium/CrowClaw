@@ -108,6 +108,11 @@ export interface SkillManifest {
   config_requirements?: SkillConfigRequirements;
   /** ISO 8601 timestamp of last modification. */
   updated_at?: string;
+  /**
+   * Optional SHA-256 integrity pin for the instruction body.
+   * Format: `sha256:<64 lowercase/uppercase hex chars>`.
+   */
+  content_hash?: string;
 }
 
 export interface ParsedSkillFile {
@@ -115,6 +120,8 @@ export interface ParsedSkillFile {
   instructions: string; // The markdown body (after frontmatter)
   raw: string; // Original file content
   filePath?: string;
+  /** True when `manifest.content_hash` was present but did not match `instructions`. */
+  hashMismatch?: boolean;
 }
 
 /**
@@ -171,6 +178,13 @@ export function validateSkillManifest(
   }
   if (manifest.updated_at !== undefined && typeof manifest.updated_at !== 'string') {
     errors.push('updated_at must be an ISO-8601 string');
+  }
+  if (manifest.content_hash !== undefined) {
+    if (typeof manifest.content_hash !== 'string') {
+      errors.push('content_hash must be a string');
+    } else if (!/^sha256:[a-f0-9]{64}$/i.test(manifest.content_hash)) {
+      warnings.push('content_hash should use sha256:<64 hex chars>');
+    }
   }
   if (manifest.config_requirements !== undefined) {
     const cr = manifest.config_requirements;
@@ -239,6 +253,7 @@ export function parseSkillFile(
     platforms: Array.isArray(yaml.platforms) ? (yaml.platforms as string[]) : undefined,
     config_requirements,
     updated_at: yaml.updated_at as string | undefined,
+    content_hash: yaml.content_hash as string | undefined,
   };
 
   return {
@@ -316,6 +331,7 @@ export function renderSkillFile(
     }
   }
   if (manifest.updated_at) lines.push(`updated_at: ${manifest.updated_at}`);
+  if (manifest.content_hash) lines.push(`content_hash: ${manifest.content_hash}`);
   lines.push('---');
   lines.push('');
   lines.push(instructions);
@@ -333,6 +349,67 @@ export interface SkillFileSystem {
   joinPath(...segments: string[]): string;
 }
 
+export interface LoadSkillsOptions {
+  /** Reject hash-mismatched skills instead of loading with `hashMismatch: true`. */
+  strict?: boolean;
+  /** Alias for `strict`, kept explicit for call sites that name the concern. */
+  strictHashes?: boolean;
+  /** Receives soft integrity warnings. Defaults to `console`. */
+  logger?: { warn(message: string): void };
+}
+
+export async function computeSkillInstructionsHash(instructions: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error('Web Crypto API is not available; cannot verify skill content_hash');
+  }
+  const bytes = new TextEncoder().encode(instructions);
+  const digest = await subtle.digest('SHA-256', bytes);
+  const hex = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+  return `sha256:${hex}`;
+}
+
+export async function verifySkillContentHash(parsed: ParsedSkillFile): Promise<ParsedSkillFile> {
+  const expected = parsed.manifest.content_hash;
+  if (!expected) {
+    parsed.hashMismatch = false;
+    return parsed;
+  }
+  const actual = await computeSkillInstructionsHash(parsed.instructions);
+  parsed.hashMismatch = actual.toLowerCase() !== expected.toLowerCase();
+  return parsed;
+}
+
+async function loadParsedSkill(
+  content: string,
+  filePath: string,
+  options: LoadSkillsOptions
+): Promise<ParsedSkillFile | null> {
+  const parsed = parseSkillFile(content, filePath);
+  if (!parsed) return null;
+  if (!parsed.manifest.content_hash) return parsed;
+
+  const logger = options.logger ?? console;
+  try {
+    await verifySkillContentHash(parsed);
+  } catch (error: unknown) {
+    parsed.hashMismatch = true;
+    logger.warn(
+      `Skill ${filePath} content_hash could not be verified: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  if (parsed.hashMismatch) {
+    logger.warn(`Skill ${filePath} content_hash mismatch; expected ${parsed.manifest.content_hash}`);
+    if (options.strict ?? options.strictHashes) {
+      return null;
+    }
+  }
+  return parsed;
+}
+
 /**
  * Load all SKILL.md files from a directory using an injected filesystem.
  * This keeps the core package runtime-agnostic (works in Node, Workers, etc.).
@@ -342,7 +419,8 @@ export interface SkillFileSystem {
  */
 export async function loadSkillsFromDirectory(
   dirPath: string,
-  fs: SkillFileSystem
+  fs: SkillFileSystem,
+  options: LoadSkillsOptions = {}
 ): Promise<ParsedSkillFile[]> {
   const skills: ParsedSkillFile[] = [];
 
@@ -355,7 +433,7 @@ export async function loadSkillsFromDirectory(
         const skillPath = fs.joinPath(dirPath, entry.name, 'SKILL.md');
         try {
           const content = await fs.readFile(skillPath);
-          const parsed = parseSkillFile(content, skillPath);
+          const parsed = await loadParsedSkill(content, skillPath, options);
           if (parsed) skills.push(parsed);
         } catch {
           /* no SKILL.md in this dir */
@@ -364,7 +442,7 @@ export async function loadSkillsFromDirectory(
         // Also support flat .md files
         const skillPath = fs.joinPath(dirPath, entry.name);
         const content = await fs.readFile(skillPath);
-        const parsed = parseSkillFile(content, skillPath);
+        const parsed = await loadParsedSkill(content, skillPath, options);
         if (parsed) skills.push(parsed);
       }
     }

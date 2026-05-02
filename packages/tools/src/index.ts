@@ -2266,10 +2266,21 @@ export function createMemoryRememberTool(memoryStore: MemoryStore): ToolDefiniti
   };
 }
 
+let warnedMissingSemanticRecall = false;
+
 export function createMemorySearchTool(
   memoryStore: MemoryStore,
-  options?: { recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]> }
+  options?: {
+    recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]>;
+    logger?: { warn(message: string): void };
+  }
 ): ToolDefinition {
+  if (!options?.recallFn && !warnedMissingSemanticRecall) {
+    warnedMissingSemanticRecall = true;
+    (options?.logger ?? console).warn(
+      'memory.search semantic recall is not configured; using local substring/tokenized memory search.'
+    );
+  }
   return {
     manifest: {
       name: 'memory.search',
@@ -2303,7 +2314,7 @@ export function createMemorySearchTool(
           runtime: 'worker' as const,
           ok: true,
           output: JSON.stringify(results, null, 2),
-          metadata: { count: results.length }
+          metadata: { count: results.length, backend: 'embedding' }
         };
       }
 
@@ -2317,7 +2328,7 @@ export function createMemorySearchTool(
         runtime: 'worker',
         ok: true,
         output: JSON.stringify(results, null, 2),
-        metadata: { count: results.length, ...(scope ? { scope, scopeKey } : {}) }
+        metadata: { count: results.length, backend: 'substring', ...(scope ? { scope, scopeKey } : {}) }
       };
     }
   };

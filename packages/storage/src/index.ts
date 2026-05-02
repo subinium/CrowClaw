@@ -88,10 +88,33 @@ function getSearchBlob(record: IndexedRecord): string {
   return blob;
 }
 
-function matchesQuery(record: MemoryRecord, query: string): boolean {
+const TERM_ALIASES: Record<string, string[]> = {
+  db: ['database'],
+  dbs: ['database', 'databases'],
+  cfg: ['config', 'configuration'],
+  authn: ['authentication'],
+  authz: ['authorization'],
+};
+
+function queryTerms(query: string): string[] {
   const needle = normalizeNeedle(query);
-  if (!needle) return true;
-  return getSearchBlob(record as IndexedRecord).includes(needle);
+  if (!needle) return [];
+  return needle
+    .split(/[^a-z0-9]+/i)
+    .filter((term) => term.length > 0)
+    .flatMap((term) => [term, ...(TERM_ALIASES[term] ?? [])]);
+}
+
+function scoreQuery(record: MemoryRecord, query: string): number {
+  const needle = normalizeNeedle(query);
+  if (!needle) return 1;
+  const blob = getSearchBlob(record as IndexedRecord);
+  let score = blob.includes(needle) ? 100 : 0;
+  const terms = [...new Set(queryTerms(query))];
+  for (const term of terms) {
+    if (blob.includes(term)) score += 1;
+  }
+  return score;
 }
 
 function sortByNewest(records: MemoryRecord[]): MemoryRecord[] {
@@ -205,14 +228,17 @@ export class InMemoryMemoryStore implements MemoryStore {
     // #105: bucket is already sorted newest-first → no copy+sort on read.
     const bucket = this.store.get(sessionId);
     if (!bucket) return [];
-    const out: MemoryRecord[] = [];
+    const out: Array<{ record: MemoryRecord; score: number }> = [];
     for (const record of bucket) {
-      if (matchesQuery(record, query)) {
-        out.push(record);
-        if (out.length >= limit) break;
+      const score = scoreQuery(record, query);
+      if (score > 0) {
+        out.push({ record, score });
       }
     }
-    return out;
+    return out
+      .sort((left, right) => right.score - left.score || right.record.createdAt.localeCompare(left.record.createdAt))
+      .slice(0, limit)
+      .map((entry) => entry.record);
   }
 
   async searchByScope(scope: MemoryRecord['scope'], query: string, limit = 10, scopeKey?: string): Promise<MemoryRecord[]> {
@@ -220,17 +246,20 @@ export class InMemoryMemoryStore implements MemoryStore {
     // Previous implementation ran query filter over every record in every
     // session regardless of scope, then flattened + stringified metadata
     // per-record — catastrophic at 10 sessions × 100 memories.
-    const out: MemoryRecord[] = [];
+    const out: Array<{ record: MemoryRecord; score: number }> = [];
     for (const records of this.store.values()) {
       for (const record of records) {
-        if (matchesScope(record, scope, scopeKey) && matchesQuery(record, query)) {
-          out.push(record);
+        if (!matchesScope(record, scope, scopeKey)) continue;
+        const score = scoreQuery(record, query);
+        if (score > 0) {
+          out.push({ record, score });
         }
       }
     }
-    // Cross-bucket aggregation still needs a final sort, but each input
-    // bucket is already sorted, so the sort is on a smaller filtered slice.
-    return sortByNewest(out).slice(0, limit);
+    return out
+      .sort((left, right) => right.score - left.score || right.record.createdAt.localeCompare(left.record.createdAt))
+      .slice(0, limit)
+      .map((entry) => entry.record);
   }
 
   async write(record: MemoryRecord): Promise<void> {

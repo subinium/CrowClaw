@@ -44,6 +44,7 @@ export type RuntimeEventType =
   // without modifying every gateway/scheduler dispatch handler.
   | 'memory:captured'
   | 'memory:recalled'
+  | 'memory:scoped_write'
   // v0.8.0 (#231) — reasoning-block extraction. `reasoning:emitted` fires when
   // a `<plan>` / `<reflection>` / `<thinking>` block is parsed from the model
   // output; carries the tag name and text. Lets the dashboard render the

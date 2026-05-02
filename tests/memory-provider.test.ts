@@ -33,6 +33,22 @@ describe('InMemoryMemoryProvider', () => {
     expect(results[0]?.summary).toContain('cloudflare');
   });
 
+  it('uses llmSummarize for semantic session summaries when provided', async () => {
+    const store = new InMemoryMemoryStore();
+    const provider = new InMemoryMemoryProvider(store, {
+      llmSummarize: async () => 'Semantic summary: deployment decision and auth migration risk.',
+    });
+
+    const captured = await provider.captureSessionSummary!('session-llm', [
+      { role: 'user', content: 'chat transcript with less useful wording', createdAt: new Date().toISOString() },
+    ]);
+
+    expect(captured?.summary).toBe('Semantic summary: deployment decision and auth migration risk.');
+    const recalled = await provider.recall('session-llm', 'auth migration', 5);
+    expect(recalled[0]?.summary).toContain('Semantic summary');
+    expect(recalled[0]?.tags).toContain('semantic-summary');
+  });
+
   it('store() persists and returns a record with id+createdAt populated', async () => {
     const store = new InMemoryMemoryStore();
     const provider = new InMemoryMemoryProvider(store);
@@ -176,6 +192,35 @@ describe('MemoryService facade with injected provider', () => {
     // Unblock so the test cleans up.
     syncResolve();
     await blocked;
+  });
+
+  it('MemoryService captureSessionSummary uses provider llmSummarize without breaking fallback', async () => {
+    const store = new InMemoryMemoryStore();
+    const fakeProvider: MemoryProvider = {
+      async recall() {
+        return [];
+      },
+      async store() {
+        throw new Error('not used');
+      },
+      async delete() {
+        return false;
+      },
+      async list() {
+        return [];
+      },
+      async llmSummarize() {
+        return 'Semantic service summary for cross-session recall.';
+      },
+    };
+    const service = new MemoryService(store, undefined, fakeProvider);
+
+    const captured = await service.captureSessionSummary('session-service-llm', [
+      { role: 'user', content: 'raw words', createdAt: new Date().toISOString() },
+    ]);
+
+    expect(captured?.summary).toBe('Semantic service summary for cross-session recall.');
+    expect(captured?.tags).toContain('semantic-summary');
   });
 
   it('prefetch on the facade prefers provider.prefetch when defined', async () => {

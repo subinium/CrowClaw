@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   parseCliArgs,
   renderCliHelp,
+  migrateImport,
+  runMigrateCommand,
   formatDoctorReport,
   formatToolsTable,
   formatSkillsTable,
@@ -113,6 +118,14 @@ describe('CLI subcommand parsing', () => {
     expect(parsed.sessionId).toBe('my-session');
     expect(parsed.continueSession).toBe(true);
   });
+
+  it('"migrate --dry-run" parses as migrate import', () => {
+    const parsed = parseCliArgs(['migrate', '--dry-run', '--only', 'skills']);
+    expect(parsed.command).toBe('migrate');
+    expect(parsed.migrateSubcommand).toBe('import');
+    expect(parsed.dryRun).toBe(true);
+    expect(parsed.migrateArgs).toEqual(['--only', 'skills']);
+  });
 });
 
 // --- Help output ---
@@ -129,6 +142,7 @@ describe('CLI help output', () => {
     expect(help).toContain('skills');
     expect(help).toContain('tools');
     expect(help).toContain('jobs');
+    expect(help).toContain('migrate import');
     expect(help).toContain('help');
   });
 
@@ -252,6 +266,59 @@ describe('runDoctor with mock runtime', () => {
     const report = await runDoctor(runtime);
     expect(report.checks.find((c) => c.name === 'Provider')?.status).toBe('error');
     expect(report.issues.length).toBeGreaterThan(0);
+  });
+});
+
+describe('migrate import command', () => {
+  it('dry-runs skill imports without touching the target directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'crowclaw-migrate-'));
+    const source = join(root, '.hermes');
+    const target = join(root, '.crowclaw');
+    await mkdir(join(source, 'skills'), { recursive: true });
+    await writeFile(join(source, 'skills', 'deploy.md'), '# deploy\n', 'utf-8');
+
+    const result = await migrateImport({ sourceDir: source, targetDir: target, only: ['skills'], dryRun: true });
+    expect(result.actions).toContainEqual({
+      section: 'skills',
+      source: join(source, 'skills', 'deploy.md'),
+      target: join(target, 'skills', 'deploy.md'),
+      action: 'copy',
+    });
+    await expect(readFile(join(target, 'skills', 'deploy.md'), 'utf-8')).rejects.toThrow();
+  });
+
+  it('copies only selected skill files and is idempotent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'crowclaw-migrate-'));
+    const source = join(root, '.openclaw');
+    const target = join(root, '.crowclaw');
+    await mkdir(join(source, 'skills'), { recursive: true });
+    await mkdir(join(source, 'personas'), { recursive: true });
+    await writeFile(join(source, 'skills', 'review.md'), '# review\n', 'utf-8');
+    await writeFile(join(source, 'personas', 'SOUL.md'), '# soul\n', 'utf-8');
+
+    await migrateImport({ sourceDir: source, targetDir: target, only: ['skills'] });
+    expect(await readFile(join(target, 'skills', 'review.md'), 'utf-8')).toBe('# review\n');
+    await expect(readFile(join(target, 'personas', 'SOUL.md'), 'utf-8')).rejects.toThrow();
+
+    const second = await migrateImport({ sourceDir: source, targetDir: target, only: ['skills'] });
+    expect(second.actions[0]?.action).toBe('skip');
+  });
+
+  it('renders command output for migrate import', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'crowclaw-migrate-'));
+    const source = join(root, '.hermes');
+    const target = join(root, '.crowclaw');
+    await mkdir(join(source, 'skills'), { recursive: true });
+    await writeFile(join(source, 'skills', 'ship.md'), '# ship\n', 'utf-8');
+
+    const output = await runMigrateCommand({
+      command: 'migrate',
+      migrateSubcommand: 'import',
+      migrateArgs: [source, '--target', target, '--only', 'skills'],
+      dryRun: true,
+    });
+    expect(output).toContain('Dry run');
+    expect(output).toContain('ship.md');
   });
 });
 

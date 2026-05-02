@@ -87,7 +87,22 @@ export class MemoryService {
       return null;
     }
 
-    const note = this.summarize(messages, scope);
+    const fallbackNote = this.summarize(messages, scope);
+    let semanticSummary = '';
+    if (this.provider?.llmSummarize) {
+      try {
+        semanticSummary = (await this.provider.llmSummarize(messages)).trim();
+      } catch {
+        semanticSummary = '';
+      }
+    }
+    const note: MemoryNote = semanticSummary
+      ? {
+          ...fallbackNote,
+          summary: semanticSummary,
+          tags: uniqueTags([...fallbackNote.tags, 'semantic-summary']),
+        }
+      : fallbackNote;
     const record: MemoryRecord = {
       id: crypto.randomUUID(),
       sessionId,

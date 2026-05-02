@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
-import { readFile, writeFile, mkdir, access, constants, appendFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, access, constants, appendFile, copyFile, readdir } from 'node:fs/promises';
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -159,7 +159,8 @@ export type CliCommandName =
   | 'mcp'
   | 'presets'
   | 'providers'
-  | 'skill';
+  | 'skill'
+  | 'migrate';
 
 export interface ParsedCliCommand {
   command: CliCommandName;
@@ -179,6 +180,8 @@ export interface ParsedCliCommand {
   /** v0.8.0 Hermes parity (#240): `crowclaw skill install|publish [...args]` */
   skillSubcommand?: string;
   skillArgs?: string[];
+  migrateSubcommand?: string;
+  migrateArgs?: string[];
   /** Forwarded `--dry-run` flag (used by `skill publish`) */
   dryRun?: boolean;
 }
@@ -575,6 +578,14 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     return { command: 'skill', skillSubcommand, skillArgs, dryRun, noOnboarding };
   }
 
+  if (first === 'migrate') {
+    const migrateSubcommand = rest[0] === 'import' ? 'import' : 'import';
+    const rawArgs = rest[0] === 'import' ? rest.slice(1) : rest;
+    const dryRun = rawArgs.includes('--dry-run');
+    const migrateArgs = rawArgs.filter((arg) => arg !== '--dry-run');
+    return { command: 'migrate', migrateSubcommand, migrateArgs, dryRun, noOnboarding };
+  }
+
   // serve — supports --port
   if (first === 'serve') {
     let port: number | undefined;
@@ -656,6 +667,7 @@ export function renderCliHelp(): string {
     '  serve               Start HTTP server + dashboard',
     '  gateway status      Show gateway platform connection status',
     '  gateway connect <p> Connect a platform (e.g., telegram)',
+    '  migrate import      Import Hermes/OpenClaw config, memories, personas, skills',
     '  mcp list            List connected MCP servers',
     '  mcp auth <provider> Authenticate with an MCP provider (github, slack, google)',
     '  mcp add <url>       Add a custom MCP server',
@@ -1250,6 +1262,257 @@ async function runProviders(runtime: CliRuntimeLike, parsed: ParsedCliCommand): 
   }
 
   return `Unknown providers subcommand: ${sub}. Available: list (default), set <slot> <provider/model>, test`;
+}
+
+type MigrateSection = 'skills' | 'memories' | 'personas' | 'config';
+
+export interface MigrateImportAction {
+  section: MigrateSection;
+  source: string;
+  target: string;
+  action: 'copy' | 'merge' | 'skip' | 'missing';
+  reason?: string;
+}
+
+export interface MigrateImportOptions {
+  sourceDir?: string;
+  from?: 'hermes' | 'openclaw' | string;
+  targetDir?: string;
+  homeDir?: string;
+  only?: MigrateSection[];
+  dryRun?: boolean;
+  force?: boolean;
+}
+
+export interface MigrateImportResult {
+  sourceDir: string;
+  targetDir: string;
+  dryRun: boolean;
+  actions: MigrateImportAction[];
+}
+
+const MIGRATE_SECTIONS: MigrateSection[] = ['skills', 'memories', 'personas', 'config'];
+
+function expandHomePath(value: string, home = homedir()): string {
+  return value === '~' ? home : value.startsWith('~/') ? join(home, value.slice(2)) : value;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readJsonObject(path: string): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function collectFiles(dirPath: string, predicate: (path: string) => boolean): Promise<string[]> {
+  if (!(await pathExists(dirPath))) return [];
+  const out: string[] = [];
+  const entries = await readdir(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...await collectFiles(fullPath, predicate));
+    } else if (entry.isFile() && predicate(fullPath)) {
+      out.push(fullPath);
+    }
+  }
+  return out;
+}
+
+function relativeTo(parent: string, child: string): string {
+  return child.slice(parent.length).replace(/^[/\\]/, '');
+}
+
+async function copyOrPlan(
+  actions: MigrateImportAction[],
+  section: MigrateSection,
+  source: string,
+  target: string,
+  options: Required<Pick<MigrateImportOptions, 'dryRun' | 'force'>>
+): Promise<void> {
+  if (!(await pathExists(source))) {
+    actions.push({ section, source, target, action: 'missing', reason: 'source not found' });
+    return;
+  }
+  const exists = await pathExists(target);
+  if (exists && !options.force) {
+    actions.push({ section, source, target, action: 'skip', reason: 'target exists' });
+    return;
+  }
+  actions.push({ section, source, target, action: 'copy' });
+  if (options.dryRun) return;
+  await mkdir(dirname(target), { recursive: true });
+  await copyFile(source, target);
+}
+
+async function mergeJsonOrPlan(
+  actions: MigrateImportAction[],
+  section: MigrateSection,
+  source: string,
+  target: string,
+  options: Required<Pick<MigrateImportOptions, 'dryRun' | 'force'>>
+): Promise<void> {
+  const sourceJson = await readJsonObject(source);
+  if (!sourceJson) {
+    actions.push({ section, source, target, action: 'missing', reason: 'source config not found or invalid' });
+    return;
+  }
+  const targetJson = await readJsonObject(target);
+  const merged = options.force || !targetJson
+    ? { ...(targetJson ?? {}), ...sourceJson }
+    : { ...sourceJson, ...targetJson };
+  const changed = JSON.stringify(targetJson ?? {}) !== JSON.stringify(merged);
+  actions.push({ section, source, target, action: changed ? 'merge' : 'skip', reason: changed ? undefined : 'already up to date' });
+  if (options.dryRun || !changed) return;
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+}
+
+async function detectMigrationSource(options: MigrateImportOptions): Promise<string> {
+  const home = options.homeDir ?? homedir();
+  if (options.sourceDir) return expandHomePath(options.sourceDir, home);
+  if (options.from && options.from !== 'hermes' && options.from !== 'openclaw') {
+    return expandHomePath(options.from, home);
+  }
+  const candidates = options.from === 'openclaw'
+    ? [join(home, '.openclaw')]
+    : options.from === 'hermes'
+      ? [join(home, '.hermes')]
+      : [join(home, '.hermes'), join(home, '.openclaw')];
+  for (const candidate of candidates) {
+    if (await pathExists(candidate)) return candidate;
+  }
+  return candidates[0]!;
+}
+
+export async function migrateImport(options: MigrateImportOptions = {}): Promise<MigrateImportResult> {
+  const home = options.homeDir ?? homedir();
+  const sourceDir = await detectMigrationSource(options);
+  const targetDir = expandHomePath(options.targetDir ?? join(home, '.crowclaw'), home);
+  const only = options.only?.length ? options.only : MIGRATE_SECTIONS;
+  const dryRun = options.dryRun ?? false;
+  const force = options.force ?? false;
+  const actions: MigrateImportAction[] = [];
+
+  if (only.includes('skills')) {
+    const sourceSkills = join(sourceDir, 'skills');
+    const files = await collectFiles(sourceSkills, (path) => path.endsWith('.md'));
+    if (files.length === 0) {
+      actions.push({ section: 'skills', source: sourceSkills, target: join(targetDir, 'skills'), action: 'missing', reason: 'no skill markdown files found' });
+    }
+    for (const file of files) {
+      await copyOrPlan(actions, 'skills', file, join(targetDir, 'skills', relativeTo(sourceSkills, file)), { dryRun, force });
+    }
+  }
+
+  if (only.includes('personas')) {
+    const sourcePersonas = join(sourceDir, 'personas');
+    const files = await collectFiles(sourcePersonas, () => true);
+    if (files.length === 0) {
+      actions.push({ section: 'personas', source: sourcePersonas, target: join(targetDir, 'personas'), action: 'missing', reason: 'no persona files found' });
+    }
+    for (const file of files) {
+      await copyOrPlan(actions, 'personas', file, join(targetDir, 'personas', relativeTo(sourcePersonas, file)), { dryRun, force });
+    }
+  }
+
+  if (only.includes('memories')) {
+    for (const name of ['memories.db', 'memory.db', 'memories.json', 'memory.json']) {
+      await copyOrPlan(actions, 'memories', join(sourceDir, name), join(targetDir, name), { dryRun, force });
+    }
+  }
+
+  if (only.includes('config')) {
+    for (const name of ['config.json', 'runtime-config.json']) {
+      await mergeJsonOrPlan(actions, 'config', join(sourceDir, name), join(targetDir, name), { dryRun, force });
+    }
+  }
+
+  return { sourceDir, targetDir, dryRun, actions };
+}
+
+function parseMigrateImportArgs(args: string[] = [], dryRun = false): MigrateImportOptions | { error: string } {
+  const options: MigrateImportOptions = { dryRun };
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === '--from') {
+      options.from = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--from=')) {
+      options.from = arg.slice('--from='.length);
+      continue;
+    }
+    if (arg === '--only') {
+      const value = args[i + 1];
+      if (!value) return { error: 'Missing value for --only' };
+      options.only = value.split(',').map((item) => item.trim()).filter(Boolean) as MigrateSection[];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--only=')) {
+      options.only = arg.slice('--only='.length).split(',').map((item) => item.trim()).filter(Boolean) as MigrateSection[];
+      continue;
+    }
+    if (arg === '--target') {
+      options.targetDir = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--target=')) {
+      options.targetDir = arg.slice('--target='.length);
+      continue;
+    }
+    if (arg === '--force') {
+      options.force = true;
+      continue;
+    }
+    if (!arg.startsWith('-')) {
+      positional.push(arg);
+      continue;
+    }
+    return { error: `Unknown migrate option: ${arg}` };
+  }
+  if (options.only?.some((section) => !MIGRATE_SECTIONS.includes(section))) {
+    return { error: `Invalid --only value. Use one or more of: ${MIGRATE_SECTIONS.join(', ')}` };
+  }
+  if (positional[0]) options.sourceDir = positional[0];
+  return options;
+}
+
+export async function runMigrateCommand(parsed: ParsedCliCommand): Promise<string> {
+  const sub = parsed.migrateSubcommand ?? 'import';
+  if (sub !== 'import') {
+    return 'Usage: crowclaw migrate import [source-dir] [--from hermes|openclaw|path] [--only skills|memories|personas|config] [--dry-run] [--force]';
+  }
+  const options = parseMigrateImportArgs(parsed.migrateArgs ?? [], parsed.dryRun ?? false);
+  if ('error' in options) {
+    return options.error;
+  }
+  const result = await migrateImport(options);
+  const lines = [
+    `${result.dryRun ? 'Dry run' : 'Migration'}: ${result.sourceDir} -> ${result.targetDir}`,
+  ];
+  for (const action of result.actions) {
+    const suffix = action.reason ? ` (${action.reason})` : '';
+    lines.push(`  ${action.action.padEnd(7)} ${action.section.padEnd(8)} ${action.source} -> ${action.target}${suffix}`);
+  }
+  return lines.join('\n');
 }
 
 async function runMcpCommand(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promise<string> {
@@ -2270,11 +2533,16 @@ export async function runCliInputLine(
 
 export async function runCli(argv: string[], options: CliRunOptions = {}): Promise<string> {
   const parsed = parseCliArgs(argv);
+  if (parsed.command === 'help') {
+    return renderCliHelp();
+  }
+  if (parsed.command === 'migrate') {
+    return runMigrateCommand(parsed);
+  }
+
   const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
 
   switch (parsed.command) {
-    case 'help':
-      return renderCliHelp();
     case 'status':
       return runStatus(runtime);
     case 'tools':
@@ -3058,6 +3326,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'skill': {
       // v0.8.0 #240: agentskills.io install/publish handlers (see end of file)
       await runSkillSubcommand(parsed.skillSubcommand ?? 'help', parsed.skillArgs ?? [], { dryRun: parsed.dryRun });
+      return;
+    }
+
+    case 'migrate': {
+      const output = await runMigrateCommand(parsed);
+      stdout.write(output + '\n');
       return;
     }
 

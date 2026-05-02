@@ -4,6 +4,8 @@ import type {
   MemoryRecord,
   SessionTranscriptMessage,
 } from './memory-provider.js';
+import type { DreamMemoryStore } from './dream-memory.js';
+import type { MemoryScope } from './types.js';
 
 /**
  * Per-provider outcome reported by `MemoryManager.shutdown`. Hosts can log
@@ -30,6 +32,15 @@ export interface SessionEndResult {
  */
 export const SKIP_REDACTION_FLAG = '__skipRedaction';
 
+export interface MemoryManagerEventSink {
+  emit(type: 'memory:scoped_write', data: Record<string, unknown>): void;
+}
+
+export interface MemoryManagerOptions {
+  eventBus?: MemoryManagerEventSink;
+  dreamMemory?: DreamMemoryStore;
+}
+
 /**
  * Orchestrates multiple MemoryProviders, fanning out writes to all backends
  * and merging results on recall. Deduplication is key-based: when multiple
@@ -46,6 +57,13 @@ export const SKIP_REDACTION_FLAG = '__skipRedaction';
  */
 export class MemoryManager {
   private providers: MemoryProvider[] = [];
+  private readonly eventBus?: MemoryManagerEventSink;
+  private readonly dreamMemory?: DreamMemoryStore;
+
+  constructor(options: MemoryManagerOptions = {}) {
+    this.eventBus = options.eventBus;
+    this.dreamMemory = options.dreamMemory;
+  }
 
   addProvider(provider: MemoryProvider): void {
     this.providers.push(provider);
@@ -57,14 +75,23 @@ export class MemoryManager {
    * `metadata[SKIP_REDACTION_FLAG] = true`. The opt-out flag is stripped
    * before being persisted.
    */
-  async store(key: string, content: string, metadata?: Record<string, unknown>): Promise<void> {
+  async store(
+    key: string,
+    content: string,
+    metadata?: Record<string, unknown>,
+    scopeArg?: MemoryScope
+  ): Promise<void> {
+    const metadataScope = typeof metadata?.scope === 'string' && isMemoryScope(metadata.scope)
+      ? metadata.scope
+      : undefined;
+    const scope = scopeArg ?? metadataScope;
     const skipRedaction = metadata?.[SKIP_REDACTION_FLAG] === true;
 
     // Always strip the opt-out flag — it's a routing hint, not data we
     // want sitting in a memory backend (and would leak across providers).
     let cleanedMetadata: Record<string, unknown> | undefined = metadata;
-    if (metadata && SKIP_REDACTION_FLAG in metadata) {
-      const { [SKIP_REDACTION_FLAG]: _drop, ...rest } = metadata;
+    if (metadata && (SKIP_REDACTION_FLAG in metadata || metadataScope)) {
+      const { [SKIP_REDACTION_FLAG]: _drop, scope: _scope, ...rest } = metadata;
       cleanedMetadata = Object.keys(rest).length > 0 ? rest : undefined;
     }
 
@@ -80,8 +107,18 @@ export class MemoryManager {
         : undefined;
     }
 
+    const providers = this.providers.filter((provider) => acceptsScope(provider, scope));
     await Promise.all(
-      this.providers.map((provider) => provider.store(key, safeContent, safeMetadata))
+      providers.map(async (provider) => {
+        await provider.store(key, safeContent, safeMetadata, scope);
+        if (scope) {
+          this.eventBus?.emit('memory:scoped_write', {
+            provider: provider.name,
+            key,
+            scope,
+          });
+        }
+      })
     );
   }
 
@@ -90,9 +127,11 @@ export class MemoryManager {
    * When duplicates exist, the record with the highest score wins;
    * ties are broken by most recent createdAt.
    */
-  async recall(query: string, limit = 10): Promise<MemoryRecord[]> {
+  async recall(query: string, limit = 10, scope?: MemoryScope): Promise<MemoryRecord[]> {
     const allResults = await Promise.all(
-      this.providers.map((provider) => provider.recall(query, limit))
+      this.providers
+        .filter((provider) => acceptsScope(provider, scope))
+        .map((provider) => provider.recall(query, limit, scope))
     );
 
     const merged = allResults.flat();
@@ -121,7 +160,7 @@ export class MemoryManager {
       // the issue is observable in logs.
       messages = [];
     }
-    return Promise.all(
+    const providerResults = await Promise.all(
       this.providers.map(async (provider): Promise<SessionEndResult> => {
         if (typeof provider.onSessionEnd !== 'function') {
           return { provider: provider.name, invoked: false, ok: true };
@@ -135,6 +174,13 @@ export class MemoryManager {
         }
       }),
     );
+    const dreamStores = new Set<DreamMemoryStore>();
+    if (this.dreamMemory) dreamStores.add(this.dreamMemory);
+    for (const provider of this.providers) {
+      if (provider.dreamMemory) dreamStores.add(provider.dreamMemory);
+    }
+    await Promise.all([...dreamStores].map((dream) => dream.consolidate()));
+    return providerResults;
   }
 
   /** Remove a key from ALL providers. Returns true if at least one provider removed it. */
@@ -175,4 +221,15 @@ export class MemoryManager {
 
     return candidate.createdAt > existing.createdAt;
   }
+}
+
+function isMemoryScope(value: string): value is MemoryScope {
+  return value === 'session' || value === 'user' || value === 'workspace';
+}
+
+function acceptsScope(provider: MemoryProvider, scope?: MemoryScope): boolean {
+  if (!scope || !provider.acceptedScopes || provider.acceptedScopes.length === 0) {
+    return true;
+  }
+  return provider.acceptedScopes.includes(scope);
 }

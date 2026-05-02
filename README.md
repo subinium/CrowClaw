@@ -234,6 +234,8 @@ CrowClaw is built around small interfaces. Bring your own implementation when yo
 
 Most of these have an `InMemory*` default and a file- or D1-backed concrete; you only implement one when you want a different backend.
 
+Memory tiers map directly to the three CrowClaw scopes: `session` is episodic turn/session recall, `user` is durable personal memory, and `workspace` is project-level memory. Embedding-backed providers can declare `acceptedScopes` to serve semantic recall for the tiers they own; providers without that declaration continue to receive all scopes for backward compatibility. This mirrors the NeMo-style split between short-term, long-term, and semantic memory without forcing a new backend.
+
 ## Tool families
 
 The 50+ built-in tools are grouped:

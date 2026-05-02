@@ -59,6 +59,21 @@ describe('storage and memory services', () => {
     expect(scopedSearch[0]?.id).toBe('m3');
   });
 
+  it('matches tokenized memory queries when contiguous substring search would miss', async () => {
+    const memories = new InMemoryMemoryStore();
+    await memories.write({
+      id: 'migration',
+      sessionId: 'session-token',
+      scope: 'session',
+      summary: 'database migration checklist for release',
+      tags: [],
+      createdAt: '2026-01-01T00:00:00.000Z'
+    });
+
+    const results = await memories.search('session-token', 'db migration', 5);
+    expect(results.map((record) => record.id)).toEqual(['migration']);
+  });
+
   it('exposes session and memory search as worker tools', async () => {
     const sessions = new InMemorySessionStore();
     await sessions.put({
@@ -94,6 +109,7 @@ describe('storage and memory services', () => {
       sessionId: 'session-b'
     });
     expect(recall.output).toContain('Persisted note');
+    expect(recall.metadata).toMatchObject({ backend: 'substring' });
 
     const scopeRecall = await registry.execute('memory.search', { query: 'cloudflare', scope: 'workspace', scopeKey: 'workspace-a' }, {
       agentId: 'crowclaw',

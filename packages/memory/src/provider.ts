@@ -83,6 +83,13 @@ export interface MemoryProvider {
     messages: ConversationMessage[]
   ): Promise<MemoryRecord | null>;
 
+  /**
+   * Optional semantic session summarizer. Hosts wire this to the active LLM
+   * provider when explicitly enabled; providers fall back to the deterministic
+   * local summarizer when this is absent or returns an empty string.
+   */
+  llmSummarize?(messages: ConversationMessage[]): Promise<string>;
+
   /** Graceful shutdown. Wait up to 10s for in-flight sync_turn calls. */
   shutdown?(): Promise<void>;
 }
@@ -155,9 +162,11 @@ function isExpired(record: MemoryRecord): boolean {
 export class InMemoryMemoryProvider implements MemoryProvider {
   private readonly memoryStore: MemoryStore;
   private readonly inFlight = new Set<Promise<void>>();
+  llmSummarize?: (messages: ConversationMessage[]) => Promise<string>;
 
-  constructor(memoryStore: MemoryStore) {
+  constructor(memoryStore: MemoryStore, options: { llmSummarize?: (messages: ConversationMessage[]) => Promise<string> } = {}) {
     this.memoryStore = memoryStore;
+    this.llmSummarize = options.llmSummarize;
   }
 
   async recall(
@@ -262,7 +271,18 @@ export class InMemoryMemoryProvider implements MemoryProvider {
     messages: ConversationMessage[]
   ): Promise<MemoryRecord | null> {
     if (messages.length === 0) return null;
-    const record = summarizeTranscript(messages, 'session', sessionId);
+    const fallback = summarizeTranscript(messages, 'session', sessionId);
+    let llmSummary = '';
+    if (this.llmSummarize) {
+      try {
+        llmSummary = (await this.llmSummarize(messages)).trim();
+      } catch {
+        llmSummary = '';
+      }
+    }
+    const record = llmSummary
+      ? { ...fallback, summary: llmSummary, tags: uniqueTags([...fallback.tags, 'semantic-summary']) }
+      : fallback;
     await this.memoryStore.write(record);
     return record;
   }

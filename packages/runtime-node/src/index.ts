@@ -1529,6 +1529,25 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // provider so adapters can intercept those hooks without rewriting the
   // facade's twenty-plus call sites.
   const memoryProvider: MemoryProvider = options.memoryProvider ?? new InMemoryMemoryProvider(memoryStore);
+  if ((runtimeEnv.CROWCLAW_MEMORY_SUMMARIZE === 'true' || (options as Record<string, unknown>).memorySummarize === true) && !memoryProvider.llmSummarize) {
+    memoryProvider.llmSummarize = async (messages) => {
+      if (!providerReady) return '';
+      const transcript = messages
+        .slice(-24)
+        .map((message) => `${message.role}: ${message.content.slice(0, 2000)}`)
+        .join('\n');
+      const result = await provider.generate({
+        messages: [{
+          role: 'user',
+          content: `Summarize this session for future cross-session recall. Preserve durable decisions, constraints, names, and open tasks. Return one concise paragraph and no preamble.\n\n${transcript}`,
+          createdAt: new Date().toISOString(),
+        }],
+        systemPrompt: 'You write concise semantic memory summaries for an agent memory index.',
+        availableTools: [],
+      });
+      return result.assistantMessage?.trim() ?? '';
+    };
+  }
   const memoryService = new MemoryService(memoryStore, undefined, memoryProvider);
   const userModelService = new UserModelService(memoryStore);
   const mcpClient = options.mcpClient ?? new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
