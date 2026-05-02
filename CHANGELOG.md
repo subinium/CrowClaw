@@ -5,6 +5,57 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [Unreleased] - 2026-05-02 - release/v0.8.1 local issue sweep
+
+This local release branch sweep is staged on `release/v0.8.1` only. It has
+not been pushed and no PR has been opened yet. GitHub issues may still appear
+open until this branch is published and merged or closed.
+
+### Runtime, gateway, and observability
+- **#73** Gateway endpoint policy is now configurable through persisted
+  gateway config and schema fields (`policyTier`, `allowedEndpoints`), applied
+  to Discord outbound routes/delivery, and surfaced through
+  `gateway:policy_denied` events.
+- **#74** Gateway token rotation, revocation, webhook mutation, and pairing
+  revocation now enforce caller-scope containment before mutating owner-scoped
+  gateway secrets.
+- **#82** Prometheus metrics moved to gated `/api/metrics`; OpenTelemetry now
+  opts into `gen_ai_latest_experimental` semantic conventions and emits stable
+  GenAI span names for harness runs, tool loops, exec calls, context assembly,
+  and outbound delivery.
+- **#96** Runtime startup now restores latest `in_progress` checkpoints across
+  sessions, emits `session:resumed`, and the CLI exposes `--no-resume` as an
+  operator override.
+- **#155** `runtime-node` entrypoint responsibility was split into focused
+  route, bootstrap, lifecycle, scheduler, plugin, startup, support, and gateway
+  modules while keeping `index.ts` as the assembler.
+- **#160** Terminal background process tracking is no longer module-global;
+  terminal state is owned by injected per-runtime/per-registry sessions.
+- **#163** `noUncheckedIndexedAccess` remains enabled across the TypeScript
+  base config.
+
+### Plugins, memory, tools, and deployment
+- **#90** Memory backends now have a plugin contract, runtime provider
+  selection, and a Honcho-compatible reference example.
+- **#204** Korean locale selection now carries into prompt-facing runtime
+  context, not only dashboard chrome.
+- **#253-#258, #261-#264** Deployment and Cloudflare parity gaps were closed
+  or documented with explicit Worker limitations, Docker hardening, persistent
+  audit logs, launchd/self-host runbooks, and vision SSRF protection.
+- **#268-#288** Provider/tool sweep added or hardened voice STT, web fetch and
+  search fallbacks, OpenAI retry/prompt-cache/model-family behavior, Docker/SSH
+  terminal planning, memory/learning parity surfaces, migration helpers, image
+  and vision provider fallbacks, and related security fixes.
+
+### Verification
+- `npm run typecheck` - clean
+- Focused release tests - 199 passed
+- Provider structured-output/token tests - 74 passed
+- `npm test` - 2,965 / 2,966 (1 skipped)
+- `npm run build:ui --workspace @crowclaw/web` - clean
+- `npm run build:html --workspace @crowclaw/web` - clean
+- `git diff --check` - clean
+
 ## [0.8.2] - 2026-05-02 - Runtime/security hardening: 9-issue release sweep
 
 This release tightens the release-critical runtime surfaces opened after
