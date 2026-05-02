@@ -11,6 +11,18 @@ This file is the interruption-safe working ledger for the local
 - Record each local commit SHA after it is created.
 - Do not rely on chat history alone for release state.
 - Do not push or open a PR from this branch until explicitly requested.
+- Keep work on `release/v0.8.1`; do not create branch names containing
+  `codex` for this release lane.
+- Leave small, reviewable local commits at natural checkpoints:
+  after each verified issue batch, after release-note/worklog updates, and
+  before any large handoff or context break.
+- Run regression tests before claiming a batch complete. Minimum gate is
+  focused tests for touched surfaces plus `npm run typecheck` and
+  `git diff --check`; broad/runtime changes require full `npm test` and
+  relevant web/package builds.
+- Manage conflicts proactively: check `git status --short` before editing,
+  avoid overlapping file ownership across subagents, inspect shared-file
+  diffs before staging, and never revert unrelated user or agent work.
 
 ## Current State
 
