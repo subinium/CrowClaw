@@ -89,6 +89,11 @@ describe('parseJsonlPrompts', () => {
     expect(result[1]).toMatchObject({ id: 'prompt-1', prompt: 'msg fallback' });
     expect(result[2]).toMatchObject({ id: 'x', prompt: 'ok', systemPrompt: 'sys' });
   });
+
+  it('parses expected output fields from JSONL', () => {
+    const result = parseJsonlPrompts(JSON.stringify({ id: 'eval', prompt: 'say hi', expectedOutput: 'hi there' }));
+    expect(result[0]?.expected).toBe('hi there');
+  });
 });
 
 // ─── runBatch ───────────────────────────────────────────────────────
@@ -151,6 +156,25 @@ describe('runBatch', () => {
     expect(summary.results[0]!.error).toBe('agent crashed');
     expect(summary.results[0]!.response).toBe('');
     expect(summary.results[0]!.toolCalls).toHaveLength(0);
+  });
+
+  it('scores expected-output assertions and summary accuracy', async () => {
+    const prompts: BatchPrompt[] = [
+      { id: 'pass', prompt: 'hello', expected: 'response' },
+      { id: 'fail', prompt: 'hello', expected: { contains: 'missing phrase' } },
+      { id: 'skip-eval', prompt: 'hello' },
+    ];
+    const agent = makeMockAgent('response');
+
+    const summary = await runBatch(prompts, agent, { runName: 'eval-run' });
+
+    expect(summary.accuracy).toBe(0.5);
+    expect(summary.succeeded).toBe(2);
+    expect(summary.failed).toBe(1);
+    expect(summary.results[0]?.assertions).toMatchObject({ evaluated: true, passed: true, failures: [] });
+    expect(summary.results[1]?.ok).toBe(false);
+    expect(summary.results[1]?.assertions?.failures[0]).toContain('missing expected text');
+    expect(summary.results[2]?.assertions).toBeUndefined();
   });
 
   it('reports progress via callback', async () => {

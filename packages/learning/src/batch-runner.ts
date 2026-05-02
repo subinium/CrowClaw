@@ -3,6 +3,7 @@ import type { ConversationMessage } from '@crowclaw/core';
 export interface BatchPrompt {
   id: string;
   prompt: string;
+  expected?: BatchExpectedOutput;
   metadata?: Record<string, unknown>;
   systemPrompt?: string;
   agentPreset?: string;
@@ -10,6 +11,15 @@ export interface BatchPrompt {
   skillSlugs?: string[];
   model?: string;
 }
+
+export type BatchExpectedOutput =
+  | string
+  | string[]
+  | {
+      equals?: string;
+      contains?: string | string[];
+      regex?: string;
+    };
 
 export interface BatchRunConfig {
   runName: string;
@@ -36,8 +46,15 @@ export interface BatchRunResult {
   toolCalls: Array<{ toolName: string; ok: boolean; output: string }>;
   messages: ConversationMessage[];
   durationMs: number;
+  assertions?: BatchAssertionResult;
   error?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface BatchAssertionResult {
+  evaluated: boolean;
+  passed: boolean;
+  failures: string[];
 }
 
 export interface BatchRunSummary {
@@ -50,6 +67,7 @@ export interface BatchRunSummary {
   skipped: number;
   totalDurationMs: number;
   avgDurationMs: number;
+  accuracy?: number;
   results: BatchRunResult[];
 }
 
@@ -81,6 +99,7 @@ export function parseJsonlPrompts(jsonl: string): BatchPrompt[] {
         id: (parsed.id as string) ?? `prompt-${idx}`,
         prompt: (parsed.prompt as string) ?? (parsed.text as string) ?? (parsed.message as string) ?? '',
         metadata: parsed.metadata as Record<string, unknown> | undefined,
+        expected: (parsed.expected ?? parsed.expectedOutput) as BatchExpectedOutput | undefined,
         systemPrompt: parsed.systemPrompt as string | undefined,
         agentPreset: parsed.agentPreset as string | undefined,
         toolset: parsed.toolset as string | undefined,
@@ -150,6 +169,8 @@ export async function runBatch(
 
           clearTimeout(timer);
           const durationMs = Date.now() - start;
+          const assertions = evaluateExpectedOutput(agentResult.finalResponse, prompt.expected);
+          const ok = assertions ? assertions.passed : true;
           completed++;
 
           config.onProgress?.({
@@ -162,11 +183,12 @@ export async function runBatch(
           return {
             promptId: prompt.id,
             sessionId,
-            ok: true,
+            ok,
             response: agentResult.finalResponse,
             toolCalls: agentResult.toolResults,
             messages: agentResult.session.messages,
             durationMs,
+            assertions,
             metadata: prompt.metadata,
           } satisfies BatchRunResult;
         } catch (err: unknown) {
@@ -189,6 +211,7 @@ export async function runBatch(
             toolCalls: [],
             messages: [],
             durationMs: Date.now() - start,
+            assertions: evaluateExpectedOutput('', prompt.expected),
             error: msg,
             metadata: prompt.metadata,
           } satisfies BatchRunResult;
@@ -200,6 +223,10 @@ export async function runBatch(
 
   const completedAt = new Date().toISOString();
   const totalDurationMs = results.reduce((sum, r) => sum + r.durationMs, 0);
+  const evaluated = results.filter((result) => result.assertions?.evaluated);
+  const accuracy = evaluated.length > 0
+    ? Math.round((evaluated.filter((result) => result.assertions?.passed).length / evaluated.length) * 1000) / 1000
+    : undefined;
 
   return {
     runName: config.runName,
@@ -211,6 +238,58 @@ export async function runBatch(
     skipped,
     totalDurationMs,
     avgDurationMs: results.length > 0 ? Math.round(totalDurationMs / results.length) : 0,
+    accuracy,
     results,
+  };
+}
+
+function normalizeForComparison(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+export function evaluateExpectedOutput(
+  response: string,
+  expected?: BatchExpectedOutput
+): BatchAssertionResult | undefined {
+  if (expected === undefined) return undefined;
+  const failures: string[] = [];
+  const normalizedResponse = normalizeForComparison(response);
+
+  const requireContains = (needle: string): void => {
+    if (!normalizedResponse.includes(normalizeForComparison(needle))) {
+      failures.push(`missing expected text: ${needle}`);
+    }
+  };
+
+  if (typeof expected === 'string') {
+    requireContains(expected);
+  } else if (Array.isArray(expected)) {
+    for (const item of expected) requireContains(item);
+  } else {
+    if (expected.equals !== undefined && normalizedResponse !== normalizeForComparison(expected.equals)) {
+      failures.push('response did not equal expected output');
+    }
+    const contains = expected.contains;
+    if (typeof contains === 'string') {
+      requireContains(contains);
+    } else if (Array.isArray(contains)) {
+      for (const item of contains) requireContains(item);
+    }
+    if (expected.regex !== undefined) {
+      try {
+        const regex = new RegExp(expected.regex, 'i');
+        if (!regex.test(response)) {
+          failures.push(`response did not match regex: ${expected.regex}`);
+        }
+      } catch {
+        failures.push(`invalid expected regex: ${expected.regex}`);
+      }
+    }
+  }
+
+  return {
+    evaluated: true,
+    passed: failures.length === 0,
+    failures,
   };
 }

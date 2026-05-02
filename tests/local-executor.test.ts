@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LocalProcessExecutor, DockerExecutor, createAutoExecutor, CloudflareSandboxExecutor } from '@crowclaw/sandbox-executor';
+import { LocalProcessExecutor, DockerExecutor, createAutoExecutor, CloudflareSandboxExecutor, buildDockerRunCommand, buildSingularityExecCommand } from '@crowclaw/sandbox-executor';
 
 describe('LocalProcessExecutor', () => {
   it('executes a simple command', async () => {
@@ -51,6 +51,20 @@ describe('LocalProcessExecutor', () => {
 });
 
 describe('DockerExecutor', () => {
+  it('includes hardening flags in docker run command plans', () => {
+    const command = buildDockerRunCommand({
+      image: 'alpine:latest',
+      memoryLimit: '256m',
+      cpuLimit: '0.5',
+      networkMode: 'none'
+    }, 'echo test');
+
+    expect(command).toContain('--security-opt no-new-privileges');
+    expect(command).toContain('--cap-drop ALL');
+    expect(command).toContain('--user 1000:1000');
+    expect(command).toContain('--network none');
+  });
+
   it('constructs docker run command correctly', async () => {
     // DockerExecutor delegates to LocalProcessExecutor internally.
     // We can't easily test actual Docker execution without Docker,
@@ -68,6 +82,17 @@ describe('DockerExecutor', () => {
     expect(result).toHaveProperty('exitCode');
     expect(result).toHaveProperty('stdout');
     expect(result).toHaveProperty('stderr');
+  });
+});
+
+describe('SingularityExecutor command plan', () => {
+  it('builds contained Singularity exec commands', () => {
+    const command = buildSingularityExecCommand({ image: 'library://alpine:latest' }, 'echo test', '/work');
+    expect(command).toContain('singularity exec --contain --cleanenv');
+    expect(command).toContain("'library://alpine:latest'");
+    expect(command).toContain('cd ');
+    expect(command).toContain('/work');
+    expect(command).toContain('echo test');
   });
 });
 

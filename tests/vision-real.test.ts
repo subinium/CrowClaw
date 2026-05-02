@@ -151,6 +151,33 @@ describe('vision.analyze tool', () => {
     expect(result.toolName).toBe('vision.analyze');
   });
 
+  it('falls back to the next configured vision provider on primary failure', async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('openai.local')) {
+        return new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 });
+      }
+      if (href.includes('generativelanguage.googleapis.com')) {
+        return new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'Gemini fallback analysis' }] } }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tool = createVisionAnalyzeTool({
+      apiKey: 'openai-key',
+      providerBaseUrl: 'https://openai.local/v1',
+      fallbackProviders: [{ provider: 'gemini', apiKey: 'gemini-key' }],
+    });
+    const result = await tool.execute({ url: 'https://example.com/image.png' }, makeContext());
+
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe('Gemini fallback analysis');
+    expect(result.metadata).toMatchObject({ provider: 'gemini' });
+  });
+
   it('handles network error gracefully without throwing', async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error('Network connection refused');
@@ -240,6 +267,31 @@ describe('vision.analyze tool', () => {
 describe('image.generate tool', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('falls back to Replicate when OpenAI-compatible image generation fails', async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('openai.local')) {
+        return new Response('rate limited', { status: 429 });
+      }
+      if (href.includes('api.replicate.com')) {
+        return new Response(JSON.stringify({ output: ['https://example.com/replicate.png'] }), { status: 200 });
+      }
+      throw new Error(`unexpected url ${href}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tool = createImageGenerateTool({
+      apiKey: 'openai-key',
+      providerBaseUrl: 'https://openai.local/v1',
+      fallbackProviders: [{ provider: 'replicate', apiKey: 'replicate-key' }],
+    });
+    const result = await tool.execute({ prompt: 'a fallback image' }, makeContext());
+
+    expect(result.ok).toBe(true);
+    expect(result.metadata).toMatchObject({ provider: 'replicate', count: 1 });
+    expect(result.output).toContain('https://example.com/replicate.png');
   });
 
   afterEach(() => {

@@ -2113,7 +2113,7 @@ export async function getTelegramWebhookInfo(
 
 export const normalizeTelegramUpdate = normalizeTelegramWebhook;
 
-export { channels, type ChannelAdapter, type NormalizedChannelMessage, telegramChannel, discordChannel, slackChannel, genericChannel } from './channel-registry.js';
+export { channels, type ChannelAdapter, type NormalizedChannelMessage, telegramChannel, discordChannel, slackChannel, whatsappChannel, signalChannel, genericChannel } from './channel-registry.js';
 
 export async function normalizeGatewayRequest(platform: GatewayPlatform, request: Request): Promise<NormalizedInboundMessage | null> {
   const payload = await request.json();

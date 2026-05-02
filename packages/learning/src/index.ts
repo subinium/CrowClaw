@@ -530,8 +530,11 @@ export class LearningPipeline {
 }
 
 export {
+  evaluateExpectedOutput,
   parseJsonlPrompts,
   runBatch,
+  type BatchAssertionResult,
+  type BatchExpectedOutput,
   type BatchPrompt,
   type BatchRunConfig,
   type BatchProgress,
@@ -577,6 +580,17 @@ export {
   filterByScore,
   rankByScore,
 } from './rl-export.js';
+
+export {
+  AtroposEnv,
+  defaultAtroposReward,
+  type AtroposEnvConfig,
+  type AtroposPrompt,
+  type AtroposRegistration,
+  type AtroposRewardFn,
+  type AtroposRollout,
+  type AtroposSubmitResult,
+} from './atropos-env.js';
 
 export {
   SkillMetricsTracker,

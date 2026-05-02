@@ -131,6 +131,40 @@ describe('tool breadth extensions', () => {
     expect(result.ok).toBe(true);
     expect(result.output).toContain('CrowClaw Result A');
     expect(result.output).toContain('https://example.com/a');
+    expect(result.metadata).toMatchObject({ provider: 'duckduckgo' });
+  });
+
+  it('falls back across structured web.search providers', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/brave')) {
+        return new Response('rate limited', { status: 429 });
+      }
+      if (url.includes('/tavily')) {
+        return new Response(JSON.stringify({
+          results: [{ title: 'Tavily Result', url: 'https://example.com/tavily', content: 'structured snippet' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebSearchTool());
+    const result = await registry.execute('web.search', {
+      query: 'crowclaw',
+      providers: [
+        { name: 'brave', baseUrl: 'https://example.com/brave', apiKey: 'brave-key' },
+        { name: 'tavily', baseUrl: 'https://example.com/tavily', apiKey: 'tavily-key' },
+      ],
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'search-fallback'
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.metadata).toMatchObject({ provider: 'tavily', count: 1 });
+    expect(result.output).toContain('Tavily Result');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('crawls linked pages with the web.crawl tool', async () => {

@@ -32,7 +32,7 @@ import type { WorkspaceStore } from '@crowclaw/workspace';
 type BackgroundProcessRecord = {
   pid: number;
   command: string;
-  backend: 'local' | 'docker' | 'ssh';
+  backend: 'local' | 'docker' | 'ssh' | 'singularity';
   resolvedCommand: string;
   cwd?: string;
   startedAt: string;
@@ -46,7 +46,7 @@ type BackgroundProcessRecord = {
 
 const backgroundProcesses = new Map<number, BackgroundProcessRecord>();
 
-type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'modal' | 'daytona';
+type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'singularity' | 'modal' | 'daytona';
 
 type TerminalBackendDescriptor = {
   backend: TerminalBackendKind;
@@ -84,6 +84,13 @@ const TERMINAL_BACKENDS: TerminalBackendDescriptor[] = [
     requires: ['target']
   },
   {
+    backend: 'singularity',
+    status: 'available',
+    execution: 'wrapped',
+    description: 'Wraps commands through Singularity/Apptainer exec for HPC container execution.',
+    requires: ['image']
+  },
+  {
     backend: 'modal',
     status: 'planned',
     execution: 'descriptor',
@@ -100,7 +107,7 @@ const TERMINAL_BACKENDS: TerminalBackendDescriptor[] = [
 ];
 
 function normalizeTerminalBackend(input: unknown): TerminalBackendKind {
-  return input === 'docker' || input === 'ssh' || input === 'modal' || input === 'daytona'
+  return input === 'docker' || input === 'ssh' || input === 'singularity' || input === 'modal' || input === 'daytona'
     ? input
     : 'local';
 }
@@ -120,6 +127,7 @@ const DOCKER_IMAGE_RE = /^[a-zA-Z0-9._/:@-]+$/;
 const DOCKER_CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 // SSH target: [user@]host[:port]; allow the same as the issue spec.
 const SSH_TARGET_RE = /^[a-zA-Z0-9._@:-]+$/;
+const SINGULARITY_IMAGE_RE = /^[a-zA-Z0-9._/:@-]+$/;
 
 function isValidDockerImage(value: string): boolean {
   return value.length > 0 && value.length <= 255 && DOCKER_IMAGE_RE.test(value);
@@ -131,6 +139,10 @@ function isValidDockerContainer(value: string): boolean {
 
 function isValidSshTarget(value: string): boolean {
   return value.length > 0 && value.length <= 255 && SSH_TARGET_RE.test(value);
+}
+
+function isValidSingularityImage(value: string): boolean {
+  return value.length > 0 && value.length <= 255 && SINGULARITY_IMAGE_RE.test(value);
 }
 
 // #70 / NemoClaw CVE-2026-32048 — required hardening flags for any docker
@@ -218,6 +230,26 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
       cwd,
       resolvedCommand,
       metadata: { backend, target, mode: 'wrapped', cwd }
+    };
+  }
+
+  if (backend === 'singularity') {
+    const image = typeof input.image === 'string' ? input.image.trim() : '';
+    if (!image) {
+      return { ok: false, backend, command, output: 'Singularity backend requires image.' };
+    }
+    if (!isValidSingularityImage(image)) {
+      return { ok: false, backend, command, output: `Singularity image rejected: invalid characters or format (${image}).` };
+    }
+    const wrappedCommand = cwd ? `cd ${quoteShell(cwd)} && ${command}` : command;
+    const resolvedCommand = `singularity exec --contain --cleanenv ${quoteShell(image)} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
+    return {
+      ok: true,
+      backend,
+      command,
+      cwd,
+      resolvedCommand,
+      metadata: { backend, image, mode: 'wrapped', cwd, contained: true }
     };
   }
 
@@ -327,6 +359,17 @@ async function probeTerminalBackends(): Promise<TerminalBackendStatus[]> {
         installed,
         command: 'ssh',
         details: installed ? 'ssh client detected for remote execution wrapping.' : 'ssh client not detected on PATH.'
+      });
+      continue;
+    }
+    if (descriptor.backend === 'singularity') {
+      const singularityInstalled = await isCommandInstalled('singularity');
+      const apptainerInstalled = await isCommandInstalled('apptainer');
+      results.push({
+        ...descriptor,
+        installed: singularityInstalled || apptainerInstalled,
+        command: singularityInstalled ? 'singularity' : apptainerInstalled ? 'apptainer' : 'singularity',
+        details: singularityInstalled || apptainerInstalled ? 'Singularity/Apptainer CLI detected for HPC container execution.' : 'Singularity/Apptainer CLI not detected on PATH.'
       });
       continue;
     }
@@ -677,9 +720,9 @@ export function createTerminalExecTool(): ToolDefinition {
         properties: {
           command: { type: 'string', description: 'The shell command to execute' },
           raw: { type: 'string', description: 'Alias for command' },
-          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, modal, daytona)' },
+          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, singularity, modal, daytona)' },
           container: { type: 'string', description: 'Docker container name (for docker backend)' },
-          image: { type: 'string', description: 'Docker image name (for docker backend)' },
+          image: { type: 'string', description: 'Docker/Singularity image name (for container backends)' },
           target: { type: 'string', description: 'SSH target host (for ssh backend)' },
           cwd: { type: 'string', description: 'Working directory for the command' },
           timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds for local execution' },
@@ -778,9 +821,9 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         properties: {
           command: { type: 'string', description: 'The shell command to run in the background' },
           raw: { type: 'string', description: 'Alias for command' },
-          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, modal, daytona)' },
+          backend: { type: 'string', description: 'Terminal backend to use (local, docker, ssh, singularity, modal, daytona)' },
           container: { type: 'string', description: 'Docker container name (for docker backend)' },
-          image: { type: 'string', description: 'Docker image name (for docker backend)' },
+          image: { type: 'string', description: 'Docker/Singularity image name (for container backends)' },
           target: { type: 'string', description: 'SSH target host (for ssh backend)' },
           cwd: { type: 'string', description: 'Working directory for the background command' },
           planOnly: { type: 'boolean', description: 'If true, return the resolved command plan without executing' }
@@ -846,7 +889,7 @@ export function createTerminalBackgroundTool(): ToolDefinition {
       const record: BackgroundProcessRecord = {
         pid,
         command: plan.command,
-        backend: plan.backend === 'local' || plan.backend === 'docker' || plan.backend === 'ssh' ? plan.backend : 'local',
+        backend: plan.backend === 'local' || plan.backend === 'docker' || plan.backend === 'ssh' || plan.backend === 'singularity' ? plan.backend : 'local',
         resolvedCommand,
         cwd,
         startedAt: new Date().toISOString(),
@@ -949,7 +992,9 @@ export function createTerminalProbeTool(): ToolDefinition {
           ? 'docker --version'
           : backend === 'ssh'
             ? 'ssh -V'
-            : '';
+            : backend === 'singularity'
+              ? 'singularity --version'
+              : '';
       if (!probeCommand) {
         return {
           toolName: 'terminal.probe',
@@ -1326,6 +1371,171 @@ export function createWebExtractTextTool(): ToolDefinition {
   };
 }
 
+interface WebSearchProviderConfig {
+  name: 'brave' | 'tavily' | 'duckduckgo' | 'exa';
+  baseUrl?: string;
+  apiKey?: string;
+}
+
+interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+  provider: string;
+  rank: number;
+}
+
+function envValue(name: string): string | undefined {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+}
+
+function normalizeSearchProviders(input: Record<string, unknown>): WebSearchProviderConfig[] {
+  if (typeof input.providerBaseUrl === 'string') {
+    return [{ name: 'duckduckgo', baseUrl: input.providerBaseUrl }];
+  }
+  if (Array.isArray(input.providers)) {
+    return input.providers
+      .map((entry): WebSearchProviderConfig | null => {
+        if (typeof entry === 'string' && ['brave', 'tavily', 'duckduckgo', 'exa'].includes(entry)) {
+          return { name: entry as WebSearchProviderConfig['name'] };
+        }
+        if (!entry || typeof entry !== 'object') return null;
+        const obj = entry as Record<string, unknown>;
+        const name = String(obj.name ?? '').toLowerCase();
+        if (!['brave', 'tavily', 'duckduckgo', 'exa'].includes(name)) return null;
+        return {
+          name: name as WebSearchProviderConfig['name'],
+          baseUrl: typeof obj.baseUrl === 'string' ? obj.baseUrl : undefined,
+          apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : undefined,
+        };
+      })
+      .filter((provider): provider is WebSearchProviderConfig => provider !== null);
+  }
+
+  const providers: WebSearchProviderConfig[] = [];
+  const braveKey = envValue('BRAVE_SEARCH_API_KEY') ?? envValue('BRAVE_API_KEY');
+  const tavilyKey = envValue('TAVILY_API_KEY');
+  const exaKey = envValue('EXA_API_KEY');
+  if (braveKey) providers.push({ name: 'brave', apiKey: braveKey });
+  if (tavilyKey) providers.push({ name: 'tavily', apiKey: tavilyKey });
+  providers.push({ name: 'duckduckgo' });
+  if (exaKey) providers.push({ name: 'exa', apiKey: exaKey });
+  return providers;
+}
+
+async function fetchSearchProvider(
+  provider: WebSearchProviderConfig,
+  query: string,
+  limit: number,
+  signal?: AbortSignal
+): Promise<{ status: number; results: WebSearchResult[] }> {
+  if (provider.name === 'brave') {
+    const url = new URL(provider.baseUrl ?? 'https://api.search.brave.com/res/v1/web/search');
+    url.searchParams.set('q', query);
+    url.searchParams.set('count', String(limit));
+    const response = await safeSearchFetch(url, signal, provider.apiKey ? { 'X-Subscription-Token': provider.apiKey } : {});
+    const json = await response.json() as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+    return { status: response.status, results: normalizeJsonSearchResults(provider.name, json.web?.results ?? [], limit) };
+  }
+
+  if (provider.name === 'tavily') {
+    const url = new URL(provider.baseUrl ?? 'https://api.tavily.com/search');
+    const response = await safeSearchFetch(url, signal, provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {}, {
+      method: 'POST',
+      body: JSON.stringify({ query, max_results: limit, api_key: provider.apiKey }),
+    });
+    const json = await response.json() as { results?: Array<{ title?: string; url?: string; content?: string; snippet?: string }> };
+    return { status: response.status, results: normalizeJsonSearchResults(provider.name, json.results ?? [], limit) };
+  }
+
+  if (provider.name === 'exa') {
+    const url = new URL(provider.baseUrl ?? 'https://api.exa.ai/search');
+    const response = await safeSearchFetch(url, signal, provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {}, {
+      method: 'POST',
+      body: JSON.stringify({ query, numResults: limit }),
+    });
+    const json = await response.json() as { results?: Array<{ title?: string; url?: string; text?: string; highlights?: string[] }> };
+    return { status: response.status, results: normalizeJsonSearchResults(provider.name, json.results ?? [], limit) };
+  }
+
+  const url = new URL(provider.baseUrl ?? 'https://duckduckgo.com/html/');
+  url.searchParams.set('q', query);
+  const response = await safeSearchFetch(url, signal);
+  const html = await response.text();
+  return { status: response.status, results: parseDuckDuckGoResults(url.toString(), html, limit, provider.name) };
+}
+
+async function safeSearchFetch(
+  url: URL,
+  signal?: AbortSignal,
+  headers: Record<string, string> = {},
+  init: RequestInit = {}
+): Promise<Response> {
+  const searchUrlCheck = await safeFetchPreflight(url.toString());
+  if (!searchUrlCheck.safe) {
+    throw new Error(`URL blocked: ${searchUrlCheck.reason}`);
+  }
+  const response = await fetch(url, {
+    ...init,
+    signal,
+    redirect: 'manual',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; CrowClaw/0.1; +https://github.com/subinium/CrowClaw)',
+      ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...headers,
+      ...(init.headers as Record<string, string> | undefined),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response;
+}
+
+function normalizeJsonSearchResults(
+  provider: string,
+  rows: Array<Record<string, unknown>>,
+  limit: number
+): WebSearchResult[] {
+  return rows
+    .map((row, index) => {
+      const title = String(row.title ?? row.url ?? '').trim();
+      const url = String(row.url ?? '').trim();
+      const snippet = String(row.description ?? row.content ?? row.snippet ?? row.text ?? (Array.isArray(row.highlights) ? row.highlights[0] : '') ?? title).trim();
+      return title && url ? { title, url, snippet, provider, rank: index + 1 } : null;
+    })
+    .filter((result): result is WebSearchResult => result !== null)
+    .slice(0, limit);
+}
+
+function parseDuckDuckGoResults(searchUrl: string, html: string, limit: number, provider: string): WebSearchResult[] {
+  const ddgResults: WebSearchResult[] = [];
+  const resultBlockRegex = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
+  for (const block of html.matchAll(resultBlockRegex)) {
+    const content = block[1];
+    const linkMatch = content.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    const snippetMatch = content.match(/<(?:a|td|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|span)>/i);
+    if (linkMatch) {
+      const href = resolveHref(searchUrl, linkMatch[1]) ?? linkMatch[1];
+      const title = linkMatch[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const snippet = snippetMatch
+        ? snippetMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
+        : title;
+      if (href && title) ddgResults.push({ title, url: href, snippet, provider, rank: ddgResults.length + 1 });
+    }
+  }
+  const results = ddgResults.length > 0
+    ? ddgResults
+    : [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
+        .map((match, index) => {
+          const href = resolveHref(searchUrl, match[1]) ?? match[1];
+          const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          return href && title ? { title, url: href, snippet: title, provider, rank: index + 1 } : null;
+        })
+        .filter((value): value is WebSearchResult => Boolean(value));
+  return results.slice(0, limit);
+}
+
 export function createWebSearchTool(): ToolDefinition {
   return {
     manifest: {
@@ -1342,9 +1552,6 @@ export function createWebSearchTool(): ToolDefinition {
     async execute(input, context) {
       const query = typeof input.query === 'string' ? input.query : '';
       const limit = typeof input.limit === 'number' ? input.limit : 5;
-      const providerBaseUrl = typeof input.providerBaseUrl === 'string'
-        ? input.providerBaseUrl
-        : 'https://duckduckgo.com/html/';
       if (!query) {
         return {
           toolName: 'web.search',
@@ -1354,61 +1561,33 @@ export function createWebSearchTool(): ToolDefinition {
         };
       }
 
-      const searchUrl = new URL(providerBaseUrl);
-      searchUrl.searchParams.set('q', query);
-      const searchUrlCheck = await safeFetchPreflight(searchUrl.toString());
-      if (!searchUrlCheck.safe) {
-        return { toolName: 'web.search', runtime: 'worker', ok: false, output: `URL blocked: ${searchUrlCheck.reason}` };
-      }
-
-      // #138 — `redirect: 'manual'` so a 30x to a private host can't bypass
-      // the SSRF preflight. The previous `redirect: 'follow'` was the SSRF
-      // hole the audit flagged.
-      const response = await fetch(searchUrl, {
-        signal: context.signal,
-        redirect: 'manual',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CrowClaw/0.1; +https://github.com/subinium/CrowClaw)' },
-      });
-      if (!response.ok) {
-        return { toolName: 'web.search', runtime: 'worker', ok: false, output: `Search request failed: HTTP ${response.status}` };
-      }
-      const html = await response.text();
-
-      // Pass 1: Parse DuckDuckGo structured results (class="result" containers with snippets)
-      const ddgResults: Array<{ title: string; url: string; snippet: string }> = [];
-      const resultBlockRegex = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
-      for (const block of html.matchAll(resultBlockRegex)) {
-        const content = block[1];
-        const linkMatch = content.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
-        const snippetMatch = content.match(/<(?:a|td|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/(?:a|td|span)>/i);
-        if (linkMatch) {
-          const href = resolveHref(searchUrl.toString(), linkMatch[1]) ?? linkMatch[1];
-          const title = linkMatch[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-          const snippet = snippetMatch
-            ? snippetMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
-            : title;
-          if (href && title) ddgResults.push({ title, url: href, snippet });
+      const providers = normalizeSearchProviders(input);
+      const errors: string[] = [];
+      for (const provider of providers) {
+        try {
+          const { status, results } = await fetchSearchProvider(provider, query, limit, context.signal);
+          if (results.length === 0) {
+            errors.push(`${provider.name}: no results`);
+            continue;
+          }
+          return {
+            toolName: 'web.search',
+            runtime: 'worker',
+            ok: true,
+            output: JSON.stringify(results, null, 2),
+            metadata: { status, query, count: results.length, provider: provider.name, attemptedProviders: providers.map((p) => p.name) }
+          };
+        } catch (error: unknown) {
+          errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-
-      // Pass 2: Fallback to generic <a> parsing if DDG structure not found
-      const results = ddgResults.length > 0
-        ? ddgResults.slice(0, limit)
-        : [...html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)]
-            .map((match) => {
-              const href = resolveHref(searchUrl.toString(), match[1]) ?? match[1];
-              const title = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-              return href && title ? { title, url: href, snippet: title } : null;
-            })
-            .filter((value): value is { title: string; url: string; snippet: string } => Boolean(value))
-            .slice(0, limit);
 
       return {
         toolName: 'web.search',
         runtime: 'worker',
-        ok: response.ok,
-        output: JSON.stringify(results, null, 2),
-        metadata: { status: response.status, query, count: results.length, providerBaseUrl }
+        ok: false,
+        output: `Search request failed: ${errors.join('; ')}`,
+        metadata: { query, count: 0, attemptedProviders: providers.map((p) => p.name), errors }
       };
     }
   };

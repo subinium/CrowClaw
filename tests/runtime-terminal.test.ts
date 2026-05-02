@@ -90,6 +90,22 @@ describe('runtime terminal integration', () => {
     // #129/#70/#71 — container quoted; --user pinned to non-root uid:gid.
     expect(dockerPlanPayload.output).toContain("docker exec --user 1000:1000 'demo-app'");
 
+    const dockerRunPlanResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
+      method: 'POST',
+      body: JSON.stringify({ backend: 'docker', image: 'alpine:latest', command: 'printf "hello-terminal"', planOnly: true })
+    }));
+    const dockerRunPlanPayload = await dockerRunPlanResponse.json() as { ok: boolean; output: string };
+    expect(dockerRunPlanPayload.ok).toBe(true);
+    expect(dockerRunPlanPayload.output).toContain('--security-opt no-new-privileges --cap-drop ALL --user 1000:1000');
+
+    const singularityPlanResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
+      method: 'POST',
+      body: JSON.stringify({ backend: 'singularity', image: 'library://alpine:latest', command: 'printf "hello-terminal"', planOnly: true })
+    }));
+    const singularityPlanPayload = await singularityPlanResponse.json() as { ok: boolean; output: string };
+    expect(singularityPlanPayload.ok).toBe(true);
+    expect(singularityPlanPayload.output).toContain("singularity exec --contain --cleanenv 'library://alpine:latest'");
+
     const backgroundResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.background), {
       method: 'POST',
       body: JSON.stringify({ command: 'sleep 5', __approvalGranted: true })

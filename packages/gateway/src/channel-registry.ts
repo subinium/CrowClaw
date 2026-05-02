@@ -174,6 +174,64 @@ export const slackChannel: ChannelAdapter = {
   },
 };
 
+export const whatsappChannel: ChannelAdapter = {
+  name: 'whatsapp',
+  displayName: 'WhatsApp',
+  normalizeInbound(payload: unknown): NormalizedChannelMessage | null {
+    const p = payload as Record<string, unknown>;
+    const entry = Array.isArray(p.entry) ? p.entry[0] as Record<string, unknown> | undefined : undefined;
+    const changes = Array.isArray(entry?.changes) ? entry?.changes[0] as Record<string, unknown> | undefined : undefined;
+    const value = changes?.value as Record<string, unknown> | undefined;
+    const metadata = value?.metadata as Record<string, unknown> | undefined;
+    const message = Array.isArray(value?.messages) ? value?.messages[0] as Record<string, unknown> | undefined : undefined;
+    const text = (message?.text as Record<string, unknown> | undefined)?.body;
+    const channelId = metadata?.phone_number_id;
+    if (!message?.from || typeof text !== 'string' || !channelId) return null;
+    return {
+      platform: 'whatsapp',
+      channelId: String(channelId),
+      senderId: String(message.from),
+      text,
+      messageId: String(message.id ?? ''),
+      timestamp: message.timestamp ? new Date(Number(message.timestamp) * 1000).toISOString() : undefined,
+      raw: payload,
+    };
+  },
+  buildOutbound(channelId, text) {
+    return {
+      messaging_product: 'whatsapp',
+      to: channelId,
+      type: 'text',
+      text: { body: text },
+    };
+  },
+};
+
+export const signalChannel: ChannelAdapter = {
+  name: 'signal',
+  displayName: 'Signal',
+  normalizeInbound(payload: unknown): NormalizedChannelMessage | null {
+    const p = payload as Record<string, unknown>;
+    const envelope = p.envelope as Record<string, unknown> | undefined;
+    const dataMessage = envelope?.dataMessage as Record<string, unknown> | undefined;
+    const text = dataMessage?.message;
+    const senderId = envelope?.sourceNumber ?? envelope?.sourceUuid;
+    if (typeof text !== 'string' || !senderId) return null;
+    return {
+      platform: 'signal',
+      channelId: String(senderId),
+      senderId: String(senderId),
+      text,
+      messageId: envelope?.timestamp ? String(envelope.timestamp) : undefined,
+      timestamp: envelope?.timestamp ? new Date(Number(envelope.timestamp)).toISOString() : undefined,
+      raw: payload,
+    };
+  },
+  buildOutbound(channelId, text) {
+    return { recipient: channelId, message: text };
+  },
+};
+
 export const genericChannel: ChannelAdapter = {
   name: 'generic',
   displayName: 'Generic Webhook',
@@ -202,4 +260,6 @@ export const genericChannel: ChannelAdapter = {
 channels.register(telegramChannel);
 channels.register(discordChannel);
 channels.register(slackChannel);
+channels.register(whatsappChannel);
+channels.register(signalChannel);
 channels.register(genericChannel);
