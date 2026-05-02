@@ -562,6 +562,10 @@ export interface SecurityEvent {
   severity: SecurityEventSeverity;
   detail: string;
   sessionId?: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  presetId?: string;
 }
 
 export class SecurityAuditLog {
@@ -572,11 +576,16 @@ export class SecurityAuditLog {
     this.maxEvents = maxEvents;
   }
 
-  record(event: Omit<SecurityEvent, 'timestamp'>): void {
+  record(event: Omit<SecurityEvent, 'timestamp'>): SecurityEvent {
     const entry: SecurityEvent = {
       ...event,
       timestamp: new Date().toISOString(),
     };
+    this.recordEntry(entry);
+    return entry;
+  }
+
+  protected recordEntry(entry: SecurityEvent): void {
     this.events.push(entry);
     if (this.events.length > this.maxEvents) {
       this.events = this.events.slice(-this.maxEvents);
@@ -611,6 +620,160 @@ export class SecurityAuditLog {
   clear(): void {
     this.events = [];
   }
+
+  flush(): SecurityEvent[] {
+    const flushed = [...this.events];
+    this.events = [];
+    return flushed;
+  }
+}
+
+function getProcessEnv(name: string): string | undefined {
+  const processRef = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+  return processRef?.env?.[name];
+}
+
+function defaultCrowclawDataDir(): string {
+  return getProcessEnv('CROWCLAW_DATA_DIR')
+    ?? `${getProcessEnv('HOME') ?? '/tmp'}/.crowclaw`;
+}
+
+function dateStamp(timestamp: string): string {
+  return timestamp.slice(0, 10);
+}
+
+export interface FileSecurityAuditLogOptions {
+  baseDir?: string;
+  maxEvents?: number;
+  retentionDays?: number;
+}
+
+interface FsPromisesApi {
+  mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<unknown>;
+  readdir(path: string): Promise<string[]>;
+  readFile(path: string, encoding: 'utf-8'): Promise<string>;
+  appendFile(path: string, data: string, options?: { encoding?: 'utf-8'; mode?: number }): Promise<unknown>;
+  chmod(path: string, mode: number): Promise<unknown>;
+  unlink(path: string): Promise<unknown>;
+}
+
+function loadFsPromises(): Promise<FsPromisesApi> {
+  const processRef = (() => {
+    try {
+      return new Function('return typeof process === "object" ? process : undefined')() as
+        | { getBuiltinModule?: (specifier: string) => unknown }
+        | undefined;
+    } catch {
+      return (globalThis as { process?: { getBuiltinModule?: (specifier: string) => unknown } }).process;
+    }
+  })();
+  const builtin = processRef?.getBuiltinModule?.('node:fs/promises')
+    ?? processRef?.getBuiltinModule?.('fs/promises');
+  if (builtin) return Promise.resolve(builtin as FsPromisesApi);
+
+  const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<FsPromisesApi>;
+  return dynamicImport('node:fs/promises');
+}
+
+export class FileSecurityAuditLog extends SecurityAuditLog {
+  private readonly baseDir: string;
+  private readonly retentionDays: number;
+  private writeQueue: Promise<void> = Promise.resolve();
+  private clearedAt: string | null = null;
+
+  constructor(options: FileSecurityAuditLogOptions = {}) {
+    super(options.maxEvents ?? 500);
+    this.baseDir = options.baseDir ?? `${defaultCrowclawDataDir()}/audit`;
+    const envRetention = Number.parseInt(getProcessEnv('CROWCLAW_AUDIT_RETENTION_DAYS') ?? '', 10);
+    this.retentionDays = options.retentionDays ?? (Number.isFinite(envRetention) && envRetention > 0 ? envRetention : 30);
+  }
+
+  override record(event: Omit<SecurityEvent, 'timestamp'>): SecurityEvent {
+    const entry = super.record(event);
+    this.enqueueWrite(entry);
+    return entry;
+  }
+
+  async readEvents(options: { since?: string; type?: string; severity?: string; limit?: number } = {}): Promise<SecurityEvent[]> {
+    const fs = await loadFsPromises();
+    await fs.mkdir(this.baseDir, { recursive: true, mode: 0o700 });
+    const entries = await fs.readdir(this.baseDir).catch(() => []);
+    const files = entries
+      .filter((name) => /^audit-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+      .sort()
+      .reverse();
+    const sinceTime = options.since ? Date.parse(options.since) : Number.NEGATIVE_INFINITY;
+    const events: SecurityEvent[] = [];
+
+    for (const file of files) {
+      const text = await fs.readFile(`${this.baseDir}/${file}`, 'utf-8').catch(() => '');
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as SecurityEvent;
+          const eventTime = Date.parse(event.timestamp);
+          if (this.clearedAt && eventTime <= Date.parse(this.clearedAt)) continue;
+          if (Number.isFinite(sinceTime) && eventTime < sinceTime) continue;
+          if (options.type && event.type !== options.type) continue;
+          if (options.severity && event.severity !== options.severity) continue;
+          events.push(event);
+        } catch {
+          // Skip malformed historical rows instead of failing the audit API.
+        }
+      }
+    }
+
+    events.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    return options.limit ? events.slice(0, options.limit) : events;
+  }
+
+  async drainWrites(): Promise<void> {
+    await this.writeQueue;
+  }
+
+  override clear(): void {
+    super.clear();
+    this.clearedAt = new Date().toISOString();
+    this.writeQueue = this.writeQueue
+      .then(() => this.deleteAuditFiles())
+      .catch(() => {});
+  }
+
+  private enqueueWrite(entry: SecurityEvent): void {
+    this.writeQueue = this.writeQueue
+      .then(() => this.append(entry))
+      .catch(() => {});
+  }
+
+  private async append(entry: SecurityEvent): Promise<void> {
+    const fs = await loadFsPromises();
+    await fs.mkdir(this.baseDir, { recursive: true, mode: 0o700 });
+    const path = `${this.baseDir}/audit-${dateStamp(entry.timestamp)}.jsonl`;
+    await fs.appendFile(path, JSON.stringify(entry) + '\n', { encoding: 'utf-8', mode: 0o600 });
+    await fs.chmod(path, 0o600).catch(() => {});
+    await this.pruneOldFiles(fs);
+  }
+
+  private async pruneOldFiles(fs: FsPromisesApi): Promise<void> {
+    if (this.retentionDays <= 0) return;
+    const cutoff = Date.now() - this.retentionDays * 24 * 60 * 60 * 1000;
+    const entries = await fs.readdir(this.baseDir).catch(() => []);
+    await Promise.all(entries.map(async (name) => {
+      const match = name.match(/^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/);
+      if (!match) return;
+      if (Date.parse(match[1]) >= cutoff) return;
+      await fs.unlink(`${this.baseDir}/${name}`).catch(() => {});
+    }));
+  }
+
+  private async deleteAuditFiles(): Promise<void> {
+    const fs = await loadFsPromises();
+    const entries = await fs.readdir(this.baseDir).catch(() => []);
+    await Promise.all(entries.map(async (name) => {
+      if (!/^audit-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)) return;
+      await fs.unlink(`${this.baseDir}/${name}`).catch(() => {});
+    }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +793,10 @@ export class SecurityAuditLog {
 
 export interface CodeExecuteAuditPayload {
   sessionId: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  presetId?: string;
   language: 'js' | 'ts' | 'python';
   code: string;
   /** Bytes of `code` to keep in the audit row before truncation. Defaults to 4 KB. */
@@ -664,6 +831,10 @@ export function recordCodeExecuteAudit(
     type: 'tool.code-execute',
     severity,
     sessionId: payload.sessionId,
+    ...(payload.agentId ? { agentId: payload.agentId } : {}),
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.provider ? { provider: payload.provider } : {}),
+    ...(payload.presetId ? { presetId: payload.presetId } : {}),
     detail: `code.execute language=${payload.language} allowedTools=[${allowedList}]\n----- source -----\n${truncated}\n----- end source -----`,
   });
 }

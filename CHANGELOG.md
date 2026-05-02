@@ -5,6 +5,55 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.8.2] - 2026-05-02 - Runtime/security hardening: 9-issue release sweep
+
+This release tightens the release-critical runtime surfaces opened after
+v0.8.1: Docker boot/hardening, Cloudflare deployment drift, OpenAI-compatible
+provider request shapes, vision SSRF validation, persistent security audit
+logs, and optional OpenTelemetry span hooks.
+
+### Critical
+- **#253** Docker now starts the built CLI server entrypoint instead of loading
+  a runtime module that never called `listen()`.
+- **#256** Security audit events persist to JSONL under
+  `CROWCLAW_DATA_DIR/audit` by default, with file permissions, retention, and
+  graceful shutdown flushing.
+- **#258** Security events now carry optional provenance (`agentId`, `model`,
+  `provider`, `presetId`), and audit logs expose `flush()` for tests and
+  consumers that need to drain pending events.
+- **#261** `vision.analyze` validates HTTP(S) image URLs with DNS-aware SSRF
+  preflight before fetch or provider handoff.
+- **#262** Docker image is multi-stage, non-root, `tini`-managed, healthchecked,
+  and volume-backed via `CROWCLAW_DATA_DIR=/data`.
+
+### Provider/runtime correctness
+- **#254** Wrangler release config is version-synchronized, and the D1 binding
+  placeholder now points operators to the `wrangler d1 create` replacement
+  flow.
+- **#257** Optional OpenTelemetry hooks record session, iteration, and tool
+  spans without requiring `@opentelemetry/api` at runtime.
+- **#259** OpenAI-compatible providers now send the right token and sampling
+  fields for chat-completions vs. Responses API and strip unsupported
+  temperature fields from reasoning models.
+- **#260** Native structured output now supports Responses API `text.format`
+  JSON schema requests and respects `requireStream` by staying on the streaming
+  path.
+
+### Cloudflare route parity
+- **#255** Route parity remains broader than this patch release. This sweep adds
+  a generated parity inventory (`docs/cloudflare-route-parity.md`) and explicit
+  `501 unsupported_on_workers` responses for Node-only terminal/code bridge
+  routes instead of silently pretending the Worker adapter is fully equivalent.
+
+### Verification
+- `npm run build` - clean
+- `npm run typecheck` - clean
+- `npm test` - 2,864 / 2,865 (1 skipped)
+- `npm audit --audit-level=moderate` - 0 vulnerabilities
+- Docker image smoke was not run locally because the Docker daemon was not
+  available in this workspace; CI now includes a Docker build + `/healthz`
+  smoke step.
+
 ## [0.8.1] — 2026-05-?? — Dashboard overhaul: 10-issue sweep against the v0.7.1 audit findings
 
 The v0.7.1 release closed 18 wiring/correctness gaps in the dashboard. The

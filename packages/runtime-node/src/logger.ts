@@ -2,7 +2,7 @@
 // Structured JSON logger — zero-dependency, pino-compatible API
 // ---------------------------------------------------------------------------
 
-import { redactStructuredData } from '@crowclaw/core';
+import { getTelemetryHooks, redactStructuredData } from '@crowclaw/core';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
 
@@ -60,6 +60,9 @@ export function createLogger(
       msg,
       ...safeData,
     };
+    const spanContext = getTelemetryHooks()?.getActiveSpan?.()?.spanContext?.();
+    if (spanContext?.traceId) entry.traceId = spanContext.traceId;
+    if (spanContext?.spanId) entry.spanId = spanContext.spanId;
 
     const line = JSON.stringify(entry) + '\n';
 

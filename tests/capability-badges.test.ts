@@ -186,8 +186,8 @@ describe('capability badges', () => {
         join(process.cwd(), 'Dockerfile'),
         'utf-8'
       );
-      expect(dockerContent).toContain('runtime-node');
-      expect(dockerContent).not.toContain('packages/cli/dist/index.js');
+      expect(dockerContent).toContain('packages/cli/dist/index.js');
+      expect(dockerContent).not.toContain('packages/runtime-node/dist/index.js');
       expect(dockerContent).toContain('EXPOSE 8787');
       expect(dockerContent).toContain('CrowClaw HTTP server');
     });

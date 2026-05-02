@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   scanForInjection, validateFetchUrl, isPrivateUrl,
-  redactPII, containsSecrets, sanitizeText
+  redactPII, containsSecrets, sanitizeText, SecurityAuditLog, FileSecurityAuditLog
 } from '@crowclaw/core';
 
 describe('SSRF protection', () => {
@@ -114,5 +117,46 @@ describe('text sanitization', () => {
 
   it('preserves normal text', () => {
     expect(sanitizeText('Hello World!')).toBe('Hello World!');
+  });
+});
+
+describe('SecurityAuditLog', () => {
+  it('flushes in-memory events and preserves provenance fields', () => {
+    const log = new SecurityAuditLog();
+    log.record({
+      type: 'injection_detected',
+      severity: 'warning',
+      detail: 'prompt injection',
+      sessionId: 's1',
+      agentId: 'a1',
+      model: 'gpt-4o',
+      provider: 'openai',
+      presetId: 'security-auditor',
+    });
+
+    const flushed = log.flush();
+    expect(flushed).toHaveLength(1);
+    expect(flushed[0]).toMatchObject({ agentId: 'a1', model: 'gpt-4o', provider: 'openai', presetId: 'security-auditor' });
+    expect(log.getEvents()).toHaveLength(0);
+  });
+
+  it('persists file-backed audit events as 0600 JSONL', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'crowclaw-audit-'));
+    try {
+      const log = new FileSecurityAuditLog({ baseDir: dir });
+      log.record({ type: 'command_blocked', severity: 'critical', detail: 'blocked', sessionId: 's1' });
+      await log.drainWrites();
+
+      const events = await log.readEvents({ type: 'command_blocked' });
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ detail: 'blocked', sessionId: 's1' });
+
+      const file = join(dir, `audit-${events[0]!.timestamp.slice(0, 10)}.jsonl`);
+      const mode = (await stat(file)).mode & 0o777;
+      expect(mode).toBe(0o600);
+      expect(await readFile(file, 'utf-8')).toContain('"command_blocked"');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

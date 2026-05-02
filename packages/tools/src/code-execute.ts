@@ -165,6 +165,7 @@ export function createCodeExecuteTool(deps: CodeExecuteToolDeps): ToolDefinition
       if (deps.securityAuditLog) {
         recordCodeExecuteAudit(deps.securityAuditLog, {
           sessionId: context.sessionId,
+          agentId: context.agentId,
           language,
           code,
           codeLimit: AUDIT_CODE_LIMIT,

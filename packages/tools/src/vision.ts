@@ -1,9 +1,30 @@
-import type { ToolDefinition, ToolExecutionResult } from '@crowclaw/core';
+import { resolveAndValidateUrl, validateFetchUrl, type ToolDefinition, type ToolExecutionResult } from '@crowclaw/core';
 
 export interface VisionAnalysisOptions {
   providerBaseUrl?: string;
   apiKey?: string;
   model?: string;
+}
+
+let cachedDnsLookup: ((host: string) => Promise<string[]>) | null | undefined;
+
+async function loadDnsLookup(): Promise<((host: string) => Promise<string[]>) | null> {
+  if (cachedDnsLookup !== undefined) return cachedDnsLookup;
+  try {
+    const dns = await import('node:dns');
+    cachedDnsLookup = async (host: string) => {
+      const records = await dns.promises.lookup(host, { all: true });
+      return records.map((record) => record.address);
+    };
+  } catch {
+    cachedDnsLookup = null;
+  }
+  return cachedDnsLookup;
+}
+
+async function safeImageUrlPreflight(url: string): Promise<{ safe: boolean; reason?: string }> {
+  const lookup = await loadDnsLookup();
+  return lookup ? resolveAndValidateUrl(url, lookup) : validateFetchUrl(url);
 }
 
 /**
@@ -108,6 +129,19 @@ export function createVisionAnalyzeTool(options?: VisionAnalysisOptions): ToolDe
       const baseUrl = (typeof input.providerBaseUrl === 'string' ? input.providerBaseUrl : undefined) ?? options?.providerBaseUrl ?? 'https://api.openai.com/v1';
       const model = (typeof input.model === 'string' ? input.model : undefined) ?? options?.model ?? 'gpt-4o';
 
+      if (/^https?:\/\//i.test(imageSource)) {
+        const urlCheck = await safeImageUrlPreflight(imageSource);
+        if (!urlCheck.safe) {
+          return {
+            toolName: 'vision.analyze',
+            runtime: 'worker',
+            ok: false,
+            output: `URL blocked: ${urlCheck.reason ?? 'unsafe image URL'}`,
+            metadata: { imageSource }
+          };
+        }
+      }
+
       // Resolve image source to a usable URL
       let resolvedUrl: string;
       try {
@@ -181,7 +215,7 @@ export function createVisionAnalyzeTool(options?: VisionAnalysisOptions): ToolDe
       // Fallback: fetch image metadata without vision API (only for HTTP URLs)
       if (/^https?:\/\//i.test(resolvedUrl)) {
         try {
-          const response = await fetch(resolvedUrl, { method: 'HEAD', signal: context.signal });
+          const response = await fetch(resolvedUrl, { method: 'HEAD', redirect: 'manual', signal: context.signal });
           const contentType = response.headers.get('content-type') ?? 'unknown';
           const contentLength = response.headers.get('content-length');
 

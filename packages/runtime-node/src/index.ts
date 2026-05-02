@@ -1,8 +1,9 @@
 import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem, type ToolCatalog, type ToolExecutor, type ToolExecutionContext, type ToolExecutionResult, type ToolManifest, type ToolDefinition } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem, type ToolCatalog, type ToolExecutor, type ToolExecutionContext, type ToolExecutionResult, type ToolManifest, type ToolDefinition } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
+import { installOpenTelemetryBridge } from './otel.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
 import {
@@ -339,6 +340,10 @@ export interface NodeRuntimeOptions {
   useEmbeddingMemory?: boolean;
   /** Path for persistent scheduler store. Defaults to ~/.crowclaw/scheduler-jobs.json. Set to null to use in-memory only. */
   schedulerStorePath?: string | null;
+  /** Base data directory for file-backed runtime state. Defaults to CROWCLAW_DATA_DIR or ~/.crowclaw. */
+  dataDir?: string;
+  /** Directory for persistent security audit JSONL files. Defaults to <dataDir>/audit. Set to null to use in-memory only. */
+  auditLogPath?: string | null;
   /** Hostname/address to bind to. Used for security checks. Defaults to '127.0.0.1'. */
   hostname?: string;
   /** Telegram webhook secret token (set via setWebhook secret_token parameter). */
@@ -351,6 +356,8 @@ export interface NodeRuntimeOptions {
   publicUrl?: string;
   /** Trust x-forwarded-for header for client IP detection (enable behind a reverse proxy). Default: false */
   trustProxy?: boolean;
+  /** Enable optional OpenTelemetry bridge when @opentelemetry/api is installed. */
+  otel?: boolean;
 }
 
 function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {
@@ -1332,6 +1339,10 @@ function verifyWebhookBearerSecret(request: Request, secret: string): boolean {
 
 export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const store = options.sessionStore ?? new InMemorySessionStore();
+  const runtimeEnv = (globalThis as Record<string, unknown>).process
+    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env
+    : {};
+  const dataDir = options.dataDir ?? runtimeEnv.CROWCLAW_DATA_DIR ?? joinPath(homedir(), '.crowclaw');
 
   // Memory store: wrap with EmbeddingMemoryStore by default for similarity search
   const useEmbeddingMemory = options.useEmbeddingMemory ?? true;
@@ -1374,7 +1385,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const schedulerStore = (() => {
     if (options.schedulerStore) return options.schedulerStore;
     if (options.schedulerStorePath === null) return new InMemorySchedulerStore();
-    const schedulerPath = options.schedulerStorePath ?? joinPath(homedir(), '.crowclaw', 'scheduler-jobs.json');
+    const schedulerPath = options.schedulerStorePath ?? joinPath(dataDir, 'scheduler-jobs.json');
     return new FileSchedulerStore(schedulerPath);
   })();
   const skillStore = options.skillStore ?? new InMemorySkillStore();
@@ -1388,7 +1399,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // store by passing an explicit configStorePath.
   const isVitest = typeof process !== 'undefined'
     && (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test');
-  const defaultConfigPath = joinPath(homedir(), '.crowclaw', 'runtime-config.json');
+  const defaultConfigPath = joinPath(dataDir, 'runtime-config.json');
   const configStore: RuntimeConfigStore =
     options.configStorePath === null || (isVitest && options.configStorePath === undefined)
       ? new RuntimeConfigStore()
@@ -1405,7 +1416,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // --- Hermes parity: ContextEngine, FrozenMemory, MessageStore ---
   const messageStore: MessageStoreInterface = new InMemoryMessageStore();
 
-  const frozenMemoryStore = new FileFrozenStore(joinPath(homedir(), '.crowclaw', 'memory'));
+  const frozenMemoryStore = new FileFrozenStore(joinPath(dataDir, 'memory'));
   const frozenMemory = new FrozenMemory(frozenMemoryStore, 'MEMORY');
   const frozenUserProfile = new FrozenMemory(frozenMemoryStore, 'USER');
 
@@ -1445,7 +1456,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
 
   // Security audit log, rate limiters, logger, and session mutex
-  const securityAuditLog = new SecurityAuditLog(500);
+  const securityAuditLog = options.auditLogPath === null
+    ? new SecurityAuditLog(500)
+    : new FileSecurityAuditLog({ baseDir: options.auditLogPath ?? joinPath(dataDir, 'audit'), maxEvents: 500 });
   const rateLimiter = new RateLimiter();
   const authRateLimiter = new RateLimiter();
   // Issue #69: per-IP WS auth rate limiter with exponential backoff bans.
@@ -1455,6 +1468,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // auth resets both the failure window and the escalation level for that IP.
   const wsAuthRateLimiter = new WsAuthRateLimiter();
   const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
+  if (options.otel ?? runtimeEnv.CROWCLAW_OTEL_ENABLED === 'true') {
+    void installOpenTelemetryBridge();
+  }
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
   let lastHeartbeatAt: string | null = null;
@@ -1574,10 +1590,6 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const usageTracker = options.usageTracker ?? new DetailedUsageTracker();
   const deploymentName = options.deploymentName ?? 'crowclaw-node';
   const version = options.version ?? '0.1.0';
-
-  const runtimeEnv = (globalThis as Record<string, unknown>).process
-    ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env
-    : {};
 
   function collectProviderKeys(prefix: string): string[] {
     const direct = runtimeEnv[prefix];
@@ -1902,6 +1914,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       requireApprovalForDangerousTools: true,
       approvalDecider: defaultApprovalDecider,
       securityAuditLog,
+      eventBus,
+      providerName: providerCfg?.primary?.provider ?? 'openai-compatible',
       securityPolicy: {
         redactToolOutput: configStore.getSecurityPolicy().redactToolOutput,
         scanUserInput: configStore.getSecurityPolicy().scanUserInput,
@@ -2419,6 +2433,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     if (memoryProvider.shutdown) {
       try { await memoryProvider.shutdown(); } catch { /* best-effort */ }
     }
+    if (securityAuditLog instanceof FileSecurityAuditLog) {
+      try { await securityAuditLog.drainWrites(); } catch { /* best-effort */ }
+    }
     return {
       ssEClosed,
       learningAwaited,
@@ -2766,18 +2783,43 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         });
       }
 
-      if (request.method === 'GET' && url.pathname === '/api/security/events') {
+      if (request.method === 'GET' && (url.pathname === '/api/security/events' || url.pathname === '/api/security/audit')) {
         const limitParam = url.searchParams.get('limit');
         const typeParam = url.searchParams.get('type');
         const severityParam = url.searchParams.get('severity');
+        const sinceParam = url.searchParams.get('since') ?? undefined;
         const limit = limitParam ? parseInt(limitParam, 10) : undefined;
         let events = typeParam
           ? securityAuditLog.getEventsByType(typeParam)
           : securityAuditLog.getEvents();
-        if (severityParam) {
-          events = events.filter((e) => e.severity === severityParam);
+        if (securityAuditLog instanceof FileSecurityAuditLog) {
+          const persisted = await securityAuditLog.readEvents({
+            ...(sinceParam ? { since: sinceParam } : {}),
+            ...(typeParam ? { type: typeParam } : {}),
+            ...(severityParam ? { severity: severityParam } : {}),
+          });
+          const seen = new Set<string>();
+          events = [...events, ...persisted]
+            .filter((event) => {
+              if (severityParam && event.severity !== severityParam) return false;
+              if (sinceParam && Date.parse(event.timestamp) < Date.parse(sinceParam)) return false;
+              const key = `${event.timestamp}:${event.type}:${event.severity}:${event.sessionId ?? ''}:${event.detail}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            })
+            .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+          if (limit) events = events.slice(0, limit);
+        } else {
+          if (severityParam) {
+            events = events.filter((e) => e.severity === severityParam);
+          }
+          if (sinceParam) {
+            const sinceTime = Date.parse(sinceParam);
+            events = events.filter((e) => Date.parse(e.timestamp) >= sinceTime);
+          }
+          if (limit) events = events.slice(0, limit);
         }
-        if (limit) events = events.slice(0, limit);
         return Response.json({ events });
       }
 

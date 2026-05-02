@@ -115,6 +115,10 @@ export interface ProviderRequest {
   messages: ConversationMessage[];
   availableTools: ToolManifest[];
   signal?: AbortSignal;
+  /** Optional provider-level generation cap. Providers map this to their API-specific token field. */
+  maxTokens?: number;
+  /** Optional sampling temperature. Providers may drop it for models that reject temperature. */
+  temperature?: number;
 }
 
 export interface ProviderResponseUsage {
@@ -685,6 +689,25 @@ export class AgentLoop {
     this.toolFailureStreakLimit = options.toolFailureStreakLimit ?? 3;
   }
 
+  private auditProvenance(input?: { agentId?: string; sessionId?: string }): {
+    agentId?: string;
+    sessionId?: string;
+    model?: string;
+    provider?: string;
+    presetId?: string;
+  } {
+    const providerWithModel = this.provider as ProviderAdapter & { getModel?: () => string };
+    const model = typeof providerWithModel.getModel === 'function' ? providerWithModel.getModel() : undefined;
+    const presetId = this.agentPreset?.role;
+    return {
+      ...(input?.agentId ? { agentId: input.agentId } : {}),
+      ...(input?.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(model ? { model } : {}),
+      ...(this.providerName ? { provider: this.providerName } : {}),
+      ...(presetId ? { presetId } : {}),
+    };
+  }
+
   /**
    * #54: Mid-run course correction. Operator submits guidance via the control
    * channel (WS / REST); the next loop iteration drains pending steers and
@@ -1016,7 +1039,7 @@ export class AgentLoop {
   }
 
   /** Scan a command string in tool input for dangerous patterns */
-  private scanToolCommandInput(toolCall: ToolCall): { blocked: boolean; warnings: string[] } {
+  private scanToolCommandInput(toolCall: ToolCall, input?: { agentId?: string; sessionId?: string }): { blocked: boolean; warnings: string[] } {
     if (!this.securityPolicy.scanCommands) return { blocked: false, warnings: [] };
 
     const commandFields = ['command', 'cmd', 'script', 'code', 'shell', 'exec'];
@@ -1042,13 +1065,14 @@ export class AgentLoop {
         type: blocked ? 'command_blocked' : 'command_warned',
         severity: blocked ? 'critical' : 'warning',
         detail: warnings.join('; '),
+        ...this.auditProvenance(input),
       });
     }
     return { blocked, warnings };
   }
 
   /** Apply redaction to tool output if security policy requires it */
-  private redactToolResult(result: ToolExecutionResult): ToolExecutionResult {
+  private redactToolResult(result: ToolExecutionResult, input?: { agentId?: string; sessionId?: string }): ToolExecutionResult {
     if (!this.securityPolicy.redactToolOutput) return result;
     let output = result.output;
     let mutated = false;
@@ -1061,6 +1085,7 @@ export class AgentLoop {
         type: 'credential_redacted',
         severity: 'info',
         detail: `Credentials/PII redacted in output from tool "${result.toolName}"`,
+        ...this.auditProvenance(input),
       });
     }
     // Second-order prompt-injection scan. Indirect injection (malicious HTML
@@ -1081,6 +1106,7 @@ export class AgentLoop {
         type: 'injection_detected',
         severity: threatCount >= 3 ? 'critical' : 'warning',
         detail: `Prompt injection in output from tool "${result.toolName}" (threats=${threatCount}: ${topThreats})`,
+        ...this.auditProvenance(input),
       });
     }
     if (!mutated) return result;
@@ -1158,7 +1184,7 @@ export class AgentLoop {
           type: 'command_blocked',
           severity: 'warning',
           detail: `plugin-veto: ${verdict.reason ?? 'no reason given'}`,
-          sessionId: input.sessionId,
+          ...this.auditProvenance(input),
         });
         const def = this.tools.get(toolCall.name);
         return {
@@ -1187,7 +1213,7 @@ export class AgentLoop {
         type: 'command_blocked',
         severity: 'critical',
         detail: `hardline-blocked: ${hardline.description} (pattern: ${hardline.pattern})`,
-        sessionId: input.sessionId,
+        ...this.auditProvenance(input),
       });
       return {
         toolName: definition.manifest.name,
@@ -1203,7 +1229,7 @@ export class AgentLoop {
     }
 
     // Command scanning: check tool input for dangerous commands
-    const commandScan = this.scanToolCommandInput(toolCall);
+    const commandScan = this.scanToolCommandInput(toolCall, input);
     if (commandScan.blocked) {
       return {
         toolName: definition.manifest.name,
@@ -1222,7 +1248,7 @@ export class AgentLoop {
         type: 'approval_required',
         severity: 'warning',
         detail: `Approval required for tool "${definition.manifest.name}" (danger: ${definition.manifest.dangerLevel})`,
-        sessionId: input.sessionId,
+        ...this.auditProvenance(input),
       });
       const approved = this.approvalDecider
         ? await this.approvalDecider(definition, toolCall.input, context)
@@ -1233,7 +1259,7 @@ export class AgentLoop {
           type: 'approval_denied',
           severity: 'critical',
           detail: `Approval denied for tool "${definition.manifest.name}"`,
-          sessionId: input.sessionId,
+          ...this.auditProvenance(input),
         });
         return {
           toolName: definition.manifest.name,
@@ -1270,7 +1296,7 @@ export class AgentLoop {
     rawResult: ToolExecutionResult,
     input: AgentRunInput,
   ): Promise<ToolExecutionResult> {
-    const redacted = this.redactToolResult(rawResult);
+    const redacted = this.redactToolResult(rawResult, input);
     if (!this.plugins) return redacted;
 
     const transformed = await this.plugins.transformToolResult({
@@ -1485,7 +1511,7 @@ export class AgentLoop {
           type: 'injection_detected',
           severity: injectionScan.threats.some(t => t.severity === 'high') ? 'critical' : 'warning',
           detail: threatSummary,
-          sessionId: input.sessionId,
+          ...this.auditProvenance(input),
         });
       }
     }
@@ -1634,6 +1660,7 @@ export class AgentLoop {
     let toolErrorTerminal = false;
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
+      this.eventBus?.emit('iteration:start', { sessionId: input.sessionId, agentId: input.agentId, iteration });
       try {
         ensureNotAborted(input.signal);
       } catch (err) {
@@ -1660,11 +1687,13 @@ export class AgentLoop {
       if (budgetCheck.exceeded) {
         tokenBudgetExceeded = true;
         finalResponse = currentResponse.assistantMessage ?? 'Token budget exceeded.';
+        this.eventBus?.emit('iteration:end', { sessionId: input.sessionId, agentId: input.agentId, iteration, toolCount: 0 });
         break;
       }
 
       if (!currentResponse.toolCalls || currentResponse.toolCalls.length === 0) {
         finalResponse = currentResponse.assistantMessage ?? finalResponse;
+        this.eventBus?.emit('iteration:end', { sessionId: input.sessionId, agentId: input.agentId, iteration, toolCount: 0 });
         break;
       }
 
@@ -1771,6 +1800,12 @@ export class AgentLoop {
       if (iterationResults.length > 0) {
         session.lastToolActivityAt = Date.now();
       }
+      this.eventBus?.emit('iteration:end', {
+        sessionId: input.sessionId,
+        agentId: input.agentId,
+        iteration,
+        toolCount: iterationResults.length,
+      });
 
       const iterationWarning = budgetStatus(iteration + 1, this.maxToolIterations, this.budgetWarningThreshold, this.budgetCriticalThreshold);
 
@@ -2091,6 +2126,7 @@ export class AgentLoop {
           type: 'injection_detected',
           severity: injectionScan.threats.some(t => t.severity === 'high') ? 'critical' : 'warning',
           detail: threatSummary,
+          ...this.auditProvenance(session),
         });
       }
     }
@@ -2173,6 +2209,7 @@ export class AgentLoop {
       for (let iteration = 0; iteration < this.maxToolIterations; iteration += 1) {
         ensureNotAborted(signal);
         yield { type: 'iteration-start', iteration };
+        this.eventBus?.emit('iteration:start', { sessionId: session.sessionId, agentId: session.agentId, iteration });
 
         // #54: drain pending /steer guidance for this turn (streaming path).
         const streamSteers = this.drainPendingSteers(session.sessionId);
@@ -2280,6 +2317,7 @@ export class AgentLoop {
           // #239: surface token-budget exhaustion to the soft-landing path.
           streamTokenBudgetExceeded = true;
           yield { type: 'iteration-end', iteration };
+          this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: 0 });
           break;
         }
 
@@ -2287,6 +2325,7 @@ export class AgentLoop {
         if (streamToolCalls.length === 0) {
           lastStreamHadToolCalls = false;
           yield { type: 'iteration-end', iteration };
+          this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: 0 });
           break;
         }
 
@@ -2409,7 +2448,7 @@ export class AgentLoop {
                 type: 'command_blocked',
                 severity: 'critical',
                 detail: `hardline-blocked: ${streamHardline.description} (pattern: ${streamHardline.pattern})`,
-                sessionId: session.sessionId,
+                ...this.auditProvenance(session),
               });
               const blockedResult: ToolExecutionResult = {
                 toolName: tc.name,
@@ -2429,7 +2468,7 @@ export class AgentLoop {
             }
 
             // Security: command scanning in streaming path
-            const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input });
+            const streamCmdScan = this.scanToolCommandInput({ name: tc.name, input: tc.input }, session);
             if (streamCmdScan.blocked) {
               const blockedResult: ToolExecutionResult = {
                 toolName: tc.name,
@@ -2520,7 +2559,7 @@ export class AgentLoop {
             }
 
             // Security: redact tool output in streaming path
-            toolResult = this.redactToolResult(toolResult);
+            toolResult = this.redactToolResult(toolResult, session);
 
             // #235: structured envelope on failure.
             toolResult = this.wrapFailureAsEnvelope(toolResult);
@@ -2537,6 +2576,7 @@ export class AgentLoop {
               } else if (this.stopOnToolError) {
                 finalResponse = 'Stopped after tool failure.';
                 yield { type: 'iteration-end', iteration };
+                this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
                 streamTerminationReason = 'tool_error_terminal';
                 this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
                 yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
@@ -2587,6 +2627,7 @@ export class AgentLoop {
           streamTerminationReason = 'tool_error_terminal';
           finalResponse = 'Stopped after tool failure (3 consecutive identical errors).';
           yield { type: 'iteration-end', iteration };
+          this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
           this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
           yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
           return;
@@ -2608,6 +2649,7 @@ export class AgentLoop {
           } else if (this.stopOnToolError) {
             finalResponse = 'Stopped after tool failure.';
             yield { type: 'iteration-end', iteration };
+            this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
             streamTerminationReason = 'tool_error_terminal';
             this.emitTerminated(session.sessionId, streamTerminationReason, streamIterationsCompleted, streamStartMs);
             yield { type: 'done', response: finalResponse, usage: accumulatedUsage, terminationReason: streamTerminationReason };
@@ -2622,6 +2664,7 @@ export class AgentLoop {
 
         streamIterationsCompleted = iteration + 1;
         yield { type: 'iteration-end', iteration };
+        this.eventBus?.emit('iteration:end', { sessionId: session.sessionId, agentId: session.agentId, iteration, toolCount: iterationToolResults.length });
       }
 
       // #239 (streaming, Hermes parity): graceful soft-landing on budget
@@ -2843,9 +2886,11 @@ export {
   type CommandRisk,
   type CommandScanResult,
   SecurityAuditLog,
+  FileSecurityAuditLog,
   type SecurityEvent,
   type SecurityEventType,
   type SecurityEventSeverity,
+  type FileSecurityAuditLogOptions,
   // v0.8.0 (#234) — code.execute audit hook. The helper appends a
   // `tool.code-execute` entry tagged with the truncated source + allowed-tool
   // list. Called from packages/tools/src/code-execute.ts at the call site so
@@ -2856,6 +2901,7 @@ export {
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';
 export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usage-tracker.js';
+export { setTelemetryHooks, getTelemetryHooks, type TelemetryHooks, type TelemetrySpan } from './telemetry.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
 export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';

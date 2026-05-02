@@ -541,7 +541,7 @@ export class AgentSessionDurableObject {
       resolvedProvider,
       registry,
       this.sessionStore,
-      { plugins: this.plugins, runtimeName: 'cloudflare', skills, agentPreset }
+      { plugins: this.plugins, runtimeName: 'cloudflare', skills, agentPreset, providerName: 'openai-compatible' }
     );
   }
 
@@ -566,6 +566,26 @@ export class AgentSessionDurableObject {
 
     if (request.method === 'GET' && url.pathname.endsWith('/plugins')) {
       return Response.json(this.plugins.list().map((plugin) => ({ name: plugin.name })));
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/agent-skills')) {
+      await this.ensureSkillsLoaded();
+      const resolved = this.skillRegistry.resolve();
+      return Response.json({
+        skills: resolved.map((s) => ({
+          name: s.manifest.name,
+          description: s.manifest.description,
+          triggers: s.manifest.triggers ?? [],
+          tools: s.manifest.tools ?? [],
+        })),
+        version: __CROWCLAW_VERSION__,
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/tools') && !url.pathname.endsWith('/mcp/tools')) {
+      const registry = createRegistry(this.sessionStore, this.memoryStore, this.workspaceStore, this.mcpClient);
+      const tools = registry.list();
+      return Response.json({ tools, count: tools.length });
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/system/status')) {

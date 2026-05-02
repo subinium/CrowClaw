@@ -624,7 +624,7 @@ export class FileCheckpointStore implements CheckpointStore {
   private static readonly INDEX_DIRNAME = '_index';
 
   constructor(baseDir?: string) {
-    this.baseDir = baseDir ?? join(process.env.HOME ?? '/tmp', '.crowclaw', 'checkpoints');
+    this.baseDir = baseDir ?? join(process.env.CROWCLAW_DATA_DIR ?? join(process.env.HOME ?? '/tmp', '.crowclaw'), 'checkpoints');
   }
 
   private sessionDir(sessionId: string): string {
