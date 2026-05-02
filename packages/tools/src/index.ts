@@ -169,10 +169,9 @@ function isValidSingularityImage(value: string): boolean {
 // #70 / NemoClaw CVE-2026-32048 — required hardening flags for any docker
 // run/exec invocation. no-new-privileges blocks setuid escalation; cap-drop
 // ALL strips Linux capabilities (NET_ADMIN, SYS_ADMIN, etc.); --user pins a
-// non-root uid:gid (#71 — set uid/gid on copies into sandbox) so processes
-// crossing the host→container boundary cannot run as root inside the
-// container.
-const DOCKER_HARDENING_FLAGS = '--security-opt no-new-privileges --cap-drop ALL --user 1000:1000';
+// non-root nobody uid:gid (#273) and the default run path has no network,
+// read-only rootfs, bounded CPU/memory, and a small writable /tmp.
+const DOCKER_HARDENING_FLAGS = '--read-only --security-opt no-new-privileges --cap-drop ALL --user 65534:65534 --network none --memory 256m --cpus 0.5 --tmpfs /tmp:rw,size=64m';
 
 function resolveTerminalCommandPlan(input: Record<string, unknown>): {
   ok: boolean;
@@ -221,7 +220,7 @@ function resolveTerminalCommandPlan(input: Record<string, unknown>): {
     // allowlist above. #70 — every docker invocation gets the hardening
     // flags so a compromised agent cannot get a privileged shell.
     const resolvedCommand = container
-      ? `docker exec --user 1000:1000 ${quoteShell(container)} /bin/sh -lc ${quoteShell(wrappedCommand)}`
+      ? `docker exec --user 65534:65534 ${quoteShell(container)} /bin/sh -lc ${quoteShell(wrappedCommand)}`
       : `docker run --rm ${DOCKER_HARDENING_FLAGS} ${quoteShell(image)} /bin/sh -lc ${quoteShell(wrappedCommand)}`;
     return {
       ok: true,
@@ -771,7 +770,8 @@ export function createWebFetchTool(): ToolDefinition {
         type: 'object',
         properties: {
           url: { type: 'string', description: 'The URL to fetch' },
-          mode: { type: 'string', enum: ['text', 'reader', 'markdown'], description: 'Return raw text or reader-mode markdown' },
+          format: { type: 'string', enum: ['raw', 'text', 'markdown'], description: 'Return raw text, readable text, or reader-mode markdown' },
+          mode: { type: 'string', enum: ['text', 'reader', 'markdown'], description: 'Deprecated alias for format' },
           maxBytes: { type: 'number', description: 'Maximum response bytes to read before truncating' }
         },
         required: ['url']
@@ -779,10 +779,15 @@ export function createWebFetchTool(): ToolDefinition {
     },
     async execute(input, context) {
       const url = typeof input.url === 'string' ? input.url : '';
-      const mode = input.mode === 'reader' || input.mode === 'markdown' ? 'markdown' : 'text';
+      const rawFormat = typeof input.format === 'string' ? input.format : typeof input.mode === 'string' ? input.mode : 'raw';
+      const format = rawFormat === 'reader' || rawFormat === 'markdown'
+        ? 'markdown'
+        : rawFormat === 'text'
+          ? 'text'
+          : 'raw';
       const maxBytes = typeof input.maxBytes === 'number' && Number.isFinite(input.maxBytes)
         ? Math.max(1, Math.floor(input.maxBytes))
-        : 1_000_000;
+        : 200_000;
       if (!url) {
         return {
           toolName: 'web.fetch',
@@ -800,15 +805,18 @@ export function createWebFetchTool(): ToolDefinition {
       const response = await fetch(url, { signal: context.signal, redirect: 'manual' });
       const { text, truncated, bytesRead } = await readResponseTextWithByteCap(response, maxBytes);
       const contentType = response.headers.get('content-type') ?? '';
-      const output = mode === 'markdown' && /html/i.test(contentType)
+      const isHtml = /html/i.test(contentType);
+      const output = format === 'markdown' && isHtml
         ? extractReadableMarkdown(text)
-        : text;
+        : format === 'text' && isHtml
+          ? extractReadableText(text)
+          : text;
       return {
         toolName: 'web.fetch',
         runtime: 'worker',
         ok: response.ok,
         output,
-        metadata: { status: response.status, url, mode, maxBytes, bytesRead, truncated }
+        metadata: { status: response.status, url, mode: format, format, maxBytes, bytesRead, truncated }
       };
     }
   };
@@ -1219,7 +1227,14 @@ async function readResponseTextWithByteCap(
   response: Response,
   maxBytes: number,
 ): Promise<{ text: string; bytesRead: number; truncated: boolean }> {
-  const decoder = new TextDecoder();
+  const contentType = response.headers.get('content-type') ?? '';
+  const charset = contentType.match(/charset=([^;\s]+)/i)?.[1]?.trim().replace(/^["']|["']$/g, '');
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset || 'utf-8');
+  } catch {
+    decoder = new TextDecoder();
+  }
   const reader = response.body?.getReader();
   if (!reader) {
     const bytes = new Uint8Array(await response.arrayBuffer());

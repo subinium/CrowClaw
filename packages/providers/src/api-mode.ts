@@ -60,7 +60,7 @@ const OPENAI_RESPONSES_CAPABILITIES: ApiModeCapabilities = {
   toolUse: true,
   vision: true,
   reasoning: true,
-  caching: false,
+  caching: true,
   batchApi: true,
 };
 
@@ -69,7 +69,7 @@ const OPENAI_CHAT_CAPABILITIES: ApiModeCapabilities = {
   toolUse: true,
   vision: true,
   reasoning: false,
-  caching: false,
+  caching: true,
   batchApi: false,
 };
 

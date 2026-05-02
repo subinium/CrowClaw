@@ -376,7 +376,7 @@ describe('cli package', () => {
 
     // #129/#70/#71 — docker container is shell-quoted and pinned to non-root --user.
     const terminalExecPlan = await runCliInputLine('/terminal-exec --backend docker --container demo --cwd /workspace --plan printf hello-terminal-cli', chat.state, { runtime });
-    expect(terminalExecPlan.output).toContain("docker exec --user 1000:1000 'demo'");
+    expect(terminalExecPlan.output).toContain("docker exec --user 65534:65534 'demo'");
     expect(terminalExecPlan.output).toContain('/workspace');
 
     // #128 — Without an explicit approval marker, terminal.exec / terminal.background

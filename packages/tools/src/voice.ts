@@ -186,13 +186,21 @@ function createTranscriptionLikeTool(
       dangerLevel: 'low'
     },
     async execute(input, context): Promise<ToolExecutionResult> {
-      const filePath = typeof input.filePath === 'string' ? input.filePath : '';
-      const url = typeof input.url === 'string' ? input.url : '';
+      const filePath = typeof input.filePath === 'string'
+        ? input.filePath
+        : typeof input.audioPath === 'string'
+          ? input.audioPath
+          : '';
+      const url = typeof input.url === 'string'
+        ? input.url
+        : typeof input.audioUrl === 'string'
+          ? input.audioUrl
+          : '';
       const language = typeof input.language === 'string' ? input.language : undefined;
       const model = typeof input.model === 'string' ? input.model : (options?.defaultModel ?? 'whisper-1');
 
       if (!filePath && !url) {
-        return { toolName: name, runtime: 'worker', ok: false, output: 'Missing filePath or url parameter.' };
+        return { toolName: name, runtime: 'worker', ok: false, output: 'Missing filePath or url parameter. Aliases: audioPath or audioUrl.' };
       }
 
       const apiKey = options?.apiKey;

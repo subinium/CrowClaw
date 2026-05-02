@@ -6,6 +6,8 @@ import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMes
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe('tool breadth extensions', () => {
@@ -34,7 +36,7 @@ describe('tool breadth extensions', () => {
     const registry = new ToolRegistry().register(createWebFetchTool());
     const result = await registry.execute('web.fetch', {
       url: 'https://example.com',
-      mode: 'reader',
+      format: 'markdown',
       maxBytes: 200,
     }, {
       agentId: 'crowclaw',
@@ -46,6 +48,22 @@ describe('tool breadth extensions', () => {
     expect(result.output).toContain('[docs](/docs)');
     expect(result.output).not.toContain('skip()');
     expect(result.metadata).toMatchObject({ mode: 'markdown', maxBytes: 200, truncated: false });
+  });
+
+  it('defaults web.fetch to a 200KB byte cap', async () => {
+    const fetchMock = vi.fn(async () => new Response('x'.repeat(250_000), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com/large',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-default-cap'
+    });
+
+    expect(result.output).toHaveLength(200_000);
+    expect(result.metadata).toMatchObject({ maxBytes: 200_000, truncated: true, format: 'raw' });
   });
 
   it('truncates web.fetch output at maxBytes', async () => {
@@ -63,6 +81,24 @@ describe('tool breadth extensions', () => {
 
     expect(result.output).toBe('abcde');
     expect(result.metadata).toMatchObject({ bytesRead: 5, truncated: true });
+  });
+
+  it('respects web.fetch response charset', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      new Uint8Array([0x63, 0x61, 0x66, 0xe9]),
+      { status: 200, headers: { 'content-type': 'text/plain; charset=windows-1252' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry().register(createWebFetchTool());
+    const result = await registry.execute('web.fetch', {
+      url: 'https://example.com/latin1',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'web-charset'
+    });
+
+    expect(result.output).toBe('café');
   });
 
   it('applies deterministic replacements with the text.patch tool', async () => {
@@ -295,6 +331,48 @@ describe('tool breadth extensions', () => {
     expect(image.output).toContain('"size": "512x512"');
   });
 
+  it('auto-selects Gemini and Replicate from environment keys', async () => {
+    vi.stubEnv('GOOGLE_API_KEY', 'google-key');
+    vi.stubEnv('REPLICATE_API_TOKEN', 'replicate-key');
+    vi.stubEnv('OPENAI_API_KEY', '');
+
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('generativelanguage.googleapis.com')) {
+        return new Response(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'Gemini analysis' }] } }]
+        }), { status: 200 });
+      }
+      if (url.includes('api.replicate.com')) {
+        return new Response(JSON.stringify({ output: ['https://example.com/replicate.png'] }), { status: 200 });
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const registry = new ToolRegistry()
+      .register(createVisionAnalyzeTool())
+      .register(createImageGenerateTool());
+
+    const vision = await registry.execute('vision.analyze', {
+      url: 'data:image/png;base64,ZmFrZQ==',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'vision-env'
+    });
+    expect(vision.ok).toBe(true);
+    expect(vision.metadata).toMatchObject({ provider: 'gemini', model: 'gemini-1.5-flash' });
+
+    const image = await registry.execute('image.generate', {
+      prompt: 'a fallback image',
+    }, {
+      agentId: 'crowclaw',
+      sessionId: 'image-env'
+    });
+    expect(image.ok).toBe(true);
+    expect(image.metadata).toMatchObject({ provider: 'replicate' });
+  });
+
   it('supports local terminal exec/background/processes/kill foundations', async () => {
     const registry = new ToolRegistry()
       .register(createTerminalExecTool())
@@ -359,7 +437,7 @@ describe('tool breadth extensions', () => {
     });
     expect(dockerPlan.ok).toBe(true);
     // #129/#70/#71 — container quoted, --user pinned to non-root uid:gid.
-    expect(dockerPlan.output).toContain("docker exec --user 1000:1000 'app'");
+    expect(dockerPlan.output).toContain("docker exec --user 65534:65534 'app'");
 
     const sshPlan = await registry.execute('terminal.exec', { backend: 'ssh', target: 'demo@example.com', command: 'uname -a', planOnly: true }, {
       agentId: 'crowclaw',

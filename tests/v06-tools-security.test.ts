@@ -116,12 +116,14 @@ describe('#70 / #71 docker hardening flags on run/exec', () => {
       planOnly: true,
     }, baseCtx);
     expect(result.ok).toBe(true);
+    expect(result.output).toContain('--read-only');
     expect(result.output).toContain('--security-opt no-new-privileges');
     expect(result.output).toContain('--cap-drop ALL');
-    expect(result.output).toContain('--user 1000:1000');
+    expect(result.output).toContain('--user 65534:65534');
+    expect(result.output).toContain('--network none');
   });
 
-  it('docker exec includes --user 1000:1000 (uid/gid on cross-boundary call)', async () => {
+  it('docker exec includes --user 65534:65534 (uid/gid on cross-boundary call)', async () => {
     const registry = new ToolRegistry().register(createTerminalExecTool());
     const result = await registry.execute('terminal.exec', {
       backend: 'docker',
@@ -130,7 +132,7 @@ describe('#70 / #71 docker hardening flags on run/exec', () => {
       planOnly: true,
     }, baseCtx);
     expect(result.ok).toBe(true);
-    expect(result.output).toContain('--user 1000:1000');
+    expect(result.output).toContain('--user 65534:65534');
   });
 
   it('terminal.background docker plan also gets hardening flags', async () => {
@@ -144,7 +146,7 @@ describe('#70 / #71 docker hardening flags on run/exec', () => {
     expect(result.ok).toBe(true);
     expect(result.output).toContain('--security-opt no-new-privileges');
     expect(result.output).toContain('--cap-drop ALL');
-    expect(result.output).toContain('--user 1000:1000');
+    expect(result.output).toContain('--user 65534:65534');
   });
 });
 

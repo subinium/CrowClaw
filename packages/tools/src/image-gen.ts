@@ -16,6 +16,12 @@ export interface ImageProviderConfig {
   model?: string;
 }
 
+function readEnv(name: string): string | undefined {
+  const env = globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } };
+  const value = env.process?.env?.[name];
+  return value && value.trim() ? value : undefined;
+}
+
 function normalizeImageProviders(input: Record<string, unknown>, options?: ImageGenerationOptions): ImageProviderConfig[] {
   const fromInput = Array.isArray(input.providers)
     ? input.providers
@@ -46,6 +52,20 @@ function normalizeImageProviders(input: Record<string, unknown>, options?: Image
     });
   }
   providers.push(...(options?.fallbackProviders ?? []));
+  if (providers.length === 0) {
+    const openaiKey = readEnv('OPENAI_API_KEY');
+    if (openaiKey) {
+      providers.push({
+        provider: 'openai',
+        apiKey: openaiKey,
+        providerBaseUrl: readEnv('LLM_BASE_URL') ?? readEnv('OPENAI_BASE_URL'),
+      });
+    }
+  }
+  const replicateKey = readEnv('REPLICATE_API_TOKEN');
+  if (replicateKey && !providers.some((provider) => provider.provider === 'replicate')) {
+    providers.push({ provider: 'replicate', apiKey: replicateKey });
+  }
   return providers;
 }
 
@@ -189,8 +209,8 @@ export function createImageGenerateTool(options?: ImageGenerationOptions): ToolD
           toolName: 'image.generate',
           runtime: 'worker',
           ok: false,
-          output: `Image generation requires an API key. Prompt: "${prompt}"\nConfigure an image generation API key to enable this feature.`,
-          metadata: { prompt, size, quality, simulated: true }
+          output: 'Image generation requires OPENAI_API_KEY or REPLICATE_API_TOKEN.',
+          metadata: { prompt, size, quality, provider: 'none' }
         };
       }
 

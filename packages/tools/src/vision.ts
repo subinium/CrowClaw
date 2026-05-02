@@ -15,6 +15,12 @@ export interface VisionProviderConfig {
   model?: string;
 }
 
+function readEnv(name: string): string | undefined {
+  const env = globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } };
+  const value = env.process?.env?.[name];
+  return value && value.trim() ? value : undefined;
+}
+
 let cachedDnsLookup: ((host: string) => Promise<string[]>) | null | undefined;
 
 async function loadDnsLookup(): Promise<((host: string) => Promise<string[]>) | null> {
@@ -110,6 +116,20 @@ function normalizeVisionProviders(input: Record<string, unknown>, options?: Visi
     });
   }
   providers.push(...(options?.fallbackProviders ?? []));
+  if (providers.length === 0) {
+    const openaiKey = readEnv('OPENAI_API_KEY');
+    if (openaiKey) {
+      providers.push({
+        provider: 'openai',
+        apiKey: openaiKey,
+        providerBaseUrl: readEnv('LLM_BASE_URL') ?? readEnv('OPENAI_BASE_URL'),
+      });
+    }
+  }
+  const googleKey = readEnv('GOOGLE_API_KEY');
+  if (googleKey && !providers.some((provider) => provider.provider === 'gemini')) {
+    providers.push({ provider: 'gemini', apiKey: googleKey, model: 'gemini-1.5-flash' });
+  }
   return providers;
 }
 
@@ -312,37 +332,12 @@ export function createVisionAnalyzeTool(options?: VisionAnalysisOptions): ToolDe
         };
       }
 
-      // Fallback: fetch image metadata without vision API (only for HTTP URLs)
-      if (/^https?:\/\//i.test(resolvedUrl)) {
-        try {
-          const response = await fetch(resolvedUrl, { method: 'HEAD', redirect: 'manual', signal: context.signal });
-          const contentType = response.headers.get('content-type') ?? 'unknown';
-          const contentLength = response.headers.get('content-length');
-
-          return {
-            toolName: 'vision.analyze',
-            runtime: 'worker',
-            ok: true,
-            output: `Image metadata for ${imageSource}:\n- Content-Type: ${contentType}\n- Size: ${contentLength ? `${Math.round(parseInt(contentLength) / 1024)}KB` : 'unknown'}\n\nNote: Full vision analysis requires a vision-capable API key to be configured.`,
-            metadata: { imageSource, contentType, contentLength, simulated: true }
-          };
-        } catch {
-          return {
-            toolName: 'vision.analyze',
-            runtime: 'worker',
-            ok: false,
-            output: `Could not access image at ${imageSource}. Verify the URL is accessible.`,
-            metadata: { imageSource, simulated: true }
-          };
-        }
-      }
-
       return {
         toolName: 'vision.analyze',
         runtime: 'worker',
-        ok: true,
-        output: `Image loaded from local source (${imageSource.length > 50 ? imageSource.slice(0, 50) + '...' : imageSource}).\n\nNote: Full vision analysis requires a vision-capable API key to be configured.`,
-        metadata: { imageSource: imageSource.slice(0, 100), simulated: true }
+        ok: false,
+        output: 'Vision analysis requires OPENAI_API_KEY or GOOGLE_API_KEY.',
+        metadata: { imageSource: imageSource.slice(0, 100), provider: 'none' }
       };
     }
   };

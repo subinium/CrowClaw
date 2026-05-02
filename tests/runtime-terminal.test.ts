@@ -88,7 +88,7 @@ describe('runtime terminal integration', () => {
     const dockerPlanPayload = await dockerPlanResponse.json() as { ok: boolean; output: string };
     expect(dockerPlanPayload.ok).toBe(true);
     // #129/#70/#71 — container quoted; --user pinned to non-root uid:gid.
-    expect(dockerPlanPayload.output).toContain("docker exec --user 1000:1000 'demo-app'");
+    expect(dockerPlanPayload.output).toContain("docker exec --user 65534:65534 'demo-app'");
 
     const dockerRunPlanResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',
@@ -96,7 +96,7 @@ describe('runtime terminal integration', () => {
     }));
     const dockerRunPlanPayload = await dockerRunPlanResponse.json() as { ok: boolean; output: string };
     expect(dockerRunPlanPayload.ok).toBe(true);
-    expect(dockerRunPlanPayload.output).toContain('--security-opt no-new-privileges --cap-drop ALL --user 1000:1000');
+    expect(dockerRunPlanPayload.output).toContain('--read-only --security-opt no-new-privileges --cap-drop ALL --user 65534:65534 --network none');
 
     const singularityPlanResponse = await runtime.fetch(authedRequest(localRoute(routePaths.terminal.exec), {
       method: 'POST',

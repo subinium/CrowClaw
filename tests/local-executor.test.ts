@@ -61,8 +61,12 @@ describe('DockerExecutor', () => {
 
     expect(command).toContain('--security-opt no-new-privileges');
     expect(command).toContain('--cap-drop ALL');
-    expect(command).toContain('--user 1000:1000');
+    expect(command).toContain('--read-only');
+    expect(command).toContain('--user 65534:65534');
     expect(command).toContain('--network none');
+    expect(command).toContain('--memory 256m');
+    expect(command).toContain('--cpus 0.5');
+    expect(command).toContain('--tmpfs /tmp:rw,size=64m');
   });
 
   it('constructs docker run command correctly', async () => {

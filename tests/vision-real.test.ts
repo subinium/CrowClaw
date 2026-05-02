@@ -19,6 +19,7 @@ describe('vision.analyze tool', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it('builds correct multimodal message format with image_url + text', async () => {
@@ -192,24 +193,13 @@ describe('vision.analyze tool', () => {
   });
 
   it('falls back to metadata when no API key is provided', async () => {
-    const fetchMock = vi.fn(async () => {
-      return new Response('', {
-        status: 200,
-        headers: {
-          'content-type': 'image/jpeg',
-          'content-length': '51200'
-        }
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
     const tool = createVisionAnalyzeTool(); // no apiKey
     const result = await tool.execute({ url: 'https://example.com/image.jpg' }, makeContext());
 
-    expect(result.ok).toBe(true);
-    expect(result.output).toContain('Image metadata');
-    expect(result.output).toContain('Content-Type: image/jpeg');
-    expect(result.metadata).toMatchObject({ simulated: true });
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('OPENAI_API_KEY');
+    expect(result.output).toContain('GOOGLE_API_KEY');
+    expect(result.metadata).toMatchObject({ provider: 'none' });
   });
 
   it('blocks private image URLs before any fetch', async () => {
@@ -350,7 +340,8 @@ describe('image.generate tool', () => {
     const result = await tool.execute({ prompt: 'a logo' }, makeContext());
 
     expect(result.ok).toBe(false);
-    expect(result.output).toContain('requires an API key');
+    expect(result.output).toContain('OPENAI_API_KEY');
+    expect(result.output).toContain('REPLICATE_API_TOKEN');
   });
 
   it('handles API error gracefully', async () => {

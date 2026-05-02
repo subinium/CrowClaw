@@ -295,27 +295,26 @@ export function buildDockerRunCommand(
     'docker',
     'run',
     '--rm',
+    '--read-only',
     '--security-opt',
     'no-new-privileges',
     '--cap-drop',
     'ALL',
     '--user',
-    '1000:1000',
+    '65534:65534',
+    '--network',
+    dockerOptions.networkMode ?? 'none',
+    '--memory',
+    dockerOptions.memoryLimit ?? '256m',
+    '--cpus',
+    dockerOptions.cpuLimit ?? '0.5',
+    '--tmpfs',
+    '/tmp:rw,size=64m',
   ];
 
   if (dockerOptions.containerName) {
     args.push('--name', dockerOptions.containerName);
   }
-  if (dockerOptions.memoryLimit) {
-    args.push('--memory', dockerOptions.memoryLimit);
-  }
-  if (dockerOptions.cpuLimit) {
-    args.push('--cpus', dockerOptions.cpuLimit);
-  }
-  if (dockerOptions.networkMode) {
-    args.push('--network', dockerOptions.networkMode);
-  }
-
   const workDir = cwd ?? dockerOptions.workDir;
   if (workDir) {
     args.push('-w', workDir);
