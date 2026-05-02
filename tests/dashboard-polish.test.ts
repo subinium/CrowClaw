@@ -92,9 +92,10 @@ describe('Dashboard UX Polish', () => {
       expect(DASHBOARD_HTML).toContain('/api/auth/check');
     });
 
-    it('uses Bearer token for authorization', () => {
-      expect(DASHBOARD_HTML).toContain('Bearer');
-      expect(DASHBOARD_HTML).toContain('Authorization');
+    it('uses cookie-backed dashboard authorization', () => {
+      expect(DASHBOARD_HTML).toContain('credentials:`same-origin`');
+      expect(DASHBOARD_HTML).toContain('/api/auth/logout');
+      expect(DASHBOARD_HTML).not.toContain('Bearer');
     });
   });
 

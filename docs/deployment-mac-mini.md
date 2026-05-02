@@ -55,16 +55,21 @@ the persistent `pmset` configuration instead.
 
 ## Tailscale
 
-For tailnet-only access, bind CrowClaw to localhost and expose it through a
-tailnet reverse proxy or a local Caddy instance that listens on the Tailscale
-IP. Confirm the Tailscale address with:
+For tailnet-only access, prefer CrowClaw's direct Tailscale bind mode:
 
 ```bash
-tailscale ip -4
+CROWCLAW_BIND_TAILNET_ONLY=1 crowclaw serve --port 8787
 ```
 
-Do not allow SSRF-protected tool fetches to treat tailnet ranges as public
-unless an explicit future policy enables that behavior.
+Keep `CROWCLAW_DASHBOARD_TOKEN` set. If the agent must call internal tailnet
+HTTP services, opt in with:
+
+```bash
+CROWCLAW_TAILNET_ALLOWLIST=100.64.0.0/10,fd7a:115c:a1e0::/48
+```
+
+See [deployment-tailscale.md](./deployment-tailscale.md) for the full threat
+model and proxy options.
 
 ## Operations
 

@@ -38,7 +38,7 @@ export class CrowClawSteerComposer extends LitElement {
 
     /* The panel is rendered in a sticky bottom-of-stream position by the
        parent view. The slide animation is purely visual — actual DOM
-       presence is governed by the `open` property. */
+       presence is governed by the "open" property. */
     .panel {
       border: 1px solid rgba(255, 214, 10, 0.25);
       background: rgba(255, 214, 10, 0.05);

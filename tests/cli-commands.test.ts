@@ -13,6 +13,7 @@ import {
   formatSessionsTable,
   formatJobsTable,
   runDoctor,
+  resolveTailnetBindHost,
   type DoctorReport,
   type CliRuntimeLike,
 } from '@crowclaw/cli';
@@ -75,6 +76,16 @@ describe('CLI subcommand parsing', () => {
     const parsed = parseCliArgs(['serve', '--port', '4000']);
     expect(parsed.command).toBe('serve');
     expect(parsed.port).toBe(4000);
+  });
+
+  it('resolves Tailscale bind host when CROWCLAW_BIND_TAILNET_ONLY is set', () => {
+    const plan = resolveTailnetBindHost({
+      env: { CROWCLAW_BIND_TAILNET_ONLY: '1' },
+      fallbackHost: '127.0.0.1',
+      spawnSync: () => ({ status: 0, stdout: '100.64.10.11\n' }),
+    });
+
+    expect(plan).toEqual({ hostname: '100.64.10.11', source: 'tailscale' });
   });
 
   it('"chat hello" → chat with query', () => {

@@ -2165,7 +2165,7 @@ export class SettingsView extends LitElement {
             <option value="">All Types</option>
             <option value="injection">Injection</option>
             <option value="auth">Auth</option>
-            <option value="rate_limit">Rate Limit</option>
+            <option value="rate_limit_exceeded">Rate Limit</option>
             <option value="policy">Policy</option>
           </select>
           <select

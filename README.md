@@ -263,19 +263,22 @@ Local terminal backends (local/docker/ssh) are available today. Other backend de
 See [docs/deployment-docker.md](./docs/deployment-docker.md) for the Docker
 image's runtime and hardening defaults.
 
+See [docs/deployment-tailscale.md](./docs/deployment-tailscale.md) for a
+tailnet-only self-host pattern that keeps CrowClaw off the public internet.
+
 See [docs/deployment-cloudflare.md](./docs/deployment-cloudflare.md) for the Cloudflare adapter's current scope and limits.
 
 ## Security
 
 Security is wired into the agent loop, not bolted on:
 
-- **SSRF protection** — every outbound `fetch()` validates against private/CGNAT/ULA/IPv4-mapped IPv6 ranges before resolving
+- **SSRF protection** — every outbound `fetch()` validates against private/CGNAT/ULA/IPv4-mapped IPv6 ranges before resolving; tailnet ranges require explicit `CROWCLAW_TAILNET_ALLOWLIST`
 - **Prompt-injection scanning** — pattern-based (fast, not ML); detected payloads from tool output are wrapped in `<untrusted-content>` so the LLM reads them as data
 - **Tool output redaction** — credentials, PII, and secrets stripped from tool output before it re-enters the model context
 - **Command risk scanning** — destructive commands gated by approval; a hardline blocklist short-circuits unrecoverable ones (`rm -rf /` and friends) without prompting
 - **Sanitized child-process env** — child shells get a stripped env (no `KEY|TOKEN|SECRET|...` vars)
 - **Webhook signature verification** — Slack HMAC, Telegram secret token, Discord Ed25519, generic HMAC; deny-by-default
-- **Auth** — HttpOnly cookie derived from `CROWCLAW_DASHBOARD_TOKEN`, timing-safe comparison, per-IP + global rate limit on `/api/auth/verify`
+- **Auth** — HttpOnly cookie derived from `CROWCLAW_DASHBOARD_TOKEN`, timing-safe comparison, per-IP + global rate limit on `/api/auth/verify`, cost-aware chat/webhook rate limits
 - **MCP owner-only enforcement** — privileged tools (`crowclaw.chat`, sessions list/get, memories search) require an owner token
 - **Audit log** — every redaction, scan, and block decision recorded; dashboard exposes a security grade (A-F)
 
@@ -437,6 +440,18 @@ ANTHROPIC_API_KEY=        # Anthropic-specific path
 # Dashboard auth — required when binding to non-localhost
 CROWCLAW_DASHBOARD_TOKEN= # Bearer token; HttpOnly cookie derived from this
 CROWCLAW_TRUSTED_PROXIES= # CIDR list (e.g. 10.0.0.0/24,fe80::/10) for X-Forwarded-For trust
+CROWCLAW_CHAT_RATE_LIMIT=30 # Chat turns per token/IP per minute
+CROWCLAW_WEBHOOK_RATE_LIMIT=10 # Webhook dispatches per platform sender per minute
+CROWCLAW_DAILY_USD_CAP=   # Optional circuit breaker for daily LLM spend
+
+# Tailnet-only self-hosting (optional)
+CROWCLAW_BIND_TAILNET_ONLY= # 1 to bind serve to `tailscale ip -4`
+CROWCLAW_TAILNET_ALLOWLIST= # e.g. 100.64.0.0/10,fd7a:115c:a1e0::/48
+
+# Secret management (optional)
+CROWCLAW_SECRETS_DIR=      # Directory containing files named CROWCLAW_API_KEY, etc.
+CREDENTIALS_DIRECTORY=     # systemd-creds directory, read automatically when set
+# Secret refs are supported in env values, e.g. CROWCLAW_API_KEY=op://Vault/Item/field
 
 # Gateway (optional)
 CROWCLAW_TELEGRAM_TOKEN=  # From @BotFather

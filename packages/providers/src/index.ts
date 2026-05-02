@@ -909,6 +909,13 @@ function parseRetryAfterMs(headers: Headers): number | null {
   return null;
 }
 
+function disableSameKeyRetryForCredentialPool(
+  config: OpenAICompatibleConfig,
+  pool?: CredentialPool,
+): OpenAICompatibleConfig {
+  return pool ? { ...config, maxRetries: 0 } : config;
+}
+
 async function fetchOpenAIWithRetry(
   fetcher: () => Promise<Response>,
   config: OpenAICompatibleConfig,
@@ -1360,13 +1367,14 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         signal: request.signal,
       });
 
-    let response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), this.config, request.signal);
+    const retryConfig = disableSameKeyRetryForCredentialPool(this.config, pool);
+    let response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
 
     if (response.status === 401 && this.config.onAuthFailure) {
       const refreshed = await this.config.onAuthFailure();
       if (refreshed && tokenProvider) {
         activeApiKey = await tokenProvider();
-        response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), this.config, request.signal);
+        response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
       }
     }
 
@@ -1561,13 +1569,14 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
         signal: request.signal,
       });
 
-    let response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), this.config, request.signal);
+    const retryConfig = disableSameKeyRetryForCredentialPool(this.config, pool);
+    let response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
 
     if (response.status === 401 && this.config.onAuthFailure) {
       const refreshed = await this.config.onAuthFailure();
       if (refreshed && tokenProvider) {
         activeApiKey = await tokenProvider();
-        response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), this.config, request.signal);
+        response = await fetchOpenAIWithRetry(() => performFetch(activeApiKey), retryConfig, request.signal);
       }
     }
 

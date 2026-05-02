@@ -82,6 +82,7 @@ import { handleCodeBridgeRoutes } from './bridge-routes.js';
 import { pruneDeadBridgeProcesses, type BridgeProcessRecord } from './bridge-process.js';
 import { routePaths } from './route-paths.js';
 import { resolveProviderFromConfig, resolveProvidersFromConfig, createProviderFromSlot } from './provider-factory.js';
+import { createDefaultSecretChain } from './secret-loader.js';
 import { SessionController } from './session-controller.js';
 import { WebSocketManager, handleWebSocketUpgrade } from './websocket.js';
 import { generateConfigSchema, validateConfigUpdate, diffConfigs } from './config-schema.js';
@@ -89,6 +90,8 @@ import { ContextEngine, formatContextForPrompt, type ContextEngineResult } from 
 import { FrozenMemory, InMemoryFrozenStore, FileFrozenStore } from '@crowclaw/memory';
 import { InMemoryMessageStore, type MessageStore as MessageStoreInterface } from '@crowclaw/storage';
 import { resolveApiMode } from '@crowclaw/providers';
+
+export { SecretChain, envSource, filesSource, systemdCredsSource, onePasswordSource, createDefaultSecretChain, resolveSecret } from './secret-loader.js';
 
 const directToolAliases = {
   'browser.wait': 'browser.waitFor',
@@ -1260,6 +1263,23 @@ function deriveCookieToken(dashToken: string): string {
   return createHmac('sha256', dashToken).update('crowclaw:cookie').digest('hex');
 }
 
+function hashRateLimitSubject(subject: string): string {
+  return createHmac('sha256', 'crowclaw:rate-limit').update(subject).digest('hex').slice(0, 24);
+}
+
+function parsePositiveIntEnv(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function parseUsdCap(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 /** Constant-time string comparison to prevent timing side-channel attacks. */
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -1342,6 +1362,19 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const runtimeEnv = (globalThis as Record<string, unknown>).process
     ? ((globalThis as Record<string, unknown>).process as { env: Record<string, string | undefined> }).env
     : {};
+  const secretChain = createDefaultSecretChain(runtimeEnv);
+  let dashboardToken = runtimeEnv.CROWCLAW_DASHBOARD_TOKEN?.trim() || undefined;
+  let secretLoadError: string | null = null;
+  let dashboardTokenReady: Promise<void> = Promise.resolve();
+  const refreshRuntimeSecrets = async (): Promise<void> => {
+    try {
+      dashboardToken = await secretChain.resolve('CROWCLAW_DASHBOARD_TOKEN');
+      secretLoadError = null;
+    } catch (err: unknown) {
+      secretLoadError = err instanceof Error ? err.message : String(err);
+    }
+  };
+  dashboardTokenReady = refreshRuntimeSecrets();
   const dataDir = options.dataDir ?? runtimeEnv.CROWCLAW_DATA_DIR ?? joinPath(homedir(), '.crowclaw');
 
   // Memory store: wrap with EmbeddingMemoryStore by default for similarity search
@@ -1461,6 +1494,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     : new FileSecurityAuditLog({ baseDir: options.auditLogPath ?? joinPath(dataDir, 'audit'), maxEvents: 500 });
   const rateLimiter = new RateLimiter();
   const authRateLimiter = new RateLimiter();
+  const webhookRateLimiter = new RateLimiter();
+  const chatRateLimiter = new RateLimiter();
   // Issue #69: per-IP WS auth rate limiter with exponential backoff bans.
   // Lives in @crowclaw/gateway so the same primitive can be reused by other
   // runtimes (CF Workers). Defaults: 5 failures / minute trigger a 5-minute
@@ -1468,6 +1503,36 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // auth resets both the failure window and the escalation level for that IP.
   const wsAuthRateLimiter = new WsAuthRateLimiter();
   const log: Logger = createLogger({ name: 'crowclaw', level: (options as Record<string, unknown>).logLevel as 'debug' | 'info' | undefined ?? 'info' });
+  const processRef = (globalThis as unknown as {
+    process?: {
+      on?: (event: string, listener: () => void) => unknown;
+      off?: (event: string, listener: () => void) => unknown;
+      removeListener?: (event: string, listener: () => void) => unknown;
+    };
+  }).process;
+  const reloadSecretsOnSighup = (): void => {
+    dashboardTokenReady = (async () => {
+      await refreshRuntimeSecrets();
+      if (!options.provider && !isHermeticMode) {
+        const resolved = await resolveProviderFromConfig({ secretChain });
+        if (resolved.source !== 'echo') {
+          provider = resolved.provider;
+        }
+      }
+      if (secretLoadError) {
+        log.error('Runtime secret reload failed', { component: 'secrets', error: secretLoadError });
+      } else {
+        log.info('Runtime secrets reloaded', { component: 'secrets' });
+      }
+    })().catch((err: unknown) => {
+      secretLoadError = err instanceof Error ? err.message : String(err);
+      log.error('Runtime secret reload failed', { component: 'secrets', error: secretLoadError });
+    });
+  };
+  const sighupListenerAttached = !isVitest && !!processRef?.on;
+  if (sighupListenerAttached) {
+    processRef.on?.('SIGHUP', reloadSecretsOnSighup);
+  }
   if (options.otel ?? runtimeEnv.CROWCLAW_OTEL_ENABLED === 'true') {
     void installOpenTelemetryBridge();
   }
@@ -1571,7 +1636,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   let provider = options.provider ?? new EchoProvider();
   let providerReady = !!options.provider || isHermeticMode;
   if (!options.provider && !isHermeticMode) {
-    void resolveProviderFromConfig().then((resolved) => {
+    void resolveProviderFromConfig({ secretChain }).then((resolved) => {
       if (resolved.source !== 'echo') {
         provider = resolved.provider;
         // v0.7.2: surface the Codex/ChatGPT route specifically so operators
@@ -1597,7 +1662,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         );
       }
       providerReady = true;
-    }).catch(() => { providerReady = true; });
+    }).catch((err: unknown) => {
+      secretLoadError = err instanceof Error ? err.message : String(err);
+      log.error('Provider secret resolution failed', { component: 'secrets', error: secretLoadError });
+      providerReady = true;
+    });
   }
 
   const toolsetPresets = new Map<string, (ReturnType<typeof listToolsetPresets>)[number]>(
@@ -1609,6 +1678,30 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const usageTracker = options.usageTracker ?? new DetailedUsageTracker();
   const deploymentName = options.deploymentName ?? 'crowclaw-node';
   const version = options.version ?? '0.1.0';
+
+  function usageCostForToday(): number {
+    const today = new Date().toISOString().slice(0, 10);
+    return usageTracker.getSummary().entries
+      .filter((entry) => entry.timestamp.slice(0, 10) === today)
+      .reduce((sum, entry) => sum + entry.costUsd, 0);
+  }
+
+  function enforceDailyUsdCap(surface: string, key: string, sessionId?: string): Response | null {
+    const cap = parseUsdCap(runtimeEnv.CROWCLAW_DAILY_USD_CAP);
+    if (cap === null) return null;
+    const spent = usageCostForToday();
+    if (spent < cap) return null;
+    securityAuditLog.record({
+      type: 'rate_limit_exceeded',
+      severity: 'warning',
+      detail: `${surface} budget exceeded key=${key} spent=${spent.toFixed(6)} cap=${cap.toFixed(6)}`,
+      ...(sessionId ? { sessionId } : {}),
+    });
+    return Response.json(
+      { error: 'Daily LLM budget exceeded', code: 'BUDGET_EXCEEDED', spentUsd: spent, capUsd: cap },
+      { status: 429, headers: { 'Retry-After': '3600' } },
+    );
+  }
 
   function collectProviderKeys(prefix: string): string[] {
     const direct = runtimeEnv[prefix];
@@ -2339,15 +2432,16 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }).catch(() => { /* scheduler store may not be ready yet */ });
 
   // Startup security check: warn loudly if no dashboard token is set
-  const startupDashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
-  if (!startupDashToken) {
-    const bindHost = options.hostname ?? '127.0.0.1';
-    if (!isLocalhostAddress(bindHost)) {
-      log.error('CROWCLAW_DASHBOARD_TOKEN is not set on non-localhost — admin API routes are unauthenticated', { component: 'security', bindHost });
-    } else {
-      log.warn('CROWCLAW_DASHBOARD_TOKEN is not set — dangerous routes disabled', { component: 'security' });
+  void dashboardTokenReady.then(() => {
+    if (!dashboardToken) {
+      const bindHost = options.hostname ?? '127.0.0.1';
+      if (!isLocalhostAddress(bindHost)) {
+        log.error('CROWCLAW_DASHBOARD_TOKEN is not set on non-localhost — admin API routes are unauthenticated', { component: 'security', bindHost });
+      } else {
+        log.warn('CROWCLAW_DASHBOARD_TOKEN is not set — dangerous routes disabled', { component: 'security' });
+      }
     }
-  }
+  });
 
   // Telegram webhook auto-registration (non-blocking)
   let publicUrl: string | null | undefined = options.publicUrl ?? (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_PUBLIC_URL;
@@ -2452,6 +2546,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     if (memoryProvider.shutdown) {
       try { await memoryProvider.shutdown(); } catch { /* best-effort */ }
     }
+    if (sighupListenerAttached) {
+      try {
+        if (processRef?.off) processRef.off('SIGHUP', reloadSecretsOnSighup);
+        else processRef?.removeListener?.('SIGHUP', reloadSecretsOnSighup);
+      } catch { /* best-effort */ }
+    }
     if (securityAuditLog instanceof FileSecurityAuditLog) {
       try { await securityAuditLog.drainWrites(); } catch { /* best-effort */ }
     }
@@ -2491,9 +2591,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     async fetch(request: Request): Promise<Response> {
      try {
       const url = new URL(request.url);
-      const dashToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
+      await dashboardTokenReady;
+      const dashToken = dashboardToken;
       const bindHostname = options.hostname ?? '127.0.0.1';
       const isLocalhost = isLocalhostAddress(bindHostname);
+      if (secretLoadError && (url.pathname.startsWith('/api/') || url.pathname === '/ws')) {
+        return Response.json({ error: 'Runtime secret loading failed', detail: secretLoadError }, { status: 500 });
+      }
       // Extract client IP — reads trustProxy from configStore (persisted, dynamic).
       //
       // Trusted-proxy allowlist (v0.4.2+): when trustProxy is on AND the caller
@@ -2521,6 +2625,42 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             ?? remoteAddr;
         }
         return remoteAddr;
+      };
+
+      const getChatRateLimitKey = (req: Request): string => {
+        const authHeader = req.headers.get('authorization');
+        const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (dashToken && bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) {
+          return `chat:token:${hashRateLimitSubject(dashToken)}`;
+        }
+        const cookieToken = parseCookieToken(req.headers.get('cookie'));
+        if (dashToken && cookieToken !== null && timingSafeEqual(cookieToken, getDerivedCookieToken(dashToken))) {
+          return `chat:token:${hashRateLimitSubject(dashToken)}`;
+        }
+        return `chat:ip:${getClientIp(req)}`;
+      };
+
+      const rateLimitExceeded = (surface: string, key: string, limit: number, sessionId?: string): Response => {
+        securityAuditLog.record({
+          type: 'rate_limit_exceeded',
+          severity: 'warning',
+          detail: `${surface} rate limit exceeded key=${key} limit=${limit}/60s`,
+          ...(sessionId ? { sessionId } : {}),
+        });
+        return Response.json(
+          { error: 'Too many requests', code: 'RATE_LIMITED', limit, windowMs: 60_000 },
+          { status: 429, headers: { 'Retry-After': '60' } },
+        );
+      };
+
+      const enforceWebhookRateLimit = (platform: string, message: NormalizedInboundMessage, req: Request): Response | null => {
+        const limit = parsePositiveIntEnv(runtimeEnv.CROWCLAW_WEBHOOK_RATE_LIMIT, 10);
+        const subject = message.userId ?? message.channelId ?? getClientIp(req);
+        const key = `webhook:${platform}:${subject}`;
+        if (!webhookRateLimiter.check(key, limit, 60_000)) {
+          return rateLimitExceeded('webhook', key, limit, buildGatewaySessionKey(message));
+        }
+        return enforceDailyUsdCap('webhook', key, buildGatewaySessionKey(message));
       };
 
       // Fail-close: if we're bound to a non-localhost interface and no dashboard
@@ -2695,6 +2835,19 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             { status: 429, headers: { 'Retry-After': '60' } }
           );
         }
+      }
+
+      const chatActionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/);
+      const chatAction = chatActionMatch?.[2] ?? 'message';
+      if (request.method === 'POST' && chatActionMatch && (chatAction === 'message' || chatAction === 'stream')) {
+        const sessionId = chatActionMatch[1];
+        const limit = parsePositiveIntEnv(runtimeEnv.CROWCLAW_CHAT_RATE_LIMIT, 30);
+        const key = getChatRateLimitKey(request);
+        if (!chatRateLimiter.check(key, limit, 60_000)) {
+          return rateLimitExceeded('chat', key, limit, sessionId);
+        }
+        const budgetResponse = enforceDailyUsdCap('chat', key, sessionId);
+        if (budgetResponse) return budgetResponse;
       }
 
       // Session rename
@@ -4044,6 +4197,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('webhook', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomically claim the idempotency key BEFORE running the agent.
         //      Previous code did `has()` then `mark()` AFTER `runAgent()`, so two
         //      concurrent retries of the same delivery could both pass the
@@ -4119,6 +4274,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('discord', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         const dispatch = buildDiscordDispatch(payload as never)!;
         // #34: Discord didn't have an idempotency check at all — Discord
         //      retries deliveries when its 3s ack timeout elapses, so the
@@ -4172,6 +4329,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('telegram', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic markIfAbsent claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);
@@ -4247,6 +4406,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('slack', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);
@@ -4293,6 +4454,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('whatsapp', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);
@@ -4339,6 +4502,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('signal', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);
@@ -4385,6 +4550,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('email', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);
@@ -4431,6 +4598,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('matrix', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);
@@ -4477,6 +4646,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         if (accessResponse) {
           return accessResponse;
         }
+        const rateLimitResponse = enforceWebhookRateLimit('sms', message, request);
+        if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
         const idempotencyKey = message ? buildGatewayIdempotencyKey(message) : null;
         const sessionKey = buildGatewaySessionKey(message!);

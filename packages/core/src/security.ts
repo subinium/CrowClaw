@@ -27,26 +27,136 @@ const PRIVATE_IP_PATTERNS = [
   /^.*\.internal$/i
 ];
 
+export interface UrlSafetyOptions {
+  /**
+   * Comma-separated CIDRs or literal host/IP entries that may bypass the
+   * default private-network SSRF block. Intended for explicit tailnet opt-in
+   * through CROWCLAW_TAILNET_ALLOWLIST.
+   */
+  tailnetAllowlist?: string | string[];
+  env?: Record<string, string | undefined>;
+}
+
+function getRuntimeEnv(): Record<string, string | undefined> {
+  return (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+}
+
+function normalizeAddress(value: string): string {
+  const unwrapped = value.trim().replace(/^\[|\]$/g, '').split('%')[0]!;
+  const mapped = unwrapped.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  return (mapped ? mapped[1]! : unwrapped).toLowerCase();
+}
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    result = (result << 8) | n;
+  }
+  return result >>> 0;
+}
+
+function expandIpv6(address: string): number[] | null {
+  const normalized = normalizeAddress(address);
+  if (!normalized.includes(':')) return null;
+  const [headRaw, tailRaw] = normalized.split('::');
+  if (normalized.indexOf('::') !== normalized.lastIndexOf('::')) return null;
+  const head = headRaw ? headRaw.split(':').filter(Boolean) : [];
+  const tail = tailRaw ? tailRaw.split(':').filter(Boolean) : [];
+  const parseGroup = (group: string): number | null => {
+    if (!/^[0-9a-f]{1,4}$/i.test(group)) return null;
+    return parseInt(group, 16);
+  };
+  if (tailRaw === undefined) {
+    if (head.length !== 8) return null;
+    return head.map(parseGroup).every((v): v is number => v !== null)
+      ? head.map((group) => parseInt(group, 16))
+      : null;
+  }
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return null;
+  const groups = [...head, ...Array.from({ length: missing }, () => '0'), ...tail];
+  const parsed = groups.map(parseGroup);
+  return parsed.every((v): v is number => v !== null) ? parsed : null;
+}
+
+function ipv6MatchesCidr(ip: string, base: string, prefixLength: number): boolean {
+  const target = expandIpv6(ip);
+  const cidrBase = expandIpv6(base);
+  if (!target || !cidrBase || prefixLength < 0 || prefixLength > 128) return false;
+  const fullGroups = Math.floor(prefixLength / 16);
+  const partialBits = prefixLength % 16;
+  for (let i = 0; i < fullGroups; i++) {
+    if (target[i] !== cidrBase[i]) return false;
+  }
+  if (partialBits === 0) return true;
+  const mask = (0xffff << (16 - partialBits)) & 0xffff;
+  return (target[fullGroups]! & mask) === (cidrBase[fullGroups]! & mask);
+}
+
+function matchesAllowlistEntry(value: string, entry: string): boolean {
+  const target = normalizeAddress(value);
+  const candidate = entry.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  if (!candidate) return false;
+  if (!candidate.includes('/')) {
+    return target === normalizeAddress(candidate);
+  }
+  const [base, prefixRaw] = candidate.split('/');
+  const prefixLength = Number(prefixRaw);
+  if (!base || !Number.isInteger(prefixLength)) return false;
+  const target4 = ipv4ToInt(target);
+  const base4 = ipv4ToInt(base);
+  if (target4 !== null && base4 !== null) {
+    if (prefixLength < 0 || prefixLength > 32) return false;
+    const mask = prefixLength === 0 ? 0 : (0xffffffff << (32 - prefixLength)) >>> 0;
+    return (target4 & mask) === (base4 & mask);
+  }
+  return ipv6MatchesCidr(target, base, prefixLength);
+}
+
+function getTailnetAllowlist(options?: UrlSafetyOptions): string[] {
+  const configured = options?.tailnetAllowlist
+    ?? options?.env?.CROWCLAW_TAILNET_ALLOWLIST
+    ?? getRuntimeEnv().CROWCLAW_TAILNET_ALLOWLIST;
+  if (Array.isArray(configured)) {
+    return configured.map((entry) => entry.trim()).filter(Boolean);
+  }
+  return (configured ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
+export function isTailnetAllowlistedAddress(address: string, options?: UrlSafetyOptions): boolean {
+  const allowlist = getTailnetAllowlist(options);
+  if (allowlist.length === 0) return false;
+  return allowlist.some((entry) => matchesAllowlistEntry(address, entry));
+}
+
 /**
  * Check if a bare IP address (already resolved) matches a private/internal range.
  * Separate from isPrivateUrl so DNS-rebinding-aware callers can validate the
  * resolved IP, not just the hostname string.
  */
-export function isPrivateIpAddress(ip: string): boolean {
-  return PRIVATE_IP_PATTERNS.some(p => p.test(ip));
+export function isPrivateIpAddress(ip: string, options?: UrlSafetyOptions): boolean {
+  const normalized = normalizeAddress(ip);
+  if (isTailnetAllowlistedAddress(normalized, options)) return false;
+  return PRIVATE_IP_PATTERNS.some(p => p.test(normalized));
 }
 
-export function isPrivateUrl(url: string): boolean {
+export function isPrivateUrl(url: string, options?: UrlSafetyOptions): boolean {
   try {
     const parsed = new URL(url);
-    const hostname = parsed.hostname.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+    const hostname = normalizeAddress(parsed.hostname); // strip IPv6 brackets/zone ids
+    if (isTailnetAllowlistedAddress(hostname, options)) return false;
     return PRIVATE_IP_PATTERNS.some(p => p.test(hostname));
   } catch {
     return true; // invalid URLs are treated as private
   }
 }
 
-export function validateFetchUrl(url: string): { safe: boolean; reason?: string } {
+export function validateFetchUrl(url: string, options?: UrlSafetyOptions): { safe: boolean; reason?: string } {
   if (!url) return { safe: false, reason: 'Empty URL' };
 
   try {
@@ -54,7 +164,7 @@ export function validateFetchUrl(url: string): { safe: boolean; reason?: string 
     if (!['http:', 'https:'].includes(parsed.protocol)) {
       return { safe: false, reason: `Disallowed protocol: ${parsed.protocol}` };
     }
-    if (isPrivateUrl(url)) {
+    if (isPrivateUrl(url, options)) {
       return { safe: false, reason: 'URL resolves to private/internal network' };
     }
     return { safe: true };
@@ -74,20 +184,21 @@ export function validateFetchUrl(url: string): { safe: boolean; reason?: string 
  */
 export async function resolveAndValidateUrl(
   url: string,
-  resolver: (hostname: string) => Promise<string[]>
+  resolver: (hostname: string) => Promise<string[]>,
+  options?: UrlSafetyOptions
 ): Promise<{ safe: boolean; reason?: string; resolvedIps?: string[] }> {
-  const base = validateFetchUrl(url);
+  const base = validateFetchUrl(url, options);
   if (!base.safe) return base;
   try {
     const parsed = new URL(url);
-    const host = parsed.hostname.replace(/^\[|\]$/g, '');
+    const host = normalizeAddress(parsed.hostname);
     // Literal IPs skip DNS (no rebinding risk).
     if (/^[0-9.]+$/.test(host) || host.includes(':')) {
       return { safe: true, resolvedIps: [host] };
     }
     const ips = await resolver(host);
     if (ips.length === 0) return { safe: false, reason: 'Hostname did not resolve to any IP' };
-    const badIp = ips.find(ip => isPrivateIpAddress(ip));
+    const badIp = ips.find(ip => isPrivateIpAddress(ip, options));
     if (badIp) {
       return { safe: false, reason: `Hostname resolves to private IP: ${badIp}`, resolvedIps: ips };
     }
@@ -548,6 +659,7 @@ export type SecurityEventType =
   | 'command_warned'
   | 'pii_redacted'
   | 'ssrf_blocked'
+  | 'rate_limit_exceeded'
   | 'approval_required'
   | 'approval_denied'
   // v0.8.0 (#234) — `code.execute` pipeline tool. Recorded at the call site

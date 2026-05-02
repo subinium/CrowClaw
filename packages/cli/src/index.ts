@@ -4,6 +4,7 @@ import { readFile, writeFile, mkdir, access, constants, appendFile, copyFile, re
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { spawnSync as nodeSpawnSync } from 'node:child_process';
 import type { NodeRuntimeOptions } from '@crowclaw/runtime-node';
 import { GatewayRunner, type GatewayStatus } from '@crowclaw/gateway';
 
@@ -200,6 +201,49 @@ export interface CliRuntimeLike {
 export interface CliRunOptions {
   runtime?: CliRuntimeLike;
   runtimeOptions?: NodeRuntimeOptions;
+}
+
+export interface TailnetBindPlan {
+  hostname?: string;
+  source: 'disabled' | 'tailscale' | 'fallback';
+  warning?: string;
+}
+
+export function resolveTailnetBindHost(options: {
+  env?: Record<string, string | undefined>;
+  fallbackHost?: string;
+  spawnSync?: (command: string, args: string[], options: { encoding: 'utf-8' }) => { stdout?: string; stderr?: string; status?: number | null; error?: { message?: string } };
+} = {}): TailnetBindPlan {
+  const env = options.env ?? process.env;
+  if (env.CROWCLAW_BIND_TAILNET_ONLY !== '1' && env.CROWCLAW_BIND_TAILNET_ONLY !== 'true') {
+    return { source: 'disabled', ...(options.fallbackHost ? { hostname: options.fallbackHost } : {}) };
+  }
+  const spawn = options.spawnSync ?? nodeSpawnSync;
+  const explicit = env.CROWCLAW_TAILNET_HOST ?? env.CROWCLAW_TAILNET_IP;
+  if (explicit?.trim()) {
+    return { hostname: explicit.trim(), source: 'tailscale' };
+  }
+  try {
+    const result = spawn('tailscale', ['ip', '-4'], { encoding: 'utf-8' });
+    const stdout = typeof result.stdout === 'string' ? result.stdout : result.stdout?.toString('utf-8');
+    const stderr = typeof result.stderr === 'string' ? result.stderr : result.stderr?.toString('utf-8');
+    const address = stdout?.trim().split(/\s+/).find(Boolean);
+    if (result.status === 0 && address) {
+      return { hostname: address, source: 'tailscale' };
+    }
+    const detail = result.error?.message ?? stderr?.trim() ?? `exit ${result.status ?? 'unknown'}`;
+    return {
+      ...(options.fallbackHost ? { hostname: options.fallbackHost } : {}),
+      source: 'fallback',
+      warning: `CROWCLAW_BIND_TAILNET_ONLY=1 but tailscale ip -4 failed: ${detail}`,
+    };
+  } catch (err: unknown) {
+    return {
+      ...(options.fallbackHost ? { hostname: options.fallbackHost } : {}),
+      source: 'fallback',
+      warning: `CROWCLAW_BIND_TAILNET_ONLY=1 but tailscale ip -4 failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 /**
@@ -3115,7 +3159,13 @@ export async function startRepl(options: ReplOptions = {}): Promise<void> {
 
 export async function runServe(options: CliRunOptions & { port?: number } = {}): Promise<void> {
   const port = options.port ?? 3117;
-  const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
+  const bindPlan = resolveTailnetBindHost({
+    fallbackHost: options.runtimeOptions?.hostname,
+  });
+  const runtimeOptions = bindPlan.hostname
+    ? { ...(options.runtimeOptions ?? {}), hostname: bindPlan.hostname }
+    : options.runtimeOptions;
+  const runtime = options.runtime ?? await lazyCreateRuntime(runtimeOptions);
 
   // Start an HTTP server that delegates to the runtime fetch handler
   const { createServer } = await import('node:http');
@@ -3173,9 +3223,14 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
     }
   });
 
-  server.listen(port, () => {
-    stdout.write(`CrowClaw server running at http://localhost:${port}\n`);
-    stdout.write(`Dashboard at http://localhost:${port}/dashboard\n`);
+  const onListening = () => {
+    const displayHost = bindPlan.hostname ?? 'localhost';
+    if (bindPlan.warning) stdout.write(`[network] ${bindPlan.warning}\n`);
+    if (bindPlan.source === 'tailscale' && bindPlan.hostname) {
+      stdout.write(`[network] Bound to Tailscale address ${bindPlan.hostname}\n`);
+    }
+    stdout.write(`CrowClaw server running at http://${displayHost}:${port}\n`);
+    stdout.write(`Dashboard at http://${displayHost}:${port}/dashboard\n`);
     for (const gs of gatewayStatuses) {
       if (gs.connected) {
         const name = gs.botName ? `${gs.platform} (${gs.botName})` : gs.platform;
@@ -3185,7 +3240,12 @@ export async function runServe(options: CliRunOptions & { port?: number } = {}):
       }
     }
     stdout.write('Press Ctrl+C to stop.\n');
-  });
+  };
+  if (bindPlan.hostname) {
+    server.listen(port, bindPlan.hostname, onListening);
+  } else {
+    server.listen(port, onListening);
+  }
 
   // Track in-flight requests for graceful drain
   let inFlight = 0;

@@ -90,7 +90,7 @@ export function createDelegateTool(options: DelegateToolOptions): ToolDefinition
       input: Record<string, unknown>,
       context: ToolExecutionContext,
     ): Promise<ToolExecutionResult> {
-      const currentDepth = context.delegateDepth ?? 0;
+      const currentDepth = context.delegateDepth ?? (context as { __delegateDepth?: number }).__delegateDepth ?? 0;
       if (typeof currentDepth === 'number' && currentDepth >= maxDepth) {
         return {
           toolName: 'delegate.task',
