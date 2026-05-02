@@ -57,6 +57,55 @@ interface McpServer {
   description?: string;
   env?: Record<string, string>;
   custom?: boolean;
+  catalogSlug?: string;
+  repo?: string;
+}
+
+interface McpCatalogEnvVar {
+  description: string;
+  required: boolean;
+  secret?: boolean;
+}
+
+interface McpCatalogEntry {
+  slug: string;
+  name: string;
+  description: string;
+  runtime: 'npx' | 'uvx';
+  package: string;
+  args: string[];
+  env?: Record<string, McpCatalogEnvVar>;
+  permissions: string[];
+  installed?: boolean;
+}
+
+interface PluginManifest {
+  name: string;
+  version?: string;
+  description?: string;
+  author?: string;
+  repo?: string;
+  hooks?: string[];
+  tools?: string[];
+  permissions?: {
+    tools?: string[];
+    memory?: string;
+    network?: boolean;
+  };
+}
+
+interface InstalledPlugin {
+  name: string;
+  manifest: PluginManifest;
+  config?: Record<string, unknown>;
+  installedAt?: string;
+}
+
+interface PluginCatalogEntry {
+  slug: string;
+  manifest: PluginManifest;
+  source: 'builtin' | 'community';
+  installed?: boolean;
 }
 
 interface GatewayPlatform {
@@ -72,6 +121,7 @@ interface GatewayPlatform {
   probeResult?: PlatformProbeResult | null;
   /** Policy settings */
   policy?: PlatformPolicy | null;
+  allowlist?: string[];
 }
 
 interface PlatformProbeResult {
@@ -107,6 +157,17 @@ interface PairingEntry {
   channelId: string;
   createdAt: string;
   expiresAt: string;
+}
+
+interface GatewayActivityEntry {
+  timestamp: string;
+  type: 'inbound' | 'outbound' | 'validation' | 'pairing';
+  platform: string;
+  channelId?: string;
+  userId?: string;
+  ok?: boolean;
+  error?: string;
+  action?: string;
 }
 
 interface TelegramWebhookInfo {
@@ -825,11 +886,15 @@ export class ConnectView extends LitElement {
   @state() private systemStatus: SystemStatus | null = null;
   @state() private providers: ProviderDisplay[] = [];
   @state() private mcpServers: McpServer[] = [];
+  @state() private mcpCatalog: McpCatalogEntry[] = [];
   @state() private platforms: GatewayPlatform[] = [];
   @state() private tools: ToolInfo[] = [];
+  @state() private installedPlugins: InstalledPlugin[] = [];
+  @state() private pluginCatalog: PluginCatalogEntry[] = [];
 
   @state() private loading = true;
   @state() private toolSearch = '';
+  @state() private pluginCatalogQuery = '';
 
   /* Tools toggle */
   @state() private togglingTool: string | null = null;
@@ -849,6 +914,13 @@ export class ConnectView extends LitElement {
   @state() private mcpForm = { name: '', command: '', args: '', description: '' };
   @state() private mcpEnvVars: { key: string; value: string }[] = [];
   @state() private mcpFormError = '';
+  @state() private mcpCatalogQuery = '';
+  @state() private selectedMcpCatalog: McpCatalogEntry | null = null;
+  @state() private mcpCatalogEnvValues: Record<string, string> = {};
+  @state() private installingMcpSlug: string | null = null;
+  @state() private mcpAdvancedRaw = false;
+  @state() private installingPluginSlug: string | null = null;
+  @state() private configuringPlugin: string | null = null;
 
   /* Platform config expand */
   @state() private expandedPlatform: string | null = null;
@@ -861,8 +933,11 @@ export class ConnectView extends LitElement {
 
   /* Pairings */
   @state() private pairings: PairingEntry[] = [];
+  @state() private gatewayActivity: GatewayActivityEntry[] = [];
   @state() private showPairings: Record<string, boolean> = {};
   @state() private approvingPairing: string | null = null;
+  @state() private rejectingPairing: string | null = null;
+  @state() private rotatedSecret: { platform: string; secret: string; graceUntil?: string | null } | null = null;
 
   /* Remote access */
   @state() private publicUrlOverride = '';
@@ -885,9 +960,13 @@ export class ConnectView extends LitElement {
       this._fetchStatus(),
       this._fetchProviders(),
       this._fetchMcp(),
+      this._fetchMcpCatalog(),
+      this._fetchPlugins(),
+      this._fetchPluginCatalog(),
       this._fetchPlatforms(),
       this._fetchTools(),
       this._fetchPairings(),
+      this._fetchGatewayActivity(),
       this._fetchTelegramWebhook(),
     ]);
     this.loading = false;
@@ -958,6 +1037,33 @@ export class ConnectView extends LitElement {
     }
   }
 
+  private async _fetchMcpCatalog() {
+    try {
+      const data = await api<{ catalog: McpCatalogEntry[] }>('/api/mcp/catalog');
+      this.mcpCatalog = data.catalog ?? [];
+    } catch {
+      this.mcpCatalog = [];
+    }
+  }
+
+  private async _fetchPlugins() {
+    try {
+      const data = await api<InstalledPlugin[]>('/api/plugins');
+      this.installedPlugins = Array.isArray(data) ? data : [];
+    } catch {
+      this.installedPlugins = [];
+    }
+  }
+
+  private async _fetchPluginCatalog() {
+    try {
+      const data = await api<{ catalog: PluginCatalogEntry[] }>('/api/plugins/catalog');
+      this.pluginCatalog = data.catalog ?? [];
+    } catch {
+      this.pluginCatalog = [];
+    }
+  }
+
   private async _fetchPlatforms() {
     try {
       const data = await api<{
@@ -969,6 +1075,7 @@ export class ConnectView extends LitElement {
           outboundRoute?: string;
           policy?: PlatformPolicy;
           configured?: boolean;
+          allowlist?: string[];
         }>;
         knownChannels?: Array<{
           platform: string;
@@ -977,6 +1084,7 @@ export class ConnectView extends LitElement {
           messageCount?: number;
           muted?: boolean;
         }>;
+        activity?: GatewayActivityEntry[];
       }>('/api/gateway/status');
 
       this.platforms = (data.platforms ?? []).map((p) => ({
@@ -988,6 +1096,7 @@ export class ConnectView extends LitElement {
         enabled: p.outboundMode !== 'not-exposed',
         configured: p.configured ?? false,
         policy: p.policy ?? null,
+        allowlist: p.allowlist ?? [],
       }));
 
       // Extract tracked channel data
@@ -998,6 +1107,7 @@ export class ConnectView extends LitElement {
         messageCount: s.messageCount ?? 0,
         muted: s.muted ?? false,
       }));
+      this.gatewayActivity = data.activity ?? this.gatewayActivity;
 
       // Update the gateway platform count in systemStatus if already loaded
       if (this.systemStatus) {
@@ -1027,6 +1137,15 @@ export class ConnectView extends LitElement {
       this.pairings = data.pairings ?? [];
     } catch {
       this.pairings = [];
+    }
+  }
+
+  private async _fetchGatewayActivity() {
+    try {
+      const data = await api<{ events: GatewayActivityEntry[] }>('/api/gateway/activity?limit=50');
+      this.gatewayActivity = data.events ?? [];
+    } catch {
+      this.gatewayActivity = [];
     }
   }
 
@@ -1131,12 +1250,57 @@ export class ConnectView extends LitElement {
         body: JSON.stringify({ code }),
       });
       await this._fetchPairings();
+      await this._fetchGatewayActivity();
     } catch (error: unknown) {
       if (error instanceof Error) {
         showToast('Failed to approve pairing', 'error');
       }
     } finally {
       this.approvingPairing = null;
+    }
+  }
+
+  private async _rejectPairing(code: string) {
+    this.rejectingPairing = code;
+    try {
+      await api('/api/gateway/pairing/reject', {
+        method: 'POST',
+        body: JSON.stringify({ code }),
+      });
+      await this._fetchPairings();
+      await this._fetchGatewayActivity();
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to reject pairing', 'error');
+    } finally {
+      this.rejectingPairing = null;
+    }
+  }
+
+  private async _revokePairing(platform: string, senderId: string) {
+    try {
+      await api(`/api/gateway/${encodeURIComponent(platform)}/pairing/revoke`, {
+        method: 'POST',
+        body: JSON.stringify({ senderId }),
+      });
+      await this._fetchPlatforms();
+      await this._fetchGatewayActivity();
+      showToast('Pairing revoked', 'success');
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to revoke pairing', 'error');
+    }
+  }
+
+  private async _rotateWebhookSecret(platform: string) {
+    try {
+      const data = await api<{ ok: boolean; platform: string; secret: string; graceUntil?: string | null }>(
+        `/api/gateway/${encodeURIComponent(platform)}/secret/rotate`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+      this.rotatedSecret = { platform: data.platform, secret: data.secret, graceUntil: data.graceUntil };
+      await this._fetchGatewayActivity();
+      showToast('Webhook secret rotated', 'success');
+    } catch (error: unknown) {
+      if (error instanceof Error) showToast('Failed to rotate secret', 'error');
     }
   }
 
@@ -1359,6 +1523,46 @@ export class ConnectView extends LitElement {
       this.mcpForm = { name: '', command: '', args: '', description: '' };
       this.mcpEnvVars = [];
       this.mcpFormError = '';
+      this.selectedMcpCatalog = null;
+      this.mcpCatalogEnvValues = {};
+      this.mcpAdvancedRaw = false;
+    }
+  }
+
+  private _selectMcpCatalog(entry: McpCatalogEntry) {
+    this.selectedMcpCatalog = entry;
+    this.mcpFormError = '';
+    const nextEnv: Record<string, string> = {};
+    for (const key of Object.keys(entry.env ?? {})) {
+      nextEnv[key] = this.mcpCatalogEnvValues[key] ?? '';
+    }
+    this.mcpCatalogEnvValues = nextEnv;
+  }
+
+  private _updateMcpCatalogEnv(key: string, value: string) {
+    this.mcpCatalogEnvValues = { ...this.mcpCatalogEnvValues, [key]: value };
+  }
+
+  private async _installMcpCatalog(entry: McpCatalogEntry) {
+    this.installingMcpSlug = entry.slug;
+    this.mcpFormError = '';
+    try {
+      await api('/api/mcp/servers/install', {
+        method: 'POST',
+        body: JSON.stringify({
+          slug: entry.slug,
+          env: this.mcpCatalogEnvValues,
+        }),
+      });
+      this.showMcpForm = false;
+      this.selectedMcpCatalog = null;
+      this.mcpCatalogEnvValues = {};
+      await Promise.all([this._fetchMcp(), this._fetchMcpCatalog()]);
+      showToast(`Installed ${entry.name}`, 'success');
+    } catch (error: unknown) {
+      this.mcpFormError = error instanceof Error ? error.message : 'Failed to install MCP server';
+    } finally {
+      this.installingMcpSlug = null;
     }
   }
 
@@ -1449,6 +1653,75 @@ export class ConnectView extends LitElement {
       showToast(`Failed to reconnect ${name}: ${msg}`, 'error');
     } finally {
       this.reconnectingMcp = null;
+    }
+  }
+
+  /* ---- plugin catalog ---- */
+
+  private _pluginPermissionSummary(manifest: PluginManifest): string {
+    const permissions = manifest.permissions;
+    const parts = [
+      ...(manifest.hooks ?? []).map((hook) => `hook:${hook}`),
+      ...(permissions?.tools ?? []).map((tool) => `tool:${tool}`),
+      permissions?.memory ? `memory:${permissions.memory}` : '',
+      permissions?.network ? 'network' : '',
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(', ') : 'no declared permissions';
+  }
+
+  private async _installPlugin(entry: PluginCatalogEntry) {
+    if (!window.confirm(`Install plugin "${entry.manifest.name}"?\n\nPermissions: ${this._pluginPermissionSummary(entry.manifest)}`)) return;
+    this.installingPluginSlug = entry.slug;
+    try {
+      await api('/api/plugins/install', {
+        method: 'POST',
+        body: JSON.stringify({ slug: entry.slug }),
+      });
+      await Promise.all([this._fetchPlugins(), this._fetchPluginCatalog()]);
+      showToast(`Installed ${entry.manifest.name}`, 'success');
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Failed to install plugin', 'error');
+    } finally {
+      this.installingPluginSlug = null;
+    }
+  }
+
+  private async _configurePlugin(plugin: InstalledPlugin) {
+    const raw = window.prompt(`Config JSON for ${plugin.name}`, JSON.stringify(plugin.config ?? {}, null, 2));
+    if (raw === null) return;
+    let config: Record<string, unknown>;
+    try {
+      config = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      showToast('Plugin config must be valid JSON', 'error');
+      return;
+    }
+    this.configuringPlugin = plugin.name;
+    try {
+      await api('/api/plugins/configure', {
+        method: 'POST',
+        body: JSON.stringify({ name: plugin.name, config }),
+      });
+      await this._fetchPlugins();
+      showToast(`Configured ${plugin.name}`, 'success');
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Failed to configure plugin', 'error');
+    } finally {
+      this.configuringPlugin = null;
+    }
+  }
+
+  private async _uninstallPlugin(plugin: InstalledPlugin) {
+    if (!window.confirm(`Uninstall plugin "${plugin.name}"?`)) return;
+    try {
+      await api('/api/plugins/uninstall', {
+        method: 'POST',
+        body: JSON.stringify({ name: plugin.name }),
+      });
+      await Promise.all([this._fetchPlugins(), this._fetchPluginCatalog()]);
+      showToast(`Uninstalled ${plugin.name}`, 'success');
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Failed to uninstall plugin', 'error');
     }
   }
 
@@ -1567,7 +1840,10 @@ export class ConnectView extends LitElement {
     return html`
       ${this._renderProviders()}
       ${this._renderMcpServers()}
+      ${this._renderPlugins()}
       ${this._renderPlatforms()}
+      ${this._renderGatewaySecurity()}
+      ${this._renderGatewayActivity()}
       ${this._renderChannels()}
       ${this._renderRemoteAccess()}
       ${this._renderTools()}
@@ -1778,8 +2054,7 @@ export class ConnectView extends LitElement {
                 icon="mcp"
                 title="No MCP servers"
                 description="Connect Model Context Protocol servers to extend your agent with new tools and resources."
-                cta-label="Browse marketplace"
-                cta-href="https://github.com/modelcontextprotocol/servers"
+                cta-label="Add from catalog"
               ></crowclaw-empty>
             `
           : html`
@@ -1792,9 +2067,9 @@ export class ConnectView extends LitElement {
           <crowclaw-button
             variant=${this.showMcpForm ? 'secondary' : 'primary'}
             size="sm"
-            aria-label="${this.showMcpForm ? 'Cancel add MCP server' : 'Add custom MCP server'}"
+            aria-label="${this.showMcpForm ? 'Cancel add MCP server' : 'Add MCP server'}"
             @click=${this._toggleMcpForm}
-          >${this.showMcpForm ? 'Cancel' : 'Add Custom Server'}</crowclaw-button>
+          >${this.showMcpForm ? 'Cancel' : 'Add MCP Server'}</crowclaw-button>
         </div>
       </div>
     `;
@@ -1834,9 +2109,54 @@ export class ConnectView extends LitElement {
   }
 
   private _renderMcpAddForm() {
+    const query = this.mcpCatalogQuery.trim().toLowerCase();
+    const catalog = this.mcpCatalog
+      .filter((entry) => !query || `${entry.name} ${entry.description} ${entry.package}`.toLowerCase().includes(query))
+      .slice(0, 8);
     return html`
       <div class="add-form">
-        <div class="add-form-title">Add Custom Server</div>
+        <div class="add-form-title">Add MCP Server</div>
+        <div class="form-group">
+          <label class="form-label" for="mcp-catalog-search">Catalog Search</label>
+          <input
+            id="mcp-catalog-search"
+            class="form-input"
+            placeholder="filesystem, github, postgres"
+            .value=${this.mcpCatalogQuery}
+            @input=${(e: InputEvent) => { this.mcpCatalogQuery = (e.target as HTMLInputElement).value; }}
+          />
+        </div>
+        <div class="mcp-list">
+          ${catalog.map((entry) => html`
+            <div class="mcp-item">
+              <div class="mcp-info">
+                <div class="mcp-name">${entry.name}</div>
+                <div class="mcp-desc">${entry.description}</div>
+                <div class="mcp-cmd">${entry.runtime} ${entry.package}</div>
+                <div class="tag-row">
+                  ${entry.permissions.slice(0, 4).map((permission) => html`<span class="tag">${permission}</span>`)}
+                  ${entry.installed ? html`<span class="tag ok">installed</span>` : nothing}
+                </div>
+              </div>
+              <crowclaw-button
+                variant=${this.selectedMcpCatalog?.slug === entry.slug ? 'secondary' : 'ghost'}
+                size="sm"
+                aria-label="Select ${entry.name}"
+                ?disabled=${entry.installed}
+                @click=${() => this._selectMcpCatalog(entry)}
+              >${this.selectedMcpCatalog?.slug === entry.slug ? 'Selected' : 'Use'}</crowclaw-button>
+            </div>
+          `)}
+        </div>
+        ${this.selectedMcpCatalog ? this._renderSelectedMcpCatalog(this.selectedMcpCatalog) : nothing}
+        <details
+          class="sub-card"
+          ?open=${this.mcpAdvancedRaw}
+          @toggle=${(e: Event) => { this.mcpAdvancedRaw = (e.target as HTMLDetailsElement).open; }}
+        >
+          <summary class="sec-h">Advanced raw command</summary>
+          <div class="status-msg warn" role="status">Raw MCP commands can execute arbitrary packages. Prefer catalog entries when possible.</div>
+          ${this.mcpAdvancedRaw ? html`
         <div class="row">
           <div class="form-group">
             <label class="form-label" for="mcp-form-name">Name</label>
@@ -1956,6 +2276,138 @@ export class ConnectView extends LitElement {
             aria-label="Add MCP server"
             @click=${this._addMcpServer}
           >Add Server</crowclaw-button>
+        </div>
+          ` : nothing}
+        </details>
+        ${!this.mcpAdvancedRaw ? html`<div class="err-msg" role="alert" aria-live="polite">${this.mcpFormError}</div>` : nothing}
+      </div>
+    `;
+  }
+
+  private _renderSelectedMcpCatalog(entry: McpCatalogEntry) {
+    const envEntries = Object.entries(entry.env ?? {});
+    return html`
+      <div class="sub-card">
+        <div class="sec-h">${entry.name}</div>
+        <div class="mcp-desc">${entry.description}</div>
+        <div class="mcp-cmd">${entry.runtime} ${entry.package} ${entry.args.join(' ')}</div>
+        <div class="tag-row">
+          ${entry.permissions.map((permission) => html`<span class="tag">${permission}</span>`)}
+        </div>
+        ${envEntries.length > 0 ? html`
+          <div class="env-rows" style="margin-top:var(--sp-3)">
+            ${envEntries.map(([key, schema]) => html`
+              <div class="form-group">
+                <label class="form-label" for=${`mcp-env-${key}`}>${key}${schema.required ? ' *' : ''}</label>
+                <input
+                  id=${`mcp-env-${key}`}
+                  class="form-input"
+                  type=${schema.secret ? 'password' : 'text'}
+                  placeholder=${schema.description}
+                  .value=${this.mcpCatalogEnvValues[key] ?? ''}
+                  @input=${(e: InputEvent) => this._updateMcpCatalogEnv(key, (e.target as HTMLInputElement).value)}
+                />
+              </div>
+            `)}
+          </div>
+        ` : nothing}
+        <div class="form-actions">
+          <crowclaw-button
+            variant="primary"
+            size="sm"
+            aria-label="Install ${entry.name}"
+            ?loading=${this.installingMcpSlug === entry.slug}
+            ?disabled=${this.installingMcpSlug === entry.slug}
+            @click=${() => this._installMcpCatalog(entry)}
+          >${this.installingMcpSlug === entry.slug ? 'Installing' : 'Install'}</crowclaw-button>
+        </div>
+      </div>
+    `;
+  }
+
+  /* ---- Section: Plugins ---- */
+
+  private _renderPlugins() {
+    const installedNames = new Set(this.installedPlugins.map((plugin) => plugin.name));
+    const query = this.pluginCatalogQuery.trim().toLowerCase();
+    const catalog = this.pluginCatalog
+      .filter((entry) => !query || `${entry.manifest.name} ${entry.manifest.description ?? ''}`.toLowerCase().includes(query))
+      .slice(0, 8);
+    return html`
+      <div class="section-block">
+        <div class="section-header">Plugins</div>
+        <div class="sub-card">
+          <div class="sec-h" style="margin-top:0">Installed</div>
+          ${this.installedPlugins.length === 0
+            ? html`<div class="status-msg" style="color:var(--text-muted)">No plugins installed.</div>`
+            : html`
+                <div class="mcp-list">
+                  ${this.installedPlugins.map((plugin) => html`
+                    <div class="mcp-item">
+                      <div class="mcp-info">
+                        <div class="mcp-name">${plugin.manifest.name}</div>
+                        <div class="mcp-desc">${plugin.manifest.description ?? 'Runtime plugin'}</div>
+                        <div class="tag-row">
+                          ${(plugin.manifest.hooks ?? []).map((hook) => html`<span class="tag">${hook}</span>`)}
+                        </div>
+                      </div>
+                      <crowclaw-button
+                        variant="ghost"
+                        size="sm"
+                        aria-label="Configure ${plugin.name}"
+                        ?loading=${this.configuringPlugin === plugin.name}
+                        ?disabled=${this.configuringPlugin === plugin.name}
+                        @click=${() => this._configurePlugin(plugin)}
+                      >Configure</crowclaw-button>
+                      <crowclaw-button
+                        variant="danger"
+                        size="sm"
+                        aria-label="Uninstall ${plugin.name}"
+                        @click=${() => this._uninstallPlugin(plugin)}
+                      >Uninstall</crowclaw-button>
+                    </div>
+                  `)}
+                </div>
+              `}
+        </div>
+        <div class="sub-card">
+          <div class="sec-h" style="margin-top:0">Browse Catalog</div>
+          <div class="form-group">
+            <label class="form-label" for="plugin-catalog-search">Search</label>
+            <input
+              id="plugin-catalog-search"
+              class="form-input"
+              placeholder="memory, policy, transform"
+              .value=${this.pluginCatalogQuery}
+              @input=${(e: InputEvent) => { this.pluginCatalogQuery = (e.target as HTMLInputElement).value; }}
+            />
+          </div>
+          <div class="mcp-list">
+            ${catalog.map((entry) => {
+              const installed = Boolean(entry.installed || installedNames.has(entry.manifest.name));
+              return html`
+                <div class="mcp-item">
+                  <div class="mcp-info">
+                    <div class="mcp-name">${entry.manifest.name}</div>
+                    <div class="mcp-desc">${entry.manifest.description ?? ''}</div>
+                    <div class="tag-row">
+                      ${(entry.manifest.hooks ?? []).map((hook) => html`<span class="tag">${hook}</span>`)}
+                      <span class="tag">${this._pluginPermissionSummary(entry.manifest)}</span>
+                      ${installed ? html`<span class="tag ok">installed</span>` : nothing}
+                    </div>
+                  </div>
+                  <crowclaw-button
+                    variant="primary"
+                    size="sm"
+                    aria-label="Install ${entry.manifest.name}"
+                    ?loading=${this.installingPluginSlug === entry.slug}
+                    ?disabled=${installed || this.installingPluginSlug === entry.slug}
+                    @click=${() => this._installPlugin(entry)}
+                  >${this.installingPluginSlug === entry.slug ? 'Installing' : 'Install'}</crowclaw-button>
+                </div>
+              `;
+            })}
+          </div>
         </div>
       </div>
     `;
@@ -2112,6 +2564,102 @@ export class ConnectView extends LitElement {
           ?disabled=${isApproving}
           @click=${() => this._approvePairing(pairing.code)}
         >${isApproving ? 'Approving' : 'Approve'}</crowclaw-button>
+        <crowclaw-button
+          variant="ghost"
+          size="sm"
+          aria-label="Reject pairing ${pairing.code}"
+          ?loading=${this.rejectingPairing === pairing.code}
+          ?disabled=${this.rejectingPairing === pairing.code}
+          @click=${() => this._rejectPairing(pairing.code)}
+        >${this.rejectingPairing === pairing.code ? 'Rejecting' : 'Reject'}</crowclaw-button>
+      </div>
+    `;
+  }
+
+  private _renderGatewaySecurity() {
+    const allowlisted = this.platforms.flatMap((platform) => {
+      const cfg = (platform as GatewayPlatform & { allowlist?: string[] });
+      return (cfg.allowlist ?? []).map((senderId) => ({ platform: platform.name, senderId }));
+    });
+    return html`
+      <div class="section-block">
+        <div class="section-header">Gateway Security</div>
+        <div class="platform-grid">
+          ${this.platforms.map((platform) => html`
+            <div class="platform-card">
+              <div class="platform-card-header">
+                <span class="platform-name">${platform.name}</span>
+                <span class="tag">${platform.configured ? 'configured' : 'not configured'}</span>
+              </div>
+              <div class="platform-card-body">Current secret: ${platform.configured ? '••••••••' : 'not set'}</div>
+              <div class="platform-actions">
+                <crowclaw-button
+                  variant="secondary"
+                  size="sm"
+                  aria-label="Rotate webhook secret for ${platform.name}"
+                  @click=${() => this._rotateWebhookSecret(platform.name)}
+                >Rotate Secret</crowclaw-button>
+              </div>
+            </div>
+          `)}
+        </div>
+        ${this.rotatedSecret
+          ? html`
+              <div class="status-msg ok" role="status" aria-live="polite">
+                New ${this.rotatedSecret.platform} secret: <code>${this.rotatedSecret.secret}</code>
+                ${this.rotatedSecret.graceUntil ? html` · old secret valid until ${new Date(this.rotatedSecret.graceUntil).toLocaleTimeString()}` : nothing}
+              </div>
+            `
+          : nothing}
+        ${allowlisted.length > 0
+          ? html`
+              <div class="sec-h">Approved Pairings</div>
+              <div class="mcp-list">
+                ${allowlisted.map((entry) => html`
+                  <div class="mcp-item">
+                    <span class="tag">${entry.platform}</span>
+                    <span class="mcp-name">${entry.senderId}</span>
+                    <crowclaw-button
+                      variant="danger"
+                      size="sm"
+                      aria-label="Revoke pairing for ${entry.senderId}"
+                      @click=${() => this._revokePairing(entry.platform, entry.senderId)}
+                    >Revoke</crowclaw-button>
+                  </div>
+                `)}
+              </div>
+            `
+          : nothing}
+      </div>
+    `;
+  }
+
+  private _renderGatewayActivity() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Gateway Activity</div>
+        ${this.gatewayActivity.length === 0
+          ? html`<div class="status-msg" style="color:var(--text-muted)">No gateway activity recorded yet.</div>`
+          : html`
+              <div class="sub-card" style="overflow-x:auto">
+                <table class="data-table">
+                  <thead>
+                    <tr><th>Time</th><th>Type</th><th>Platform</th><th>Subject</th><th>Status</th></tr>
+                  </thead>
+                  <tbody>
+                    ${this.gatewayActivity.slice(0, 50).map((entry) => html`
+                      <tr>
+                        <td>${new Date(entry.timestamp).toLocaleTimeString()}</td>
+                        <td>${entry.action ?? entry.type}</td>
+                        <td>${entry.platform}</td>
+                        <td>${entry.userId ?? entry.channelId ?? '--'}</td>
+                        <td>${entry.error ?? (entry.ok === false ? 'failed' : 'ok')}</td>
+                      </tr>
+                    `)}
+                  </tbody>
+                </table>
+              </div>
+            `}
       </div>
     `;
   }
@@ -2123,6 +2671,15 @@ export class ConnectView extends LitElement {
     const groupPolicyId = `platform-${platform.name}-group-policy`;
     return html`
       <div class="platform-expand-panel">
+        <div class="sub-card" style="margin-bottom:var(--sp-3)">
+          <div class="sec-h" style="margin-top:0">Setup Wizard</div>
+          <ol style="margin-left:var(--sp-4);color:var(--text-secondary);font-size:var(--text-xs);line-height:1.7">
+            <li>Open the ${platform.name} developer portal and create a bot/app.</li>
+            <li>Paste the bot token or webhook URL below, then save.</li>
+            <li>Use Probe to validate the credentials server-side.</li>
+            <li>For Telegram, set the webhook in Remote Access after saving the token.</li>
+          </ol>
+        </div>
         <!-- Token / webhook config -->
         <div class="form-group">
           <label class="form-label" for=${tokenId}>Token</label>

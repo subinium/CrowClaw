@@ -163,6 +163,37 @@ export class ChatView extends LitElement {
       .sess-hdr input:focus { border-color: var(--accent); }
       .sess-hdr input::placeholder { color: var(--text-muted); }
 
+      .sess-filter-row {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: 0 var(--sp-3) var(--sp-3);
+        border-bottom: 1px solid var(--glass-border);
+      }
+
+      .sess-filter-row select {
+        flex: 1;
+        min-width: 0;
+        padding: var(--sp-1) var(--sp-2);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-sm);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        font-size: var(--text-xs);
+        font-family: inherit;
+      }
+
+      .sess-page {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-3);
+        border-top: 1px solid var(--glass-border);
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+      }
+
       .sess-list { flex: 1; overflow-y: auto; }
 
       .sess-item {
@@ -1189,6 +1220,8 @@ export class ChatView extends LitElement {
   @state() private currentSessionId: string | null = localStorage.getItem('cc_sid');
   @state() private messages: ChatMessage[] = [];
   @state() private searchQuery = '';
+  @state() private sessionFilter: 'all' | 'active' | 'inactive' = 'all';
+  @state() private sessionPage = 0;
   @state() private streaming = false;
   @state() private streamText = '';
   /**
@@ -1241,6 +1274,7 @@ export class ChatView extends LitElement {
 
   // v0.8.1 #248 — session-list keyboard focus index (j/k navigation).
   @state() private focusedSessionIndex = -1;
+  private readonly sessionPageSize = 20;
 
   // v0.7.0 #193/#194/#195: state for the new session-action components.
   // These flags are independent from the legacy inline overlays so the old
@@ -1508,9 +1542,7 @@ export class ChatView extends LitElement {
           lastRole?: string | null;
         }>;
       }>('/api/sessions');
-      const existing = this.sessions.map((s) => s.id);
-      const newSessions = (data.sessions || [])
-        .filter((s) => !existing.includes(s.sessionId))
+      const incoming = (data.sessions || [])
         .map((s) => ({
           id: s.sessionId,
           title: s.title ?? '',
@@ -1518,7 +1550,11 @@ export class ChatView extends LitElement {
           messageCount: s.messageCount ?? 0,
           updatedAt: s.updatedAt ?? new Date().toISOString(),
         }));
-      this.sessions = [...this.sessions, ...newSessions];
+      const byId = new Map(this.sessions.map((s) => [s.id, s]));
+      for (const session of incoming) {
+        byId.set(session.id, { ...byId.get(session.id), ...session });
+      }
+      this.sessions = [...byId.values()];
     } catch { /* ignore */ }
   }
 
@@ -1576,6 +1612,51 @@ export class ChatView extends LitElement {
     try {
       await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
     } catch { /* ignore */ }
+  }
+
+  private async _exportSession(e: Event, id: string) {
+    e.stopPropagation();
+    this.contextMenuSessionId = null;
+    try {
+      const data = await api<Record<string, unknown>>(`/api/sessions/${encodeURIComponent(id)}/export`);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `crowclaw-session-${id}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Session export includes transcript data. Review before sharing.', 'info');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Export failed';
+      showToast(msg, 'error');
+    }
+  }
+
+  private _openImportSession(e: Event) {
+    e.stopPropagation();
+    this.contextMenuSessionId = null;
+    this.shadowRoot?.querySelector<HTMLInputElement>('#session-import-input')?.click();
+  }
+
+  private async _importSessionFile(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      const payload = JSON.parse(await file.text()) as unknown;
+      const data = await api<{ ok: boolean; sessionId: string }>('/api/sessions/import', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      await this._loadSessions();
+      this._selectSession(data.sessionId);
+      showToast('Session imported', 'success');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Import failed';
+      showToast(msg, 'error');
+    }
   }
 
   // --- Context menu ---
@@ -2154,14 +2235,29 @@ export class ChatView extends LitElement {
 
   private get _filteredSessions() {
     const q = this.searchQuery.toLowerCase();
-    const filtered = q
+    const searched = q
       ? this.sessions.filter((s) =>
           s.id.toLowerCase().includes(q) ||
           s.title.toLowerCase().includes(q) ||
           s.preview.toLowerCase().includes(q))
       : this.sessions;
+    const filtered = searched.filter((s) => {
+      if (this.sessionFilter === 'active') return this._isSessionActive(s.id);
+      if (this.sessionFilter === 'inactive') return !this._isSessionActive(s.id);
+      return true;
+    });
     return filtered.sort((a, b) =>
       new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  }
+
+  private get _sessionPageCount() {
+    return Math.max(1, Math.ceil(this._filteredSessions.length / this.sessionPageSize));
+  }
+
+  private get _pagedSessions() {
+    const page = Math.min(this.sessionPage, this._sessionPageCount - 1);
+    const start = page * this.sessionPageSize;
+    return this._filteredSessions.slice(start, start + this.sessionPageSize);
   }
 
   // --- Render ---
@@ -2169,6 +2265,14 @@ export class ChatView extends LitElement {
   render() {
     return html`
       <div class="chat-area">
+        <input
+          id="session-import-input"
+          type="file"
+          accept="application/json,.json"
+          style="display:none"
+          aria-label="Import session JSON"
+          @change=${this._importSessionFile}
+        />
         <!-- Session Sidebar -->
         ${this.sessSidebarOpen ? html`
           <div class="sess-sb"
@@ -2178,7 +2282,7 @@ export class ChatView extends LitElement {
               <input placeholder="Search sessions..."
                      aria-label="Search sessions"
                      .value=${this.searchQuery}
-                     @input=${(e: InputEvent) => { this.searchQuery = (e.target as HTMLInputElement).value; }}>
+                     @input=${(e: InputEvent) => { this.searchQuery = (e.target as HTMLInputElement).value; this.sessionPage = 0; }}>
               <crowclaw-button
                 variant="primary"
                 size="sm"
@@ -2188,6 +2292,21 @@ export class ChatView extends LitElement {
                 <crowclaw-icon name="send" size="14" aria-hidden="true"></crowclaw-icon>
                 New
               </crowclaw-button>
+            </div>
+            <div class="sess-filter-row">
+              <select
+                aria-label="Filter sessions"
+                .value=${this.sessionFilter}
+                @change=${(e: Event) => {
+                  this.sessionFilter = (e.target as HTMLSelectElement).value as 'all' | 'active' | 'inactive';
+                  this.sessionPage = 0;
+                }}
+              >
+                <option value="all">All sessions</option>
+                <option value="active">Active only</option>
+                <option value="inactive">Inactive only</option>
+              </select>
+              <span>${this._filteredSessions.length} shown</span>
             </div>
             <div class="sess-list" role="listbox" aria-label="Sessions" tabindex="0">
               ${this._filteredSessions.length === 0
@@ -2201,8 +2320,21 @@ export class ChatView extends LitElement {
                       @cc-empty-new-session=${this._createSession}
                     ></crowclaw-empty>`
                   : html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">No matching sessions</div></div>`
-                : this._filteredSessions.map((s, idx) => this._renderSessionCard(s, idx))}
+                : this._pagedSessions.map((s, idx) => this._renderSessionCard(s, idx))}
             </div>
+            ${this._filteredSessions.length > this.sessionPageSize
+              ? html`
+                  <div class="sess-page">
+                    <button class="btn" ?disabled=${this.sessionPage === 0} @click=${() => { this.sessionPage = Math.max(0, this.sessionPage - 1); }}>
+                      Prev
+                    </button>
+                    <span>Page ${Math.min(this.sessionPage + 1, this._sessionPageCount)} / ${this._sessionPageCount}</span>
+                    <button class="btn" ?disabled=${this.sessionPage >= this._sessionPageCount - 1} @click=${() => { this.sessionPage = Math.min(this._sessionPageCount - 1, this.sessionPage + 1); }}>
+                      Next
+                    </button>
+                  </div>
+                `
+              : nothing}
           </div>
         ` : nothing}
 
@@ -2393,6 +2525,8 @@ export class ChatView extends LitElement {
             <!-- v0.7.0 #194: fork-trigger in the 3-dot actions menu. -->
             <button @click=${(e: Event) => { e.stopPropagation(); void this._openForkModal(s.id); }}>Fork session...</button>
             <button @click=${(e: Event) => { e.stopPropagation(); this.contextMenuSessionId = null; this._selectSession(s.id); this.showConfirmCompact = true; }}>Compact</button>
+            <button @click=${(e: Event) => this._exportSession(e, s.id)}>Export JSON</button>
+            <button @click=${(e: Event) => this._openImportSession(e)}>Import JSON</button>
             <button class="danger" @click=${(e: Event) => this._deleteSession(e, s.id)}>Delete</button>
           </div>
         ` : nothing}
@@ -2921,7 +3055,7 @@ export class ChatView extends LitElement {
 
   /** j/k + arrow keys move focus through the session list. Enter opens. */
   private _sessionListKeydown(e: KeyboardEvent) {
-    const list = this._filteredSessions;
+    const list = this._pagedSessions;
     if (list.length === 0) return;
     const target = e.target as HTMLElement | null;
     const inForm =

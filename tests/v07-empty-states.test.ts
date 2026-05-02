@@ -128,15 +128,14 @@ describe('empty-state wiring per view (#176)', () => {
     expect(view).toMatch(/@cc-empty-new-job=\$\{this\._openForm\}/);
   });
 
-  it('connect-view: MCP servers empty links to the marketplace', () => {
+  it('connect-view: MCP servers empty links to the catalog flow', () => {
     const view = read('views/connect-view.ts');
     expect(view).toContain('<crowclaw-empty');
     expect(view).toMatch(/this\.mcpServers\.length\s*===\s*0[\s\S]{0,300}<crowclaw-empty/);
     expect(view).toContain('No MCP servers');
-    expect(view).toContain('cta-label="Browse marketplace"');
+    expect(view).toContain('cta-label="Add from catalog"');
     expect(view).toMatch(/icon=["']mcp["']/);
-    // Marketplace link points at the canonical MCP servers repo.
-    expect(view).toMatch(/cta-href=["']https?:\/\/[^"']*modelcontextprotocol[^"']*["']/i);
+    expect(view).toContain('/api/mcp/catalog');
   });
 
   it('connect-view: pairings/platforms empty calls out the supported platforms', () => {

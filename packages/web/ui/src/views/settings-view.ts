@@ -33,14 +33,21 @@ interface AgentConfig {
 }
 
 interface ProviderSlot {
+  name?: string;
   provider?: string;
   model?: string;
   apiKey?: string;
+  baseUrl?: string;
 }
 
 interface ProvidersConfig {
   primary?: ProviderSlot;
   fallback?: ProviderSlot;
+  vision?: ProviderSlot;
+  compression?: ProviderSlot;
+  embedding?: ProviderSlot;
+  slots?: Record<string, ProviderSlot | null | undefined>;
+  config?: Record<string, ProviderSlot | null | undefined> | null;
   [key: string]: unknown;
 }
 
@@ -64,12 +71,15 @@ interface SecurityEvent {
   type: string;
   severity: 'info' | 'warning' | 'critical';
   detail: string;
+  sessionId?: string;
 }
 
 interface UsageEntry {
   timestamp: string;
   model: string;
   provider: string;
+  sessionId?: string;
+  toolName?: string;
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
@@ -86,6 +96,9 @@ interface UsageData {
   avgLatencyMs: number;
   entries: UsageEntry[];
   byModel: Record<string, { tokens: number; cost: number; calls: number }>;
+  byProvider?: Record<string, { tokens: number; cost: number; calls: number }>;
+  bySession?: Record<string, { tokens: number; cost: number; calls: number }>;
+  byTool?: Record<string, { tokens: number; cost: number; calls: number }>;
 }
 
 interface MemoryRecord {
@@ -97,6 +110,8 @@ interface MemoryRecord {
   tags: string[];
   createdAt: string;
   metadata?: Record<string, unknown>;
+  pinned?: boolean;
+  sizeBytes?: number;
   // Computed aliases for UI compatibility
   key: string;
   value: string;
@@ -157,7 +172,13 @@ interface PresetsResponse {
 }
 
 interface PersonasResponse {
-  personas: Array<{ name: string; active: boolean }>;
+  personas: Array<{ name: string; active: boolean; identity?: Record<string, unknown>; promptPreview?: string }>;
+}
+
+interface PersonaPreview {
+  name: string;
+  identity?: Record<string, unknown>;
+  promptPreview?: string;
 }
 
 interface ToolEntry {
@@ -192,10 +213,49 @@ interface Skill {
   triggers: string[];
   steps: string[];
   tools: string[];
+  matchReasons?: string[];
+  score?: number;
 }
 
 interface SkillsResponse {
   skills: BackendSkill[];
+}
+
+interface LearningDashboard {
+  drafts: Array<{
+    id: string;
+    slug?: string;
+    title: string;
+    summary: string;
+    triggerPhrases?: string[];
+    status: string;
+    recurrenceCount?: number;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  metrics: {
+    totalDrafts: number;
+    pendingDrafts: number;
+    publishedDrafts: number;
+    helpfulRatings?: number;
+    unhelpfulRatings?: number;
+  };
+}
+
+interface ConfigDiffEntry {
+  path?: string;
+  key?: string;
+  before?: unknown;
+  after?: unknown;
+  type?: string;
+}
+
+interface ConfigDiffResult {
+  changes?: ConfigDiffEntry[];
+  added?: ConfigDiffEntry[];
+  removed?: ConfigDiffEntry[];
+  modified?: ConfigDiffEntry[];
+  [key: string]: unknown;
 }
 
 type IdentityTab = 'personas' | 'toolsets';
@@ -590,6 +650,11 @@ export class SettingsView extends LitElement {
         cursor: pointer;
       }
 
+      .filter-row input {
+        min-width: 180px;
+        flex: 1;
+      }
+
       .filter-row select:focus {
         border-color: var(--accent);
       }
@@ -679,6 +744,29 @@ export class SettingsView extends LitElement {
         font-family: var(--font-mono);
         max-height: 300px;
         overflow-y: auto;
+      }
+
+      .mem-edit {
+        width: 100%;
+        min-height: 120px;
+        resize: vertical;
+      }
+
+      .compact-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: var(--sp-3);
+      }
+
+      .diff-box {
+        font-family: var(--font-mono);
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 220px;
+        overflow: auto;
+        padding: var(--sp-3);
       }
 
       /* Log output */
@@ -800,6 +888,9 @@ export class SettingsView extends LitElement {
   @state() private skills: Skill[] = [];
   @state() private skillsLoading = true;
   @state() private skillSearch = '';
+  @state() private skillMatchQuery = '';
+  @state() private skillMatches: Skill[] = [];
+  @state() private skillMatching = false;
   @state() private showSkillForm = false;
   @state() private showImportForm = false;
   @state() private editingSkillSlug: string | null = null;
@@ -820,9 +911,13 @@ export class SettingsView extends LitElement {
   @state() private securityEvents: SecurityEvent[] = [];
   @state() private secEventTypeFilter = '';
   @state() private secEventSeverityFilter = '';
+  @state() private secEventSearch = '';
 
   // Usage
   @state() private usageData: UsageData | null = null;
+
+  // Learning
+  @state() private learningDashboard: LearningDashboard | null = null;
 
   // System
   @state() private systemConfig: Record<string, string> = {};
@@ -849,7 +944,17 @@ export class SettingsView extends LitElement {
   @state() private memories: MemoryRecord[] = [];
   @state() private memorySearch = '';
   @state() private memoryScope = 'All';
+  @state() private memoryPinnedOnly = false;
   @state() private selectedMemoryId: string | null = null;
+  @state() private memoryEditDraft = '';
+
+  // Config previews
+  @state() private personaPreview: PersonaPreview | null = null;
+  @state() private providerTestSlot: string | null = null;
+  @state() private providerTestResults: Record<string, string> = {};
+  @state() private configDiffBefore = '';
+  @state() private configDiffAfter = '';
+  @state() private configDiffResult: ConfigDiffResult | null = null;
 
   /* ---------------------------------------------------------------- */
   /*  Lifecycle                                                       */
@@ -875,6 +980,7 @@ export class SettingsView extends LitElement {
       case 'agent':
         this._loadAgentConfig();
         this._loadProvidersConfig();
+        this._loadPersonaPreview();
         this._fetchPresets();
         this._fetchPersonas();
         this._fetchTools();
@@ -887,6 +993,7 @@ export class SettingsView extends LitElement {
         this._loadUsage();
         this._loadMemorySessions();
         this._loadFeedback();
+        this._loadLearningDashboard();
         break;
       case 'system':
         this._loadSystem();
@@ -921,10 +1028,18 @@ export class SettingsView extends LitElement {
 
   private async _loadProvidersConfig() {
     try {
-      const data = await api<ProvidersConfig>('/api/providers/config');
-      this.providersConfig = data;
+      const data = await api<{ slots?: ProvidersConfig; config?: ProvidersConfig | null }>('/api/providers/config');
+      this.providersConfig = data.slots ?? data.config ?? null;
     } catch {
       this.providersConfig = null;
+    }
+  }
+
+  private async _loadPersonaPreview() {
+    try {
+      this.personaPreview = await api<PersonaPreview>('/api/persona/active');
+    } catch {
+      this.personaPreview = null;
     }
   }
 
@@ -942,6 +1057,7 @@ export class SettingsView extends LitElement {
       const params = new URLSearchParams({ limit: '50' });
       if (this.secEventTypeFilter) params.set('type', this.secEventTypeFilter);
       if (this.secEventSeverityFilter) params.set('severity', this.secEventSeverityFilter);
+      if (this.secEventSearch) params.set('q', this.secEventSearch);
       const data = await api<{ events: SecurityEvent[] }>(
         `/api/security/events?${params.toString()}`,
       );
@@ -960,9 +1076,19 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _loadLearningDashboard() {
+    try {
+      this.learningDashboard = await api<LearningDashboard>('/api/learning/dashboard');
+    } catch {
+      this.learningDashboard = null;
+    }
+  }
+
   private async _loadSystem() {
     try {
       const data = await api<Record<string, unknown>>('/api/config/snapshot');
+      if (!this.configDiffBefore) this.configDiffBefore = JSON.stringify(data, null, 2);
+      if (!this.configDiffAfter) this.configDiffAfter = JSON.stringify(data, null, 2);
       // Capture active profile fields for the human-readable summary
       const presetName = data['activePresetName'];
       const toolsetName = data['activeToolsetName'];
@@ -1045,7 +1171,14 @@ export class SettingsView extends LitElement {
         key: r.tags?.[0] ?? r.id?.slice(0, 8) ?? 'memory',
         value: r.summary ?? '',
         timestamp: r.createdAt ?? '',
+        pinned: r.metadata?.pinned === true,
+        sizeBytes: typeof r.metadata?.sizeBytes === 'number'
+          ? r.metadata.sizeBytes
+          : new TextEncoder().encode(r.summary ?? '').length,
       }));
+      if (this.memoryPinnedOnly) {
+        records = records.filter((m) => m.pinned);
+      }
       // Client-side search filter
       if (this.memorySearch) {
         const term = this.memorySearch.toLowerCase();
@@ -1056,6 +1189,8 @@ export class SettingsView extends LitElement {
         );
       }
       this.memories = records;
+      const selected = this.memories.find((m) => m.id === this.selectedMemoryId);
+      if (selected) this.memoryEditDraft = selected.value;
     } catch {
       this.memories = [];
     }
@@ -1221,6 +1356,58 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _matchSkills() {
+    const query = this.skillMatchQuery.trim();
+    if (!query) {
+      this.skillMatches = [];
+      return;
+    }
+    this.skillMatching = true;
+    try {
+      const result = await api<unknown>('/api/learning/match', {
+        method: 'POST',
+        body: JSON.stringify({ query, limit: 5 }),
+      });
+      const matches = Array.isArray(result)
+        ? result
+        : Array.isArray((result as { matches?: unknown[] }).matches)
+          ? (result as { matches: unknown[] }).matches
+          : Array.isArray((result as { skills?: unknown[] }).skills)
+            ? (result as { skills: unknown[] }).skills
+            : [];
+      this.skillMatches = matches.map((item) => {
+        const raw = item as Record<string, unknown>;
+        const skill = (raw.skill && typeof raw.skill === 'object' ? raw.skill : raw) as Record<string, unknown>;
+        const slug = String(skill.slug ?? skill.name ?? skill.title ?? 'match');
+        return {
+          slug,
+          title: String(skill.title ?? skill.name ?? slug),
+          summary: String(skill.summary ?? skill.description ?? ''),
+          triggers: Array.isArray(skill.triggerPhrases)
+            ? skill.triggerPhrases as string[]
+            : Array.isArray(skill.triggers)
+              ? skill.triggers as string[]
+              : [],
+          steps: [],
+          tools: Array.isArray(skill.requiredTools) ? skill.requiredTools as string[] : [],
+          matchReasons: Array.isArray(raw.reasons)
+            ? raw.reasons as string[]
+            : Array.isArray(raw.matchReasons)
+              ? raw.matchReasons as string[]
+              : typeof raw.reason === 'string'
+                ? [raw.reason]
+                : [],
+          score: typeof raw.score === 'number' ? raw.score : undefined,
+        };
+      });
+    } catch {
+      this.skillMatches = [];
+      showToast('Failed to match skills', 'error');
+    } finally {
+      this.skillMatching = false;
+    }
+  }
+
   private _editSkill(skill: Skill) {
     this.editingSkillSlug = skill.slug;
     this.formTitle = skill.title;
@@ -1350,6 +1537,15 @@ export class SettingsView extends LitElement {
     return this.identityTab === 'personas' ? this.personasLoading : this.presetsLoading;
   }
 
+  private get _providerSlots(): Array<[string, ProviderSlot]> {
+    const source = this.providersConfig?.slots ?? this.providersConfig?.config ?? this.providersConfig ?? {};
+    return Object.entries(source as Record<string, ProviderSlot | null | undefined>)
+      .filter((entry): entry is [string, ProviderSlot] => {
+        const slot = entry[1];
+        return !!slot && typeof slot === 'object' && slot.provider !== 'none' && !!slot.model;
+      });
+  }
+
   /* ---------------------------------------------------------------- */
   /*  Actions                                                         */
   /* ---------------------------------------------------------------- */
@@ -1464,6 +1660,72 @@ export class SettingsView extends LitElement {
     }
   }
 
+  private async _saveMemory(memory: MemoryRecord) {
+    const summary = this.memoryEditDraft.trim();
+    if (!summary) return;
+    try {
+      await api(`/api/memories/${encodeURIComponent(memory.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          summary,
+          tags: memory.tags,
+          metadata: memory.metadata ?? {},
+        }),
+      });
+      await this._loadMemories();
+      showToast('Memory updated.', 'success');
+    } catch {
+      showToast('Failed to update memory.', 'error');
+    }
+  }
+
+  private async _toggleMemoryPin(memory: MemoryRecord) {
+    try {
+      await api(`/api/memories/${encodeURIComponent(memory.id)}/pin`, {
+        method: 'POST',
+        body: JSON.stringify({ pinned: !memory.pinned }),
+      });
+      await this._loadMemories();
+    } catch {
+      showToast('Failed to update pin.', 'error');
+    }
+  }
+
+  private async _testProviderSlot(slot: string, provider: ProviderSlot) {
+    this.providerTestSlot = slot;
+    try {
+      const result = await api<{ ok: boolean; error?: string; response?: string }>('/api/providers/test', {
+        method: 'POST',
+        body: JSON.stringify({ slot, provider: provider.provider, model: provider.model }),
+      });
+      this.providerTestResults = {
+        ...this.providerTestResults,
+        [slot]: result.ok ? (result.response ?? 'ok') : (result.error ?? 'failed'),
+      };
+    } catch (error: unknown) {
+      this.providerTestResults = {
+        ...this.providerTestResults,
+        [slot]: error instanceof Error ? error.message : 'failed',
+      };
+    } finally {
+      this.providerTestSlot = null;
+    }
+  }
+
+  private async _previewConfigDiff() {
+    try {
+      const before = JSON.parse(this.configDiffBefore || '{}') as Record<string, unknown>;
+      const after = JSON.parse(this.configDiffAfter || '{}') as Record<string, unknown>;
+      this.configDiffResult = await api<ConfigDiffResult>('/api/config/diff', {
+        method: 'POST',
+        body: JSON.stringify({ before, after }),
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof SyntaxError ? 'Config diff JSON is invalid.' : 'Failed to preview config diff.';
+      showToast(msg, 'error');
+    }
+  }
+
   /* ---------------------------------------------------------------- */
   /*  Tab switching                                                   */
   /* ---------------------------------------------------------------- */
@@ -1539,6 +1801,7 @@ export class SettingsView extends LitElement {
     return html`
       ${this._renderUsage()}
       ${this._renderMemory()}
+      ${this._renderLearningDashboard()}
       ${this._renderFeedback()}
     `;
   }
@@ -1767,7 +2030,54 @@ export class SettingsView extends LitElement {
         </div>
       </div>
 
+      ${this._renderProviderSlotsPreview()}
       ${this._renderIdentitySection()}
+    `;
+  }
+
+  private _renderProviderSlotsPreview() {
+    const slots = this._providerSlots;
+    return html`
+      <div class="section-block">
+        <div class="actions-row">
+          <div class="section-header" style="border:none;padding:0;margin:0">Provider Slots</div>
+          <a href="#connect" style="font-size:var(--text-xs)">Edit in Connect</a>
+        </div>
+        ${slots.length === 0
+          ? html`<div class="status-msg" style="color:var(--text-muted)">No provider slots configured.</div>`
+          : html`
+              <div class="compact-grid">
+                ${slots.map(([slot, provider]) => html`
+                  <div class="sub-card" style="padding:var(--sp-3)">
+                    <div class="kv">
+                      <span class="kv-k">${slot}</span>
+                      <span class="kv-v">${provider.provider ?? '--'}</span>
+                    </div>
+                    <div class="kv">
+                      <span class="kv-k">Model</span>
+                      <span class="kv-v">${provider.model ?? '--'}</span>
+                    </div>
+                    <div class="kv">
+                      <span class="kv-k">Key</span>
+                      <span class="kv-v">${provider.apiKey ? 'configured' : 'missing'}</span>
+                    </div>
+                    ${this.providerTestResults[slot]
+                      ? html`<div class="status-msg">${this.providerTestResults[slot]}</div>`
+                      : nothing}
+                    <div class="form-actions">
+                      <button
+                        class="btn"
+                        ?disabled=${this.providerTestSlot === slot}
+                        @click=${() => this._testProviderSlot(slot, provider)}
+                      >
+                        ${this.providerTestSlot === slot ? 'Testing...' : 'Test'}
+                      </button>
+                    </div>
+                  </div>
+                `)}
+              </div>
+            `}
+      </div>
     `;
   }
 
@@ -1804,6 +2114,7 @@ export class SettingsView extends LitElement {
   }
 
   private _renderPersonasPanel() {
+    const preview = this.personaPreview;
     if (this.personas.length === 0) {
       return html`<crowclaw-empty
         icon="memory"
@@ -1814,6 +2125,22 @@ export class SettingsView extends LitElement {
       ></crowclaw-empty>`;
     }
     return html`
+      ${preview
+        ? html`
+            <div class="sub-card" style="padding:var(--sp-3);margin-bottom:var(--sp-3)">
+              <div class="kv">
+                <span class="kv-k">Active persona preview</span>
+                <span class="kv-v">${preview.name}</span>
+              </div>
+              ${preview.identity
+                ? html`<div class="diff-box">${JSON.stringify(preview.identity, null, 2)}</div>`
+                : nothing}
+              ${preview.promptPreview
+                ? html`<div class="mem-detail-body" style="max-height:160px">${preview.promptPreview}</div>`
+                : nothing}
+            </div>
+          `
+        : nothing}
       <div class="grid">
         ${this.personas.map((p) => this._renderPresetCard(p))}
       </div>
@@ -1900,6 +2227,34 @@ export class SettingsView extends LitElement {
       <div class="section-block">
         <div class="section-header">Skills</div>
         <p class="hint">Reusable skill definitions that map trigger phrases to tool execution steps.</p>
+
+        <div class="sub-card" style="padding:var(--sp-3)">
+          <div class="filter-row" style="margin-bottom:0">
+            <input
+              class="srch"
+              type="text"
+              placeholder="Test skill matching reasons..."
+              aria-label="Test skill matching reasons"
+              .value=${this.skillMatchQuery}
+              @input=${(e: InputEvent) => { this.skillMatchQuery = (e.target as HTMLInputElement).value; }}
+            />
+            <button class="btn" ?disabled=${this.skillMatching} @click=${this._matchSkills}>
+              ${this.skillMatching ? 'Matching...' : 'Match'}
+            </button>
+          </div>
+          ${this.skillMatches.length > 0
+            ? html`
+                <div style="display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-3)">
+                  ${this.skillMatches.map((m) => html`
+                    <div class="kv">
+                      <span class="kv-k">${m.title}</span>
+                      <span class="kv-v">${m.matchReasons?.join('; ') || (m.score == null ? 'matched' : `score ${m.score}`)}</span>
+                    </div>
+                  `)}
+                </div>
+              `
+            : nothing}
+        </div>
 
         <div class="filter-row">
           <input class="srch"
@@ -2127,10 +2482,11 @@ export class SettingsView extends LitElement {
                             title="SSRF protection is enforced at the code level and cannot be disabled at runtime."
                             aria-label="SSRF protection is enforced at the code level and cannot be disabled at runtime."
                           >Always on (enforced)</span>`
-                        : html`<label class="switch">
+                        : html`<label class="switch" title=${p.description ?? `${p.name} protection`}>
                             <input
                               type="checkbox"
                               .checked=${p.enabled}
+                              aria-label="${p.name}: ${p.description ?? 'security protection'}"
                               @change=${(e: Event) =>
                                 this._toggleProtection(
                                   p.key,
@@ -2155,6 +2511,17 @@ export class SettingsView extends LitElement {
         </div>
 
         <div class="filter-row">
+          <input
+            class="srch"
+            type="text"
+            placeholder="Search event detail..."
+            aria-label="Search security audit log"
+            .value=${this.secEventSearch}
+            @input=${(e: InputEvent) => {
+              this.secEventSearch = (e.target as HTMLInputElement).value;
+              this._loadSecurityEvents();
+            }}
+          />
           <select
             aria-label="Filter events by type"
             @change=${(e: Event) => {
@@ -2262,38 +2629,21 @@ export class SettingsView extends LitElement {
 
               <!-- Per-model breakdown -->
               <div class="sec-h">Per-Model Breakdown</div>
-              ${Object.keys(usage.byModel).length > 0
-                ? html`
-                    <div class="sub-card" style="overflow-x:auto;margin-bottom:var(--sp-5)">
-                      <table class="data-table">
-                        <thead>
-                          <tr>
-                            <th>Model</th>
-                            <th>Tokens</th>
-                            <th>Cost</th>
-                            <th>Calls</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          ${Object.entries(usage.byModel).map(
-                            ([model, stats]) => html`
-                              <tr>
-                                <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
-                                  ${model}
-                                </td>
-                                <td>${formatTokens(stats.tokens)}</td>
-                                <td>${formatCost(stats.cost)}</td>
-                                <td>${stats.calls}</td>
-                              </tr>
-                            `,
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  `
-                : html`<div class="status-msg" style="color:var(--text-muted)">
-                    No model data yet.
-                  </div>`}
+              ${this._renderUsageBreakdown('Model', usage.byModel)}
+              <div class="compact-grid">
+                <div>
+                  <div class="sec-h">Per-Provider Breakdown</div>
+                  ${this._renderUsageBreakdown('Provider', usage.byProvider ?? this._groupUsageEntries('provider'))}
+                </div>
+                <div>
+                  <div class="sec-h">Per-Session Breakdown</div>
+                  ${this._renderUsageBreakdown('Session', usage.bySession ?? this._groupUsageEntries('sessionId'))}
+                </div>
+                <div>
+                  <div class="sec-h">Per-Tool Breakdown</div>
+                  ${this._renderUsageBreakdown('Tool', usage.byTool ?? this._groupUsageEntries('toolName'))}
+                </div>
+              </div>
 
               <!-- Recent entries -->
               <div class="sec-h">Recent Entries</div>
@@ -2304,6 +2654,9 @@ export class SettingsView extends LitElement {
                         <thead>
                           <tr>
                             <th>Time</th>
+                            <th>Session</th>
+                            <th>Tool</th>
+                            <th>Provider</th>
                             <th>Model</th>
                             <th>Input</th>
                             <th>Output</th>
@@ -2319,6 +2672,13 @@ export class SettingsView extends LitElement {
                                 <td style="white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs)">
                                   ${formatTime(e.timestamp)}
                                 </td>
+                                <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                                  ${e.sessionId ?? '--'}
+                                </td>
+                                <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                                  ${e.toolName ?? '--'}
+                                </td>
+                                <td>${e.provider}</td>
                                 <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
                                   ${e.model}
                                 </td>
@@ -2344,6 +2704,119 @@ export class SettingsView extends LitElement {
                   ></crowclaw-empty>`}
             `
           : html`<div class="status-msg">Loading usage data...</div>`}
+      </div>
+    `;
+  }
+
+  private _groupUsageEntries(key: 'provider' | 'sessionId' | 'toolName'): Record<string, { tokens: number; cost: number; calls: number }> {
+    const out: Record<string, { tokens: number; cost: number; calls: number }> = {};
+    for (const entry of this.usageData?.entries ?? []) {
+      const label = entry[key] || 'unattributed';
+      const current = out[label] ?? { tokens: 0, cost: 0, calls: 0 };
+      current.tokens += entry.totalTokens;
+      current.cost += entry.costUsd;
+      current.calls += 1;
+      out[label] = current;
+    }
+    return out;
+  }
+
+  private _renderUsageBreakdown(label: string, rows: Record<string, { tokens: number; cost: number; calls: number }>) {
+    const entries = Object.entries(rows);
+    if (entries.length === 0) {
+      return html`<div class="status-msg" style="color:var(--text-muted)">No ${label.toLowerCase()} data yet.</div>`;
+    }
+    return html`
+      <div class="sub-card" style="overflow-x:auto;margin-bottom:var(--sp-5)">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>${label}</th>
+              <th>Tokens</th>
+              <th>Cost</th>
+              <th>Calls</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${entries.map(
+              ([name, stats]) => html`
+                <tr>
+                  <td style="font-family:var(--font-mono);font-size:var(--text-xs)">${name}</td>
+                  <td>${formatTokens(stats.tokens)}</td>
+                  <td>${formatCost(stats.cost)}</td>
+                  <td>${stats.calls}</td>
+                </tr>
+              `,
+            )}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  private _renderLearningDashboard() {
+    const learning = this.learningDashboard;
+    return html`
+      <div class="section-block">
+        <div class="actions-row">
+          <div class="section-header" style="border:none;padding:0;margin:0">Learning Loop</div>
+          <button class="btn" @click=${this._loadLearningDashboard}>Refresh</button>
+        </div>
+        ${learning
+          ? html`
+              <div class="summary-row">
+                <div class="summary-card">
+                  <div class="label">Drafts</div>
+                  <div class="value">${learning.metrics.totalDrafts}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Pending</div>
+                  <div class="value">${learning.metrics.pendingDrafts}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Published</div>
+                  <div class="value">${learning.metrics.publishedDrafts}</div>
+                </div>
+                <div class="summary-card">
+                  <div class="label">Ratings</div>
+                  <div class="value">${learning.metrics.helpfulRatings ?? 0}/${learning.metrics.unhelpfulRatings ?? 0}</div>
+                </div>
+              </div>
+              ${learning.drafts.length > 0
+                ? html`
+                    <div class="sub-card" style="overflow-x:auto">
+                      <table class="data-table">
+                        <thead>
+                          <tr>
+                            <th>Draft</th>
+                            <th>Status</th>
+                            <th>Triggers</th>
+                            <th>Updated</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${learning.drafts.slice(0, 10).map((draft) => html`
+                            <tr>
+                              <td>
+                                <div style="font-weight:600">${draft.title}</div>
+                                <div style="font-size:var(--text-xs);color:var(--text-muted)">${draft.summary}</div>
+                              </td>
+                              <td><span class="tag">${draft.status}</span></td>
+                              <td>${(draft.triggerPhrases ?? []).slice(0, 3).join(', ') || '--'}</td>
+                              <td>${formatTime(draft.updatedAt)}</td>
+                            </tr>
+                          `)}
+                        </tbody>
+                      </table>
+                    </div>
+                  `
+                : html`<crowclaw-empty
+                    icon="skills"
+                    title="No learning drafts"
+                    description="Draft skill suggestions appear here after repeated useful patterns are captured."
+                  ></crowclaw-empty>`}
+            `
+          : html`<div class="status-msg">Loading learning metrics...</div>`}
       </div>
     `;
   }
@@ -2389,8 +2862,43 @@ export class SettingsView extends LitElement {
             </div>`}
       </div>
 
+      ${this._renderConfigDiff()}
       ${this._renderRemoteAccess()}
       ${this._renderDiagnostics()}
+    `;
+  }
+
+  private _renderConfigDiff() {
+    return html`
+      <div class="section-block">
+        <div class="section-header">Config Diff</div>
+        <div class="compact-grid">
+          <div class="form-group">
+            <label class="form-label">Before JSON</label>
+            <textarea
+              class="form-input"
+              rows="8"
+              .value=${this.configDiffBefore}
+              @input=${(e: InputEvent) => { this.configDiffBefore = (e.target as HTMLTextAreaElement).value; }}
+            ></textarea>
+          </div>
+          <div class="form-group">
+            <label class="form-label">After JSON</label>
+            <textarea
+              class="form-input"
+              rows="8"
+              .value=${this.configDiffAfter}
+              @input=${(e: InputEvent) => { this.configDiffAfter = (e.target as HTMLTextAreaElement).value; }}
+            ></textarea>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn" @click=${this._previewConfigDiff}>Preview Diff</button>
+        </div>
+        ${this.configDiffResult
+          ? html`<div class="sub-card diff-box">${JSON.stringify(this.configDiffResult, null, 2)}</div>`
+          : nothing}
+      </div>
     `;
   }
 
@@ -2563,6 +3071,15 @@ export class SettingsView extends LitElement {
                     </button>
                   `,
                 )}
+                <button
+                  class="scope-btn ${this.memoryPinnedOnly ? 'active' : ''}"
+                  @click=${() => {
+                    this.memoryPinnedOnly = !this.memoryPinnedOnly;
+                    this._loadMemories();
+                  }}
+                >
+                  Pinned only
+                </button>
               </div>
 
               ${this.memories.length > 0
@@ -2573,14 +3090,17 @@ export class SettingsView extends LitElement {
                           <div
                             class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
                             @click=${() => {
-                              this.selectedMemoryId =
-                                this.selectedMemoryId === m.id ? null : m.id;
+                              const next = this.selectedMemoryId === m.id ? null : m.id;
+                              this.selectedMemoryId = next;
+                              this.memoryEditDraft = next ? m.value : '';
                             }}
                           >
                             <div class="mem-header">
                               <span class="mem-key">${m.key}</span>
                               <div class="mem-meta">
+                                ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
                                 <span class="tag">${m.scope}</span>
+                                <span class="tag">${m.sizeBytes ?? 0}b</span>
                                 <span style="font-size:var(--text-xs);color:var(--text-muted)">
                                   ${formatTime(m.timestamp)}
                                 </span>
@@ -2601,15 +3121,32 @@ export class SettingsView extends LitElement {
                           <div class="mem-detail">
                             <div class="mem-detail-header">
                               <span class="mem-detail-key">${selected.key}</span>
-                              <button
-                                class="btn btn-danger"
-                                aria-label="Delete memory record"
-                                @click=${() => this._deleteMemory(selected.id)}
-                              >
-                                Delete
-                              </button>
+                              <div style="display:flex;gap:var(--sp-2)">
+                                <button class="btn" @click=${() => this._toggleMemoryPin(selected)}>
+                                  ${selected.pinned ? 'Unpin' : 'Pin'}
+                                </button>
+                                <button
+                                  class="btn btn-danger"
+                                  aria-label="Delete memory record"
+                                  @click=${() => this._deleteMemory(selected.id)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
                             </div>
-                            <div class="mem-detail-body">${selected.value}</div>
+                            <textarea
+                              class="form-input mem-edit"
+                              aria-label="Edit memory summary"
+                              .value=${this.memoryEditDraft || selected.value}
+                              @input=${(e: InputEvent) => { this.memoryEditDraft = (e.target as HTMLTextAreaElement).value; }}
+                            ></textarea>
+                            <div class="kv" style="margin-top:var(--sp-3)">
+                              <span class="kv-k">Metadata</span>
+                              <span class="kv-v">${JSON.stringify(selected.metadata ?? {})}</span>
+                            </div>
+                            <div class="form-actions">
+                              <button class="btn btn-p" @click=${() => this._saveMemory(selected)}>Save Memory</button>
+                            </div>
                           </div>
                         `
                       : nothing}

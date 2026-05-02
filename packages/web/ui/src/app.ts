@@ -502,6 +502,16 @@ export class CrowClawApp extends LitElement {
         gap: var(--sp-2);
       }
 
+      .header-select {
+        height: 28px;
+        border: 1px solid var(--glass-border);
+        background: var(--bg-input);
+        color: var(--text-primary);
+        border-radius: var(--radius-sm);
+        padding: 0 var(--sp-2);
+        font-size: var(--text-xs);
+      }
+
       .mh {
         padding: var(--sp-5) var(--sp-8) 0;
         flex-shrink: 0;
@@ -740,6 +750,10 @@ export class CrowClawApp extends LitElement {
   @state() private activeSessions: ActiveSession[] = [];
   @state() private instanceVersion = '';
   @state() private instanceRuntime = '';
+  @state() private themeMode: 'light' | 'dark' | 'system' = 'system';
+  @state() private localeMode: 'en' | 'ko' = 'en';
+  @state() private releaseLatest: string | null = null;
+  @state() private releaseOutdated = false;
   /** Latest snapshot from /api/system/status. Drives onboarding + demo badge. */
   @state() private systemStatus: SystemStatus | null = null;
   /** True when no real provider is configured — gates the onboarding view. */
@@ -767,6 +781,10 @@ export class CrowClawApp extends LitElement {
   private _commandPaletteHandle: CommandPaletteHandle | null = null;
   /** True after firstUpdated has run once — guards against double registration. */
   private _commandPaletteRegistered = false;
+  private _systemThemeQuery: MediaQueryList | null = null;
+  private _systemThemeHandler = () => {
+    if (this.themeMode === 'system') this._applyTheme();
+  };
 
   private _authRequiredHandler = () => {
     this.authenticated = false;
@@ -918,6 +936,7 @@ export class CrowClawApp extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    this._restorePreferences();
     // Restore view from hash. Legacy `#agent` bookmarks rewrite to `#settings`
     // (the Agent surface was merged into Settings → Agent in v0.8.1 / #246).
     const raw = location.hash.slice(1);
@@ -947,7 +966,41 @@ export class CrowClawApp extends LitElement {
     window.addEventListener('crowclaw:cmdk-action', this._cmdkActionHandler);
     window.addEventListener('crowclaw:open-shortcut-help', this._shortcutHelpOpenHandler);
     window.addEventListener('crowclaw:close-shortcut-help', this._shortcutHelpCloseHandler);
+    this._systemThemeQuery = window.matchMedia?.('(prefers-color-scheme: dark)') ?? null;
+    this._systemThemeQuery?.addEventListener('change', this._systemThemeHandler);
     this._checkAuth();
+  }
+
+  private _restorePreferences() {
+    const storedTheme = localStorage.getItem('crowclaw:theme');
+    this.themeMode = storedTheme === 'light' || storedTheme === 'dark' || storedTheme === 'system'
+      ? storedTheme
+      : 'system';
+    const storedLocale = localStorage.getItem('crowclaw:locale');
+    this.localeMode = storedLocale === 'ko' || storedLocale === 'en'
+      ? storedLocale
+      : (navigator.language?.toLowerCase().startsWith('ko') ? 'ko' : 'en');
+    this._applyTheme();
+    document.documentElement.lang = this.localeMode;
+  }
+
+  private _applyTheme() {
+    const systemDark = window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? true;
+    const resolved = this.themeMode === 'system' ? (systemDark ? 'dark' : 'light') : this.themeMode;
+    document.documentElement.dataset.theme = resolved;
+  }
+
+  private _setTheme(mode: 'light' | 'dark' | 'system') {
+    this.themeMode = mode;
+    localStorage.setItem('crowclaw:theme', mode);
+    this._applyTheme();
+  }
+
+  private _setLocale(locale: 'en' | 'ko') {
+    this.localeMode = locale;
+    localStorage.setItem('crowclaw:locale', locale);
+    document.documentElement.lang = locale;
+    window.dispatchEvent(new CustomEvent('crowclaw:locale-change', { detail: { locale } }));
   }
 
   /**
@@ -1007,6 +1060,8 @@ export class CrowClawApp extends LitElement {
     window.removeEventListener('crowclaw:cmdk-action', this._cmdkActionHandler);
     window.removeEventListener('crowclaw:open-shortcut-help', this._shortcutHelpOpenHandler);
     window.removeEventListener('crowclaw:close-shortcut-help', this._shortcutHelpCloseHandler);
+    this._systemThemeQuery?.removeEventListener('change', this._systemThemeHandler);
+    this._systemThemeQuery = null;
     if (this._commandPaletteHandle) {
       this._commandPaletteHandle.dispose();
       this._commandPaletteHandle = null;
@@ -1152,6 +1207,11 @@ export class CrowClawApp extends LitElement {
     try {
       const tools = await api<{ tools: unknown[] }>('/api/tools');
       this.toolCount = tools.tools?.length ?? 0;
+    } catch { /* non-critical */ }
+    try {
+      const release = await api<{ current?: string; latest?: string | null; isOutdated?: boolean }>('/api/system/release-check');
+      this.releaseLatest = release.latest ?? null;
+      this.releaseOutdated = Boolean(release.isOutdated);
     } catch { /* non-critical */ }
 
     // v0.7.0: pull system status to decide onboarding + demo-mode flags. The
@@ -1378,12 +1438,35 @@ export class CrowClawApp extends LitElement {
                          the property and let it self-hide. -->
                     <crowclaw-demo-badge .active=${this.demoMode}></crowclaw-demo-badge>
 
-                    <!-- TODO(persona/theme): existing persona pill + theme
-                         toggle slot in here once their components land. -->
+                    <select
+                      class="header-select"
+                      aria-label="Language"
+                      .value=${this.localeMode}
+                      @change=${(e: Event) => this._setLocale((e.target as HTMLSelectElement).value as 'en' | 'ko')}
+                    >
+                      <option value="en">EN</option>
+                      <option value="ko">KO</option>
+                    </select>
+                    <select
+                      class="header-select"
+                      aria-label="Theme"
+                      .value=${this.themeMode}
+                      @change=${(e: Event) => this._setTheme((e.target as HTMLSelectElement).value as 'light' | 'dark' | 'system')}
+                    >
+                      <option value="system">System</option>
+                      <option value="dark">Dark</option>
+                      <option value="light">Light</option>
+                    </select>
                   </div>
                 </header>
 
                 <div class="banner-stack">
+                  ${this.releaseOutdated && this.releaseLatest ? html`
+                    <div class="banner warn" role="status" aria-live="polite">
+                      <span class="banner-msg">CrowClaw v${this.releaseLatest} is available. Running v${this.instanceVersion || 'unknown'}.</span>
+                      <a class="banner-btn" href="https://github.com/subinium/CrowClaw/releases" target="_blank" rel="noreferrer">Changelog</a>
+                    </div>
+                  ` : nothing}
                   ${this.transportFallback ? html`
                     <div class="banner warn" role="status" aria-live="polite">
                       <span class="banner-msg">
