@@ -86,7 +86,7 @@ export interface AgentBootstrapContext {
   setActiveUsageSessionId: (sessionId: string | null) => void;
 }
 
-function isInProgressCheckpoint(checkpoint: SessionCheckpoint): boolean {
+export function isInProgressCheckpoint(checkpoint: SessionCheckpoint): boolean {
   const metadata = checkpoint.metadata as SessionCheckpoint['metadata'] & { status?: string; checkpointStatus?: string };
   return metadata.status === 'in_progress' ||
     metadata.checkpointStatus === 'in_progress' ||
@@ -305,7 +305,7 @@ export function createAgentBootstrap(ctx: AgentBootstrapContext) {
     const restored = restoreFromCheckpoint(checkpoint, session);
     await ctx.store.put(restored.session);
     ctx.autoResumedCheckpointIds.add(checkpoint.id);
-    ctx.eventBus.emit('session:updated', {
+    ctx.eventBus.emit('session:resumed', {
       sessionId,
       action: 'checkpoint:auto-resume',
       checkpointId: checkpoint.id,
@@ -323,6 +323,8 @@ export function createAgentBootstrap(ctx: AgentBootstrapContext) {
     locale?: SupportedLocale;
   }, overrides?: ExecutionOverrides) {
     let memories: string[] = [];
+    const contextAssembleStartedAt = performance.now();
+    ctx.eventBus.emit('context:assemble_start', { sessionId: input.sessionId });
     await ctx.contextEngineReady;
     await ctx.frozenMemoryReady;
     await autoResumeFromInProgressCheckpoint(input.sessionId);
@@ -375,6 +377,11 @@ export function createAgentBootstrap(ctx: AgentBootstrapContext) {
     if (feedbackDigest) {
       memories.push(feedbackDigest);
     }
+    ctx.eventBus.emit('context:assemble_end', {
+      sessionId: input.sessionId,
+      memoryCount: memories.length,
+      durationMs: Math.round(performance.now() - contextAssembleStartedAt),
+    });
 
     const providerCfg = ctx.configStore.getProviderConfig();
     if (providerCfg?.fast && !overrides?.model) {

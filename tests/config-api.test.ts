@@ -75,6 +75,30 @@ describe('Configuration API', () => {
       expect(data.configured).toBe(true);
     });
 
+    it('persists gateway endpoint policy fields through config and policy routes', async () => {
+      const configRes = await req('POST', '/api/gateway/discord/config', {
+        enabled: true,
+        webhookUrl: 'https://discord.com/api/webhooks/123/token',
+        policyTier: 'restricted',
+        allowedEndpoints: ['/api/webhooks/*'],
+      });
+      expect((await configRes.json() as { ok: boolean }).ok).toBe(true);
+
+      const policyRes = await req('POST', '/api/gateway/discord/policy', {
+        dmPolicy: 'open',
+        policyTier: 'balanced',
+        allowedEndpoints: ['https://discord.com/api/webhooks/*'],
+      });
+      const policy = await policyRes.json() as {
+        ok: boolean;
+        policy: { policyTier?: string; allowedEndpoints?: string[]; extra?: Record<string, string> };
+      };
+      expect(policy.ok).toBe(true);
+      expect(policy.policy.policyTier).toBe('balanced');
+      expect(policy.policy.allowedEndpoints).toEqual(['https://discord.com/api/webhooks/*']);
+      expect(policy.policy.extra?.webhookUrl).toBe('https://discord.com/api/webhooks/123/token');
+    });
+
     it('rotates webhook secrets without exposing old secret', async () => {
       await req('POST', '/api/gateway/slack/config', { webhookSecret: 'old-secret', enabled: true });
 

@@ -252,6 +252,8 @@ export interface NodeRuntimeOptions {
   trustProxy?: boolean;
   /** Enable optional OpenTelemetry bridge when @opentelemetry/api is installed. */
   otel?: boolean;
+  /** Expose Prometheus scrape endpoint at /api/metrics. Default: false. */
+  prometheusMetrics?: boolean;
 }
 
 export function summarizeDirectTools(bridgeProcesses: Map<string, BridgeProcessRecord>) {

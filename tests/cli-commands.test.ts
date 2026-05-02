@@ -130,6 +130,12 @@ describe('CLI subcommand parsing', () => {
     expect(parsed.continueSession).toBe(true);
   });
 
+  it('--no-resume parses as a global runtime override', () => {
+    const parsed = parseCliArgs(['serve', '--no-resume']);
+    expect(parsed.command).toBe('serve');
+    expect(parsed.noResume).toBe(true);
+  });
+
   it('"migrate --dry-run" parses as migrate import', () => {
     const parsed = parseCliArgs(['migrate', '--dry-run', '--only', 'skills']);
     expect(parsed.command).toBe('migrate');
@@ -161,6 +167,7 @@ describe('CLI help output', () => {
     const help = renderCliHelp();
     expect(help).toContain('-q');
     expect(help).toContain('--no-onboarding');
+    expect(help).toContain('--no-resume');
     expect(help).toContain('--port');
   });
 

@@ -81,6 +81,8 @@ export interface GatewayPlatformConfig {
   token?: string;
   webhookSecret?: string;
   extra?: Record<string, string>;
+  policyTier?: 'restricted' | 'balanced' | 'open';
+  allowedEndpoints?: string[];
   // Access policy (OpenClaw-inspired)
   dmPolicy?: 'pairing' | 'allowlist' | 'open' | 'disabled';
   groupPolicy?: 'open' | 'disabled' | 'allowlist';

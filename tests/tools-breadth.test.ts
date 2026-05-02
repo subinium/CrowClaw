@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ToolRegistry, createClarifyTool, createImageGenerateTool, createSendMessageTool, createSkillPreviewTool, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '@crowclaw/tools';
+import { ToolRegistry, createClarifyTool, createDefaultWorkerRegistry, createImageGenerateTool, createSendMessageTool, createSkillPreviewTool, createTerminalSession, createTextPatchTool, createTodoTool, createVisionAnalyzeTool, createWebCrawlTool, createWebExtractTextTool, createWebFetchTool, createWebSearchTool, createTerminalExecTool, createTerminalBackgroundTool, createTerminalBackendsTool, createTerminalBackendStatusTool, createTerminalProbeTool, createTerminalProcessesTool, createTerminalKillTool } from '../packages/tools/src/index.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -374,14 +374,15 @@ describe('tool breadth extensions', () => {
   });
 
   it('supports local terminal exec/background/processes/kill foundations', async () => {
+    const terminalSession = createTerminalSession();
     const registry = new ToolRegistry()
       .register(createTerminalExecTool())
-      .register(createTerminalBackgroundTool())
+      .register(createTerminalBackgroundTool({ terminalSession }))
       .register(createTerminalBackendsTool())
       .register(createTerminalBackendStatusTool())
       .register(createTerminalProbeTool())
-      .register(createTerminalProcessesTool())
-      .register(createTerminalKillTool());
+      .register(createTerminalProcessesTool({ terminalSession }))
+      .register(createTerminalKillTool({ terminalSession }));
 
     const backends = await registry.execute('terminal.backends', {}, {
       agentId: 'crowclaw',
@@ -468,11 +469,12 @@ describe('tool breadth extensions', () => {
     expect(kill.output).toContain('"killed"');
   });
 
-  it('isolates terminal background process tracking by session', async () => {
+  it('shares terminal background process tracking through an explicit terminal session', async () => {
+    const terminalSession = createTerminalSession();
     const registry = new ToolRegistry()
-      .register(createTerminalBackgroundTool())
-      .register(createTerminalProcessesTool())
-      .register(createTerminalKillTool());
+      .register(createTerminalBackgroundTool({ terminalSession }))
+      .register(createTerminalProcessesTool({ terminalSession }))
+      .register(createTerminalKillTool({ terminalSession }));
 
     const started = await registry.execute('terminal.background', { command: 'sleep 5', __approvalGranted: true }, {
       agentId: 'crowclaw',
@@ -487,16 +489,37 @@ describe('tool breadth extensions', () => {
     });
     expect(sameSession.output).toContain(String(payload.pid));
 
-    const otherSession = await registry.execute('terminal.processes', {}, {
+    const otherContext = await registry.execute('terminal.processes', {}, {
       agentId: 'crowclaw',
-      sessionId: 'term-isolated-b'
+      sessionId: 'term-session-b'
     });
-    expect(otherSession.output).not.toContain(String(payload.pid));
+    expect(otherContext.output).toContain(String(payload.pid));
 
     await registry.execute('terminal.kill', { pid: payload.pid }, {
       agentId: 'crowclaw',
       sessionId: 'term-isolated-a'
     });
+  });
+
+  it('does not share terminal background process state across default registries', async () => {
+    const registryA = createDefaultWorkerRegistry();
+    const registryB = createDefaultWorkerRegistry();
+    const context = {
+      agentId: 'crowclaw',
+      sessionId: 'term-default-registry-isolation',
+    };
+
+    const started = await registryA.execute('terminal.background', { command: 'sleep 5', __approvalGranted: true }, context);
+    expect(started.ok).toBe(true);
+    const payload = JSON.parse(started.output) as { pid: number };
+
+    const registryAProcesses = await registryA.execute('terminal.processes', {}, context);
+    expect(registryAProcesses.output).toContain(String(payload.pid));
+
+    const registryBProcesses = await registryB.execute('terminal.processes', {}, context);
+    expect(registryBProcesses.output).not.toContain(String(payload.pid));
+
+    await registryA.execute('terminal.kill', { pid: payload.pid }, context);
   });
 
   it('previews skill manifests without installing or executing them', async () => {

@@ -2,6 +2,7 @@ import {
   buildGatewaySessionKey,
   createDefaultAccessPolicy,
   evaluateAccess,
+  resolveGatewayEndpointPolicy,
   sendDiscordMessage,
   sendSlackMessage,
   sendTelegramMessage,
@@ -193,9 +194,24 @@ export function createGatewayDelivery(options: {
         case 'discord': {
           const webhookUrl = cfg.webhookUrl ?? cfg.channel;
           if (!webhookUrl) return { ok: false, error: 'Missing Discord webhook URL' };
-          const result = await sendDiscordMessage(webhookUrl, content);
+          const storedConfig = configStore.getGatewayConfig('discord');
+          const result = await sendDiscordMessage(
+            webhookUrl,
+            content,
+            { endpointPolicy: resolveGatewayEndpointPolicy(storedConfig) },
+          );
           if (!result.ok) {
-            const raw = result.raw as { event?: string; reason?: string } | undefined;
+            const raw = result.raw as { event?: string; reason?: string; method?: string; protocol?: string; path?: string; policyTier?: string } | undefined;
+            if (raw?.event === 'gateway:endpoint_policy' && raw.reason) {
+              eventBus.emit('gateway:policy_denied', {
+                platform,
+                reason: raw.reason,
+                method: raw.method,
+                protocol: raw.protocol,
+                path: raw.path,
+                policyTier: raw.policyTier,
+              });
+            }
             eventBus.emit('gateway:error', {
               platform,
               error: result.error,

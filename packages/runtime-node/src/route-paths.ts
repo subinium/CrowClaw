@@ -89,7 +89,7 @@ export const routePaths = {
     reset: '/api/usage/reset'
   },
   observability: {
-    metrics: '/metrics'
+    metrics: '/api/metrics'
   },
   sessions: {
     list: '/api/sessions',

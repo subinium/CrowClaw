@@ -7,6 +7,7 @@ import {
   canMutateToken,
   createDefaultEndpointPolicy,
   evaluateGatewayEndpointPolicy,
+  resolveGatewayEndpointPolicy,
   type NormalizedInboundMessage,
   type ChannelAccessPolicy,
   type PairingChallenge,
@@ -187,6 +188,37 @@ describe('Gateway Endpoint Policy', () => {
     );
     expect(denied.allowed).toBe(false);
     expect(denied.reason).toBe('disallowed-path');
+  });
+
+  it('allowedEndpoints can narrow by path or full URL prefix', () => {
+    const pathAllowed = evaluateGatewayEndpointPolicy(
+      { url: 'https://discord.com/api/webhooks/123/token', method: 'POST' },
+      { policyTier: 'balanced', allowedEndpoints: ['/api/webhooks/*'] },
+    );
+    expect(pathAllowed.allowed).toBe(true);
+
+    const urlAllowed = evaluateGatewayEndpointPolicy(
+      { url: 'https://discord.com/api/webhooks/123/token?wait=true', method: 'POST' },
+      { policyTier: 'balanced', allowedEndpoints: ['https://discord.com/api/webhooks/*'] },
+    );
+    expect(urlAllowed.allowed).toBe(true);
+
+    const denied = evaluateGatewayEndpointPolicy(
+      { url: 'https://discord.com/api/channels/123/messages', method: 'POST' },
+      { policyTier: 'balanced', allowedEndpoints: ['https://discord.com/api/webhooks/*'] },
+    );
+    expect(denied.allowed).toBe(false);
+    expect(denied.reason).toBe('disallowed-path');
+  });
+
+  it('derives endpoint policy from GatewayConfig fields', () => {
+    expect(resolveGatewayEndpointPolicy({
+      policyTier: 'restricted',
+      allowedEndpoints: ['/api/webhooks/*'],
+    })).toEqual({
+      policyTier: 'restricted',
+      allowedEndpoints: ['/api/webhooks/*'],
+    });
   });
 
   it('keeps SSRF blocking observable through endpoint policy', () => {

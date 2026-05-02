@@ -2,7 +2,10 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { DetailedUsageTracker } from '@crowclaw/core';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 import {
+  ensureGenAiSemconvOptIn,
+  GEN_AI_SEMCONV_OPT_IN,
   getRuntimeTelemetryMetrics,
+  isPrometheusMetricsEnabled,
   observeRuntimeTelemetryEvent,
   renderPrometheusMetrics,
   resetRuntimeTelemetryMetrics,
@@ -48,7 +51,13 @@ describe('runtime OpenTelemetry metrics', () => {
     expect(text).toContain('crowclaw_usage_entries 1');
   });
 
-  it('serves /metrics as Prometheus text', async () => {
+  it('keeps Prometheus metrics disabled until explicitly gated on', async () => {
+    expect(isPrometheusMetricsEnabled({}, {})).toBe(false);
+    expect(isPrometheusMetricsEnabled({ prometheusMetrics: true }, {})).toBe(true);
+    expect(isPrometheusMetricsEnabled({}, { CROWCLAW_PROMETHEUS_METRICS: 'true' })).toBe(true);
+  });
+
+  it('serves /api/metrics as Prometheus text when enabled', async () => {
     const tracker = new DetailedUsageTracker();
     tracker.record({
       model: 'gpt-4.1',
@@ -60,11 +69,44 @@ describe('runtime OpenTelemetry metrics', () => {
       costUsd: 0,
       latencyMs: 1,
     });
-    const runtime = createNodeRuntime({ usageTracker: tracker, schedulerStorePath: null, configStorePath: null });
+    const runtime = createNodeRuntime({
+      usageTracker: tracker,
+      schedulerStorePath: null,
+      configStorePath: null,
+      prometheusMetrics: true,
+    });
 
-    const response = await runtime.fetch(new Request('http://localhost/metrics'));
+    const response = await runtime.fetch(new Request('http://localhost/api/metrics'));
     expect(response.headers.get('content-type')).toContain('text/plain');
     expect(await response.text()).toContain('crowclaw_genai_tokens_total 5');
     await runtime.shutdown();
+  });
+
+  it('returns 404 for /api/metrics when the metrics gate is off', async () => {
+    const previous = process.env.CROWCLAW_PROMETHEUS_METRICS;
+    delete process.env.CROWCLAW_PROMETHEUS_METRICS;
+    const runtime = createNodeRuntime({ schedulerStorePath: null, configStorePath: null });
+
+    try {
+      const response = await runtime.fetch(new Request('http://localhost/api/metrics'));
+
+      expect(response.status).toBe(404);
+    } finally {
+      await runtime.shutdown();
+      if (previous === undefined) {
+        delete process.env.CROWCLAW_PROMETHEUS_METRICS;
+      } else {
+        process.env.CROWCLAW_PROMETHEUS_METRICS = previous;
+      }
+    }
+  });
+
+  it('opts into latest experimental GenAI semantic conventions without clobbering existing values', () => {
+    const env: Record<string, string | undefined> = { OTEL_SEMCONV_STABILITY_OPT_IN: 'http' };
+
+    ensureGenAiSemconvOptIn(env);
+    ensureGenAiSemconvOptIn(env);
+
+    expect(env.OTEL_SEMCONV_STABILITY_OPT_IN).toBe(`http,${GEN_AI_SEMCONV_OPT_IN}`);
   });
 });

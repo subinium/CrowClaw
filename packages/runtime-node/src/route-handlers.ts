@@ -44,6 +44,7 @@ import {
   canMutateToken,
   createTypingIndicator,
   deleteTelegramWebhook,
+  evaluateGatewayEndpointPolicy,
   getTelegramWebhookInfo,
   normalizeDiscordWebhook,
   normalizeEmailWebhook,
@@ -60,6 +61,7 @@ import {
   probeSlack,
   probeTelegram,
   probeWhatsApp,
+  resolveGatewayEndpointPolicy,
   sendTelegramMessage,
   setTelegramWebhook,
   verifySlackSignature,
@@ -87,7 +89,7 @@ import { createProviderFromSlot } from './provider-factory.js';
 import { compareSemverLike } from './gateway-wiring.js';
 import { BUILTIN_MCP_CATALOG, BUILTIN_PLUGIN_CATALOG, buildMcpServerConfigFromCatalog, getMcpCatalogEntry, getPluginCatalogEntry, validateMcpCatalogEnv } from './runtime-catalogs.js';
 import { routePaths } from './route-paths.js';
-import { renderPrometheusMetrics } from './otel.js';
+import { isPrometheusMetricsEnabled, renderPrometheusMetrics } from './otel.js';
 import { handleWebSocketUpgrade } from './websocket.js';
 
 const BLOCKED_CONFIG_MUTATIONS = new Set([
@@ -2366,9 +2368,17 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
 
       if (request.method === 'POST' && url.pathname === '/api/discord/send') {
         const body = (await request.json()) as { webhookUrl: string; content: string };
-        const ssrfCheck = validateFetchUrl(body.webhookUrl);
-        if (!ssrfCheck.safe) {
-          return new Response(JSON.stringify({ error: 'SSRF blocked', reason: ssrfCheck.reason }), { status: 403 });
+        const endpointDecision = evaluateGatewayEndpointPolicy(
+          { url: buildDiscordWebhookSendUrl(body.webhookUrl), method: 'POST' },
+          resolveGatewayEndpointPolicy(configStore.getGatewayConfig('discord')),
+        );
+        if (!endpointDecision.allowed) {
+          eventBus.emit('gateway:policy_denied', { platform: 'discord', ...endpointDecision.observability });
+          if (endpointDecision.reason === 'unsafe-url') {
+            const ssrfCheck = validateFetchUrl(body.webhookUrl);
+            return new Response(JSON.stringify({ error: 'SSRF blocked', reason: ssrfCheck.reason }), { status: 403 });
+          }
+          return new Response(JSON.stringify({ error: 'Endpoint policy blocked', reason: endpointDecision.reason }), { status: 403 });
         }
         const response = await fetch(buildDiscordWebhookSendUrl(body.webhookUrl), {
           method: 'POST',
@@ -2383,9 +2393,17 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
 
       if (request.method === 'POST' && url.pathname === '/api/discord/edit') {
         const body = (await request.json()) as { webhookUrl: string; messageId: string; content: string };
-        const ssrfCheck = validateFetchUrl(body.webhookUrl);
-        if (!ssrfCheck.safe) {
-          return new Response(JSON.stringify({ error: 'SSRF blocked', reason: ssrfCheck.reason }), { status: 403 });
+        const endpointDecision = evaluateGatewayEndpointPolicy(
+          { url: buildDiscordWebhookEditUrl(body.webhookUrl, body.messageId), method: 'PATCH' },
+          resolveGatewayEndpointPolicy(configStore.getGatewayConfig('discord')),
+        );
+        if (!endpointDecision.allowed) {
+          eventBus.emit('gateway:policy_denied', { platform: 'discord', ...endpointDecision.observability });
+          if (endpointDecision.reason === 'unsafe-url') {
+            const ssrfCheck = validateFetchUrl(body.webhookUrl);
+            return new Response(JSON.stringify({ error: 'SSRF blocked', reason: ssrfCheck.reason }), { status: 403 });
+          }
+          return new Response(JSON.stringify({ error: 'Endpoint policy blocked', reason: endpointDecision.reason }), { status: 403 });
         }
         const response = await fetch(buildDiscordWebhookEditUrl(body.webhookUrl, body.messageId), {
           method: 'PATCH',
@@ -4726,6 +4744,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           webhookUrl?: string;
           phoneNumberId?: string;
           homeserverUrl?: string;
+          policyTier?: 'restricted' | 'balanced' | 'open';
+          allowedEndpoints?: string[];
         };
         const existing = configStore.getGatewayConfig(platform);
         if (body.token !== undefined || body.webhookSecret !== undefined) {
@@ -4744,10 +4764,13 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (body.phoneNumberId !== undefined) mergedExtra.phoneNumberId = body.phoneNumberId;
         if (body.homeserverUrl !== undefined) mergedExtra.homeserverUrl = body.homeserverUrl;
         configStore.setGatewayConfig(platform, {
+          ...existing,
           enabled: body.enabled ?? existing?.enabled ?? true,
           token: body.token ?? existing?.token,
           webhookSecret: body.webhookSecret ?? existing?.webhookSecret,
           extra: Object.keys(mergedExtra).length > 0 ? mergedExtra : existing?.extra,
+          policyTier: body.policyTier ?? existing?.policyTier,
+          allowedEndpoints: body.allowedEndpoints ?? existing?.allowedEndpoints,
         });
         eventBus.emit('gateway:status', { platform, enabled: body.enabled ?? existing?.enabled ?? true });
         return Response.json({ ok: true, platform, configured: Boolean(configStore.getGatewayConfig(platform)) });
@@ -4837,6 +4860,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           allowlist?: string[];
           groupAllowlist?: string[];
           requireMention?: boolean;
+          policyTier?: 'restricted' | 'balanced' | 'open';
+          allowedEndpoints?: string[];
         };
 
         const existing = configStore.getGatewayConfig(platform) ?? { enabled: false };
@@ -4847,6 +4872,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           allowlist: body.allowlist ?? existing.allowlist,
           groupAllowlist: body.groupAllowlist ?? existing.groupAllowlist,
           requireMention: body.requireMention ?? existing.requireMention,
+          policyTier: body.policyTier ?? existing.policyTier,
+          allowedEndpoints: body.allowedEndpoints ?? existing.allowedEndpoints,
         });
 
         return Response.json({ ok: true, platform, policy: configStore.getGatewayConfig(platform) });
@@ -5005,6 +5032,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       }
 
       if (request.method === 'GET' && url.pathname === routePaths.observability.metrics) {
+        if (!isPrometheusMetricsEnabled(options, runtimeEnv)) {
+          return Response.json({ error: 'metrics disabled' }, { status: 404 });
+        }
         return new Response(renderPrometheusMetrics(usageTracker.getSummary()), {
           headers: { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' },
         });

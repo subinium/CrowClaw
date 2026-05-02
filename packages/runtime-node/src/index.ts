@@ -1,5 +1,5 @@
 import { join as joinPath } from 'node:path';
-import { InMemoryCheckpointStore, PersonaRegistry, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, type ToolExecutionContext } from '@crowclaw/core';
+import { InMemoryCheckpointStore, PersonaRegistry, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, restoreFromCheckpoint, type ToolExecutionContext } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
 import { installOpenTelemetryBridge, observeRuntimeTelemetryEvent } from './otel.js';
 import { SessionMutex } from './session-mutex.js';
@@ -31,7 +31,7 @@ import { SessionController } from './session-controller.js';
 import { WebSocketManager } from './websocket.js';
 import { createEmbeddedProtocolServers } from './mcp-acp-embed.js';
 import { createGatewayActivityLog, createGatewayAccessController, createGatewayDelivery } from './gateway-wiring.js';
-import { createAgentBootstrap } from './agent-bootstrap.js';
+import { createAgentBootstrap, isInProgressCheckpoint } from './agent-bootstrap.js';
 import {
   FeedbackLedger,
   GatewayDebouncer,
@@ -401,6 +401,35 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   });
   const { createConfiguredAgent, runConfiguredAgent } = agentBootstrap;
 
+  const autoResumeStartupReady = (async () => {
+    if (options.autoResumeCheckpoints === false) return;
+    const listSessions = (store as unknown as { list?: () => Promise<Array<{ sessionId: string }>> }).list;
+    if (typeof listSessions !== 'function') return;
+    const sessions = await listSessions.call(store);
+    for (const sessionSummary of sessions) {
+      const session = await store.get(sessionSummary.sessionId);
+      if (!session) continue;
+      const checkpoints = await checkpointStore.listBySession(session.sessionId);
+      const checkpoint = checkpoints.slice().reverse().find((cp) => isInProgressCheckpoint(cp) && !autoResumedCheckpointIds.has(cp.id));
+      if (!checkpoint) continue;
+      const restored = restoreFromCheckpoint(checkpoint, session);
+      await store.put(restored.session);
+      autoResumedCheckpointIds.add(checkpoint.id);
+      eventBus.emit('session:resumed', {
+        sessionId: session.sessionId,
+        action: 'checkpoint:auto-resume',
+        checkpointId: checkpoint.id,
+        reason: 'in_progress_checkpoint',
+        messageCount: restored.session.messages.length,
+      });
+    }
+  })().catch((err: unknown) => {
+    log.warn('Checkpoint auto-resume startup sweep failed', {
+      component: 'checkpoints',
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
   // #152: wire ownerToken from CROWCLAW_DASHBOARD_TOKEN so the embedded MCP
   // server enforces ownerOnly tool gating. Without this, the bridge runs in
   // "legacy mode" where every caller is treated as owner — any unauthenticated
@@ -491,6 +520,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     eventBus,
     feedbackLedger,
     shutdown,
+    autoResumeStartupReady,
     // v0.7.1: exposed so Node entry-points (serve-local.mjs) can wire an
     // upgraded `ws` library WebSocket into the runtime's event broadcast
     // pipeline. The fetch() path uses Workers-only WebSocketPair which is

@@ -30,7 +30,7 @@ import { createScheduledAgentJob } from '@crowclaw/scheduler';
 import type { MemoryRecord, MemoryStore, SessionSearchStore } from '@crowclaw/storage';
 import type { WorkspaceStore } from '@crowclaw/workspace';
 
-type BackgroundProcessRecord = {
+export type BackgroundProcessRecord = {
   pid: number;
   command: string;
   backend: 'local' | 'docker' | 'ssh' | 'singularity';
@@ -45,26 +45,36 @@ type BackgroundProcessRecord = {
   };
 };
 
-const backgroundProcessStores = new Map<string, Map<number, BackgroundProcessRecord>>();
+export type BackgroundProcessStore = Map<number, BackgroundProcessRecord>;
 
-function backgroundProcessStoreKey(context: ToolExecutionContext): string {
-  return `${context.agentId || 'unknown-agent'}:${context.sessionId || 'unknown-session'}`;
+export type TerminalSession = {
+  backgroundProcesses: BackgroundProcessStore;
+};
+
+export function createTerminalSession(backgroundProcesses: BackgroundProcessStore = new Map()): TerminalSession {
+  return { backgroundProcesses };
 }
 
-function getBackgroundProcessStore(context: ToolExecutionContext): Map<number, BackgroundProcessRecord> {
+export type TerminalSessionOptions = {
+  terminalSession?: TerminalSession;
+  backgroundProcesses?: BackgroundProcessStore;
+};
+
+function resolveTerminalBackgroundProcessStore(options?: TerminalSessionOptions): BackgroundProcessStore {
+  return options?.backgroundProcesses ?? options?.terminalSession?.backgroundProcesses ?? new Map();
+}
+
+function getBackgroundProcessStore(
+  context: ToolExecutionContext,
+  fallbackStore: BackgroundProcessStore,
+): BackgroundProcessStore {
   const contextWithStore = context as ToolExecutionContext & {
-    backgroundProcesses?: Map<number, BackgroundProcessRecord>;
+    backgroundProcesses?: BackgroundProcessStore;
   };
   if (contextWithStore.backgroundProcesses) {
     return contextWithStore.backgroundProcesses;
   }
-  const key = backgroundProcessStoreKey(context);
-  let store = backgroundProcessStores.get(key);
-  if (!store) {
-    store = new Map<number, BackgroundProcessRecord>();
-    backgroundProcessStores.set(key, store);
-  }
-  return store;
+  return fallbackStore;
 }
 
 type TerminalBackendKind = 'local' | 'docker' | 'ssh' | 'singularity' | 'modal' | 'daytona';
@@ -923,7 +933,8 @@ export function createTerminalExecTool(): ToolDefinition {
   };
 }
 
-export function createTerminalBackgroundTool(): ToolDefinition {
+export function createTerminalBackgroundTool(options?: TerminalSessionOptions): ToolDefinition {
+  const backgroundProcesses = resolveTerminalBackgroundProcessStore(options);
   return {
     manifest: {
       name: 'terminal.background',
@@ -1018,7 +1029,7 @@ export function createTerminalBackgroundTool(): ToolDefinition {
         record.status = record.status === 'killed' ? 'killed' : 'exited';
         record.exitCode = code;
       });
-      getBackgroundProcessStore(context).set(pid, record);
+      getBackgroundProcessStore(context, backgroundProcesses).set(pid, record);
       return {
         toolName: 'terminal.background',
         runtime: 'worker',
@@ -1141,7 +1152,8 @@ export function createTerminalProbeTool(): ToolDefinition {
   };
 }
 
-export function createTerminalProcessesTool(): ToolDefinition {
+export function createTerminalProcessesTool(options?: TerminalSessionOptions): ToolDefinition {
+  const backgroundProcesses = resolveTerminalBackgroundProcessStore(options);
   return {
     manifest: {
       name: 'terminal.processes',
@@ -1155,7 +1167,7 @@ export function createTerminalProcessesTool(): ToolDefinition {
       inputSchema: { type: 'object', properties: {}, required: [] }
     },
     async execute(_input, context) {
-      const processes = [...getBackgroundProcessStore(context).values()].map((record) => ({
+      const processes = [...getBackgroundProcessStore(context, backgroundProcesses).values()].map((record) => ({
         pid: record.pid,
         command: record.command,
         backend: record.backend,
@@ -1175,7 +1187,8 @@ export function createTerminalProcessesTool(): ToolDefinition {
   };
 }
 
-export function createTerminalKillTool(): ToolDefinition {
+export function createTerminalKillTool(options?: TerminalSessionOptions): ToolDefinition {
+  const backgroundProcesses = resolveTerminalBackgroundProcessStore(options);
   return {
     manifest: {
       name: 'terminal.kill',
@@ -1199,7 +1212,7 @@ export function createTerminalKillTool(): ToolDefinition {
       if (!pid || Number.isNaN(pid)) {
         return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: 'Missing pid.' };
       }
-      const store = getBackgroundProcessStore(context);
+      const store = getBackgroundProcessStore(context, backgroundProcesses);
       const record = store.get(pid);
       if (!record) {
         return { toolName: 'terminal.kill', runtime: 'worker', ok: false, output: `Unknown pid: ${pid}` };
@@ -3563,16 +3576,17 @@ export function registerSchedulerTools(
   return registry;
 }
 
-export function registerCoreTools(registry: ToolRegistry): ToolRegistry {
+export function registerCoreTools(registry: ToolRegistry, options?: TerminalSessionOptions): ToolRegistry {
+  const terminalSession = options?.terminalSession ?? createTerminalSession(options?.backgroundProcesses);
   registry.register(createEchoTool());
   registry.register(createTimeTool());
   registry.register(createTerminalExecTool());
-  registry.register(createTerminalBackgroundTool());
+  registry.register(createTerminalBackgroundTool({ terminalSession }));
   registry.register(createTerminalBackendsTool());
   registry.register(createTerminalBackendStatusTool());
   registry.register(createTerminalProbeTool());
-  registry.register(createTerminalProcessesTool());
-  registry.register(createTerminalKillTool());
+  registry.register(createTerminalProcessesTool({ terminalSession }));
+  registry.register(createTerminalKillTool({ terminalSession }));
   registry.register(createTodoTool());
   registry.register(createClarifyTool());
   registry.register(createSendMessageTool());
@@ -3640,8 +3654,13 @@ export function createDefaultWorkerRegistry(options?: {
   recallFn?: (sessionId: string, query: string, limit: number) => Promise<MemoryRecord[]>;
   schedulerStore?: SchedulerStore;
   autonomousScheduler?: { start: () => void; isRunning: () => boolean };
+  terminalSession?: TerminalSession;
+  backgroundProcesses?: BackgroundProcessStore;
 }): ToolRegistry {
-  const registry = registerCoreTools(new ToolRegistry());
+  const registry = registerCoreTools(new ToolRegistry(), {
+    terminalSession: options?.terminalSession,
+    backgroundProcesses: options?.backgroundProcesses,
+  });
   if (options?.sessionSearchStore && options.memoryStore) {
     registerSearchAndMemoryTools(registry, options.sessionSearchStore, options.memoryStore, {
       recallFn: options.recallFn

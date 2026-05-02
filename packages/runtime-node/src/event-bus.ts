@@ -12,6 +12,7 @@ export type RuntimeEventType =
   | 'gateway:inbound'
   | 'gateway:outbound'
   | 'gateway:error'
+  | 'gateway:policy_denied'
   | 'gateway:status'
   | 'job:start'
   | 'job:complete'
@@ -29,6 +30,7 @@ export type RuntimeEventType =
   | 'session:aborted'
   | 'session:forked'
   | 'session:compacted'
+  | 'session:resumed'
   // v0.7 (#179) — surface tool execution to the dashboard so operators can
   // audit what the agent actually did. `tool:start` fires before the worker
   // executes; `tool:complete` fires after with `durationMs` + `ok`. Emitted
@@ -45,6 +47,8 @@ export type RuntimeEventType =
   | 'memory:captured'
   | 'memory:recalled'
   | 'memory:scoped_write'
+  | 'context:assemble_start'
+  | 'context:assemble_end'
   // v0.8.0 (#231) — reasoning-block extraction. `reasoning:emitted` fires when
   // a `<plan>` / `<reflection>` / `<thinking>` block is parsed from the model
   // output; carries the tag name and text. Lets the dashboard render the
@@ -94,6 +98,7 @@ export class EventBus {
   private sessionSpans = new Map<string, TelemetrySpan>();
   private iterationSpans = new Map<string, TelemetrySpan>();
   private toolSpans = new Map<string, TelemetrySpan>();
+  private contextSpans = new Map<string, TelemetrySpan>();
 
   /** Subscribe to all events. Returns an unsubscribe function. */
   subscribe(listener: Listener): () => void {
@@ -131,7 +136,7 @@ export class EventBus {
 
     const sessionId = typeof data.sessionId === 'string' ? data.sessionId : undefined;
     if ((type === 'chat:message' || type === 'chat:stream') && sessionId && !this.sessionSpans.has(sessionId)) {
-      const span = telemetry.startSpan('crowclaw.session', {
+      const span = telemetry.startSpan('crowclaw.harness.run', {
         'crowclaw.session.id': sessionId,
         'crowclaw.event.type': type,
       });
@@ -153,7 +158,7 @@ export class EventBus {
     if (type === 'iteration:start' && sessionId) {
       const iteration = typeof data.iteration === 'number' ? data.iteration : -1;
       const key = `${sessionId}:${iteration}`;
-      const span = telemetry.startSpan('crowclaw.iteration', {
+      const span = telemetry.startSpan('crowclaw.tool.loop', {
         'crowclaw.session.id': sessionId,
         'crowclaw.iteration.index': iteration,
       });
@@ -177,7 +182,7 @@ export class EventBus {
       const callId = typeof data.callId === 'string' ? data.callId : undefined;
       const toolName = typeof data.toolName === 'string' ? data.toolName : 'unknown';
       if (!callId) return;
-      const span = telemetry.startSpan('crowclaw.tool-call', {
+      const span = telemetry.startSpan('crowclaw.exec', {
         'crowclaw.tool.name': toolName,
         ...(sessionId ? { 'crowclaw.session.id': sessionId } : {}),
       });
@@ -195,6 +200,34 @@ export class EventBus {
         span.end();
         this.toolSpans.delete(callId);
       }
+      return;
+    }
+
+    if (type === 'context:assemble_start' && sessionId) {
+      const span = telemetry.startSpan('crowclaw.context.assemble', {
+        'crowclaw.session.id': sessionId,
+      });
+      if (span) this.contextSpans.set(sessionId, span);
+      return;
+    }
+
+    if (type === 'context:assemble_end' && sessionId) {
+      const span = this.contextSpans.get(sessionId);
+      if (span) {
+        if (typeof data.memoryCount === 'number') span.setAttribute('crowclaw.context.memory_count', data.memoryCount);
+        if (typeof data.durationMs === 'number') span.setAttribute('crowclaw.context.duration_ms', data.durationMs);
+        span.end();
+        this.contextSpans.delete(sessionId);
+      }
+      return;
+    }
+
+    if (type === 'gateway:outbound') {
+      const span = telemetry.startSpan('crowclaw.outbound.deliver', {
+        ...(typeof data.platform === 'string' ? { 'crowclaw.outbound.platform': data.platform } : {}),
+        ...(typeof data.contentLength === 'number' ? { 'crowclaw.outbound.content_length': data.contentLength } : {}),
+      });
+      span?.end();
     }
   }
 }

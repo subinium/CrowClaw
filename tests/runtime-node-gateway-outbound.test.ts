@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
+import { RuntimeConfigStore } from '../packages/runtime-node/src/config-store.js';
+import { EventBus, type RuntimeEvent } from '../packages/runtime-node/src/event-bus.js';
+import { createGatewayActivityLog, createGatewayDelivery } from '../packages/runtime-node/src/gateway-wiring.js';
 
 describe('runtime-node gateway outbound routes', () => {
   beforeEach(() => {
@@ -73,6 +76,66 @@ describe('runtime-node gateway outbound routes', () => {
       'https://discord.test/webhook/messages/123',
       expect.objectContaining({ method: 'PATCH' })
     );
+  });
+
+  it('refuses Discord send routes that violate configured endpoint policy', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => Response.json({ ok: true, body: JSON.parse(String(init?.body)) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const runtime = createNodeRuntime();
+
+    await runtime.fetch(new Request('http://localhost/api/gateway/discord/config', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        enabled: true,
+        policyTier: 'balanced',
+        allowedEndpoints: ['/api/webhooks/*'],
+      })
+    }));
+
+    const send = await runtime.fetch(new Request('http://localhost/api/discord/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ webhookUrl: 'https://discord.test/not-webhook', content: 'blocked' })
+    }));
+    expect(send.status).toBe(403);
+    await expect(send.json()).resolves.toMatchObject({ error: 'Endpoint policy blocked', reason: 'disallowed-path' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('derives Discord delivery endpoint policy from gateway config and emits denial events', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const configStore = new RuntimeConfigStore();
+    configStore.setGatewayConfig('discord', {
+      enabled: true,
+      policyTier: 'restricted',
+      allowedEndpoints: ['/api/webhooks/*'],
+    });
+    const eventBus = new EventBus();
+    const events: RuntimeEvent[] = [];
+    eventBus.subscribe((event) => events.push(event));
+    const deliver = createGatewayDelivery({
+      configStore,
+      eventBus,
+      gatewayActivityLog: createGatewayActivityLog(10),
+    });
+
+    const result = await deliver(
+      { platform: 'discord', config: { webhookUrl: 'https://discord.com/api/channels/123/messages' } },
+      'blocked',
+    );
+
+    expect(result).toMatchObject({ ok: false, error: 'Endpoint policy blocked: disallowed-path' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'gateway:policy_denied',
+      data: expect.objectContaining({
+        platform: 'discord',
+        reason: 'disallowed-path',
+        policyTier: 'restricted',
+      }),
+    }));
   });
 
   it('edits Slack messages through the node runtime', async () => {

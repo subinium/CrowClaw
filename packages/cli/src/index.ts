@@ -170,6 +170,7 @@ export interface ParsedCliCommand {
   continueSession?: boolean;
   port?: number;
   noOnboarding?: boolean;
+  noResume?: boolean;
   gatewaySubcommand?: string;
   gatewayArgs?: string[];
   mcpSubcommand?: string;
@@ -398,6 +399,12 @@ async function lazyCreateRuntime(options?: NodeRuntimeOptions): Promise<CliRunti
   return createNodeRuntime(options);
 }
 
+function runtimeOptionsForParsed(parsed: ParsedCliCommand, options?: NodeRuntimeOptions): NodeRuntimeOptions | undefined {
+  return parsed.noResume
+    ? { ...(options ?? {}), autoResumeCheckpoints: false }
+    : options;
+}
+
 export class StreamRenderer {
   private buffer = '';
   private lineCount = 0;
@@ -558,14 +565,15 @@ function formatOutput(output: string): string {
 
 export function parseCliArgs(argv: string[]): ParsedCliCommand {
   const noOnboarding = argv.includes('--no-onboarding');
-  const filtered = argv.filter((a) => a !== '--no-onboarding');
+  const noResume = argv.includes('--no-resume');
+  const filtered = argv.filter((a) => a !== '--no-onboarding' && a !== '--no-resume');
 
   if (filtered.length === 0) {
-    return { command: 'repl', noOnboarding };
+    return { command: 'repl', noOnboarding, noResume };
   }
 
   if (filtered.includes('--help') || filtered.includes('-h')) {
-    return { command: 'help' };
+    return { command: 'help', noResume };
   }
 
   const [first, ...rest] = filtered;
@@ -583,35 +591,35 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
   };
 
   if (first !== undefined && first in simpleCommands) {
-    return { command: simpleCommands[first]!, noOnboarding };
+    return { command: simpleCommands[first]!, noOnboarding, noResume };
   }
 
   // gateway — supports subcommands: status, connect <platform>
   if (first === 'gateway') {
     const gatewaySubcommand = rest[0] ?? 'status';
     const gatewayArgs = rest.slice(1);
-    return { command: 'gateway', gatewaySubcommand, gatewayArgs, noOnboarding };
+    return { command: 'gateway', gatewaySubcommand, gatewayArgs, noOnboarding, noResume };
   }
 
   // mcp — supports subcommands: auth <provider>, add <url>, list, remove <name>
   if (first === 'mcp') {
     const mcpSubcommand = rest[0] ?? 'list';
     const mcpArgs = rest.slice(1);
-    return { command: 'mcp', mcpSubcommand, mcpArgs, noOnboarding };
+    return { command: 'mcp', mcpSubcommand, mcpArgs, noOnboarding, noResume };
   }
 
   // presets — supports subcommands: list, switch <name>
   if (first === 'presets') {
     const presetsSubcommand = rest[0] ?? 'list';
     const presetsArgs = rest.slice(1);
-    return { command: 'presets', presetsSubcommand, presetsArgs, noOnboarding };
+    return { command: 'presets', presetsSubcommand, presetsArgs, noOnboarding, noResume };
   }
 
   // providers — supports subcommands: list (default), set <slot> <provider/model>, test
   if (first === 'providers') {
     const providersSubcommand = rest[0] ?? 'list';
     const providersArgs = rest.slice(1);
-    return { command: 'providers', providersSubcommand, providersArgs, noOnboarding };
+    return { command: 'providers', providersSubcommand, providersArgs, noOnboarding, noResume };
   }
 
   // skill — v0.8.0 #240: agentskills.io install/publish
@@ -619,7 +627,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     const skillSubcommand = rest[0] ?? 'help';
     const dryRun = rest.includes('--dry-run');
     const skillArgs = rest.slice(1).filter((a) => a !== '--dry-run');
-    return { command: 'skill', skillSubcommand, skillArgs, dryRun, noOnboarding };
+    return { command: 'skill', skillSubcommand, skillArgs, dryRun, noOnboarding, noResume };
   }
 
   if (first === 'migrate') {
@@ -627,7 +635,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     const rawArgs = rest[0] === 'import' ? rest.slice(1) : rest;
     const dryRun = rawArgs.includes('--dry-run');
     const migrateArgs = rawArgs.filter((arg) => arg !== '--dry-run');
-    return { command: 'migrate', migrateSubcommand, migrateArgs, dryRun, noOnboarding };
+    return { command: 'migrate', migrateSubcommand, migrateArgs, dryRun, noOnboarding, noResume };
   }
 
   // serve — supports --port
@@ -639,7 +647,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
         i += 1;
       }
     }
-    return { command: 'serve', port, noOnboarding };
+    return { command: 'serve', port, noOnboarding, noResume };
   }
 
   // chat subcommand or -q flag at top level
@@ -679,12 +687,12 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
 
   // If -q was used at the top level (no 'chat' subcommand), treat as chat
   if (!isChat && query) {
-    return { command: 'chat', query, sessionId, continueSession, port, noOnboarding };
+    return { command: 'chat', query, sessionId, continueSession, port, noOnboarding, noResume };
   }
 
   // 'chat' subcommand with no query → start REPL
   if (isChat && !query && !continueSession) {
-    return { command: 'repl', noOnboarding };
+    return { command: 'repl', noOnboarding, noResume };
   }
 
   return {
@@ -694,6 +702,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     continueSession,
     port,
     noOnboarding,
+    noResume,
   };
 }
 
@@ -728,6 +737,7 @@ export function renderCliHelp(): string {
     'Options:',
     '  -q "msg"            One-shot chat (alias for chat)',
     '  --no-onboarding     Skip first-run wizard',
+    '  --no-resume         Disable startup auto-resume from in-progress checkpoints',
     '  --port N            Server port (default: 3117)',
     '',
     'Session actions (REST):',
@@ -2584,7 +2594,7 @@ export async function runCli(argv: string[], options: CliRunOptions = {}): Promi
     return runMigrateCommand(parsed);
   }
 
-  const runtime = options.runtime ?? await lazyCreateRuntime(options.runtimeOptions);
+  const runtime = options.runtime ?? await lazyCreateRuntime(runtimeOptionsForParsed(parsed, options.runtimeOptions));
 
   switch (parsed.command) {
     case 'status':
@@ -3326,6 +3336,7 @@ async function applyConfigToEnv(argv: string[]): Promise<void> {
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
   const parsed = parseCliArgs(argv);
+  const runtimeOptions = runtimeOptionsForParsed(parsed);
 
   switch (parsed.command) {
     case 'help':
@@ -3334,7 +3345,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
     case 'repl':
       await applyConfigToEnv(argv);
-      await startRepl();
+      await startRepl({ runtimeOptions });
       return;
 
     case 'init': {
@@ -3347,7 +3358,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
     case 'serve':
       await applyConfigToEnv(argv);
-      await runServe({ port: parsed.port });
+      await runServe({ port: parsed.port, runtimeOptions });
       return;
 
     case 'gateway': {

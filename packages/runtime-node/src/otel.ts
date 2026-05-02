@@ -10,6 +10,7 @@ type OtelApi = {
 };
 
 let installed = false;
+export const GEN_AI_SEMCONV_OPT_IN = 'gen_ai_latest_experimental';
 
 export interface RuntimeTelemetryMetrics {
   genAiRequests: number;
@@ -104,9 +105,26 @@ export function renderPrometheusMetrics(usageSummary?: UsageSummary): string {
   ].join('\n') + '\n';
 }
 
+export function ensureGenAiSemconvOptIn(env: Record<string, string | undefined> = process.env): void {
+  const raw = env.OTEL_SEMCONV_STABILITY_OPT_IN;
+  if (!raw) {
+    env.OTEL_SEMCONV_STABILITY_OPT_IN = GEN_AI_SEMCONV_OPT_IN;
+    return;
+  }
+  const values = raw.split(',').map((value) => value.trim()).filter(Boolean);
+  if (!values.includes(GEN_AI_SEMCONV_OPT_IN)) {
+    env.OTEL_SEMCONV_STABILITY_OPT_IN = [...values, GEN_AI_SEMCONV_OPT_IN].join(',');
+  }
+}
+
+export function isPrometheusMetricsEnabled(options: { prometheusMetrics?: boolean }, env: Record<string, string | undefined>): boolean {
+  return options.prometheusMetrics === true || env.CROWCLAW_PROMETHEUS_METRICS === 'true';
+}
+
 export async function installOpenTelemetryBridge(): Promise<boolean> {
   if (installed) return true;
   try {
+    ensureGenAiSemconvOptIn();
     const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<OtelApi>;
     const api = await dynamicImport('@opentelemetry/api');
     const trace = api.trace;

@@ -4,6 +4,8 @@ export type GatewayPolicyTier = 'restricted' | 'balanced' | 'open';
 
 export interface GatewayEndpointPolicy {
   policyTier: GatewayPolicyTier;
+  /** Optional endpoint/path allowlist. Supports exact matches and trailing `*` prefixes. */
+  allowedEndpoints?: string[];
   /** Optional protocol allowlist. Values may be `https` or `https:`. */
   protocols?: string[];
   /** Optional HTTP method allowlist. Values are normalized to uppercase. */
@@ -52,11 +54,11 @@ function normalizeMethod(method: string): string {
   return method.trim().toUpperCase();
 }
 
-function pathMatchesPolicy(path: string, patterns: string[]): boolean {
-  return patterns.some((pattern) => {
-    if (pattern.endsWith('*')) return path.startsWith(pattern.slice(0, -1));
-    return path === pattern;
-  });
+function endpointMatchesPolicy(candidates: string[], patterns: string[]): boolean {
+  return patterns.some((pattern) => candidates.some((candidate) => {
+    if (pattern.endsWith('*')) return candidate.startsWith(pattern.slice(0, -1));
+    return candidate === pattern;
+  }));
 }
 
 export function createDefaultEndpointPolicy(policyTier: GatewayPolicyTier = 'balanced'): GatewayEndpointPolicy {
@@ -109,7 +111,13 @@ export function evaluateGatewayEndpointPolicy(
     };
   }
 
-  if (policy.paths && !pathMatchesPolicy(parsed.pathname, policy.paths)) {
+  const endpointPatterns = policy.allowedEndpoints ?? policy.paths;
+  const endpointCandidates = [
+    parsed.pathname,
+    `${parsed.origin}${parsed.pathname}`,
+    endpoint.url,
+  ];
+  if (endpointPatterns && !endpointMatchesPolicy(endpointCandidates, endpointPatterns)) {
     return {
       allowed: false,
       reason: 'disallowed-path',
@@ -747,6 +755,24 @@ export interface GatewayConfig {
    * when neither model nor provider declared a timeout.
    */
   globalRequestTimeoutMs?: number;
+  /**
+   * Issue #73: Policy tier used for outbound gateway HTTP endpoints.
+   * `restricted` limits protocols/methods most tightly; `balanced` is the
+   * default; `open` keeps SSRF checks but removes method restrictions.
+   */
+  policyTier?: GatewayPolicyTier;
+  /**
+   * Issue #73: Optional allowlist for outbound endpoint paths or full URLs.
+   * Exact matches and trailing `*` prefixes are supported.
+   */
+  allowedEndpoints?: string[];
+}
+
+export function resolveGatewayEndpointPolicy(config?: GatewayConfig): GatewayEndpointPolicy {
+  return {
+    policyTier: config?.policyTier ?? 'balanced',
+    ...(config?.allowedEndpoints ? { allowedEndpoints: config.allowedEndpoints } : {}),
+  };
 }
 
 /**
