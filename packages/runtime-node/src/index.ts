@@ -1,9 +1,9 @@
 import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type SkillFileSystem, type ToolCatalog, type ToolExecutor, type ToolExecutionContext, type ToolExecutionResult, type ToolManifest, type ToolDefinition } from '@crowclaw/core';
+import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, loadSkillsFromDirectory, loadPersonaFiles, buildPersonaPrompt, getDefaultPersonaPrompt, PersonaRegistry, parseIdentity, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, validateFetchUrl, scanCommand, redactToolOutput, scoreComplexity, selectModelForComplexity, forkSession, type ParsedSkillFile, type ProviderAdapter, type SessionState, type CheckpointTrigger, type CheckpointStore, type SessionCheckpoint, type SkillFileSystem, type ToolCatalog, type ToolExecutor, type ToolExecutionContext, type ToolExecutionResult, type ToolManifest, type ToolDefinition } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
-import { installOpenTelemetryBridge } from './otel.js';
+import { installOpenTelemetryBridge, observeRuntimeTelemetryEvent, renderPrometheusMetrics } from './otel.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
 import {
@@ -65,16 +65,14 @@ import {
 } from '@crowclaw/gateway';
 import { LearningPipeline, InMemorySkillStore, getBuiltInSkills, SkillRegistry, createLlmSkillExtractor } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
-import { CrowClawMcpServer } from '@crowclaw/mcp-server';
 import { MemoryService, EmbeddingMemoryStore, InMemoryMemoryProvider, type EmbeddingProvider, type MemoryProvider } from '@crowclaw/memory';
 import { UserModelService } from '@crowclaw/memory';
-import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
+import { MemoryCapturePlugin, PluginManager, ReferencePreToolCallPlugin, ReferenceToolResultPlugin, validatePluginManifest, type Plugin, type PluginManifest } from '@crowclaw/plugins';
 import { CredentialPool, EchoProvider, OpenAICompatibleProvider, AnthropicProvider, ProviderChain, SmartModelRouter, classifyQueryComplexity, listKnownModelMetadata, isModelOverridable } from '@crowclaw/providers';
 import { InMemoryMemoryStore, InMemorySessionStore, type SessionListStore } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools, createFrozenMemorySetTool, createFrozenMemoryRemoveTool } from '@crowclaw/tools';
 import { InMemoryWorkspaceStore, FileWorkspaceStore, type WorkspaceStore } from '@crowclaw/workspace';
 import { InMemorySchedulerStore, FileSchedulerStore, SchedulerExecutor, AutonomousScheduler, collectDueJobs, createEveryNMinutesJob, createScheduledAgentJob, markJobRun, type DeliveryFn, type DeliveryTarget } from '@crowclaw/scheduler';
-import { AcpServer } from '@crowclaw/acp';
 import { RuntimeConfigStore, FileConfigStore } from './config-store.js';
 import { pruneStaleBridgeSessions, type CodeBridgeSession } from './bridge-state.js';
 import { ensureBrowserSession, pruneStaleBrowserSessions, recordBrowserNavigation, type BrowserSessionState } from './browser-state.js';
@@ -86,6 +84,9 @@ import { createDefaultSecretChain } from './secret-loader.js';
 import { SessionController } from './session-controller.js';
 import { WebSocketManager, handleWebSocketUpgrade } from './websocket.js';
 import { generateConfigSchema, validateConfigUpdate, diffConfigs } from './config-schema.js';
+import { createEmbeddedProtocolServers } from './mcp-acp-embed.js';
+import { createGatewayActivityLog, compareSemverLike } from './gateway-wiring.js';
+import { BUILTIN_MCP_CATALOG, BUILTIN_PLUGIN_CATALOG, buildMcpServerConfigFromCatalog, getMcpCatalogEntry, getPluginCatalogEntry, validateMcpCatalogEnv } from './runtime-catalogs.js';
 import { ContextEngine, formatContextForPrompt, type ContextEngineResult } from '@crowclaw/core';
 import { FrozenMemory, InMemoryFrozenStore, FileFrozenStore } from '@crowclaw/memory';
 import { InMemoryMessageStore, type MessageStore as MessageStoreInterface } from '@crowclaw/storage';
@@ -223,6 +224,7 @@ export class FeedbackLedger {
     const toolNames = Object.keys(stats.byTool).slice(0, 10);
     for (const name of toolNames) {
       const t = stats.byTool[name];
+      if (!t) continue;
       lines.push(`- **${name}**: ${t.ok} ok, ${t.fail} fail`);
     }
     return lines.join('\n');
@@ -238,8 +240,9 @@ export class FeedbackLedger {
       if (!byTool[entry.toolName]) {
         byTool[entry.toolName] = { ok: 0, fail: 0 };
       }
-      if (entry.ok) byTool[entry.toolName].ok++;
-      else byTool[entry.toolName].fail++;
+      const toolStats = byTool[entry.toolName] ?? (byTool[entry.toolName] = { ok: 0, fail: 0 });
+      if (entry.ok) toolStats.ok++;
+      else toolStats.fail++;
     }
     return { total: this.entries.length, success, failure, byTool };
   }
@@ -335,6 +338,12 @@ export interface NodeRuntimeOptions {
   personaFs?: { readFile(path: string): Promise<string>; joinPath(...parts: string[]): string };
   /** Optional usage tracker for cost/token tracking. Created automatically if not provided. */
   usageTracker?: DetailedUsageTracker;
+  /** Optional checkpoint store for manual restore/replay and auto-checkpoint integration. */
+  checkpointStore?: CheckpointStore;
+  /** Enable automatic checkpoints for agent turns. Default: false. */
+  autoCheckpoint?: boolean;
+  /** Restore the latest checkpoint marked in_progress before the next turn. Default: true. */
+  autoResumeCheckpoints?: boolean;
   /** Path for persistent config store. Defaults to ~/.crowclaw/runtime-config.json. Set to null to use in-memory only. */
   configStorePath?: string | null;
   /** Seed provider slot configuration for tests or embedded runtimes. */
@@ -1210,6 +1219,7 @@ const DANGEROUS_ROUTES = [
   '/api/scheduler/start', '/api/scheduler/stop',
   '/api/mcp/connect', '/api/mcp/disconnect',
   '/api/mcp/servers',  // CRUD for custom MCP servers — can define commands to spawn
+  '/api/plugins/install', '/api/plugins/configure', '/api/plugins/uninstall',
   '/api/providers/config',
   '/api/config/provider',
   '/api/config/agent',
@@ -1248,6 +1258,11 @@ function isDangerousRoute(pathname: string): boolean {
   return DANGEROUS_ROUTES.some((route) => pathname.startsWith(route)) || isGatewayMutationRoute(pathname);
 }
 
+function getRouteCapture(match: RegExpMatchArray | null, index: number): string | null {
+  const capture = match?.[index];
+  return typeof capture === 'string' ? capture : null;
+}
+
 function isLocalhostAddress(hostname: string): boolean {
   return hostname === '127.0.0.1' || hostname === '::1' || hostname === 'localhost';
 }
@@ -1255,7 +1270,7 @@ function isLocalhostAddress(hostname: string): boolean {
 function parseCookieToken(cookieHeader: string | null): string | null {
   if (!cookieHeader) return null;
   const match = cookieHeader.match(/(?:^|;\s*)crowclaw_auth=([^;]+)/);
-  return match ? match[1] : null;
+  return match?.[1] ?? null;
 }
 
 /** Derive a cookie-safe token from the dashboard token (never store raw token in cookie). */
@@ -1393,7 +1408,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const vec = new Array(128).fill(0) as number[];
           for (const word of words) {
             for (let i = 0; i < word.length; i++) {
-              vec[(word.charCodeAt(i) * 31 + i) % 128] += 1;
+              const index = (word.charCodeAt(i) * 31 + i) % 128;
+              vec[index] = (vec[index] ?? 0) + 1;
             }
           }
           // Normalize
@@ -1425,6 +1441,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const gatewayIdempotencyStore = options.gatewayIdempotencyStore ?? new InMemoryGatewayIdempotencyStore();
   const feedbackLedger = new FeedbackLedger();
   const gatewayDebouncer = new GatewayDebouncer();
+  const gatewayActivityLog = createGatewayActivityLog(100);
+  let releaseCheckCache: { fetchedAt: number; latest: string | null; isOutdated: boolean } | null = null;
 
   // Config store: FileConfigStore for persistence, or in-memory if null
   // Under Vitest, force in-memory to avoid parallel-test races on the shared
@@ -1539,6 +1557,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
   let lastHeartbeatAt: string | null = null;
+  const unsubscribeRuntimeTelemetryMetrics = eventBus.subscribe((event) => {
+    observeRuntimeTelemetryEvent(event);
+  });
   // #118: Capture the unsubscribe so `shutdown()` can detach the listener.
   // EventBus is per-runtime today, but listeners outliving their runtime would
   // still pin closures (resolve fns, runtime locals) until GC, and any future
@@ -1617,6 +1638,37 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const userModelService = new UserModelService(memoryStore);
   const mcpClient = options.mcpClient ?? new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
   const plugins = options.plugins ?? new PluginManager().register(new MemoryCapturePlugin());
+  const installedPluginConfigs = new Map<string, { manifest: PluginManifest; config?: Record<string, unknown>; installedAt: string }>();
+  for (const plugin of plugins.list()) {
+    const catalogEntry = getPluginCatalogEntry(plugin.name);
+    installedPluginConfigs.set(plugin.name, {
+      manifest: catalogEntry?.manifest ?? { name: plugin.name, hooks: [] },
+      installedAt: new Date().toISOString(),
+    });
+  }
+
+  const createCatalogPlugin = (slug: string, config: Record<string, unknown> = {}): Plugin => {
+    if (slug === 'memory-capture') return new MemoryCapturePlugin();
+    if (slug === 'reference-pre-tool-call') {
+      const denyTools = Array.isArray(config.denyTools)
+        ? config.denyTools.filter((tool): tool is string => typeof tool === 'string')
+        : [];
+      return new ReferencePreToolCallPlugin('reference-pre-tool-call', denyTools);
+    }
+    if (slug === 'reference-tool-result') return new ReferenceToolResultPlugin('reference-tool-result');
+    const entry = getPluginCatalogEntry(slug);
+    return { name: entry?.manifest.name ?? slug };
+  };
+
+  const listInstalledPlugins = () => plugins.list().map((plugin) => {
+    const installed = installedPluginConfigs.get(plugin.name);
+    return {
+      name: plugin.name,
+      manifest: installed?.manifest ?? { name: plugin.name },
+      config: installed?.config ?? {},
+      installedAt: installed?.installedAt,
+    };
+  });
   const tools = options.tools ?? createDefaultWorkerRegistry({
     sessionSearchStore: store,
     memoryStore,
@@ -1624,6 +1676,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     mcpClient,
     recallFn: (sessionId: string, query: string, limit: number) => memoryService.recall(sessionId, query, limit)
   });
+  const terminalBackgroundProcesses = new Map<number, unknown>();
+  const terminalToolContext = (sessionId: string): ToolExecutionContext => ({
+    agentId: options.agentId ?? 'crowclaw',
+    sessionId,
+    backgroundProcesses: terminalBackgroundProcesses,
+  } as ToolExecutionContext);
 
   // Provider: resolve from env/config if not explicitly provided.
   // Hermetic mode (skip ALL env/config resolution → keep EchoProvider) when:
@@ -1676,6 +1734,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   const bridgeProcesses = new Map<string, BridgeProcessRecord>();
   const browserSessions = new Map<string, BrowserSessionState>();
   const usageTracker = options.usageTracker ?? new DetailedUsageTracker();
+  let activeUsageSessionId: string | null = null;
+  const recordUsageEntry = usageTracker.record.bind(usageTracker);
+  usageTracker.record = ((entry: Parameters<DetailedUsageTracker['record']>[0] & { sessionId?: string; toolName?: string }) => {
+    recordUsageEntry({
+      ...entry,
+      ...(entry.sessionId || !activeUsageSessionId ? {} : { sessionId: activeUsageSessionId }),
+    } as Parameters<DetailedUsageTracker['record']>[0]);
+  }) as DetailedUsageTracker['record'];
   const deploymentName = options.deploymentName ?? 'crowclaw-node';
   const version = options.version ?? '0.1.0';
 
@@ -2023,6 +2089,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       skills: buildConfiguredSkillManifests(overrides),
       agentPreset: resolveConfiguredAgentPreset(overrides),
       personaPrompt: activePersonaPrompt,
+      usageTracker,
+      checkpointStore,
+      autoCheckpoint: options.autoCheckpoint ?? false,
       requireApprovalForDangerousTools: true,
       approvalDecider: defaultApprovalDecider,
       securityAuditLog,
@@ -2039,6 +2108,32 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     });
   }
 
+  function isInProgressCheckpoint(checkpoint: SessionCheckpoint): boolean {
+    const metadata = checkpoint.metadata as SessionCheckpoint['metadata'] & { status?: string; checkpointStatus?: string };
+    return metadata.status === 'in_progress' ||
+      metadata.checkpointStatus === 'in_progress' ||
+      checkpoint.metadata.label === 'in_progress';
+  }
+
+  async function autoResumeFromInProgressCheckpoint(sessionId: string): Promise<void> {
+    if (options.autoResumeCheckpoints === false) return;
+    const session = await store.get(sessionId);
+    if (!session) return;
+    const checkpoints = await checkpointStore.listBySession(sessionId);
+    const checkpoint = checkpoints.slice().reverse().find((cp) => isInProgressCheckpoint(cp) && !autoResumedCheckpointIds.has(cp.id));
+    if (!checkpoint) return;
+    const restored = restoreFromCheckpoint(checkpoint, session);
+    await store.put(restored.session);
+    autoResumedCheckpointIds.add(checkpoint.id);
+    eventBus.emit('session:updated', {
+      sessionId,
+      action: 'checkpoint:auto-resume',
+      checkpointId: checkpoint.id,
+      reason: 'in_progress_checkpoint',
+      messageCount: restored.session.messages.length,
+    });
+  }
+
   async function runConfiguredAgent(input: {
     sessionId: string;
     userMessage: string;
@@ -2051,6 +2146,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     // Ensure startup tasks have completed before first agent run
     await contextEngineReady;
     await frozenMemoryReady;
+    await autoResumeFromInProgressCheckpoint(input.sessionId);
 
     try {
       // v0.8.0 Hermes parity (#233): prefer the provider's `prefetch` hook when
@@ -2124,11 +2220,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     // Timestamp the start of this turn for accurate new-message detection
     const turnStartedAt = new Date().toISOString();
 
-    const result = await createConfiguredAgent(overrides).run({
-      agentId: options.agentId ?? 'crowclaw',
-      ...input,
-      memories,
-    });
+    activeUsageSessionId = input.sessionId;
+    let result: Awaited<ReturnType<AgentLoop['run']>>;
+    try {
+      result = await createConfiguredAgent(overrides).run({
+        agentId: options.agentId ?? 'crowclaw',
+        ...input,
+        memories,
+      });
+    } finally {
+      activeUsageSessionId = null;
+    }
 
     // Determine which messages are new this turn.
     // Use the turn start timestamp to find messages created during this run.
@@ -2210,37 +2312,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // "legacy mode" where every caller is treated as owner — any unauthenticated
   // POST to /api/mcp/server/request could invoke `crowclaw.chat`.
   const embeddedMcpOwnerToken = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.CROWCLAW_DASHBOARD_TOKEN;
-  const embeddedMcpServer = new CrowClawMcpServer({
-    run: async ({ sessionId, userMessage }) => {
-      const result = await runConfiguredAgent({
-        sessionId,
-        userMessage,
-        systemPrompt: 'You are CrowClaw running in embedded MCP server mode.'
-      });
-      return { finalResponse: result.finalResponse };
-    }
-  }, {
-    name: options.agentId ?? 'crowclaw-mcp-server',
+  const { embeddedMcpServer, embeddedAcpServer } = createEmbeddedProtocolServers({
+    run: async (input) => runConfiguredAgent({ ...input, systemPrompt: input.systemPrompt ?? '' }),
+    agentId: options.agentId ?? 'crowclaw-mcp-server',
     version,
     ownerToken: embeddedMcpOwnerToken,
-  });
-
-  const embeddedAcpServer = new AcpServer({
-    run: async ({ sessionId, userMessage, systemPrompt }) => {
-      const result = await runConfiguredAgent({
-        sessionId,
-        userMessage,
-        systemPrompt: systemPrompt ?? 'You are CrowClaw running in embedded ACP server mode.'
-      });
-      return {
-        finalResponse: result.finalResponse,
-        toolResults: result.toolResults
-      };
-    }
-  }, {
-    agentId: options.agentId ?? 'crowclaw-acp',
-    displayName: 'CrowClaw ACP',
-    version,
   });
 
   function getGatewayAccessPolicy(platform: GatewayPlatform): ChannelAccessPolicy | null {
@@ -2277,6 +2353,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
   function enforceGatewayAccess(message: NormalizedInboundMessage): Response | null {
     eventBus.emit('gateway:inbound', { platform: message.platform, channelId: message.channelId, userId: message.userId });
+    gatewayActivityLog.push({
+      type: 'inbound',
+      platform: message.platform,
+      channelId: message.channelId,
+      userId: message.userId,
+    });
     // Record channel in gateway config for knownChannels tracking
     // Only update existing platform configs (don't auto-create)
     if (message.channelId) {
@@ -2330,12 +2412,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   // Cap at 1000 checkpoints across all sessions. With autoCheckpoint on,
   // a long-running server accumulates one per iteration forever — the cap
   // keeps in-memory growth bounded. FIFO evicts the oldest.
-  const checkpointStore = new InMemoryCheckpointStore({ maxCheckpoints: 1000 });
+  const checkpointStore = options.checkpointStore ?? new InMemoryCheckpointStore({ maxCheckpoints: 1000 });
+  const autoResumedCheckpointIds = new Set<string>();
 
   // Delivery function — routes scheduled job results to gateway platforms
   const deliverToGateway: DeliveryFn = async (target: DeliveryTarget, content: string) => {
     const { platform, config: cfg } = target;
     eventBus.emit('gateway:outbound', { platform, contentLength: content.length });
+    gatewayActivityLog.push({
+      type: 'outbound',
+      platform,
+      channelId: cfg.channel ?? cfg.chatId ?? cfg.webhookUrl,
+    });
     try {
       switch (platform) {
         case 'telegram': {
@@ -2354,7 +2442,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           const webhookUrl = cfg.webhookUrl ?? cfg.channel;
           if (!webhookUrl) return { ok: false, error: 'Missing Discord webhook URL' };
           const result = await sendDiscordMessage(webhookUrl, content);
-          if (!result.ok) eventBus.emit('gateway:error', { platform, error: result.error });
+          if (!result.ok) {
+            const raw = result.raw as { event?: string; reason?: string } | undefined;
+            eventBus.emit('gateway:error', {
+              platform,
+              error: result.error,
+              ...(raw?.event === 'gateway:endpoint_policy' && raw.reason ? { reason: `endpoint-policy:${raw.reason}` } : {}),
+            });
+          }
           return { ok: result.ok, error: result.error };
         }
         case 'slack': {
@@ -2507,6 +2602,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     //    closure (which captures `lastHeartbeatAt`) doesn't pin the
     //    runtime's locals after shutdown.
     try { unsubscribeHeartbeatTracker(); } catch { /* best-effort */ }
+    try { unsubscribeRuntimeTelemetryMetrics(); } catch { /* best-effort */ }
 
     // 4. #119: Stop the context-engine refresh interval. Two consecutive
     //    `createNodeRuntime({ workingDirectory })` calls would otherwise
@@ -2661,6 +2757,17 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           return rateLimitExceeded('webhook', key, limit, buildGatewaySessionKey(message));
         }
         return enforceDailyUsdCap('webhook', key, buildGatewaySessionKey(message));
+      };
+
+      const validWebhookSecrets = (platform: string, primary?: string): string[] => {
+        const cfg = configStore.getGatewayConfig(platform);
+        const secrets = [primary ?? cfg?.webhookSecret].filter((secret): secret is string => Boolean(secret));
+        const previous = cfg?.extra?.previousWebhookSecret;
+        const previousExpiresAt = cfg?.extra?.previousWebhookSecretExpiresAt;
+        if (previous && previousExpiresAt && Date.parse(previousExpiresAt) > Date.now()) {
+          secrets.push(previous);
+        }
+        return [...new Set(secrets)];
       };
 
       // Fail-close: if we're bound to a non-localhost interface and no dashboard
@@ -2853,7 +2960,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Session rename
       const renameMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/rename$/);
       if (request.method === 'POST' && renameMatch) {
-        const sessionId = renameMatch[1];
+        const sessionId = getRouteCapture(renameMatch, 1);
+        if (!sessionId) {
+          return Response.json({ error: 'Invalid session ID' }, { status: 400 });
+        }
         const body = (await request.json()) as { name: string };
         const session = await store.get(sessionId);
         if (session) {
@@ -2875,7 +2985,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Session delete
       const deleteSessionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
       if (request.method === 'DELETE' && deleteSessionMatch) {
-        const sessionId = deleteSessionMatch[1];
+        const sessionId = getRouteCapture(deleteSessionMatch, 1);
+        if (!sessionId) {
+          return Response.json({ error: 'Invalid session ID' }, { status: 400 });
+        }
         if (typeof (store as unknown as { delete?: unknown }).delete === 'function') {
           await (store as unknown as { delete(id: string): Promise<void> }).delete(sessionId);
         }
@@ -2885,11 +2998,73 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       // Memory delete
       const deleteMemoryMatch = url.pathname.match(/^\/api\/memories\/([^/]+)$/);
       if (request.method === 'DELETE' && deleteMemoryMatch) {
-        const memoryId = deleteMemoryMatch[1];
-        if (typeof (memoryStore as unknown as { delete?: unknown }).delete === 'function') {
-          await (memoryStore as unknown as { delete(id: string): Promise<void> }).delete(memoryId);
+        const memoryId = getRouteCapture(deleteMemoryMatch, 1);
+        if (!memoryId) {
+          return Response.json({ error: 'Invalid memory ID' }, { status: 400 });
         }
-        return Response.json({ ok: true, memoryId });
+        const removed = await memoryService.delete(memoryId);
+        return Response.json({ ok: true, memoryId, removed });
+      }
+
+      const memoryUpdateMatch = url.pathname.match(/^\/api\/memories\/([^/]+)$/);
+      if ((request.method === 'PUT' || request.method === 'PATCH') && memoryUpdateMatch) {
+        const memoryId = getRouteCapture(memoryUpdateMatch, 1);
+        if (!memoryId) {
+          return Response.json({ error: 'Invalid memory ID' }, { status: 400 });
+        }
+        const decodedMemoryId = decodeURIComponent(memoryId);
+        const existing = (await memoryStore.getByIds([decodedMemoryId]))[0];
+        if (!existing) {
+          return Response.json({ ok: false, error: 'Memory not found' }, { status: 404 });
+        }
+        const body = (await request.json()) as {
+          summary?: string;
+          tags?: string[];
+          metadata?: Record<string, unknown>;
+          scope?: 'session' | 'user' | 'workspace';
+          scopeKey?: string;
+        };
+        const nextSummary = typeof body.summary === 'string' ? body.summary : existing.summary;
+        const metadata = {
+          ...(existing.metadata ?? {}),
+          ...(body.metadata ?? {}),
+          sizeBytes: Buffer.byteLength(nextSummary, 'utf8'),
+        };
+        const updated = {
+          ...existing,
+          summary: nextSummary,
+          tags: Array.isArray(body.tags) ? body.tags : existing.tags,
+          scope: body.scope ?? existing.scope,
+          scopeKey: body.scopeKey ?? existing.scopeKey,
+          metadata,
+        };
+        await memoryStore.write(updated);
+        return Response.json({ ok: true, record: updated });
+      }
+
+      const memoryPinMatch = url.pathname.match(/^\/api\/memories\/([^/]+)\/pin$/);
+      if (request.method === 'POST' && memoryPinMatch) {
+        const memoryId = getRouteCapture(memoryPinMatch, 1);
+        if (!memoryId) {
+          return Response.json({ error: 'Invalid memory ID' }, { status: 400 });
+        }
+        const decodedMemoryId = decodeURIComponent(memoryId);
+        const existing = (await memoryStore.getByIds([decodedMemoryId]))[0];
+        if (!existing) {
+          return Response.json({ ok: false, error: 'Memory not found' }, { status: 404 });
+        }
+        const body = (await request.json().catch(() => ({}))) as { pinned?: boolean };
+        const pinned = typeof body.pinned === 'boolean' ? body.pinned : existing.metadata?.pinned !== true;
+        const updated = {
+          ...existing,
+          metadata: {
+            ...(existing.metadata ?? {}),
+            pinned,
+            sizeBytes: Buffer.byteLength(existing.summary, 'utf8'),
+          },
+        };
+        await memoryStore.write(updated);
+        return Response.json({ ok: true, record: updated });
       }
 
       // Dashboard — serve web UI at root and /dashboard
@@ -2959,6 +3134,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const limitParam = url.searchParams.get('limit');
         const typeParam = url.searchParams.get('type');
         const severityParam = url.searchParams.get('severity');
+        const queryParam = url.searchParams.get('q')?.trim().toLowerCase();
         const sinceParam = url.searchParams.get('since') ?? undefined;
         const limit = limitParam ? parseInt(limitParam, 10) : undefined;
         let events = typeParam
@@ -2975,6 +3151,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             .filter((event) => {
               if (severityParam && event.severity !== severityParam) return false;
               if (sinceParam && Date.parse(event.timestamp) < Date.parse(sinceParam)) return false;
+              if (queryParam) {
+                const haystack = `${event.type} ${event.severity} ${event.detail} ${event.sessionId ?? ''}`.toLowerCase();
+                if (!haystack.includes(queryParam)) return false;
+              }
               const key = `${event.timestamp}:${event.type}:${event.severity}:${event.sessionId ?? ''}:${event.detail}`;
               if (seen.has(key)) return false;
               seen.add(key);
@@ -2989,6 +3169,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (sinceParam) {
             const sinceTime = Date.parse(sinceParam);
             events = events.filter((e) => Date.parse(e.timestamp) >= sinceTime);
+          }
+          if (queryParam) {
+            events = events.filter((event) =>
+              `${event.type} ${event.severity} ${event.detail} ${event.sessionId ?? ''}`.toLowerCase().includes(queryParam),
+            );
           }
           if (limit) events = events.slice(0, limit);
         }
@@ -3079,7 +3264,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       {
         const toolToggleMatch = url.pathname.match(/^\/api\/tools\/([^/]+)\/toggle$/);
         if (request.method === 'POST' && toolToggleMatch) {
-          const toolName = decodeURIComponent(toolToggleMatch[1]);
+          const toolName = getRouteCapture(toolToggleMatch, 1);
+          if (!toolName) {
+            return Response.json(
+              { error: { code: 'VALIDATION_ERROR', message: 'Invalid tool name' } },
+              { status: 400 },
+            );
+          }
+          const decodedToolName = decodeURIComponent(toolName);
           const body = (await request.json().catch(() => ({}))) as { disabled?: boolean };
           if (typeof body.disabled !== 'boolean') {
             return Response.json(
@@ -3089,14 +3281,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           }
           // Reject toggles for unknown tool names so the UI can't silently
           // accumulate dead entries in the disabled set.
-          if (!tools.get(toolName)) {
+          if (!tools.get(decodedToolName)) {
             return Response.json(
-              { error: { code: 'TOOL_NOT_FOUND', message: `Tool '${toolName}' is not registered` } },
+              { error: { code: 'TOOL_NOT_FOUND', message: `Tool '${decodedToolName}' is not registered` } },
               { status: 404 },
             );
           }
-          configStore.setToolDisabled(toolName, body.disabled);
-          return Response.json({ ok: true, name: toolName, disabled: body.disabled });
+          configStore.setToolDisabled(decodedToolName, body.disabled);
+          return Response.json({ ok: true, name: decodedToolName, disabled: body.disabled });
         }
       }
 
@@ -3325,7 +3517,25 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             prompts: []
           };
         }
+        let latest: string | null = releaseCheckCache?.latest ?? null;
+        let isOutdated = releaseCheckCache?.isOutdated ?? false;
+        if (!releaseCheckCache || Date.now() - releaseCheckCache.fetchedAt > 60 * 60_000) {
+          try {
+            const registry = await fetch('https://registry.npmjs.org/crowclaw/latest');
+            if (registry.ok) {
+              const body = await registry.json() as { version?: string };
+              latest = typeof body.version === 'string' ? body.version : null;
+              isOutdated = Boolean(latest && compareSemverLike(latest, version) > 0);
+              releaseCheckCache = { fetchedAt: Date.now(), latest, isOutdated };
+            }
+          } catch {
+            releaseCheckCache = { fetchedAt: Date.now(), latest: null, isOutdated: false };
+          }
+        }
         return Response.json({
+          current: version,
+          latest,
+          isOutdated,
           doctor: {
             ok: true,
             deployment: deploymentName,
@@ -3347,6 +3557,9 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             },
             release: {
               candidate: true,
+              current: version,
+              latest,
+              isOutdated,
               verification: {
                 note: 'typecheck and tests passed at build time'
               }
@@ -3582,6 +3795,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           config: providerCfg ? {
             primary: redactSlot(providerCfg.primary),
             fallback: redactSlot(providerCfg.fallback),
+            fast: redactSlot(providerCfg.fast),
             vision: redactSlot(providerCfg.vision),
             compression: redactSlot(providerCfg.compression),
             embedding: redactSlot(providerCfg.embedding),
@@ -3589,6 +3803,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           slots: {
             primary: redactSlot(providerCfg?.primary),
             fallback: redactSlot(providerCfg?.fallback),
+            fast: redactSlot(providerCfg?.fast),
             vision: redactSlot(providerCfg?.vision),
             compression: redactSlot(providerCfg?.compression),
             embedding: redactSlot(providerCfg?.embedding),
@@ -3677,7 +3892,55 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/plugins') {
-        return Response.json(plugins.list().map((plugin) => ({ name: plugin.name })));
+        return Response.json(listInstalledPlugins());
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/plugins/catalog') {
+        const installed = new Set(plugins.list().map((plugin) => plugin.name));
+        return Response.json({
+          catalog: BUILTIN_PLUGIN_CATALOG.map((entry) => ({
+            ...entry,
+            installed: installed.has(entry.manifest.name),
+          })),
+          source: 'builtin',
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/plugins/install') {
+        const body = await request.json().catch(() => ({})) as { slug?: string; config?: Record<string, unknown> };
+        const slug = body.slug?.trim();
+        const entry = slug ? getPluginCatalogEntry(slug) : undefined;
+        if (!entry) return Response.json({ ok: false, error: 'Unknown plugin catalog entry' }, { status: 404 });
+        const validation = validatePluginManifest(entry.manifest);
+        if (!validation.valid) {
+          return Response.json({ ok: false, errors: validation.errors, warnings: validation.warnings }, { status: 400 });
+        }
+        const plugin = createCatalogPlugin(entry.slug, body.config ?? {});
+        plugins.register(plugin);
+        installedPluginConfigs.set(plugin.name, {
+          manifest: entry.manifest,
+          config: body.config ?? {},
+          installedAt: new Date().toISOString(),
+        });
+        return Response.json({ ok: true, plugin: listInstalledPlugins().find((item) => item.name === plugin.name) });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/plugins/configure') {
+        const body = await request.json().catch(() => ({})) as { name?: string; config?: Record<string, unknown> };
+        if (!body.name || !plugins.get(body.name)) {
+          return Response.json({ ok: false, error: 'Plugin not installed' }, { status: 404 });
+        }
+        const current = installedPluginConfigs.get(body.name) ?? { manifest: { name: body.name }, installedAt: new Date().toISOString() };
+        installedPluginConfigs.set(body.name, { ...current, config: body.config ?? {} });
+        return Response.json({ ok: true, plugin: listInstalledPlugins().find((item) => item.name === body.name) });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/plugins/uninstall') {
+        const body = await request.json().catch(() => ({})) as { name?: string };
+        if (!body.name) return Response.json({ ok: false, error: 'name is required' }, { status: 400 });
+        const removed = plugins.unregister(body.name);
+        installedPluginConfigs.delete(body.name);
+        return Response.json({ ok: removed, name: body.name });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/skills') {
@@ -3723,7 +3986,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       if (request.method === 'GET' && url.pathname === routePaths.personas.active) {
         const active = personaRegistry.getActive();
         const identity = active.files.identity ? parseIdentity(active.files.identity) : {};
-        return Response.json({ name: active.name, identity });
+        return Response.json({
+          name: active.name,
+          identity,
+          promptPreview: active.prompt.slice(0, 1200),
+        });
       }
 
       if (request.method === 'POST' && url.pathname === routePaths.personas.switch) {
@@ -3862,6 +4129,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
         return Response.json({
           knownChannels: channelList,
+          activity: gatewayActivityLog.list(null, 100),
           platforms: [
             {
               name: 'telegram',
@@ -3939,6 +4207,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
               configured: !!cfg,
               enabled: cfg?.enabled ?? false,
               policy: cfg ? { dmPolicy: cfg.dmPolicy, groupPolicy: cfg.groupPolicy, requireMention: cfg.requireMention } : undefined,
+              allowlist: cfg?.allowlist ?? [],
             };
           }),
         });
@@ -4183,12 +4452,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         // Require HMAC signature: prior releases accepted unsigned requests,
         // so any caller who knew a whitelisted channelId could drive the agent.
         // Fail-closed: no secret → 403 instead of allowing.
-        const genericSecret = configStore.getGatewayConfig('webhook')?.webhookSecret;
-        if (!genericSecret) {
+        const genericSecrets = validWebhookSecrets('webhook');
+        if (genericSecrets.length === 0) {
           return Response.json({ ok: false, error: 'Generic webhook secret not configured' }, { status: 403 });
         }
         const rawBody = await request.text();
-        if (!verifyGenericWebhookSignature(request.headers.get('x-crowclaw-signature'), genericSecret, rawBody)) {
+        if (!genericSecrets.some((secret) => verifyGenericWebhookSignature(request.headers.get('x-crowclaw-signature'), secret, rawBody))) {
           return Response.json({ ok: false, error: 'Invalid webhook signature' }, { status: 403 });
         }
         const payload = JSON.parse(rawBody) as { channelId?: string; chatId?: string; userId?: string; text?: string; message?: string };
@@ -4254,13 +4523,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/discord') {
         // Discord webhook Ed25519 signature verification
-        const discordPubKey = options.discordPublicKey
-          ?? configStore.getGatewayConfig('discord')?.webhookSecret;
-        if (!discordPubKey) {
+        const discordPubKeys = validWebhookSecrets('discord', options.discordPublicKey);
+        if (discordPubKeys.length === 0) {
           return Response.json({ ok: false, error: 'Discord public key not configured' }, { status: 403 });
         }
         const discordRawBody = await request.text();
-        const discordSigValid = await verifyDiscordWebhookSignature(request, discordPubKey, discordRawBody);
+        const discordSigValid = (await Promise.all(
+          discordPubKeys.map((secret) => verifyDiscordWebhookSignature(request, secret, discordRawBody).catch(() => false)),
+        )).some(Boolean);
         if (!discordSigValid) {
           return Response.json({ ok: false, error: 'Invalid Discord webhook signature' }, { status: 403 });
         }
@@ -4311,12 +4581,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/telegram') {
         // Telegram webhook signature verification
-        const telegramSecret = options.telegramWebhookSecret
-          ?? configStore.getGatewayConfig('telegram')?.webhookSecret;
-        if (!telegramSecret) {
+        const telegramSecrets = validWebhookSecrets('telegram', options.telegramWebhookSecret);
+        if (telegramSecrets.length === 0) {
           return Response.json({ ok: false, error: 'Telegram webhook secret not configured' }, { status: 403 });
         }
-        if (!verifyTelegramWebhookSecret(request, telegramSecret)) {
+        if (!telegramSecrets.some((secret) => verifyTelegramWebhookSecret(request, secret))) {
           return Response.json({ ok: false, error: 'Invalid Telegram webhook secret' }, { status: 403 });
         }
 
@@ -4368,9 +4637,8 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/slack') {
         // Slack webhook signature verification — deny if no signing secret configured
-        const slackSecret = options.slackSigningSecret
-          ?? configStore.getGatewayConfig('slack')?.webhookSecret;
-        if (!slackSecret) {
+        const slackSecrets = validWebhookSecrets('slack', options.slackSigningSecret);
+        if (slackSecrets.length === 0) {
           return Response.json({ ok: false, error: 'Slack signing secret not configured' }, { status: 403 });
         }
         const rawBody = await request.text();
@@ -4384,12 +4652,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
           if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 300) {
             return Response.json({ ok: false, error: 'Slack timestamp outside replay window.' }, { status: 401 });
           }
-          const verified = await verifySlackSignature({
-            signingSecret: slackSecret,
+          const verified = (await Promise.all(slackSecrets.map((signingSecret) => verifySlackSignature({
+            signingSecret,
             timestamp,
             body: rawBody,
             signature
-          });
+          }).catch(() => false)))).some(Boolean);
           if (!verified) {
             return Response.json({ ok: false, error: 'Invalid Slack signature.' }, { status: 401 });
           }
@@ -4436,12 +4704,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/whatsapp') {
         // WhatsApp webhook secret verification
-        const whatsappSecret = options.webhookSecrets?.whatsapp
-          ?? configStore.getGatewayConfig('whatsapp')?.webhookSecret;
-        if (!whatsappSecret) {
+        const whatsappSecrets = validWebhookSecrets('whatsapp', options.webhookSecrets?.whatsapp);
+        if (whatsappSecrets.length === 0) {
           return Response.json({ ok: false, error: 'WhatsApp webhook secret not configured' }, { status: 403 });
         }
-        if (!verifyWebhookBearerSecret(request, whatsappSecret)) {
+        if (!whatsappSecrets.some((secret) => verifyWebhookBearerSecret(request, secret))) {
           return Response.json({ ok: false, error: 'Invalid WhatsApp webhook secret' }, { status: 403 });
         }
 
@@ -4484,12 +4751,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/signal') {
         // Signal webhook secret verification
-        const signalSecret = options.webhookSecrets?.signal
-          ?? configStore.getGatewayConfig('signal')?.webhookSecret;
-        if (!signalSecret) {
+        const signalSecrets = validWebhookSecrets('signal', options.webhookSecrets?.signal);
+        if (signalSecrets.length === 0) {
           return Response.json({ ok: false, error: 'Signal webhook secret not configured' }, { status: 403 });
         }
-        if (!verifyWebhookBearerSecret(request, signalSecret)) {
+        if (!signalSecrets.some((secret) => verifyWebhookBearerSecret(request, secret))) {
           return Response.json({ ok: false, error: 'Invalid Signal webhook secret' }, { status: 403 });
         }
 
@@ -4532,12 +4798,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/email') {
         // Email webhook secret verification
-        const emailSecret = options.webhookSecrets?.email
-          ?? configStore.getGatewayConfig('email')?.webhookSecret;
-        if (!emailSecret) {
+        const emailSecrets = validWebhookSecrets('email', options.webhookSecrets?.email);
+        if (emailSecrets.length === 0) {
           return Response.json({ ok: false, error: 'Email webhook secret not configured' }, { status: 403 });
         }
-        if (!verifyWebhookBearerSecret(request, emailSecret)) {
+        if (!emailSecrets.some((secret) => verifyWebhookBearerSecret(request, secret))) {
           return Response.json({ ok: false, error: 'Invalid Email webhook secret' }, { status: 403 });
         }
 
@@ -4580,12 +4845,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/matrix') {
         // Matrix webhook secret verification
-        const matrixSecret = options.webhookSecrets?.matrix
-          ?? configStore.getGatewayConfig('matrix')?.webhookSecret;
-        if (!matrixSecret) {
+        const matrixSecrets = validWebhookSecrets('matrix', options.webhookSecrets?.matrix);
+        if (matrixSecrets.length === 0) {
           return Response.json({ ok: false, error: 'Matrix webhook secret not configured' }, { status: 403 });
         }
-        if (!verifyWebhookBearerSecret(request, matrixSecret)) {
+        if (!matrixSecrets.some((secret) => verifyWebhookBearerSecret(request, secret))) {
           return Response.json({ ok: false, error: 'Invalid Matrix webhook secret' }, { status: 403 });
         }
 
@@ -4628,12 +4892,11 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       if (request.method === 'POST' && url.pathname === '/webhooks/sms') {
         // SMS webhook secret verification
-        const smsSecret = options.webhookSecrets?.sms
-          ?? configStore.getGatewayConfig('sms')?.webhookSecret;
-        if (!smsSecret) {
+        const smsSecrets = validWebhookSecrets('sms', options.webhookSecrets?.sms);
+        if (smsSecrets.length === 0) {
           return Response.json({ ok: false, error: 'SMS webhook secret not configured' }, { status: 403 });
         }
-        if (!verifyWebhookBearerSecret(request, smsSecret)) {
+        if (!smsSecrets.some((secret) => verifyWebhookBearerSecret(request, secret))) {
           return Response.json({ ok: false, error: 'Invalid SMS webhook secret' }, { status: 403 });
         }
 
@@ -4773,10 +5036,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             return Response.json({ ok: false, error: `Command blocked by security policy: ${criticalRisks.map((risk) => risk.description).join(', ')}` }, { status: 403 });
           }
         }
-        return Response.json(await tools.execute('terminal.background', body as Record<string, unknown>, {
-          agentId: options.agentId ?? 'crowclaw',
-          sessionId: 'terminal-background',
-        }));
+        return Response.json(await tools.execute('terminal.background', body as Record<string, unknown>, terminalToolContext('terminal-background')));
       }
 
       if (request.method === 'GET' && url.pathname === '/api/terminal/backends') {
@@ -4802,18 +5062,12 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/terminal/processes') {
-        return Response.json(await tools.execute('terminal.processes', {}, {
-          agentId: options.agentId ?? 'crowclaw',
-          sessionId: 'terminal-processes',
-        }));
+        return Response.json(await tools.execute('terminal.processes', {}, terminalToolContext('terminal-processes')));
       }
 
       if (request.method === 'POST' && url.pathname === '/api/terminal/kill') {
         const body = (await request.json()) as { pid?: string | number };
-        return Response.json(await tools.execute('terminal.kill', body as Record<string, unknown>, {
-          agentId: options.agentId ?? 'crowclaw',
-          sessionId: 'terminal-kill',
-        }));
+        return Response.json(await tools.execute('terminal.kill', body as Record<string, unknown>, terminalToolContext('terminal-kill')));
       }
 
       if (request.method === 'POST' && url.pathname === routePaths.actions.todo) {
@@ -5407,6 +5661,37 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json(await learning.listDrafts());
       }
 
+      if (request.method === 'GET' && url.pathname === '/api/learning/dashboard') {
+        const drafts = await learning.listDrafts();
+        let helpfulRatings = 0;
+        let unhelpfulRatings = 0;
+        for (const draft of drafts) {
+          const ratings = (draft as { ratings?: { helpful?: number; unhelpful?: number } }).ratings;
+          helpfulRatings += ratings?.helpful ?? 0;
+          unhelpfulRatings += ratings?.unhelpful ?? 0;
+        }
+        return Response.json({
+          drafts: drafts.map((draft) => ({
+            id: draft.id,
+            slug: draft.slug,
+            title: draft.title,
+            summary: draft.summary,
+            triggerPhrases: draft.triggerPhrases,
+            status: draft.status,
+            recurrenceCount: draft.sourceMessages,
+            createdAt: draft.createdAt,
+            updatedAt: draft.updatedAt,
+          })),
+          metrics: {
+            totalDrafts: drafts.length,
+            pendingDrafts: drafts.filter((draft) => draft.status === 'draft').length,
+            publishedDrafts: drafts.filter((draft) => draft.status === 'published').length,
+            helpfulRatings,
+            unhelpfulRatings,
+          },
+        });
+      }
+
       if (request.method === 'POST' && url.pathname === '/api/learning/auto-capture') {
         const body = (await request.json()) as {
           title?: string;
@@ -5585,24 +5870,28 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const jobDeleteMatch = url.pathname.match(/^\/api\/scheduler\/jobs\/([^/]+)$/);
 
         if (request.method === 'POST' && jobActionMatch) {
-          const jobId = decodeURIComponent(jobActionMatch[1]);
-          const action = jobActionMatch[2];
+          const jobId = getRouteCapture(jobActionMatch, 1);
+          const action = getRouteCapture(jobActionMatch, 2);
+          if (!jobId || !action) {
+            return Response.json({ error: 'Invalid job route' }, { status: 400 });
+          }
+          const decodedJobId = decodeURIComponent(jobId);
 
           if (action === 'pause') {
-            const result = await schedulerExecutor.pauseJob(jobId);
+            const result = await schedulerExecutor.pauseJob(decodedJobId);
             if (!result) return Response.json({ error: 'Job not found' }, { status: 404 });
             return Response.json(result);
           }
 
           if (action === 'resume') {
-            const result = await schedulerExecutor.resumeJob(jobId);
+            const result = await schedulerExecutor.resumeJob(decodedJobId);
             if (!result) return Response.json({ error: 'Job not found' }, { status: 404 });
             return Response.json(result);
           }
 
           if (action === 'dry-run') {
             try {
-              const record = await schedulerExecutor.dryRun(jobId);
+              const record = await schedulerExecutor.dryRun(decodedJobId);
               return Response.json(record);
             } catch (err: unknown) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -5612,20 +5901,27 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
 
         if (request.method === 'GET' && jobActionMatch) {
-          const jobId = decodeURIComponent(jobActionMatch[1]);
-          const action = jobActionMatch[2];
+          const jobId = getRouteCapture(jobActionMatch, 1);
+          const action = getRouteCapture(jobActionMatch, 2);
+          if (!jobId || !action) {
+            return Response.json({ error: 'Invalid job route' }, { status: 400 });
+          }
+          const decodedJobId = decodeURIComponent(jobId);
 
           if (action === 'history') {
             const limitParam = url.searchParams.get('limit');
             const limit = limitParam ? parseInt(limitParam, 10) : undefined;
-            const history = await schedulerStore.getRunHistory(jobId, limit);
+            const history = await schedulerStore.getRunHistory(decodedJobId, limit);
             return Response.json(history);
           }
         }
 
         if (request.method === 'DELETE' && jobDeleteMatch) {
-          const jobId = decodeURIComponent(jobDeleteMatch[1]);
-          const deleted = await schedulerExecutor.deleteJob(jobId);
+          const jobId = getRouteCapture(jobDeleteMatch, 1);
+          if (!jobId) {
+            return Response.json({ error: 'Invalid job route' }, { status: 400 });
+          }
+          const deleted = await schedulerExecutor.deleteJob(decodeURIComponent(jobId));
           if (!deleted) return Response.json({ error: 'Job not found' }, { status: 404 });
           return Response.json({ ok: true });
         }
@@ -5724,6 +6020,31 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             : await memoryService.list(sessionId, limit);
           return Response.json({ ok: true, records, ...(scopeParam ? { scope: scopeParam, scopeKey } : { sessionId }) });
         }
+        if (parts[3] === 'export') {
+          const session = sessionId ? await store.get(sessionId) : null;
+          if (!session) return Response.json({ ok: false, error: 'Session not found' }, { status: 404 });
+          const checkpoints = await checkpointStore.listBySession(sessionId);
+          const memories = await memoryService.list(sessionId, 100);
+          const toolResults = session.messages
+            .filter((m) => m.role === 'tool')
+            .map((m) => ({
+              toolName: m.name ?? 'tool',
+              ok: (m.metadata as { ok?: boolean } | undefined)?.ok ?? true,
+              output: m.content,
+            }));
+          return Response.json({
+            ok: true,
+            session,
+            checkpoints,
+            memories,
+            toolResults,
+            metadata: {
+              exportVersion: 1,
+              exportedAt: new Date().toISOString(),
+              sourceSessionId: sessionId,
+            },
+          });
+        }
         if (parts[3] === 'history' || parts[3] === 'state' || parts.length === 3) {
           const session = sessionId ? await store.get(sessionId) : null;
           if (!session) return Response.json({ sessionId, messages: [] });
@@ -5736,6 +6057,32 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
             ),
           });
         }
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/sessions/import') {
+        const body = await request.json().catch(() => ({})) as {
+          session?: Partial<SessionState> & { messages?: SessionState['messages'] };
+          metadata?: { sourceSessionId?: string };
+        };
+        if (!body.session || !Array.isArray(body.session.messages)) {
+          return Response.json({ ok: false, error: 'Invalid session export' }, { status: 400 });
+        }
+        const sessionId = crypto.randomUUID();
+        const imported: SessionState = {
+          agentId: body.session.agentId ?? options.agentId ?? 'crowclaw',
+          sessionId,
+          userId: body.session.userId,
+          workspaceId: body.session.workspaceId,
+          messages: body.session.messages,
+          updatedAt: new Date().toISOString(),
+          lineage: { rootSessionId: sessionId, compressionCount: 0 },
+        };
+        await store.put(imported);
+        eventBus.emit('session:created', {
+          sessionId,
+          importedFrom: body.metadata?.sourceSessionId ?? body.session.sessionId,
+        });
+        return Response.json({ ok: true, sessionId, session: summarizeSessionRecord(imported) });
       }
 
       if (request.method === 'POST' && url.pathname.startsWith('/api/sessions/')) {
@@ -6412,9 +6759,44 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({ ok: true, platform, configured: Boolean(configStore.getGatewayConfig(platform)) });
       }
 
+      const secretRotateMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/secret\/rotate$/);
+      if (request.method === 'POST' && secretRotateMatch) {
+        const platform = secretRotateMatch[1]!;
+        const existing = configStore.getGatewayConfig(platform) ?? { enabled: true };
+        const previous = existing.webhookSecret;
+        const nextSecret = `ccwhsec_${crypto.randomUUID().replace(/-/g, '')}`;
+        const extra = {
+          ...(existing.extra ?? {}),
+          ...(previous ? {
+            previousWebhookSecret: previous,
+            previousWebhookSecretExpiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+          } : {}),
+          webhookSecretRotatedAt: new Date().toISOString(),
+        };
+        configStore.setGatewayConfig(platform, {
+          ...existing,
+          webhookSecret: nextSecret,
+          extra,
+        });
+        gatewayActivityLog.push({
+          type: 'pairing',
+          platform,
+          action: 'secret-rotated',
+        });
+        return Response.json({
+          ok: true,
+          platform,
+          secret: nextSecret,
+          graceUntil: extra.previousWebhookSecretExpiresAt ?? null,
+        });
+      }
+
       const probeMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/probe$/);
       if (request.method === 'POST' && probeMatch) {
-        const platform = probeMatch[1];
+        const platform = getRouteCapture(probeMatch, 1);
+        if (!platform) {
+          return Response.json({ ok: false, error: 'Invalid platform' }, { status: 400 });
+        }
         const body = await request.json().catch(() => ({})) as { token?: string; webhookUrl?: string; phoneNumberId?: string; homeserverUrl?: string };
         // Fall back to the platform's stored config so the dashboard doesn't have to
         // re-send credentials on every probe.
@@ -6449,7 +6831,10 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
 
       const policyMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/policy$/);
       if (request.method === 'POST' && policyMatch) {
-        const platform = policyMatch[1];
+        const platform = getRouteCapture(policyMatch, 1);
+        if (!platform) {
+          return Response.json({ ok: false, error: 'Invalid platform' }, { status: 400 });
+        }
         const body = await request.json() as {
           dmPolicy?: string;
           groupPolicy?: string;
@@ -6527,7 +6912,58 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
 
         const result = approvePairing(configStore.getPendingPairingsMap() as Map<string, PairingChallenge>, body.code, policy);
+        gatewayActivityLog.push({
+          type: 'pairing',
+          platform: challenge.platform,
+          userId: challenge.senderId,
+          channelId: challenge.channelId,
+          ok: result.approved,
+          action: 'approved',
+        });
         return Response.json({ ok: result.approved, ...result });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/gateway/pairing/reject') {
+        const body = await request.json() as { code: string };
+        const code = body.code?.toUpperCase();
+        const entry = [...configStore.getPendingPairingsMap()].find(([, pairing]) => pairing.code === code);
+        if (!entry) return Response.json({ ok: false, rejected: false });
+        const [, pairing] = entry;
+        configStore.getPendingPairingsMap().delete(entry[0]);
+        gatewayActivityLog.push({
+          type: 'pairing',
+          platform: pairing.platform,
+          userId: pairing.senderId,
+          channelId: pairing.channelId,
+          ok: true,
+          action: 'rejected',
+        });
+        return Response.json({ ok: true, rejected: true, platform: pairing.platform, senderId: pairing.senderId });
+      }
+
+      if (request.method === 'POST' && url.pathname.match(/^\/api\/gateway\/([^/]+)\/pairing\/revoke$/)) {
+        const platform = url.pathname.split('/')[3]!;
+        const body = await request.json() as { senderId?: string };
+        const cfg = configStore.getGatewayConfig(platform);
+        if (!cfg || !body.senderId) return Response.json({ ok: false, revoked: false }, { status: 400 });
+        const nextAllowlist = (cfg.allowlist ?? []).filter((id) => id !== body.senderId);
+        configStore.setGatewayConfig(platform, { ...cfg, allowlist: nextAllowlist });
+        gatewayActivityLog.push({
+          type: 'pairing',
+          platform,
+          userId: body.senderId,
+          ok: true,
+          action: 'revoked',
+        });
+        return Response.json({ ok: true, revoked: true, platform, senderId: body.senderId });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/gateway/activity') {
+        const platform = url.searchParams.get('platform');
+        const limitParam = Number(url.searchParams.get('limit') ?? '100');
+        const limit = Number.isFinite(limitParam) ? Math.max(1, Math.min(100, limitParam)) : 100;
+        const events = gatewayActivityLog.list(platform, limit);
+        return Response.json({ ok: true, events });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/gateway/pairings') {
@@ -6566,8 +7002,32 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         return Response.json({ ok: true, config: configStore.getAgentConfig() });
       }
 
+      if (request.method === 'GET' && url.pathname === routePaths.observability.metrics) {
+        return new Response(renderPrometheusMetrics(usageTracker.getSummary()), {
+          headers: { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' },
+        });
+      }
+
       if (request.method === 'GET' && url.pathname === '/api/usage') {
-        return Response.json(usageTracker.getSummary());
+        const summary = usageTracker.getSummary();
+        const groupBy = (key: 'provider' | 'sessionId' | 'toolName') => {
+          const grouped: Record<string, { tokens: number; cost: number; calls: number }> = {};
+          for (const entry of summary.entries as Array<typeof summary.entries[number] & { sessionId?: string; toolName?: string }>) {
+            const label = entry[key] || 'unattributed';
+            const current = grouped[label] ?? { tokens: 0, cost: 0, calls: 0 };
+            current.tokens += entry.totalTokens;
+            current.cost += entry.costUsd;
+            current.calls += 1;
+            grouped[label] = current;
+          }
+          return grouped;
+        };
+        return Response.json({
+          ...summary,
+          byProvider: groupBy('provider'),
+          bySession: groupBy('sessionId'),
+          byTool: groupBy('toolName'),
+        });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/usage/reset') {
@@ -6585,6 +7045,45 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       }
 
       // --- MCP Server CRUD ---
+
+      if (request.method === 'GET' && url.pathname === '/api/mcp/catalog') {
+        const installed = new Set(configStore.getMcpServers().map((server) => server.catalogSlug ?? server.name));
+        return Response.json({
+          catalog: BUILTIN_MCP_CATALOG.map((entry) => ({
+            ...entry,
+            installed: installed.has(entry.slug),
+          })),
+          source: 'builtin',
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/mcp/servers/install') {
+        const body = await request.json().catch(() => ({})) as {
+          slug?: string;
+          env?: Record<string, string>;
+          packageSha256?: string;
+        };
+        const slug = body.slug?.trim();
+        const entry = slug ? getMcpCatalogEntry(slug) : undefined;
+        if (!entry) return Response.json({ ok: false, error: 'Unknown MCP catalog entry' }, { status: 404 });
+        if (entry.sha256 && body.packageSha256 !== entry.sha256) {
+          return Response.json({ ok: false, error: 'Catalog entry requires matching packageSha256 before install' }, { status: 400 });
+        }
+        const env = Object.fromEntries(
+          Object.entries(body.env ?? {}).filter(([, value]) => typeof value === 'string' && value.trim() !== ''),
+        ) as Record<string, string>;
+        const envErrors = validateMcpCatalogEnv(entry, env);
+        if (envErrors.length > 0) {
+          return Response.json({ ok: false, errors: envErrors }, { status: 400 });
+        }
+        const serverConfig = buildMcpServerConfigFromCatalog(entry, env);
+        configStore.saveMcpServer(serverConfig);
+        configStore.setMcpConnection(serverConfig.name, {
+          presetName: serverConfig.name,
+          status: 'disconnected',
+        });
+        return Response.json({ ok: true, server: { ...serverConfig, env: serverConfig.env ? Object.fromEntries(Object.keys(serverConfig.env).map((key) => [key, '***'])) : undefined } });
+      }
 
       if (request.method === 'POST' && url.pathname === '/api/mcp/servers') {
         const body = (await request.json()) as { name: string; command: string; args?: string | string[]; env?: Record<string, string>; description?: string };
@@ -6611,24 +7110,32 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       {
         const mcpServerMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)$/);
         if (request.method === 'DELETE' && mcpServerMatch) {
-          const name = decodeURIComponent(mcpServerMatch[1]);
-          const deleted = configStore.deleteMcpServer(name);
+          const name = getRouteCapture(mcpServerMatch, 1);
+          if (!name) {
+            return Response.json({ ok: false, error: 'Invalid server name' }, { status: 400 });
+          }
+          const decodedName = decodeURIComponent(name);
+          const deleted = configStore.deleteMcpServer(decodedName);
           if (!deleted) return Response.json({ ok: false, error: 'Server not found' }, { status: 404 });
-          configStore.removeMcpConnection(name);
-          return Response.json({ ok: true, name });
+          configStore.removeMcpConnection(decodedName);
+          return Response.json({ ok: true, name: decodedName });
         }
       }
 
       {
         const mcpServerToolsMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/tools$/);
         if (request.method === 'GET' && mcpServerToolsMatch) {
-          const name = decodeURIComponent(mcpServerToolsMatch[1]);
+          const name = getRouteCapture(mcpServerToolsMatch, 1);
+          if (!name) {
+            return Response.json({ server: '', tools: [], error: 'Invalid server name' }, { status: 400 });
+          }
+          const decodedName = decodeURIComponent(name);
           try {
             const tools = await mcpClient.listTools({ refresh: true });
-            return Response.json({ server: name, tools });
+            return Response.json({ server: decodedName, tools });
           } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
-            return Response.json({ server: name, tools: [], error: msg });
+            return Response.json({ server: decodedName, tools: [], error: msg });
           }
         }
       }
@@ -6636,16 +7143,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       {
         const mcpServerReconnectMatch = url.pathname.match(/^\/api\/mcp\/servers\/([^/]+)\/reconnect$/);
         if (request.method === 'POST' && mcpServerReconnectMatch) {
-          const name = decodeURIComponent(mcpServerReconnectMatch[1]);
-          configStore.setMcpConnection(name, { presetName: name, status: 'connecting', connectedAt: new Date().toISOString() });
+          const name = getRouteCapture(mcpServerReconnectMatch, 1);
+          if (!name) {
+            return Response.json({ ok: false, error: 'Invalid server name' }, { status: 400 });
+          }
+          const decodedName = decodeURIComponent(name);
+          configStore.setMcpConnection(decodedName, { presetName: decodedName, status: 'connecting', connectedAt: new Date().toISOString() });
           try {
             await mcpClient.refreshTools();
-            configStore.setMcpConnection(name, { presetName: name, status: 'connected', connectedAt: new Date().toISOString() });
-            return Response.json({ ok: true, name, status: 'connected' });
+            configStore.setMcpConnection(decodedName, { presetName: decodedName, status: 'connected', connectedAt: new Date().toISOString() });
+            return Response.json({ ok: true, name: decodedName, status: 'connected' });
           } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
-            configStore.setMcpConnection(name, { presetName: name, status: 'error', error: msg, connectedAt: new Date().toISOString() });
-            return Response.json({ ok: false, name, status: 'error', error: msg });
+            configStore.setMcpConnection(decodedName, { presetName: decodedName, status: 'error', error: msg, connectedAt: new Date().toISOString() });
+            return Response.json({ ok: false, name: decodedName, status: 'error', error: msg });
           }
         }
       }
@@ -6684,10 +7195,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         const skillSlugMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
 
         if (request.method === 'PUT' && skillSlugMatch) {
-          const slug = decodeURIComponent(skillSlugMatch[1]);
+          const slug = getRouteCapture(skillSlugMatch, 1);
+          if (!slug) {
+            return Response.json({ ok: false, error: 'Invalid skill slug' }, { status: 400 });
+          }
+          const decodedSlug = decodeURIComponent(slug);
           const body = (await request.json()) as { title?: string; summary?: string; triggerPhrases?: string[]; steps?: string[]; requiredTools?: string[] };
           const allSkills = await skillStore.list();
-          const existing = allSkills.find((s) => s.slug === slug);
+          const existing = allSkills.find((s) => s.slug === decodedSlug);
           if (!existing) {
             return Response.json({ ok: false, error: 'Skill not found' }, { status: 404 });
           }
@@ -6708,10 +7223,14 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
         }
 
         if (request.method === 'DELETE' && skillSlugMatch) {
-          const slug = decodeURIComponent(skillSlugMatch[1]);
+          const slug = getRouteCapture(skillSlugMatch, 1);
+          if (!slug) {
+            return Response.json({ ok: false, error: 'Invalid skill slug' }, { status: 400 });
+          }
+          const decodedSlug = decodeURIComponent(slug);
           // Check if built-in — built-in skills cannot be deleted
           const resolved = skillRegistry.resolveAll();
-          const match = resolved.find((s) => s.skill.manifest.name === slug);
+          const match = resolved.find((s) => s.skill.manifest.name === decodedSlug);
           if (match && (match.skill.manifest.category === 'builtin')) {
             return Response.json({ ok: false, error: 'Cannot delete built-in skill. Use disable instead.' }, { status: 400 });
           }
@@ -6854,9 +7373,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       {
         const skillDetailMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
         if (request.method === 'GET' && skillDetailMatch) {
-          const slug = decodeURIComponent(skillDetailMatch[1]);
+          const slug = getRouteCapture(skillDetailMatch, 1);
+          if (!slug) {
+            return Response.json({ ok: false, error: 'Invalid skill slug' }, { status: 400 });
+          }
+          const decodedSlug = decodeURIComponent(slug);
           const allSkills = await skillStore.list();
-          const match = allSkills.find((s) => s.slug === slug);
+          const match = allSkills.find((s) => s.slug === decodedSlug);
           if (!match) {
             return Response.json({ ok: false, error: 'Skill not found' }, { status: 404 });
           }
@@ -6867,9 +7390,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       {
         const skillVersionsMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/versions$/);
         if (request.method === 'GET' && skillVersionsMatch) {
-          const slug = decodeURIComponent(skillVersionsMatch[1]);
+          const slug = getRouteCapture(skillVersionsMatch, 1);
+          if (!slug) {
+            return Response.json({ versions: [] });
+          }
+          const decodedSlug = decodeURIComponent(slug);
           const allSkills = await skillStore.list();
-          const match = allSkills.find((s) => s.slug === slug);
+          const match = allSkills.find((s) => s.slug === decodedSlug);
           if (!match) return Response.json({ versions: [] });
           return Response.json({ versions: [{ version: match.version ?? 1, updatedAt: match.updatedAt, status: match.status }] });
         }
@@ -6878,14 +7405,18 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       {
         const skillRateMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/rate$/);
         if (request.method === 'POST' && skillRateMatch) {
-          const slug = decodeURIComponent(skillRateMatch[1]);
+          const slug = getRouteCapture(skillRateMatch, 1);
+          if (!slug) {
+            return Response.json({ ok: false, error: 'Invalid skill slug' }, { status: 400 });
+          }
+          const decodedSlug = decodeURIComponent(slug);
           const body = (await request.json()) as { rating: 'helpful' | 'unhelpful' };
           if (body.rating !== 'helpful' && body.rating !== 'unhelpful') {
             return Response.json({ ok: false, error: 'rating must be helpful or unhelpful' }, { status: 400 });
           }
           try {
-            await learning.rateSkill(slug, body.rating);
-            return Response.json({ ok: true, slug, rating: body.rating });
+            await learning.rateSkill(decodedSlug, body.rating);
+            return Response.json({ ok: true, slug: decodedSlug, rating: body.rating });
           } catch (error: unknown) {
             const msg = error instanceof Error ? error.message : String(error);
             return Response.json({ ok: false, error: msg }, { status: 404 });

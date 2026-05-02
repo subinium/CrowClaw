@@ -1,5 +1,153 @@
 export type GatewayPlatform = 'webhook' | 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'signal' | 'email' | 'matrix' | 'sms';
 
+export type GatewayPolicyTier = 'restricted' | 'balanced' | 'open';
+
+export interface GatewayEndpointPolicy {
+  policyTier: GatewayPolicyTier;
+  /** Optional protocol allowlist. Values may be `https` or `https:`. */
+  protocols?: string[];
+  /** Optional HTTP method allowlist. Values are normalized to uppercase. */
+  methods?: string[];
+  /** Optional pathname allowlist. Supports exact paths and trailing `*` prefixes. */
+  paths?: string[];
+}
+
+export interface GatewayEndpointPolicyDecision {
+  allowed: boolean;
+  reason:
+    | 'allowed'
+    | 'invalid-url'
+    | 'disallowed-protocol'
+    | 'disallowed-method'
+    | 'disallowed-path'
+    | 'unsafe-url';
+  policyTier: GatewayPolicyTier;
+  observability: {
+    event: 'gateway:endpoint_policy';
+    reason: GatewayEndpointPolicyDecision['reason'];
+    method: string;
+    protocol?: string;
+    path?: string;
+    policyTier: GatewayPolicyTier;
+  };
+}
+
+const TIER_PROTOCOLS: Record<GatewayPolicyTier, string[]> = {
+  restricted: ['https:'],
+  balanced: ['http:', 'https:'],
+  open: ['http:', 'https:'],
+};
+
+const TIER_METHODS: Record<GatewayPolicyTier, string[] | null> = {
+  restricted: ['GET', 'POST'],
+  balanced: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  open: null,
+};
+
+function normalizeProtocol(protocol: string): string {
+  return protocol.endsWith(':') ? protocol.toLowerCase() : `${protocol.toLowerCase()}:`;
+}
+
+function normalizeMethod(method: string): string {
+  return method.trim().toUpperCase();
+}
+
+function pathMatchesPolicy(path: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => {
+    if (pattern.endsWith('*')) return path.startsWith(pattern.slice(0, -1));
+    return path === pattern;
+  });
+}
+
+export function createDefaultEndpointPolicy(policyTier: GatewayPolicyTier = 'balanced'): GatewayEndpointPolicy {
+  return { policyTier };
+}
+
+export function evaluateGatewayEndpointPolicy(
+  endpoint: { url: string; method?: string },
+  policy: GatewayEndpointPolicy = createDefaultEndpointPolicy(),
+): GatewayEndpointPolicyDecision {
+  const method = normalizeMethod(endpoint.method ?? 'GET');
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint.url);
+  } catch {
+    return {
+      allowed: false,
+      reason: 'invalid-url',
+      policyTier: policy.policyTier,
+      observability: { event: 'gateway:endpoint_policy', reason: 'invalid-url', method, policyTier: policy.policyTier },
+    };
+  }
+
+  const protocol = parsed.protocol;
+  const tierProtocols = TIER_PROTOCOLS[policy.policyTier];
+  const configuredProtocols = policy.protocols?.map(normalizeProtocol);
+  const allowedProtocols = configuredProtocols
+    ? configuredProtocols.filter((candidate) => tierProtocols.includes(candidate))
+    : tierProtocols;
+  if (!allowedProtocols.includes(protocol)) {
+    return {
+      allowed: false,
+      reason: 'disallowed-protocol',
+      policyTier: policy.policyTier,
+      observability: { event: 'gateway:endpoint_policy', reason: 'disallowed-protocol', method, protocol, path: parsed.pathname, policyTier: policy.policyTier },
+    };
+  }
+
+  const tierMethods = TIER_METHODS[policy.policyTier];
+  const configuredMethods = policy.methods?.map(normalizeMethod);
+  const allowedMethods = configuredMethods && tierMethods
+    ? configuredMethods.filter((candidate) => tierMethods.includes(candidate))
+    : configuredMethods ?? tierMethods;
+  if (allowedMethods && !allowedMethods.includes(method)) {
+    return {
+      allowed: false,
+      reason: 'disallowed-method',
+      policyTier: policy.policyTier,
+      observability: { event: 'gateway:endpoint_policy', reason: 'disallowed-method', method, protocol, path: parsed.pathname, policyTier: policy.policyTier },
+    };
+  }
+
+  if (policy.paths && !pathMatchesPolicy(parsed.pathname, policy.paths)) {
+    return {
+      allowed: false,
+      reason: 'disallowed-path',
+      policyTier: policy.policyTier,
+      observability: { event: 'gateway:endpoint_policy', reason: 'disallowed-path', method, protocol, path: parsed.pathname, policyTier: policy.policyTier },
+    };
+  }
+
+  const urlSafety = validateFetchUrl(endpoint.url);
+  if (!urlSafety.safe) {
+    return {
+      allowed: false,
+      reason: 'unsafe-url',
+      policyTier: policy.policyTier,
+      observability: { event: 'gateway:endpoint_policy', reason: 'unsafe-url', method, protocol, path: parsed.pathname, policyTier: policy.policyTier },
+    };
+  }
+
+  return {
+    allowed: true,
+    reason: 'allowed',
+    policyTier: policy.policyTier,
+    observability: { event: 'gateway:endpoint_policy', reason: 'allowed', method, protocol, path: parsed.pathname, policyTier: policy.policyTier },
+  };
+}
+
+export type GatewayCallerScope = 'pairing' | 'operator' | 'owner';
+
+const TOKEN_SCOPE_RANK: Record<GatewayCallerScope, number> = {
+  pairing: 0,
+  operator: 1,
+  owner: 2,
+};
+
+export function canMutateToken(callerScope: GatewayCallerScope, targetScope: GatewayCallerScope): boolean {
+  return TOKEN_SCOPE_RANK[callerScope] >= TOKEN_SCOPE_RANK[targetScope];
+}
+
 // Inline URL safety check (gateway is zero-dep, cannot import from @crowclaw/core).
 // Patterns kept in sync with `packages/core/src/security.ts` PRIVATE_IP_PATTERNS —
 // update both when changing. IPv4-mapped IPv6, CGNAT, and multicast ranges included
@@ -1691,12 +1839,20 @@ export async function sendTelegramMessage(
  */
 export async function sendDiscordMessage(
   webhookUrl: string,
-  content: string
+  content: string,
+  options?: { endpointPolicy?: GatewayEndpointPolicy }
 ): Promise<GatewaySendResult> {
-  // Validate webhook URL to prevent SSRF
-  const urlCheck = validateFetchUrl(webhookUrl);
-  if (!urlCheck.safe) {
-    return { ok: false, platform: 'discord', error: `URL blocked: ${urlCheck.reason}` };
+  const endpointDecision = evaluateGatewayEndpointPolicy(
+    { url: webhookUrl, method: 'POST' },
+    options?.endpointPolicy ?? createDefaultEndpointPolicy('balanced'),
+  );
+  if (!endpointDecision.allowed) {
+    return {
+      ok: false,
+      platform: 'discord',
+      error: `Endpoint policy blocked: ${endpointDecision.reason}`,
+      raw: endpointDecision.observability,
+    };
   }
   const payload = buildDiscordSendPayload({ content });
 

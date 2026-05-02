@@ -4,6 +4,9 @@ import {
   createDefaultAccessPolicy,
   generatePairingCode,
   approvePairing,
+  canMutateToken,
+  createDefaultEndpointPolicy,
+  evaluateGatewayEndpointPolicy,
   type NormalizedInboundMessage,
   type ChannelAccessPolicy,
   type PairingChallenge,
@@ -135,5 +138,76 @@ describe('Gateway Access Policy', () => {
       const result = approvePairing(pending, 'INVALIDCODE', policy);
       expect(result.approved).toBe(false);
     });
+  });
+});
+
+describe('Gateway Endpoint Policy', () => {
+  it('balanced default allows safe http/https POST endpoints', () => {
+    const decision = evaluateGatewayEndpointPolicy(
+      { url: 'https://discord.com/api/webhooks/123/token', method: 'POST' },
+      createDefaultEndpointPolicy('balanced'),
+    );
+    expect(decision.allowed).toBe(true);
+    expect(decision.reason).toBe('allowed');
+    expect(decision.observability).toMatchObject({
+      event: 'gateway:endpoint_policy',
+      reason: 'allowed',
+      method: 'POST',
+      policyTier: 'balanced',
+    });
+  });
+
+  it('restricted tier refuses protocol or method violations with an event reason', () => {
+    const httpDecision = evaluateGatewayEndpointPolicy(
+      { url: 'http://discord.com/api/webhooks/123/token', method: 'POST' },
+      { policyTier: 'restricted' },
+    );
+    expect(httpDecision.allowed).toBe(false);
+    expect(httpDecision.reason).toBe('disallowed-protocol');
+    expect(httpDecision.observability.reason).toBe('disallowed-protocol');
+
+    const deleteDecision = evaluateGatewayEndpointPolicy(
+      { url: 'https://discord.com/api/webhooks/123/token', method: 'DELETE' },
+      { policyTier: 'restricted' },
+    );
+    expect(deleteDecision.allowed).toBe(false);
+    expect(deleteDecision.reason).toBe('disallowed-method');
+  });
+
+  it('optional paths narrow endpoint access', () => {
+    const allowed = evaluateGatewayEndpointPolicy(
+      { url: 'https://example.com/webhooks/telegram', method: 'POST' },
+      { policyTier: 'balanced', paths: ['/webhooks/*'] },
+    );
+    expect(allowed.allowed).toBe(true);
+
+    const denied = evaluateGatewayEndpointPolicy(
+      { url: 'https://example.com/admin/token', method: 'POST' },
+      { policyTier: 'balanced', paths: ['/webhooks/*'] },
+    );
+    expect(denied.allowed).toBe(false);
+    expect(denied.reason).toBe('disallowed-path');
+  });
+
+  it('keeps SSRF blocking observable through endpoint policy', () => {
+    const decision = evaluateGatewayEndpointPolicy(
+      { url: 'https://127.0.0.1/webhook', method: 'POST' },
+      { policyTier: 'open' },
+    );
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('unsafe-url');
+  });
+});
+
+describe('Gateway Token Scope Containment', () => {
+  it('does not allow pairing-only callers to mutate owner-scoped tokens', () => {
+    expect(canMutateToken('pairing', 'owner')).toBe(false);
+    expect(canMutateToken('pairing', 'operator')).toBe(false);
+  });
+
+  it('allows callers to mutate only same-or-lower token scopes', () => {
+    expect(canMutateToken('owner', 'operator')).toBe(true);
+    expect(canMutateToken('operator', 'pairing')).toBe(true);
+    expect(canMutateToken('operator', 'owner')).toBe(false);
   });
 });

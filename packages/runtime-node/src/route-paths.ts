@@ -88,6 +88,9 @@ export const routePaths = {
     summary: '/api/usage',
     reset: '/api/usage/reset'
   },
+  observability: {
+    metrics: '/metrics'
+  },
   sessions: {
     list: '/api/sessions',
     create: '/api/sessions',

@@ -102,7 +102,9 @@ export interface McpServerConfig {
   args: string[];
   env?: Record<string, string>;
   description?: string;
-  custom: true;
+  custom: boolean;
+  catalogSlug?: string;
+  repo?: string;
 }
 
 export interface SecurityPolicyConfig {
