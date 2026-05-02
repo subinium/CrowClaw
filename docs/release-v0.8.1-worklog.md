@@ -98,9 +98,14 @@ This file is the interruption-safe working ledger for the local
 
 Use this section for the next live batch before editing code:
 
-- Batch:
-- Subagents:
-- Files expected:
-- Verification plan:
-- Result:
-- Commit:
+- Batch: remote-open issue coverage audit after local implementation sweep
+  on 2026-05-03.
+- Subagents: pending; split by issue ranges/surfaces so unresolved items can
+  be patched without file ownership conflicts.
+- Files expected: initially read-only audit; update this worklog before any
+  implementation patch.
+- Verification plan: compare `gh issue list --state open` against local code,
+  tests, `origin/main` release sweep commits, and `release/v0.8.1` local
+  commits; produce a concrete unresolved issue list with file evidence.
+- Result: pending.
+- Commit: pending.
