@@ -24,9 +24,9 @@ import { ToolRegistry } from '@crowclaw/tools';
 import { createProviderFromSlot } from './provider-factory.js';
 import type { RuntimeConfigStore } from './config-store.js';
 import type { EventBus } from './event-bus.js';
-import type { FeedbackLedger } from './index.js';
+import type { FeedbackLedger } from './runtime-support.js';
 import type { Logger } from './logger.js';
-import type { NodeRuntimeOptions } from './index.js';
+import type { NodeRuntimeOptions } from './runtime-support.js';
 
 export interface ExecutionOverrides {
   agentPreset?: string;

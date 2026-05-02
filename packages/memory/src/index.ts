@@ -395,5 +395,5 @@ export {
 // v0.8.0 Hermes parity (#233) — pluggable MemoryProvider ABC.
 export type { MemoryProvider } from './provider.js';
 export type { MemoryScope } from './types.js';
-export { InMemoryMemoryProvider } from './provider.js';
+export { InMemoryMemoryProvider, PluginMemoryProvider, memoryProviderFromPluginRegistry } from './provider.js';
 export type { MemoryRecord as ProviderMemoryRecord, ConversationMessage as ProviderConversationMessage } from './types.js';

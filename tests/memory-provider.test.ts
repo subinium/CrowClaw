@@ -9,11 +9,14 @@ import { describe, expect, it } from 'vitest';
 import {
   InMemoryMemoryProvider,
   MemoryService,
+  memoryProviderFromPluginRegistry,
   type MemoryProvider,
   type MemoryScope,
   type ProviderMemoryRecord,
 } from '@crowclaw/memory';
+import { createMemoryBackendPlugin, PluginManager } from '@crowclaw/plugins';
 import { InMemoryMemoryStore } from '@crowclaw/storage';
+import { createNodeRuntime } from '../packages/runtime-node/src/index.js';
 
 // ---------------------------------------------------------------------------
 // InMemoryMemoryProvider — parity with the legacy MemoryService cases
@@ -116,6 +119,104 @@ describe('InMemoryMemoryProvider', () => {
     const start = Date.now();
     await provider.shutdown!();
     expect(Date.now() - start).toBeLessThan(50);
+  });
+});
+
+describe('memoryProviderFromPluginRegistry', () => {
+  it('adapts the first registered memory backend plugin', async () => {
+    const calls: Array<{ sessionId: string; query: string; limit: number; scope?: string; scopeKey?: string }> = [];
+    const provider = memoryProviderFromPluginRegistry({
+      list: () => [
+        { name: 'ordinary-plugin' },
+        {
+          name: 'custom-memory',
+          kind: 'memory-backend',
+          manifest: { name: 'custom-memory', memoryBackend: true },
+          provider: {
+            async recall(sessionId: string, query: string, limit: number, scope?: string, scopeKey?: string) {
+              calls.push({ sessionId, query, limit, scope, scopeKey });
+              return [{
+                id: 'plugin-record',
+                sessionId,
+                scope: scope ?? 'session',
+                scopeKey,
+                summary: `plugin memory for ${query}`,
+                tags: ['plugin'],
+                createdAt: '2026-01-01T00:00:00.000Z',
+              }];
+            },
+            async store(record: Record<string, unknown>) {
+              return { ...record, id: 'stored-by-plugin', createdAt: '2026-01-01T00:00:00.000Z' };
+            },
+            async delete() {
+              return true;
+            },
+            async list() {
+              return [];
+            },
+          },
+        },
+      ],
+    });
+
+    expect(provider).toBeTruthy();
+    const recalled = await provider!.recall('session-plugin', 'registry', 3, 'workspace', 'repo');
+
+    expect(calls).toEqual([{
+      sessionId: 'session-plugin',
+      query: 'registry',
+      limit: 3,
+      scope: 'workspace',
+      scopeKey: 'repo',
+    }]);
+    expect(recalled[0]?.summary).toBe('plugin memory for registry');
+    expect(await provider!.store({
+      sessionId: 'session-plugin',
+      scope: 'session',
+      summary: 'save through plugin',
+      tags: [],
+    })).toMatchObject({ id: 'stored-by-plugin', summary: 'save through plugin' });
+  });
+
+  it('returns undefined when the registry has no memory backend plugin', () => {
+    expect(memoryProviderFromPluginRegistry({ list: () => [{ name: 'ordinary-plugin' }] })).toBeUndefined();
+  });
+
+  it('runtime-node selects a registered memory backend plugin by default', async () => {
+    const plugin = createMemoryBackendPlugin({
+      name: 'runtime-memory',
+      provider: {
+        async recall(sessionId: string, query: string) {
+          return [{
+            id: 'runtime-plugin-record',
+            sessionId,
+            scope: 'session',
+            summary: `runtime plugin handled ${query}`,
+            tags: ['runtime'],
+            createdAt: '2026-01-01T00:00:00.000Z',
+          }];
+        },
+        async store(record: Record<string, unknown>) {
+          return { ...record, id: 'runtime-stored', createdAt: '2026-01-01T00:00:00.000Z' };
+        },
+        async delete() {
+          return true;
+        },
+        async list() {
+          return [];
+        },
+      },
+    });
+    const runtime = createNodeRuntime({
+      configStorePath: null,
+      plugins: new PluginManager().register(plugin),
+    });
+
+    const recalled = await runtime.memoryProvider.recall('runtime-session', 'registry', 1);
+
+    expect(recalled[0]?.id).toBe('runtime-plugin-record');
+    expect(recalled[0]?.summary).toBe('runtime plugin handled registry');
+    await runtime.shutdown();
   });
 });
 

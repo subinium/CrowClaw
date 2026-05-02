@@ -41,6 +41,7 @@ import {
   buildTelegramSendPayload,
   buildTelegramSendUrl,
   buildWhatsAppDispatch,
+  canMutateToken,
   createTypingIndicator,
   deleteTelegramWebhook,
   getTelegramWebhookInfo,
@@ -62,6 +63,7 @@ import {
   sendTelegramMessage,
   setTelegramWebhook,
   verifySlackSignature,
+  type GatewayCallerScope,
 } from '@crowclaw/gateway';
 import { listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { validatePluginManifest } from '@crowclaw/plugins';
@@ -543,6 +545,23 @@ export function verifyWebhookBearerSecret(request: Request, secret: string): boo
   return customSecret ? timingSafeEqual(customSecret, secret) : false;
 }
 
+function parseGatewayCallerScope(value: string | null): GatewayCallerScope | null {
+  return value === 'pairing' || value === 'operator' || value === 'owner' ? value : null;
+}
+
+function rejectTokenScopeMutation(callerScope: GatewayCallerScope, targetScope: GatewayCallerScope): Response | null {
+  if (canMutateToken(callerScope, targetScope)) return null;
+  return Response.json(
+    {
+      ok: false,
+      error: 'Forbidden: caller scope cannot mutate a broader-scoped token',
+      callerScope,
+      targetScope,
+    },
+    { status: 403 },
+  );
+}
+
 export interface RuntimeRouteHandlerContext {
   [key: string]: any;
 }
@@ -707,6 +726,7 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           { status: 429, headers: { 'Retry-After': '60' } },
         );
       };
+      let gatewayCallerScope: GatewayCallerScope = 'owner';
 
       const enforceWebhookRateLimit = (platform: string, message: NormalizedInboundMessage, req: Request): Response | null => {
         const limit = parsePositiveIntEnv(runtimeEnv.CROWCLAW_WEBHOOK_RATE_LIMIT, 10);
@@ -855,6 +875,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         const cookieToken = parseCookieToken(request.headers.get('cookie'));
         const derivedCookie = getDerivedCookieToken(dashToken);
         const tokenMatch = dashToken ? ((bearerToken !== null && timingSafeEqual(bearerToken, dashToken)) || (cookieToken !== null && timingSafeEqual(cookieToken, derivedCookie))) : false;
+        gatewayCallerScope = tokenMatch
+          ? 'owner'
+          : (parseGatewayCallerScope(request.headers.get('x-crowclaw-caller-scope')) ?? 'owner');
 
         // Dangerous routes require auth, regardless of localhost — UNLESS we're
         // in dev mode (no dashToken) AND the route is a dashboard-config
@@ -4705,6 +4728,10 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           homeserverUrl?: string;
         };
         const existing = configStore.getGatewayConfig(platform);
+        if (body.token !== undefined || body.webhookSecret !== undefined) {
+          const forbidden = rejectTokenScopeMutation(gatewayCallerScope, 'owner');
+          if (forbidden) return forbidden;
+        }
         // Channel-level mute: store in extra map
         if (body.channelId && body.muted !== undefined) {
           const extra = existing?.extra ?? {};
@@ -4729,6 +4756,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       const secretRotateMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/secret\/rotate$/);
       if (request.method === 'POST' && secretRotateMatch) {
         const platform = secretRotateMatch[1]!;
+        const forbidden = rejectTokenScopeMutation(gatewayCallerScope, 'owner');
+        if (forbidden) return forbidden;
         const existing = configStore.getGatewayConfig(platform) ?? { enabled: true };
         const previous = existing.webhookSecret;
         const nextSecret = `ccwhsec_${crypto.randomUUID().replace(/-/g, '')}`;
@@ -4827,6 +4856,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
 
       if (request.method === 'POST' && url.pathname === '/api/gateway/telegram/webhook') {
         const body = await request.json() as { url?: string; secretToken?: string; maxConnections?: number; allowedUpdates?: string[] };
+        const forbidden = rejectTokenScopeMutation(gatewayCallerScope, 'owner');
+        if (forbidden) return forbidden;
         const telegramConfig = configStore.getGatewayConfig('telegram');
         const token = telegramConfig?.token;
         if (!token) {
@@ -4846,6 +4877,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       }
 
       if (request.method === 'DELETE' && url.pathname === '/api/gateway/telegram/webhook') {
+        const forbidden = rejectTokenScopeMutation(gatewayCallerScope, 'owner');
+        if (forbidden) return forbidden;
         const telegramConfig = configStore.getGatewayConfig('telegram');
         const token = telegramConfig?.token;
         if (!token) {
@@ -4913,6 +4946,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         const body = await request.json() as { senderId?: string };
         const cfg = configStore.getGatewayConfig(platform);
         if (!cfg || !body.senderId) return Response.json({ ok: false, revoked: false }, { status: 400 });
+        const forbidden = rejectTokenScopeMutation(gatewayCallerScope, 'owner');
+        if (forbidden) return forbidden;
         const nextAllowlist = (cfg.allowlist ?? []).filter((id) => id !== body.senderId);
         configStore.setGatewayConfig(platform, { ...cfg, allowlist: nextAllowlist });
         gatewayActivityLog.push({

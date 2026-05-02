@@ -10,11 +10,18 @@
  */
 
 import type { Plugin, PluginContext, ToolResultTransform, PreToolCallVeto } from '@crowclaw/core';
+import type { MemoryBackendPlugin, MemoryBackendProvider } from './contracts.js';
 
 export {
   PluginManager,
   MemoryCapturePlugin,
 } from '@crowclaw/core';
+export type {
+  MemoryBackendManifest,
+  MemoryBackendPlugin,
+  MemoryBackendProvider,
+} from './contracts.js';
+
 export type {
   Plugin,
   PluginContext,
@@ -105,23 +112,6 @@ export class PluginCatalog {
   get(name: string): PluginCatalogEntry | undefined {
     return this.entries.get(name);
   }
-}
-
-export interface MemoryBackendPlugin extends Plugin {
-  kind: 'memory-backend';
-  manifest: PluginManifest & { memoryBackend: true };
-  provider: MemoryBackendProvider;
-}
-
-export interface MemoryBackendProvider {
-  recall(sessionId: string, query: string, limit: number, scope?: string, scopeKey?: string): Promise<unknown[]>;
-  store(record: Record<string, unknown>): Promise<unknown>;
-  delete(id: string): Promise<boolean>;
-  list(sessionId: string, scope?: string, limit?: number): Promise<unknown[]>;
-  init?(config?: Record<string, unknown>): Promise<void>;
-  prefetch?(sessionId: string, query: string, limit: number): Promise<unknown[]>;
-  sync_turn?(sessionId: string, summary: string, metadata?: Record<string, unknown>): Promise<void>;
-  shutdown?(): Promise<void>;
 }
 
 export function createMemoryBackendPlugin(options: {

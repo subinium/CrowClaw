@@ -94,6 +94,110 @@ export interface MemoryProvider {
   shutdown?(): Promise<void>;
 }
 
+interface MemoryBackendProviderLike {
+  recall(sessionId: string, query: string, limit: number, scope?: string, scopeKey?: string): Promise<unknown[]>;
+  store(record: Record<string, unknown>): Promise<unknown>;
+  delete(id: string): Promise<boolean>;
+  list(sessionId: string, scope?: string, limit?: number): Promise<unknown[]>;
+  init?(config?: Record<string, unknown>): Promise<void>;
+  prefetch?(sessionId: string, query: string, limit: number): Promise<unknown[]>;
+  sync_turn?(sessionId: string, summary: string, metadata?: Record<string, unknown>): Promise<void>;
+  shutdown?(): Promise<void>;
+}
+
+interface MemoryBackendPluginLike {
+  name?: string;
+  kind?: string;
+  manifest?: { memoryBackend?: boolean; name?: string };
+  provider?: MemoryBackendProviderLike;
+}
+
+export interface MemoryPluginRegistryLike {
+  list(): unknown[];
+}
+
+function isMemoryBackendProvider(value: unknown): value is MemoryBackendProviderLike {
+  if (!value || typeof value !== 'object') return false;
+  const provider = value as Partial<Record<keyof MemoryBackendProviderLike, unknown>>;
+  return typeof provider.recall === 'function'
+    && typeof provider.store === 'function'
+    && typeof provider.delete === 'function'
+    && typeof provider.list === 'function';
+}
+
+function isMemoryBackendPlugin(value: unknown): value is MemoryBackendPluginLike & { provider: MemoryBackendProviderLike } {
+  if (!value || typeof value !== 'object') return false;
+  const plugin = value as MemoryBackendPluginLike;
+  return plugin.kind === 'memory-backend'
+    && plugin.manifest?.memoryBackend === true
+    && isMemoryBackendProvider(plugin.provider);
+}
+
+/**
+ * Adapts a registered `MemoryBackendPlugin` from the plugin registry to the
+ * canonical `MemoryProvider` consumed by `MemoryService` and runtime hosts.
+ *
+ * The memory package intentionally keeps this structural so it can consume the
+ * registry without depending on `@crowclaw/plugins` and reintroducing a package
+ * layering cycle.
+ */
+export class PluginMemoryProvider implements MemoryProvider {
+  readonly name: string;
+  private readonly backend: MemoryBackendProviderLike;
+
+  constructor(plugin: MemoryBackendPluginLike & { provider: MemoryBackendProviderLike }) {
+    this.name = plugin.manifest?.name ?? plugin.name ?? 'memory-backend-plugin';
+    this.backend = plugin.provider;
+  }
+
+  async init(config?: Record<string, unknown>): Promise<void> {
+    await this.backend.init?.(config);
+  }
+
+  async prefetch(sessionId: string, query: string, limit: number): Promise<MemoryRecord[]> {
+    if (!this.backend.prefetch) {
+      return this.recall(sessionId, query, limit);
+    }
+    return this.backend.prefetch(sessionId, query, limit) as Promise<MemoryRecord[]>;
+  }
+
+  async recall(
+    sessionId: string,
+    query: string,
+    limit: number,
+    scope?: MemoryScope,
+    scopeKey?: string
+  ): Promise<MemoryRecord[]> {
+    return this.backend.recall(sessionId, query, limit, scope, scopeKey) as Promise<MemoryRecord[]>;
+  }
+
+  async sync_turn(sessionId: string, summary: string, metadata?: Record<string, unknown>): Promise<void> {
+    await this.backend.sync_turn?.(sessionId, summary, metadata);
+  }
+
+  async store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>): Promise<MemoryRecord> {
+    const stored = await this.backend.store(record as Record<string, unknown>);
+    return stored as MemoryRecord;
+  }
+
+  async delete(id: string): Promise<boolean> {
+    return this.backend.delete(id);
+  }
+
+  async list(sessionId: string, scope?: MemoryScope, limit?: number): Promise<MemoryRecord[]> {
+    return this.backend.list(sessionId, scope, limit) as Promise<MemoryRecord[]>;
+  }
+
+  async shutdown(): Promise<void> {
+    await this.backend.shutdown?.();
+  }
+}
+
+export function memoryProviderFromPluginRegistry(registry?: MemoryPluginRegistryLike): MemoryProvider | undefined {
+  const plugin = registry?.list().find(isMemoryBackendPlugin);
+  return plugin ? new PluginMemoryProvider(plugin) : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // InMemoryMemoryProvider — default backend
 // ---------------------------------------------------------------------------

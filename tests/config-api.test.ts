@@ -6,8 +6,8 @@ describe('Configuration API', () => {
   const TEST_TOKEN = 'config-api-token';
   const runtime = createNodeRuntime();
 
-  function req(method: string, path: string, body?: unknown, auth = false) {
-    const init: RequestInit = { method, headers: { 'content-type': 'application/json' } };
+  function req(method: string, path: string, body?: unknown, auth = false, headers?: Record<string, string>) {
+    const init: RequestInit = { method, headers: { 'content-type': 'application/json', ...headers } };
     if (auth) (init.headers as Record<string, string>).authorization = `Bearer ${TEST_TOKEN}`;
     if (body) init.body = JSON.stringify(body);
     return runtime.fetch(new Request(`http://localhost${path}`, init));
@@ -112,6 +112,23 @@ describe('Configuration API', () => {
       const data = await activity.json() as { ok: boolean; events: unknown[] };
       expect(data.ok).toBe(true);
       expect(Array.isArray(data.events)).toBe(true);
+    });
+
+    it('rejects pairing-scoped callers mutating owner-scoped gateway tokens', async () => {
+      const headers = { 'x-crowclaw-caller-scope': 'pairing' };
+
+      const configRes = await req('POST', '/api/gateway/telegram/config', { token: 'owner-bot-token', enabled: true }, false, headers);
+      expect(configRes.status).toBe(403);
+      await expect(configRes.json()).resolves.toMatchObject({ ok: false, callerScope: 'pairing', targetScope: 'owner' });
+
+      const rotateRes = await req('POST', '/api/gateway/slack/secret/rotate', {}, false, headers);
+      expect(rotateRes.status).toBe(403);
+      await expect(rotateRes.json()).resolves.toMatchObject({ ok: false, callerScope: 'pairing', targetScope: 'owner' });
+
+      await req('POST', '/api/gateway/telegram/policy', { allowlist: ['paired-user'] });
+      const revokeRes = await req('POST', '/api/gateway/telegram/pairing/revoke', { senderId: 'paired-user' }, false, headers);
+      expect(revokeRes.status).toBe(403);
+      await expect(revokeRes.json()).resolves.toMatchObject({ ok: false, callerScope: 'pairing', targetScope: 'owner' });
     });
   });
 
