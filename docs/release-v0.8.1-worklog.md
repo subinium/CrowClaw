@@ -119,6 +119,42 @@ Use this section for the next live batch before editing code:
     Patch areas: dashboard highlight.js loading/generated HTML, visual reset
     glass tokens/styles, accessibility live-region/reduced-motion/test
     coverage, and chat/perf virtualization or equivalent bounded rendering.
-  - #181-#228 verifier pending.
-  - #253-#288 verifier pending.
+  - #181-#228 verifier PARTIAL. PASS: #181, #182, #183, #185, #186,
+    #189-#201, #204-#228. UNRESOLVED: #184, #187, #188, #202, #203.
+    Patch areas: memory entry preview/edit/delete warnings, per-session
+    memory size/cost metadata, skill execution preview UX, embedded MCP
+    session store wiring, and embedded ACP live tool registry wiring.
+  - #253-#288 verifier PARTIAL. PASS: #253, #254, #255, #256, #257,
+    #258, #259, #260, #261, #262, #263, #264, #265, #266, #267, #268,
+    #269, #270, #271, #272, #273, #274, #275, #276, #277, #278, #279,
+    #280, #283, #284, #285, #286, #288. UNRESOLVED: #281, #282, #287.
+    Strict-read risks: #255 route parity inventory intentionally still reports
+    missing routes, and #267 documents secret-provider options without adding a
+    real `sops:` backend.
+- Commit: pending.
+
+## Active Batch: unresolved verifier gaps on 2026-05-03
+
+- Scope: #184, #187, #188, #202, #203, #243, #245, #249, #250, #281,
+  #282, #287, plus strict-read review for #255 and #267.
+- Branch: `release/v0.8.1`
+- Push/PR status: local only; no push, no PR, no remote issue closure.
+- Implementation ownership:
+  - UI memory/skills: #184, #187, #188 in `packages/web/ui/src/views/settings-view.ts`
+    and `packages/runtime-node/src/route-handlers.ts`.
+  - Embedded protocol wiring: #202, #203 in runtime/MCP/ACP embedding code.
+  - Dashboard polish/perf/a11y: #243, #245, #249, #250 in dashboard HTML/CSS,
+    chat/connect/toast components, a11y tests, and generated web HTML.
+  - Semantic memory: #281 in memory/storage/tool recall paths.
+  - Delegate depth: #282 in core delegate metadata/tooling tests.
+  - Codex provider defaults/JSDoc: #287 in provider/runtime provider docs and
+    tests.
+- Verification plan:
+  - Focused tests for each touched issue surface.
+  - `npm run typecheck`.
+  - `npm test` before claiming the batch complete.
+  - `npm run build:ui --workspace @crowclaw/web`.
+  - `npm run build:html --workspace @crowclaw/web`.
+  - `git diff --check`.
+- Result: in progress.
 - Commit: pending.
