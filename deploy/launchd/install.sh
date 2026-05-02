@@ -35,12 +35,17 @@ cat >"$plist_path" <<EOF
     <string>/usr/bin/env</string>
     <string>bash</string>
     <string>-lc</string>
-    <string>set -a; source "${env_file}"; set +a; exec node scripts/docker-serve.mjs</string>
+    <string>set -a; source "${env_file}"; set +a; exec /usr/bin/caffeinate -i -s node scripts/docker-serve.mjs</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>StandardOutPath</key>
   <string>${log_dir}/runtime.log</string>
   <key>StandardErrorPath</key>

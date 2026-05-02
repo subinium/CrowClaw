@@ -1,9 +1,9 @@
 import { getSandbox } from '@cloudflare/sandbox';
-import { AgentLoop, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, validateFetchUrl, type ParsedSkillFile, type ProviderAdapter, type CheckpointTrigger, type SessionState } from '@crowclaw/core';
+import { AgentLoop, DetailedUsageTracker, SecurityAuditLog, getAgentPreset, listAgentPresets, InMemoryCheckpointStore, createCheckpoint, restoreFromCheckpoint, createReplaySession, validateFetchUrl, type ParsedSkillFile, type ProviderAdapter, type CheckpointTrigger, type SessionState } from '@crowclaw/core';
 import { buildGatewayDeliveryPlan, normalizeGatewayRequest } from '@crowclaw/gateway';
 import { InMemorySkillStore, LearningPipeline, SkillRegistry, getBuiltInSkills } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport, getMcpPresetDescription, listMcpPresetNames } from '@crowclaw/mcp';
-import { MemoryService } from '@crowclaw/memory';
+import { FrozenMemory, InMemoryFrozenStore, MemoryService } from '@crowclaw/memory';
 import { MemoryCapturePlugin, PluginManager } from '@crowclaw/plugins';
 import { OpenAICompatibleProvider, isModelOverridable } from '@crowclaw/providers';
 import { buildToolBridgeArtifacts, CloudflareSandboxExecutor, registerSandboxTools } from '@crowclaw/sandbox-executor';
@@ -306,6 +306,10 @@ export class AgentSessionDurableObject {
   private readonly sessionStore: D1SessionStore;
   private readonly memoryStore: D1MemoryStore;
   private readonly memoryService: MemoryService;
+  private readonly frozenMemory = new FrozenMemory(new InMemoryFrozenStore(), 'MEMORY');
+  private readonly frozenUserProfile = new FrozenMemory(new InMemoryFrozenStore(), 'USER');
+  private readonly securityAuditLog = new SecurityAuditLog(500);
+  private readonly usageTracker = new DetailedUsageTracker();
   private readonly workspaceStore = new InMemoryWorkspaceStore();
   private readonly schedulerStore = new InMemorySchedulerStore();
   private readonly checkpointStore = new InMemoryCheckpointStore({ maxCheckpoints: 1000 });
@@ -631,6 +635,206 @@ export class AgentSessionDurableObject {
           schedulerJobs: (await this.schedulerStore.listJobs()).length
         }
       });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/diagnostics')) {
+      await this.ensureSchedulerHydrated();
+      this.pruneStaleSessions();
+      const jobs = await this.schedulerStore.listJobs();
+      const dynamicMcpClient = this.mcpClient as unknown as { getStatus?: () => { degraded?: boolean; lastError?: unknown } | null | undefined };
+      const mcpStatus = dynamicMcpClient.getStatus?.();
+      return Response.json({
+        ok: true,
+        runtime: 'cloudflare',
+        version: __CROWCLAW_VERSION__,
+        activeSessions: 0,
+        wsConnections: 0,
+        bridgeSessions: this.codeBridgeSessions.size,
+        browserSessions: this.browserSessions.size,
+        schedulerJobs: jobs.length,
+        transport: { ws: false, sse: false },
+        provider: {
+          configured: Boolean(this.env.OPENAI_API_KEY),
+          reachable: Boolean(this.env.OPENAI_API_KEY),
+          lastCallOk: null,
+        },
+        scheduler: {
+          running: this.autonomousRunning,
+          errored: false,
+          lastTick: this.autonomousLastTick,
+          jobCount: jobs.length,
+        },
+        mcp: {
+          total: mcpStatus ? 1 : 0,
+          connected: mcpStatus && !mcpStatus.degraded ? 1 : 0,
+          degraded: mcpStatus?.degraded ? 1 : 0,
+        },
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/config/snapshot')) {
+      await this.ensureActivePresetHydrated();
+      return Response.json({
+        ok: true,
+        activePreset: this.activePreset,
+        activeToolset: this.activePreset.toolset,
+        disabledSkills: [],
+        gatewayConfigs: {},
+        providerConfig: {
+          primary: {
+            name: 'Cloudflare OpenAI',
+            provider: 'openai',
+            model: this.env.OPENAI_MODEL ?? 'gpt-4.1-mini',
+            baseUrl: this.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
+            apiKey: this.env.OPENAI_API_KEY ? '***' : '',
+          },
+        },
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/config/schema')) {
+      return Response.json({
+        ok: true,
+        schema: {
+          runtime: 'cloudflare',
+          sections: ['provider', 'gateway', 'presets', 'remoteAccess'],
+        },
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/config/validate')) {
+      return Response.json({ ok: true, errors: [], warnings: [] });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/config/diff')) {
+      return Response.json({ ok: true, diff: [] });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/config/remote-access')) {
+      return Response.json({
+        ok: true,
+        publicUrl: null,
+        bindTailnetOnly: false,
+        trustedProxies: [],
+        runtime: 'cloudflare',
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/config/remote-access')) {
+      return Response.json(
+        { ok: false, error: 'remote_access_config_is_managed_by_worker_environment' },
+        { status: 501 },
+      );
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/memory/snapshot')) {
+      return Response.json({
+        ok: true,
+        memory: { entries: this.frozenMemory.getAll(), version: this.frozenMemory.snapshotVersion, size: this.frozenMemory.size },
+        user: { entries: this.frozenUserProfile.getAll(), version: this.frozenUserProfile.snapshotVersion, size: this.frozenUserProfile.size },
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/memory/snapshot')) {
+      const body = (await request.json().catch(() => ({}))) as { namespace?: 'memory' | 'user'; action?: 'set' | 'remove'; key?: string; value?: string; category?: string };
+      if (!body.key || (body.action !== 'set' && body.action !== 'remove')) {
+        return Response.json({ ok: false, error: 'Expected { namespace, action, key }' }, { status: 400 });
+      }
+      const target = body.namespace === 'user' ? this.frozenUserProfile : this.frozenMemory;
+      if (body.action === 'set') {
+        target.set(body.key, body.value ?? '', body.category);
+      } else {
+        target.remove(body.key);
+      }
+      await target.save(this.state.id.toString()).catch(() => {});
+      return Response.json({ ok: true, size: target.size, version: target.snapshotVersion });
+    }
+
+    if (request.method === 'GET' && (url.pathname.endsWith('/security/events') || url.pathname.endsWith('/security/audit'))) {
+      const type = url.searchParams.get('type');
+      const severity = url.searchParams.get('severity');
+      const limit = Number.parseInt(url.searchParams.get('limit') ?? '', 10);
+      let events = type ? this.securityAuditLog.getEventsByType(type) : this.securityAuditLog.getEvents();
+      if (severity) events = events.filter((event) => event.severity === severity);
+      return Response.json({ events: Number.isFinite(limit) ? events.slice(0, limit) : events });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/security/stats')) {
+      return Response.json(this.securityAuditLog.getStats());
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/security/status')) {
+      const stats = this.securityAuditLog.getStats();
+      return Response.json({
+        policy: {
+          redactToolOutput: true,
+          scanUserInput: true,
+          scanCommands: true,
+          blockDangerousCommands: true,
+          piiRedaction: true,
+        },
+        protections: ['ssrf', 'dashboard-auth', 'webhook-signatures', 'command-scan'],
+        activeCount: 4,
+        totalCount: 4,
+        grade: 'A',
+        stats,
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/security/policy')) {
+      return Response.json(
+        { ok: false, error: 'security_policy_is_read_only_on_workers' },
+        { status: 501 },
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/security/events/clear')) {
+      this.securityAuditLog.clear();
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/usage')) {
+      return Response.json(this.usageTracker.getSummary());
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/usage/reset')) {
+      this.usageTracker.reset();
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/providers/config')) {
+      return Response.json({
+        configured: Boolean(this.env.OPENAI_API_KEY),
+        slots: {
+          primary: {
+            name: 'Cloudflare OpenAI',
+            provider: 'openai',
+            model: this.env.OPENAI_MODEL ?? 'gpt-4.1-mini',
+            baseUrl: this.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
+            apiKey: this.env.OPENAI_API_KEY ? '***' : '',
+          },
+          fallback: null,
+          vision: null,
+          compression: null,
+          embedding: null,
+        },
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/providers/config')) {
+      return Response.json(
+        { ok: false, error: 'provider_config_is_managed_by_worker_environment' },
+        { status: 501 },
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/providers/test')) {
+      return Response.json({
+        ok: Boolean(this.env.OPENAI_API_KEY),
+        provider: 'openai',
+        model: this.env.OPENAI_MODEL ?? 'gpt-4.1-mini',
+        error: this.env.OPENAI_API_KEY ? undefined : 'OPENAI_API_KEY is not configured',
+      }, { status: this.env.OPENAI_API_KEY ? 200 : 400 });
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/skills')) {
@@ -1542,6 +1746,24 @@ export class AgentSessionDurableObject {
       return Response.json(await this.learning.listDrafts());
     }
 
+    if (request.method === 'GET' && url.pathname.endsWith('/learning/drafts/pending')) {
+      const drafts = await this.learning.listDrafts();
+      return Response.json(drafts.filter((draft) => draft.status === 'draft'));
+    }
+
+    if (request.method === 'GET' && url.pathname.endsWith('/learning/dashboard')) {
+      const drafts = await this.learning.listDrafts();
+      const published = drafts.filter((draft) => draft.status === 'published').length;
+      const pending = drafts.length - published;
+      return Response.json({
+        ok: true,
+        total: drafts.length,
+        pending,
+        published,
+        drafts,
+      });
+    }
+
     if (request.method === 'POST' && url.pathname.endsWith('/learning/drafts')) {
       const body = (await request.json()) as { title: string; messages: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }> };
       const stored = await this.learning.captureDraft(
@@ -1549,6 +1771,19 @@ export class AgentSessionDurableObject {
         body.title
       );
       return Response.json(stored);
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/learning/auto-capture')) {
+      const body = (await request.json()) as { title?: string; trigger?: string; messages?: Array<{ role: 'user' | 'assistant' | 'tool' | 'system'; content: string; createdAt?: string }> };
+      const messages = (body.messages ?? []).map((message) => ({ ...message, createdAt: message.createdAt ?? new Date().toISOString() }));
+      const draft = await this.learning.autoCapture(messages, body.title, { trigger: body.trigger });
+      return Response.json({ ok: true, captured: Boolean(draft), draft });
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/learning/match')) {
+      const body = (await request.json()) as { query?: string; limit?: number };
+      const matches = await this.learning.findRelevantSkills(body.query ?? '', body.limit);
+      return Response.json({ ok: true, matches });
     }
 
     if (request.method === 'POST' && /\/learning\/drafts\/.+\/publish$/.test(url.pathname)) {

@@ -17,6 +17,8 @@ docker run --rm \
   -p 8787:8787 \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
   -v crowclaw-data:/data \
   -e CROWCLAW_DASHBOARD_TOKEN="$CROWCLAW_DASHBOARD_TOKEN" \
   -e OPENAI_API_KEY="$OPENAI_API_KEY" \
@@ -34,6 +36,8 @@ mounted volume instead of the container home directory.
 - `tini` is PID 1 so signals and child processes are reaped correctly.
 - `/healthz` is used by the Docker `HEALTHCHECK`.
 - `/data` is the only persistent writable location expected by the runtime.
+- Use `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and `--read-only`
+  for standalone containers. The Compose template applies the same defaults.
 
 Keep `CROWCLAW_DASHBOARD_TOKEN` set whenever the dashboard is reachable from
 anything other than local development.

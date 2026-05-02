@@ -6,6 +6,10 @@ services:
     image: crowclaw:0.8.2
     restart: unless-stopped
     read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
@@ -14,6 +18,7 @@ services:
       CROWCLAW_DATA_DIR: /data
       CROWCLAW_PUBLIC_URL: ${CROWCLAW_PUBLIC_URL:?set CROWCLAW_PUBLIC_URL}
       CROWCLAW_DASHBOARD_TOKEN: ${CROWCLAW_DASHBOARD_TOKEN:?set CROWCLAW_DASHBOARD_TOKEN}
+      CROWCLAW_TRUSTED_PROXIES: ${CROWCLAW_TRUSTED_PROXIES:-172.16.0.0/12}
       CROWCLAW_API_KEY: ${CROWCLAW_API_KEY:-}
       CROWCLAW_PROVIDER: ${CROWCLAW_PROVIDER:-openai}
       CROWCLAW_BASE_URL: ${CROWCLAW_BASE_URL:-https://api.openai.com/v1}

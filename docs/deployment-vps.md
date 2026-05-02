@@ -19,6 +19,7 @@ Create a `.env` file next to `docker-compose.yml`:
 CROWCLAW_DOMAIN=crowclaw.example.com
 CROWCLAW_PUBLIC_URL=https://crowclaw.example.com
 CROWCLAW_DASHBOARD_TOKEN=replace-with-a-long-random-token
+CROWCLAW_TRUSTED_PROXIES=172.16.0.0/12
 OPENAI_API_KEY=sk-...
 ```
 
@@ -80,3 +81,8 @@ docker compose up -d --build
   the host has other explicit duties.
 - Do not put API keys in `docker-compose.yml`; keep secrets in `.env` or a
   host-level secret manager.
+- `CROWCLAW_TRUSTED_PROXIES=172.16.0.0/12` lets CrowClaw trust the
+  `X-Forwarded-For` chain from Caddy on the private Docker bridge while the
+  CrowClaw service remains un-published outside Compose.
+- Caddy stores ACME certificates in the `caddy-data` volume and auto-renews
+  Let's Encrypt certificates for `CROWCLAW_DOMAIN`.

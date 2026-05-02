@@ -99,6 +99,18 @@ function unsupportedOnWorkers(path: string): Response {
   );
 }
 
+async function forwardToSystemSession(request: Request, env: RuntimeEnv, url: URL, internalPath: string): Promise<Response> {
+  const stub = getSpecialSessionStub(env, '__system__');
+  const init: RequestInit = {
+    method: request.method,
+    headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' },
+  };
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    init.body = await request.text();
+  }
+  return stub.fetch(new Request(`https://internal/session${internalPath}${url.search}`, init));
+}
+
 /**
  * Derive the cookie-safe token from CROWCLAW_DASHBOARD_TOKEN using HMAC-SHA256.
  * Mirrors the Node runtime so `/api/auth/verify` semantics are consistent
@@ -257,6 +269,54 @@ export default {
         method: 'GET',
         headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' }
       }));
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/diagnostics') {
+      return forwardToSystemSession(request, env, url, '/diagnostics');
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/config/snapshot') {
+      return forwardToSystemSession(request, env, url, '/config/snapshot');
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/config/schema') {
+      return forwardToSystemSession(request, env, url, '/config/schema');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/config/validate') {
+      return forwardToSystemSession(request, env, url, '/config/validate');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/config/diff') {
+      return forwardToSystemSession(request, env, url, '/config/diff');
+    }
+
+    if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/api/config/remote-access') {
+      return forwardToSystemSession(request, env, url, '/config/remote-access');
+    }
+
+    if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/api/memory/snapshot') {
+      return forwardToSystemSession(request, env, url, '/memory/snapshot');
+    }
+
+    if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/api/usage') {
+      return forwardToSystemSession(request, env, url, '/usage');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/usage/reset') {
+      return forwardToSystemSession(request, env, url, '/usage/reset');
+    }
+
+    if (url.pathname.startsWith('/api/security/')) {
+      return forwardToSystemSession(request, env, url, url.pathname.replace('/api', ''));
+    }
+
+    if ((request.method === 'GET' || request.method === 'POST') && url.pathname === '/api/providers/config') {
+      return forwardToSystemSession(request, env, url, '/providers/config');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/providers/test') {
+      return forwardToSystemSession(request, env, url, '/providers/test');
     }
 
     if (request.method === 'GET' && url.pathname === '/api/skills') {
@@ -779,6 +839,22 @@ export default {
         method: 'GET',
         headers: { 'content-type': request.headers.get('content-type') ?? 'application/json' }
       }));
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/learning/drafts/pending') {
+      return forwardToSystemSession(request, env, url, '/learning/drafts/pending');
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/learning/dashboard') {
+      return forwardToSystemSession(request, env, url, '/learning/dashboard');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/learning/auto-capture') {
+      return forwardToSystemSession(request, env, url, '/learning/auto-capture');
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/learning/match') {
+      return forwardToSystemSession(request, env, url, '/learning/match');
     }
 
     if (request.method === 'POST' && url.pathname === '/api/learning/drafts') {
