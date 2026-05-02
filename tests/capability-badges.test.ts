@@ -188,8 +188,19 @@ describe('capability badges', () => {
       );
       expect(dockerContent).toContain('scripts/docker-serve.mjs');
       expect(dockerContent).not.toContain('packages/runtime-node/dist/index.js');
+      expect(dockerContent).toContain('npm run build -- --force');
       expect(dockerContent).toContain('EXPOSE 8787');
       expect(dockerContent).toContain('CrowClaw HTTP server');
+    });
+
+    it('.dockerignore excludes TypeScript build cache from image builds', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const dockerIgnoreContent = await readFile(
+        join(process.cwd(), '.dockerignore'),
+        'utf-8'
+      );
+      expect(dockerIgnoreContent).toContain('**/*.tsbuildinfo');
     });
 
     it('wrangler.jsonc uses crowclaw branding', async () => {

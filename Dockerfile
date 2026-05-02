@@ -8,7 +8,7 @@ COPY tsconfig.json tsconfig.base.json vitest.config.ts ./
 RUN npm ci --no-audit
 
 COPY . .
-RUN npm run build && npm prune --omit=dev
+RUN npm run build -- --force && npm prune --omit=dev
 
 FROM node:22-slim AS runtime
 RUN apt-get update \
