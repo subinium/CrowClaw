@@ -43,6 +43,17 @@ interface SessionInfo {
   messageCount: number;
   updatedAt: string;
   contextPct?: number;
+  /**
+   * v0.8.4 (#192-UI): server-derived metadata used by the sessions sidebar.
+   * `status` mirrors the runtime classifier (active|completed|failed) so the
+   * filter dropdown stays consistent with the backend; `memoryBytes` lets the
+   * "Memory size" sort work without a second round-trip; `firstUserMessage`
+   * powers the hover preview popover that the audit demanded.
+   */
+  status?: 'active' | 'completed' | 'failed';
+  memoryBytes?: number;
+  memoryEntryCount?: number;
+  lastRole?: string | null;
 }
 
 interface ActiveSessionInfo {
@@ -219,6 +230,30 @@ export class ChatView extends LitElement {
         color: var(--text-muted);
       }
 
+      /* v0.8.4 (#192-UI): bulk-action toolbar that surfaces above the
+         session list when at least one row is checked. */
+      .sess-bulk-bar {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-3);
+        border-bottom: 1px solid var(--border);
+        background: var(--accent-soft, rgba(255,255,255,0.06));
+        font-size: var(--text-xs);
+      }
+      .sess-bulk-bar .sess-bulk-count {
+        flex: 1;
+        color: var(--text-muted);
+      }
+
+      /* v0.8.4 (#192-UI): inline checkbox replaces the previous "menu only"
+         actions row so bulk delete is one click away. */
+      .sess-check {
+        margin-right: 4px;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+
       .sess-list { flex: 1; overflow-y: auto; }
 
       .sess-item {
@@ -233,6 +268,30 @@ export class ChatView extends LitElement {
       .sess-item.active { background: var(--accent-soft); border-left: 2px solid var(--accent); }
       .sess-item.focused { outline: 2px solid var(--accent); outline-offset: -2px; }
       .sess-item:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+      .sess-item.selected { background: var(--accent-soft, rgba(255,255,255,0.06)); border-left: 2px solid var(--accent); }
+
+      /* v0.8.4 (#192-UI): preview tooltip pinned to the right edge of the
+         hovered row. Truncates at 200 chars with ellipsis to keep the
+         floating layer compact. */
+      .sess-preview-tooltip {
+        position: absolute;
+        top: 8px;
+        left: calc(100% + 8px);
+        z-index: 30;
+        width: 320px;
+        max-width: 60vw;
+        max-height: 200px;
+        overflow: hidden;
+        background: var(--bg-secondary, var(--bg-primary));
+        color: var(--text-primary);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: var(--sp-2) var(--sp-3);
+        font-size: var(--text-xs);
+        line-height: 1.45;
+        box-shadow: var(--shadow-md);
+        pointer-events: none;
+      }
 
       .sess-item-top {
         display: flex;
@@ -1334,8 +1393,41 @@ export class ChatView extends LitElement {
   @state() private currentSessionId: string | null = localStorage.getItem('cc_sid');
   @state() private messages: ChatMessage[] = [];
   @state() private searchQuery = '';
-  @state() private sessionFilter: 'all' | 'active' | 'inactive' = 'all';
+  /**
+   * v0.8.4 (#192-UI): status filter mapped to the server `?status=` query.
+   * `inactive` was a client-only filter prior to v0.8.4; the backend now
+   * exposes a richer classifier (active|completed|failed) so we mirror it.
+   */
+  @state() private sessionFilter: 'all' | 'active' | 'completed' | 'failed' = 'all';
   @state() private sessionPage = 0;
+  /**
+   * v0.8.4 (#192-UI): cursor-based pagination state from /api/sessions.
+   * `nextCursor` is the keyset cursor returned by the server; null when the
+   * filtered result fits in the current view. `totalCount` is shown next to
+   * "X shown" so the operator knows whether they're seeing all results.
+   */
+  @state() private sessionsNextCursor: string | null = null;
+  @state() private sessionsTotalCount = 0;
+  @state() private sessionsLoadingMore = false;
+  /**
+   * v0.8.4 (#192-UI): bulk-action multi-select. Map of session id -> selected
+   * for fast toggling. Empty when no rows are checked. The "Delete N selected"
+   * action button only renders when the size is > 0.
+   */
+  @state() private sessionsSelected: Set<string> = new Set();
+  /**
+   * v0.8.4 (#192-UI): client-side sort over the already-paginated window.
+   * Server returns `updatedAt DESC` by default; the dropdown lets the user
+   * resort by created/tokens/memory without a re-fetch.
+   */
+  @state() private sessionsSort: 'updated' | 'created' | 'tokens' | 'memory' = 'updated';
+  /**
+   * v0.8.4 (#192-UI): which session card is currently hovered for preview.
+   * Used to position the floating tooltip showing the first user message.
+   */
+  @state() private hoverPreviewSessionId: string | null = null;
+  /** v0.8.4 (#192-UI): debounce timer for the search input. */
+  private _sessionSearchTimer: ReturnType<typeof setTimeout> | null = null;
   @state() private streaming = false;
   @state() private streamText = '';
   /**
@@ -1712,12 +1804,28 @@ export class ChatView extends LitElement {
 
   // --- Session loading ---
 
-  private async _loadSessions() {
+  /**
+   * v0.8.4 (#192-UI): hit GET /api/sessions with the new query params
+   * (`?search=`, `?status=`, `?limit=`, `?cursor=`) so search and filtering
+   * happen server-side. `append=true` keeps the current sessions list and
+   * tacks on the next page for the "Load more" button. When the params
+   * change (search/status), pass `append=false` so the list resets.
+   */
+  private async _loadSessions(opts: { append?: boolean; cursor?: string | null } = {}) {
+    const append = opts.append === true;
+    const params = new URLSearchParams();
+    if (this.searchQuery.trim()) params.set('search', this.searchQuery.trim());
+    if (this.sessionFilter !== 'all') params.set('status', this.sessionFilter);
+    if (opts.cursor) params.set('cursor', opts.cursor);
+    const qs = params.toString();
+    const path = qs ? `/api/sessions?${qs}` : '/api/sessions';
     try {
       const data = await api<{
         ok: boolean;
         supported: boolean;
         count: number;
+        totalCount?: number;
+        nextCursor?: string | null;
         sessions: Array<{
           sessionId: string;
           title?: string;
@@ -1727,22 +1835,122 @@ export class ChatView extends LitElement {
           userId?: string;
           workspaceId?: string;
           lastRole?: string | null;
+          memoryBytes?: number;
+          memoryEntryCount?: number;
         }>;
-      }>('/api/sessions');
+      }>(path);
       const incoming = (data.sessions || [])
-        .map((s) => ({
+        .map((s): SessionInfo => ({
           id: s.sessionId,
           title: s.title ?? '',
           preview: s.preview ?? '',
           messageCount: s.messageCount ?? 0,
           updatedAt: s.updatedAt ?? new Date().toISOString(),
+          memoryBytes: typeof s.memoryBytes === 'number' ? s.memoryBytes : undefined,
+          memoryEntryCount: typeof s.memoryEntryCount === 'number' ? s.memoryEntryCount : undefined,
+          lastRole: s.lastRole ?? null,
         }));
-      const byId = new Map(this.sessions.map((s) => [s.id, s]));
-      for (const session of incoming) {
-        byId.set(session.id, { ...byId.get(session.id), ...session });
+      if (append) {
+        // Preserve any client-side state on existing rows (e.g. unread badge)
+        // by merging incoming rows on top rather than replacing wholesale.
+        const byId = new Map(this.sessions.map((s) => [s.id, s]));
+        for (const session of incoming) {
+          byId.set(session.id, { ...byId.get(session.id), ...session });
+        }
+        this.sessions = [...byId.values()];
+      } else {
+        // Fresh result set — drop client-side merging so the UI mirrors
+        // exactly what the server returned for the current filter window.
+        this.sessions = incoming;
+        // Drop bulk-select state that no longer maps to a visible row.
+        const visible = new Set(incoming.map((s) => s.id));
+        if (this.sessionsSelected.size > 0) {
+          const next = new Set<string>();
+          for (const id of this.sessionsSelected) {
+            if (visible.has(id)) next.add(id);
+          }
+          this.sessionsSelected = next;
+        }
       }
-      this.sessions = [...byId.values()];
+      this.sessionsNextCursor = data.nextCursor ?? null;
+      this.sessionsTotalCount = typeof data.totalCount === 'number' ? data.totalCount : this.sessions.length;
     } catch { /* ignore */ }
+  }
+
+  /**
+   * v0.8.4 (#192-UI): "Load more" button handler. Appends the next cursor
+   * page to the existing list. No-op when nothing left.
+   */
+  private async _loadMoreSessions() {
+    if (!this.sessionsNextCursor || this.sessionsLoadingMore) return;
+    this.sessionsLoadingMore = true;
+    try {
+      await this._loadSessions({ append: true, cursor: this.sessionsNextCursor });
+    } finally {
+      this.sessionsLoadingMore = false;
+    }
+  }
+
+  /**
+   * v0.8.4 (#192-UI): debounced re-fetch on search/filter change. The
+   * pagination cursor resets each time so the new filter starts from the top.
+   */
+  private _onSearchInput(value: string) {
+    this.searchQuery = value;
+    this.sessionPage = 0;
+    if (this._sessionSearchTimer) clearTimeout(this._sessionSearchTimer);
+    this._sessionSearchTimer = setTimeout(() => {
+      void this._loadSessions();
+    }, 300);
+  }
+
+  private _onStatusFilterChange(value: string) {
+    if (value !== 'all' && value !== 'active' && value !== 'completed' && value !== 'failed') return;
+    this.sessionFilter = value;
+    this.sessionPage = 0;
+    void this._loadSessions();
+  }
+
+  private _toggleSessionSelected(id: string, e?: Event) {
+    if (e) e.stopPropagation();
+    const next = new Set(this.sessionsSelected);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    this.sessionsSelected = next;
+  }
+
+  private _clearSessionSelection() {
+    if (this.sessionsSelected.size === 0) return;
+    this.sessionsSelected = new Set();
+  }
+
+  private async _bulkDeleteSelected() {
+    if (this.sessionsSelected.size === 0) return;
+    const ids = [...this.sessionsSelected];
+    if (!confirm(`Delete ${ids.length} selected session${ids.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    // Optimistic UI: drop them locally, then hit the API. If any fail we
+    // resync from the server — the user will see at most a brief flicker.
+    const remaining = this.sessions.filter((s) => !this.sessionsSelected.has(s.id));
+    this.sessions = remaining;
+    if (this.currentSessionId && this.sessionsSelected.has(this.currentSessionId)) {
+      this.currentSessionId = null;
+      localStorage.removeItem('cc_sid');
+      this.messages = [];
+    }
+    this.sessionsSelected = new Set();
+    let failures = 0;
+    await Promise.all(ids.map(async (id) => {
+      try {
+        await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      } catch {
+        failures += 1;
+      }
+    }));
+    if (failures > 0) {
+      showToast(`Deleted ${ids.length - failures} of ${ids.length} sessions`, 'error');
+      void this._loadSessions();
+    } else {
+      showToast(`Deleted ${ids.length} session${ids.length === 1 ? '' : 's'}`, 'success');
+    }
   }
 
   private async _loadHistory() {
@@ -2436,21 +2644,37 @@ export class ChatView extends LitElement {
     if (detail) detail.classList.toggle('open');
   }
 
-  private get _filteredSessions() {
-    const q = this.searchQuery.toLowerCase();
-    const searched = q
-      ? this.sessions.filter((s) =>
-          s.id.toLowerCase().includes(q) ||
-          s.title.toLowerCase().includes(q) ||
-          s.preview.toLowerCase().includes(q))
-      : this.sessions;
-    const filtered = searched.filter((s) => {
-      if (this.sessionFilter === 'active') return this._isSessionActive(s.id);
-      if (this.sessionFilter === 'inactive') return !this._isSessionActive(s.id);
-      return true;
-    });
-    return filtered.sort((a, b) =>
-      new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  /**
+   * v0.8.4 (#192-UI): server now handles search + status filter, so the
+   * client-side filter pass collapses to identity. We keep the getter so
+   * the rest of the component (length checks, render lists) doesn't need
+   * to change shape; the server-truncated list IS the visible window.
+   *
+   * Sort runs client-side over the already-paginated window. The default
+   * server response is `updatedAt DESC` and that path stays untouched; the
+   * non-default sorts (created/tokens/memory) reorder the on-screen rows
+   * without a re-fetch.
+   */
+  private get _filteredSessions(): SessionInfo[] {
+    const list = [...this.sessions];
+    switch (this.sessionsSort) {
+      case 'created':
+        // No created-at field on the wire today. Approximate via updatedAt
+        // descending so the dropdown isn't a no-op; replace once the API
+        // exposes a `createdAt` field.
+        list.sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+        break;
+      case 'tokens':
+        list.sort((a, b) => (b.messageCount ?? 0) - (a.messageCount ?? 0));
+        break;
+      case 'memory':
+        list.sort((a, b) => (b.memoryBytes ?? 0) - (a.memoryBytes ?? 0));
+        break;
+      case 'updated':
+      default:
+        list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    }
+    return list;
   }
 
   private get _sessionPageCount() {
@@ -2458,9 +2682,11 @@ export class ChatView extends LitElement {
   }
 
   private get _pagedSessions() {
-    const page = Math.min(this.sessionPage, this._sessionPageCount - 1);
-    const start = page * this.sessionPageSize;
-    return this._filteredSessions.slice(start, start + this.sessionPageSize);
+    // v0.8.4 (#192-UI): the server already paginates via cursor; client
+    // pagination becomes a no-op so the "Load more" button is the single
+    // pagination affordance. Returning the full window keeps the existing
+    // render contract intact.
+    return this._filteredSessions;
   }
 
   private get _messageWindowStart() {
@@ -2500,7 +2726,7 @@ export class ChatView extends LitElement {
               <input placeholder="Search sessions..."
                      aria-label="Search sessions"
                      .value=${this.searchQuery}
-                     @input=${(e: InputEvent) => { this.searchQuery = (e.target as HTMLInputElement).value; this.sessionPage = 0; }}>
+                     @input=${(e: InputEvent) => this._onSearchInput((e.target as HTMLInputElement).value)}>
               <crowclaw-button
                 variant="primary"
                 size="sm"
@@ -2513,22 +2739,46 @@ export class ChatView extends LitElement {
             </div>
             <div class="sess-filter-row">
               <select
-                aria-label="Filter sessions"
+                aria-label="Filter sessions by status"
                 .value=${this.sessionFilter}
+                @change=${(e: Event) => this._onStatusFilterChange((e.target as HTMLSelectElement).value)}
+              >
+                <option value="all">All</option>
+                <option value="active">Active</option>
+                <option value="completed">Completed</option>
+                <option value="failed">Failed</option>
+              </select>
+              <select
+                aria-label="Sort sessions"
+                .value=${this.sessionsSort}
                 @change=${(e: Event) => {
-                  this.sessionFilter = (e.target as HTMLSelectElement).value as 'all' | 'active' | 'inactive';
-                  this.sessionPage = 0;
+                  const v = (e.target as HTMLSelectElement).value;
+                  if (v === 'updated' || v === 'created' || v === 'tokens' || v === 'memory') {
+                    this.sessionsSort = v;
+                  }
                 }}
               >
-                <option value="all">All sessions</option>
-                <option value="active">Active only</option>
-                <option value="inactive">Inactive only</option>
+                <option value="updated">Updated</option>
+                <option value="created">Created</option>
+                <option value="tokens">Tokens</option>
+                <option value="memory">Memory</option>
               </select>
-              <span>${this._filteredSessions.length} shown</span>
+              <span title=${`${this._filteredSessions.length} of ${this.sessionsTotalCount} total`}>
+                ${this._filteredSessions.length}${this.sessionsTotalCount > this._filteredSessions.length ? ` / ${this.sessionsTotalCount}` : ''}
+              </span>
             </div>
+            ${this.sessionsSelected.size > 0 ? html`
+              <div class="sess-bulk-bar" role="toolbar" aria-label="Bulk session actions">
+                <span class="sess-bulk-count">${this.sessionsSelected.size} selected</span>
+                <button class="btn btn-danger" @click=${this._bulkDeleteSelected}>
+                  Delete ${this.sessionsSelected.size}
+                </button>
+                <button class="btn" @click=${this._clearSessionSelection}>Clear</button>
+              </div>
+            ` : nothing}
             <div class="sess-list" role="listbox" aria-label="Sessions" tabindex="0">
               ${this._filteredSessions.length === 0
-                ? this.sessions.length === 0
+                ? this.sessions.length === 0 && !this.searchQuery && this.sessionFilter === 'all'
                   ? html`<crowclaw-empty
                       icon="sessions"
                       title="No active sessions"
@@ -2540,16 +2790,13 @@ export class ChatView extends LitElement {
                   : html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">No matching sessions</div></div>`
                 : this._pagedSessions.map((s, idx) => this._renderSessionCard(s, idx))}
             </div>
-            ${this._filteredSessions.length > this.sessionPageSize
+            ${this.sessionsNextCursor
               ? html`
                   <div class="sess-page">
-                    <button class="btn" ?disabled=${this.sessionPage === 0} @click=${() => { this.sessionPage = Math.max(0, this.sessionPage - 1); }}>
-                      Prev
+                    <button class="btn" ?disabled=${this.sessionsLoadingMore} @click=${this._loadMoreSessions}>
+                      ${this.sessionsLoadingMore ? 'Loading...' : 'Load more'}
                     </button>
-                    <span>Page ${Math.min(this.sessionPage + 1, this._sessionPageCount)} / ${this._sessionPageCount}</span>
-                    <button class="btn" ?disabled=${this.sessionPage >= this._sessionPageCount - 1} @click=${() => { this.sessionPage = Math.min(this._sessionPageCount - 1, this.sessionPage + 1); }}>
-                      Next
-                    </button>
+                    <span>${this._filteredSessions.length} of ${this.sessionsTotalCount}</span>
                   </div>
                 `
               : nothing}
@@ -2729,15 +2976,29 @@ export class ChatView extends LitElement {
     const isCurrent = s.id === this.currentSessionId;
     const isFocused = listIndex >= 0 && listIndex === this.focusedSessionIndex;
     const showMenu = this.contextMenuSessionId === s.id;
+    // v0.8.4 (#192-UI): bulk-select state mirrors the checkbox; hovering a
+    // row produces a floating preview tooltip with the first user message.
+    const isSelected = this.sessionsSelected.has(s.id);
+    const showPreview = this.hoverPreviewSessionId === s.id && !!s.preview;
 
     return html`
-      <div class="sess-item ${isCurrent ? 'active' : ''} ${isFocused ? 'focused' : ''}"
+      <div class="sess-item ${isCurrent ? 'active' : ''} ${isFocused ? 'focused' : ''} ${isSelected ? 'selected' : ''}"
            role="option"
            tabindex="0"
            aria-selected=${isCurrent ? 'true' : 'false'}
            @click=${() => this._selectSession(s.id)}
-           @focus=${() => { this.focusedSessionIndex = listIndex; }}>
+           @focus=${() => { this.focusedSessionIndex = listIndex; }}
+           @mouseenter=${() => { this.hoverPreviewSessionId = s.id; }}
+           @mouseleave=${() => { if (this.hoverPreviewSessionId === s.id) this.hoverPreviewSessionId = null; }}>
         <div class="sess-actions">
+          <input
+            class="sess-check"
+            type="checkbox"
+            aria-label=${`Select session ${s.title || s.id}`}
+            .checked=${isSelected}
+            @click=${(e: Event) => e.stopPropagation()}
+            @change=${(e: Event) => this._toggleSessionSelected(s.id, e)}
+          />
           <crowclaw-button
             variant="ghost"
             size="sm"
@@ -2771,6 +3032,11 @@ export class ChatView extends LitElement {
         </div>
         ${s.contextPct !== undefined ? html`
           <div class="sess-ctx"><div class="sess-ctx-bar" style="width:${Math.min(100, s.contextPct)}%"></div></div>
+        ` : nothing}
+        ${showPreview ? html`
+          <div class="sess-preview-tooltip" role="tooltip" aria-label="Session preview">
+            ${s.preview.slice(0, 200)}${s.preview.length > 200 ? '…' : ''}
+          </div>
         ` : nothing}
       </div>
     `;
