@@ -5,6 +5,39 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [Unreleased] — release/v0.8.4 sweep — 17 reopened issues (in progress)
+
+After v0.8.3's GitHub-close pass closed 105 issues via verifier-only
+pass, a follow-up audit found that 17 of them were actually shipped
+incompletely — 6 FAIL (features missing entirely) plus 11 PARTIAL
+(acceptance criteria not fully met). Those 17 have been reopened on
+2026-05-03 and will be properly implemented in this sweep.
+
+Working ledger: `docs/release-v0.8.4-worklog.md`.
+
+### Reopened — FAIL (6, missing features)
+- **#185** learning loop dashboard — status state machine, per-skill metrics panel, loop diagram absent
+- **#187** per-session memory size + cost — SessionState fields and Memory column missing
+- **#189** plugin catalog UI — backend present, `connect-view.ts` UI absent
+- **#192** sessions list — pagination / search / filter / virtualizer all missing both backend and UI
+- **#197** persona switcher header — only Settings tab variant, no header pill / dropdown / preview modal
+- **#200** Telegram / Slack / Discord setup wizard — step-by-step flow absent
+
+### Reopened — PARTIAL (11, AC gap)
+- **#181** chat-view skill chip row + EventBus `skill:matched` + activation counters
+- **#184** memory delete UX — redaction confidence indicator + bulk multi-select
+- **#227** onboarding wizard → Connect redirect + chat header active model badge
+- **#233** `docs/memory-providers.md` (required by AC, file does not exist)
+- **#240** `compat: 'crowclaw-legacy'` interop + agentskills.io compliance audit comment
+- **#244** chat-view button-style consolidation — `.ops-btn`, `.steer-sticky-btn`, `.cp-restore` still hand-rolled
+- **#245** visual reset — `backdrop-filter: blur` and `#e05545` warning-red still hardcoded in 4+ sites
+- **#250** `@lit-labs/virtualizer` (Phase A) — never landed; only stream-delta batching shipped
+- **#254** CI version-drift check step in `.github/workflows/ci.yml`
+- **#272** batch-runner CLI `--eval` flag + `accuracy < threshold` non-zero exit
+- **#274** `gpt-tokenizer` npm dep + ±5% precision equivalence test
+
+(... per-issue CHANGELOG entries follow as the sweep batches land ...)
+
 ## [0.8.3] — 2026-05-03 — GitHub-close pass: 52 verifier-confirmed issues
 
 **This release is a GitHub-close pass with no code change.** Earlier

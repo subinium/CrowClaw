@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/learning",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,7 +17,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.8.3"
+    "@crowclaw/core": "0.8.4"
   },
   "repository": {
     "type": "git",

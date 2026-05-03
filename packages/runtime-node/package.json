@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/runtime-node",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -33,19 +33,19 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/acp": "0.8.3",
-    "@crowclaw/core": "0.8.3",
-    "@crowclaw/gateway": "0.8.3",
-    "@crowclaw/learning": "0.8.3",
-    "@crowclaw/mcp": "0.8.3",
-    "@crowclaw/mcp-server": "0.8.3",
-    "@crowclaw/memory": "0.8.3",
-    "@crowclaw/plugins": "0.8.3",
-    "@crowclaw/providers": "0.8.3",
-    "@crowclaw/scheduler": "0.8.3",
-    "@crowclaw/storage": "0.8.3",
-    "@crowclaw/tools": "0.8.3",
-    "@crowclaw/workspace": "0.8.3"
+    "@crowclaw/acp": "0.8.4",
+    "@crowclaw/core": "0.8.4",
+    "@crowclaw/gateway": "0.8.4",
+    "@crowclaw/learning": "0.8.4",
+    "@crowclaw/mcp": "0.8.4",
+    "@crowclaw/mcp-server": "0.8.4",
+    "@crowclaw/memory": "0.8.4",
+    "@crowclaw/plugins": "0.8.4",
+    "@crowclaw/providers": "0.8.4",
+    "@crowclaw/scheduler": "0.8.4",
+    "@crowclaw/storage": "0.8.4",
+    "@crowclaw/tools": "0.8.4",
+    "@crowclaw/workspace": "0.8.4"
   },
   "peerDependencies": {
     "@opentelemetry/api": "^1.9.0"
