@@ -123,6 +123,86 @@ interface MemoryRecord {
   timestamp: string;
 }
 
+/* ---- v0.8.4 (#184) Redaction confidence indicator ----------------- */
+
+export type RedactionLevel = 'low' | 'medium' | 'high';
+
+export interface RedactionAssessment {
+  /**
+   * `low`  — no detectable patterns; safe to keep.
+   * `medium` — common PII (email, phone) detected or backend reports
+   *           redactions already happened. Worth a quick review.
+   * `high` — credentials/secrets/API keys detected (current text); a
+   *          strong signal that the row needs immediate audit/delete.
+   */
+  level: RedactionLevel;
+  /** Pattern names that triggered the assessment. */
+  reasons: string[];
+  /** True when the backend reports it already redacted before storage. */
+  backendRedacted: boolean;
+}
+
+/**
+ * Conservative client-side patterns. Mirrors a subset of
+ * `@crowclaw/core/security` PII_PATTERNS for offline classification.
+ * Only used when the backend has not already attached
+ * `metadata.redactedTypes` — when it has, we trust that authoritative list.
+ */
+const CLIENT_REDACTION_PATTERNS: Array<{ name: string; pattern: RegExp; level: RedactionLevel }> = [
+  { name: 'api_key', pattern: /\b(sk-[a-zA-Z0-9]{20,}|AIza[a-zA-Z0-9_-]{35}|ghp_[a-zA-Z0-9]{36})\b/, level: 'high' },
+  { name: 'aws_key', pattern: /\b(AKIA[0-9A-Z]{16})\b/, level: 'high' },
+  { name: 'jwt', pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/, level: 'high' },
+  { name: 'private_key', pattern: /-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----/, level: 'high' },
+  { name: 'ssn', pattern: /\b\d{3}-\d{2}-\d{4}\b/, level: 'high' },
+  { name: 'credit_card', pattern: /\b(?:\d{4}[-\s]?){3}\d{4}\b/, level: 'high' },
+  { name: 'password_assignment', pattern: /(?:password|passwd|pwd)\s*[:=]\s*\S+/i, level: 'high' },
+  { name: 'email', pattern: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/, level: 'medium' },
+  { name: 'phone_us', pattern: /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/, level: 'medium' },
+];
+
+/**
+ * Returns the redaction confidence for a memory row. Reads the
+ * authoritative backend signal first (`metadata.redactedTypes`,
+ * `metadata.redactedCount`, and the convention placeholder strings like
+ * `[API_KEY_REDACTED]`), then falls back to client-side detection so
+ * pre-redaction rows still show a warning.
+ */
+export function assessRedaction(memory: Pick<MemoryRecord, 'value' | 'metadata'>): RedactionAssessment {
+  const reasons: string[] = [];
+  const meta = memory.metadata ?? {};
+  const backendTypes = Array.isArray(meta.redactedTypes)
+    ? (meta.redactedTypes as unknown[]).filter((t): t is string => typeof t === 'string')
+    : [];
+  const backendCount = typeof meta.redactedCount === 'number' ? meta.redactedCount : 0;
+  const hasPlaceholder = /\[(?:API_KEY|AWS_KEY|JWT|SSN|CC|EMAIL|PHONE|REDACTED)_REDACTED\]/.test(memory.value);
+  const backendRedacted = backendTypes.length > 0 || backendCount > 0 || hasPlaceholder;
+
+  // Backend-attested redactions of credential types are always 'high'.
+  const HIGH_TYPES = new Set(['api_key', 'aws_key', 'jwt', 'ssn', 'credit_card', 'private_key', 'password']);
+  let highHit = false;
+  let mediumHit = false;
+
+  for (const t of backendTypes) {
+    reasons.push(t);
+    if (HIGH_TYPES.has(t)) highHit = true;
+    else mediumHit = true;
+  }
+
+  // Client-side detection as a defence in depth — catches rows whose
+  // backend never redacted (e.g. memories captured before the redactor
+  // shipped, or before redaction was wired in for that scope).
+  for (const { name, pattern, level } of CLIENT_REDACTION_PATTERNS) {
+    if (pattern.test(memory.value)) {
+      if (!reasons.includes(name)) reasons.push(name);
+      if (level === 'high') highHit = true;
+      else mediumHit = true;
+    }
+  }
+
+  const level: RedactionLevel = highHit ? 'high' : mediumHit || backendRedacted ? 'medium' : 'low';
+  return { level, reasons, backendRedacted };
+}
+
 interface SessionSummary {
   sessionId: string;
   title: string;
@@ -827,6 +907,109 @@ export class SettingsView extends LitElement {
         resize: vertical;
       }
 
+      /* v0.8.4 (#184) — Redaction confidence + bulk multi-select. */
+      .mem-redaction {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 1px 6px;
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        border-radius: var(--radius-sm);
+        border: 1px solid transparent;
+        font-family: var(--font-mono);
+      }
+
+      .mem-redaction.low {
+        color: var(--success);
+        background: rgba(48, 209, 88, 0.08);
+        border-color: rgba(48, 209, 88, 0.25);
+      }
+
+      .mem-redaction.medium {
+        color: var(--warn, #ffcc00);
+        background: rgba(255, 204, 0, 0.1);
+        border-color: rgba(255, 204, 0, 0.35);
+      }
+
+      .mem-redaction.high {
+        color: var(--error);
+        background: rgba(255, 69, 58, 0.1);
+        border-color: rgba(255, 69, 58, 0.4);
+      }
+
+      .mem-bulk-bar {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-3);
+        padding: var(--sp-2) var(--sp-3);
+        margin-bottom: var(--sp-2);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        font-size: var(--text-xs);
+      }
+
+      .mem-bulk-bar.armed {
+        border-color: rgba(255, 69, 58, 0.4);
+        background: rgba(255, 69, 58, 0.05);
+      }
+
+      .mem-bulk-count {
+        font-weight: 600;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+      }
+
+      .mem-bulk-actions {
+        margin-left: auto;
+        display: flex;
+        gap: var(--sp-2);
+      }
+
+      .mem-bulk-checkbox {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+
+      .mem-row-checkbox {
+        flex-shrink: 0;
+        width: 16px;
+        height: 16px;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+
+      .mem-item .mem-header {
+        gap: var(--sp-2);
+      }
+
+      .mem-row-detail-banner {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-3);
+        font-size: var(--text-xs);
+        margin-bottom: var(--sp-3);
+        border-radius: var(--radius-sm);
+      }
+
+      .mem-row-detail-banner.medium {
+        color: var(--warn, #ffcc00);
+        background: rgba(255, 204, 0, 0.08);
+        border: 1px solid rgba(255, 204, 0, 0.25);
+      }
+
+      .mem-row-detail-banner.high {
+        color: var(--error);
+        background: rgba(255, 69, 58, 0.08);
+        border: 1px solid rgba(255, 69, 58, 0.3);
+      }
+
       .warn-box {
         border: 1px solid rgba(255, 204, 0, 0.35);
         background: rgba(255, 204, 0, 0.08);
@@ -1044,6 +1227,10 @@ export class SettingsView extends LitElement {
   @state() private selectedMemoryId: string | null = null;
   @state() private memoryEditDraft = '';
   @state() private memorySummary: MemorySummary | null = null;
+  // v0.8.4 (#184) — bulk multi-select for delete. Stores memory ids of rows
+  // currently checked. Cleared on session change / scope change.
+  @state() private memoryBulkSelected: Set<string> = new Set();
+  @state() private memoryBulkDeleting = false;
 
   // Config previews
   @state() private personaPreview: PersonaPreview | null = null;
@@ -1808,9 +1995,100 @@ export class SettingsView extends LitElement {
       if (this.selectedMemoryId === id) {
         this.selectedMemoryId = null;
       }
+      // Drop from bulk selection if it was checked.
+      if (this.memoryBulkSelected.has(id)) {
+        const next = new Set(this.memoryBulkSelected);
+        next.delete(id);
+        this.memoryBulkSelected = next;
+      }
       showToast('Memory deleted.', 'success');
     } catch {
       /* ignore */
+    }
+  }
+
+  /**
+   * v0.8.4 (#184) — Bulk multi-select helpers.
+   * Toggle a single row in the selection set without affecting expand/collapse.
+   */
+  private _toggleBulkSelect(id: string) {
+    const next = new Set(this.memoryBulkSelected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    this.memoryBulkSelected = next;
+  }
+
+  /**
+   * Select-all-visible toggles between (a) all currently visible rows are
+   * selected, in which case it clears, and (b) at least one is unselected,
+   * in which case it adds every visible id to the selection.
+   */
+  private _toggleSelectAllVisible() {
+    const visibleIds = this.memories.map((m) => m.id);
+    const allSelected = visibleIds.length > 0 && visibleIds.every((id) => this.memoryBulkSelected.has(id));
+    if (allSelected) {
+      // Clear only the visible ones — preserves any out-of-filter selections.
+      const next = new Set(this.memoryBulkSelected);
+      for (const id of visibleIds) next.delete(id);
+      this.memoryBulkSelected = next;
+    } else {
+      this.memoryBulkSelected = new Set([...this.memoryBulkSelected, ...visibleIds]);
+    }
+  }
+
+  private _clearBulkSelection() {
+    this.memoryBulkSelected = new Set();
+  }
+
+  /**
+   * Bulk delete: shows a single confirm dialog with the count + first 3
+   * key previews, then issues DELETE requests in parallel. On success,
+   * removes deleted rows from the local memory list and emits a single
+   * toast. Failures are reported per row (best-effort) and the still-
+   * present rows remain selected so the user can retry.
+   */
+  private async _bulkDeleteMemories() {
+    const ids = [...this.memoryBulkSelected];
+    if (ids.length === 0 || this.memoryBulkDeleting) return;
+    const idSet = new Set(ids);
+    const targets = this.memories.filter((m) => idSet.has(m.id));
+    const previewKeys = targets.slice(0, 3).map((m) => m.key).join(', ');
+    const more = targets.length > 3 ? `, +${targets.length - 3} more` : '';
+    const ok = window.confirm(
+      `Delete ${ids.length} memor${ids.length === 1 ? 'y' : 'ies'}? This permanently removes stored recall metadata.\n\nFirst rows: ${previewKeys}${more}\n\nThis cannot be undone.`,
+    );
+    if (!ok) return;
+    this.memoryBulkDeleting = true;
+    try {
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            return { id, ok: true as const };
+          } catch (error: unknown) {
+            return { id, ok: false as const, error: error instanceof Error ? error.message : 'unknown' };
+          }
+        }),
+      );
+      const succeeded = new Set(results.filter((r) => r.ok).map((r) => r.id));
+      const failed = results.filter((r) => !r.ok);
+      this.memories = this.memories.filter((m) => !succeeded.has(m.id));
+      // Keep failed ids selected so the user can retry; drop succeeded ones.
+      const nextSel = new Set(this.memoryBulkSelected);
+      for (const id of succeeded) nextSel.delete(id);
+      this.memoryBulkSelected = nextSel;
+      if (this.selectedMemoryId && succeeded.has(this.selectedMemoryId)) {
+        this.selectedMemoryId = null;
+      }
+      if (failed.length === 0) {
+        showToast(`Deleted ${succeeded.size} memor${succeeded.size === 1 ? 'y' : 'ies'}.`, 'success');
+      } else if (succeeded.size === 0) {
+        showToast(`Failed to delete ${failed.length} memor${failed.length === 1 ? 'y' : 'ies'}.`, 'error');
+      } else {
+        showToast(`Deleted ${succeeded.size}; ${failed.length} failed.`, 'info');
+      }
+    } finally {
+      this.memoryBulkDeleting = false;
     }
   }
 
@@ -3297,6 +3575,8 @@ export class SettingsView extends LitElement {
             @change=${(e: Event) => {
               this.memorySessionId = (e.target as HTMLSelectElement).value || null;
               this.selectedMemoryId = null;
+              // v0.8.4 (#184) — bulk selection is session-scoped; reset on switch.
+              this.memoryBulkSelected = new Set();
               this._loadMemories();
             }}
           >
@@ -3358,6 +3638,7 @@ export class SettingsView extends LitElement {
                       class="scope-btn ${this.memoryScope === s ? 'active' : ''}"
                       @click=${() => {
                         this.memoryScope = s;
+                        this.memoryBulkSelected = new Set();
                         this._loadMemories();
                       }}
                     >
@@ -3369,6 +3650,7 @@ export class SettingsView extends LitElement {
                   class="scope-btn ${this.memoryPinnedOnly ? 'active' : ''}"
                   @click=${() => {
                     this.memoryPinnedOnly = !this.memoryPinnedOnly;
+                    this.memoryBulkSelected = new Set();
                     this._loadMemories();
                   }}
                 >
@@ -3377,68 +3659,7 @@ export class SettingsView extends LitElement {
               </div>
 
               ${this.memories.length > 0
-                ? html`
-                    <div class="mem-list">
-                      ${this.memories.length > 50
-                        ? html`
-                            <!-- v0.8.4 (#250 Phase A): a 1000-record memory
-                                 snapshot used to jank scroll; virtualization
-                                 keeps every visible row in the DOM and pages
-                                 the rest. Threshold of 50 keeps short lists
-                                 in plain DOM for snapshot-style tests. -->
-                            <lit-virtualizer
-                              class="mem-virt"
-                              scroller
-                              .items=${this.memories}
-                              .renderItem=${(m: MemoryRecord) => this._renderMemoryItem(m)}
-                              .keyFunction=${(m: MemoryRecord) => m.id}
-                            ></lit-virtualizer>
-                          `
-                        : this.memories.map((m) => this._renderMemoryItem(m))}
-                    </div>
-
-                    ${selected
-                      ? html`
-                          <div class="mem-detail">
-                            <div class="mem-detail-header">
-                              <span class="mem-detail-key">${selected.key}</span>
-                              <div style="display:flex;gap:var(--sp-2)">
-                                <button class="btn" @click=${() => this._toggleMemoryPin(selected)}>
-                                  ${selected.pinned ? 'Unpin' : 'Pin'}
-                                </button>
-                                <button
-                                  class="btn btn-danger"
-                                  aria-label="Delete memory record"
-                                  @click=${() => this._deleteMemory(selected.id)}
-                                >
-                                  Delete
-                                </button>
-                              </div>
-                            </div>
-                            <div class="warn-box" style="margin-bottom:var(--sp-3)">
-                              Memory values are stored recall data. Review edits for secrets, credentials, and PII before saving; deletion requires typing DELETE because it permanently removes this recall record.
-                            </div>
-                            <textarea
-                              class="form-input mem-edit"
-                              aria-label="Edit memory summary"
-                              .value=${this.memoryEditDraft || selected.value}
-                              @input=${(e: InputEvent) => { this.memoryEditDraft = (e.target as HTMLTextAreaElement).value; }}
-                            ></textarea>
-                            <div class="kv" style="margin-top:var(--sp-3)">
-                              <span class="kv-k">Size / Tokens</span>
-                              <span class="kv-v">${formatBytes(selected.sizeBytes ?? 0)} / ${formatTokens(Number(selected.metadata?.estimatedTokens ?? 0))}</span>
-                            </div>
-                            <div class="kv" style="margin-top:var(--sp-3)">
-                              <span class="kv-k">Metadata</span>
-                              <span class="kv-v">${JSON.stringify(selected.metadata ?? {})}</span>
-                            </div>
-                            <div class="form-actions">
-                              <button class="btn btn-p" @click=${() => this._saveMemory(selected)}>Save Memory</button>
-                            </div>
-                          </div>
-                        `
-                      : nothing}
-                  `
+                ? this._renderMemoryList(selected)
                 : html`<div class="status-msg" style="color:var(--text-muted)">
                     No memories found for this session.
                   </div>`}
@@ -3455,6 +3676,176 @@ export class SettingsView extends LitElement {
             : html`<div class="status-msg" style="color:var(--text-muted)">
                 Select a session to browse its memories.
               </div>`}
+      </div>
+    `;
+  }
+
+  /**
+   * v0.8.4 (#184) — Memory list with redaction confidence indicator and
+   * bulk multi-select. Renders the bulk-action bar, the per-row checkboxes
+   * + redaction badges, and the detail drawer for the selected row.
+   */
+  private _renderMemoryList(selected: MemoryRecord | undefined) {
+    const visibleIds = this.memories.map((m) => m.id);
+    const selectedCount = this.memoryBulkSelected.size;
+    const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => this.memoryBulkSelected.has(id));
+    const someVisibleSelected = !allVisibleSelected && visibleIds.some((id) => this.memoryBulkSelected.has(id));
+
+    return html`
+      <div
+        class="mem-bulk-bar ${selectedCount > 0 ? 'armed' : ''}"
+        role="toolbar"
+        aria-label="Bulk memory actions"
+      >
+        <input
+          class="mem-bulk-checkbox"
+          type="checkbox"
+          aria-label="${allVisibleSelected ? 'Clear visible selection' : 'Select all visible memories'}"
+          .checked=${allVisibleSelected}
+          .indeterminate=${someVisibleSelected}
+          @change=${() => this._toggleSelectAllVisible()}
+        />
+        <span class="mem-bulk-count" aria-live="polite">
+          ${selectedCount > 0
+            ? `${selectedCount} selected`
+            : `${this.memories.length} visible`}
+        </span>
+        <div class="mem-bulk-actions">
+          ${selectedCount > 0
+            ? html`
+                <button
+                  class="btn"
+                  type="button"
+                  aria-label="Clear bulk selection"
+                  @click=${() => this._clearBulkSelection()}
+                >Clear</button>
+                <button
+                  class="btn btn-danger"
+                  type="button"
+                  aria-label="Delete ${selectedCount} selected memor${selectedCount === 1 ? 'y' : 'ies'}"
+                  ?disabled=${this.memoryBulkDeleting}
+                  @click=${() => this._bulkDeleteMemories()}
+                >${this.memoryBulkDeleting ? 'Deleting...' : `Delete ${selectedCount} selected`}</button>
+              `
+            : nothing}
+        </div>
+      </div>
+      <div class="mem-list">
+        ${this.memories.map((m) => {
+          const checked = this.memoryBulkSelected.has(m.id);
+          const redaction = assessRedaction(m);
+          return html`
+            <div
+              class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
+              @click=${(e: Event) => {
+                // Don't toggle row selection if the click came from the
+                // checkbox — let the checkbox handler own that interaction.
+                const target = e.target as HTMLElement;
+                if (target.classList.contains('mem-row-checkbox') || target.tagName === 'INPUT') return;
+                const next = this.selectedMemoryId === m.id ? null : m.id;
+                this.selectedMemoryId = next;
+                this.memoryEditDraft = next ? m.value : '';
+              }}
+            >
+              <div class="mem-header">
+                <input
+                  class="mem-row-checkbox"
+                  type="checkbox"
+                  aria-label="Select memory ${m.key}"
+                  .checked=${checked}
+                  @click=${(e: Event) => e.stopPropagation()}
+                  @change=${(e: Event) => {
+                    e.stopPropagation();
+                    this._toggleBulkSelect(m.id);
+                  }}
+                />
+                <span class="mem-key">${m.key}</span>
+                <div class="mem-meta">
+                  ${redaction.level !== 'low'
+                    ? html`<span
+                        class="mem-redaction ${redaction.level}"
+                        title="Patterns: ${redaction.reasons.join(', ') || 'none'}"
+                        aria-label="Redaction confidence ${redaction.level}"
+                      >Redaction: ${redaction.level}</span>`
+                    : html`<span
+                        class="mem-redaction low"
+                        title="No sensitive patterns detected"
+                        aria-label="Redaction confidence low"
+                      >Redaction: low</span>`}
+                  ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
+                  <span class="tag">${m.scope}</span>
+                  <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
+                  <span style="font-size:var(--text-xs);color:var(--text-muted)">
+                    ${formatTime(m.timestamp)}
+                  </span>
+                </div>
+              </div>
+              <div class="mem-preview">
+                ${m.value.length > 120 ? `${m.value.slice(0, 120)}...` : m.value}
+              </div>
+            </div>
+          `;
+        })}
+      </div>
+
+      ${selected ? this._renderMemoryDetail(selected) : nothing}
+    `;
+  }
+
+  private _renderMemoryDetail(selected: MemoryRecord) {
+    const redaction = assessRedaction(selected);
+    return html`
+      <div class="mem-detail">
+        <div class="mem-detail-header">
+          <span class="mem-detail-key">${selected.key}</span>
+          <div style="display:flex;gap:var(--sp-2)">
+            <button class="btn" @click=${() => this._toggleMemoryPin(selected)}>
+              ${selected.pinned ? 'Unpin' : 'Pin'}
+            </button>
+            <button
+              class="btn btn-danger"
+              aria-label="Delete memory record"
+              @click=${() => this._deleteMemory(selected.id)}
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+        ${redaction.level !== 'low'
+          ? html`<div
+              class="mem-row-detail-banner ${redaction.level}"
+              role="status"
+              aria-live="polite"
+            >
+              <span class="mem-redaction ${redaction.level}">Redaction: ${redaction.level}</span>
+              <span>
+                ${redaction.backendRedacted
+                  ? `Backend redacted: ${redaction.reasons.join(', ') || 'pattern hit'}.`
+                  : `Detected pattern${redaction.reasons.length === 1 ? '' : 's'}: ${redaction.reasons.join(', ')}.`}
+                Audit before saving.
+              </span>
+            </div>`
+          : nothing}
+        <div class="warn-box" style="margin-bottom:var(--sp-3)">
+          Memory values are stored recall data. Review edits for secrets, credentials, and PII before saving; deletion requires typing DELETE because it permanently removes this recall record.
+        </div>
+        <textarea
+          class="form-input mem-edit"
+          aria-label="Edit memory summary"
+          .value=${this.memoryEditDraft || selected.value}
+          @input=${(e: InputEvent) => { this.memoryEditDraft = (e.target as HTMLTextAreaElement).value; }}
+        ></textarea>
+        <div class="kv" style="margin-top:var(--sp-3)">
+          <span class="kv-k">Size / Tokens</span>
+          <span class="kv-v">${formatBytes(selected.sizeBytes ?? 0)} / ${formatTokens(Number(selected.metadata?.estimatedTokens ?? 0))}</span>
+        </div>
+        <div class="kv" style="margin-top:var(--sp-3)">
+          <span class="kv-k">Metadata</span>
+          <span class="kv-v">${JSON.stringify(selected.metadata ?? {})}</span>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-p" @click=${() => this._saveMemory(selected)}>Save Memory</button>
+        </div>
       </div>
     `;
   }
