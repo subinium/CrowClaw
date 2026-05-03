@@ -26,6 +26,7 @@
     "cli": "node packages/cli/dist/index.js",
     "preflight": "npm run typecheck && npm test",
     "release:check": "npm run preflight",
+    "sync-versions": "node scripts/sync-versions.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:vps": "docker compose up -d --build"
