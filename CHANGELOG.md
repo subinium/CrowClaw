@@ -5,6 +5,29 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [Unreleased] — release/v0.8.3 sweep (in progress)
+
+Working ledger: `docs/release-v0.8.3-worklog.md`. This branch is the
+umbrella sweep against the 52 issues that remained open after v0.8.2.
+
+### Verifier-close (already shipped in v0.8.1, GitHub close only)
+- **#224**, **#242** — `<crowclaw-tool-call-trace>` and
+  `<crowclaw-memory-stream>` mount in `chat-view.ts` with SSE wiring;
+  shipped in v0.8.1 (PR #252) and verified in v0.8.2 (PR #290).
+- **#244** — component library (`<crowclaw-button>`,
+  `<crowclaw-status-dot>`, `<crowclaw-icon>`,
+  `<crowclaw-skeleton-*>`, …) consolidated 9 button styles in v0.8.1
+  (PR #252).
+- **#246** — IA restructure (top-nav 5→4, Agent into Settings,
+  `<crowclaw-sidebar>` canonical, empty states unified) shipped in
+  v0.8.1 (PR #252).
+- **#247** — inspector rail (right-side 3-tab Trace / Memory /
+  Checkpoints) shipped in v0.8.1 (PR #252).
+- **#248** — keyboard system (Cmd+K palette wired, `?` help, vim
+  chord nav, session list `j/k`) shipped in v0.8.1 (PR #252).
+
+(... further sections appended as the sweep batches land ...)
+
 ## [0.8.2] — 2026-05-03 — Audit + parity sweep: 53-issue release
 
 This release lands two parallel investigations against the post-v0.8.1
