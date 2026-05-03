@@ -106,17 +106,53 @@ reality going forward.
 - CHANGELOG `[Unreleased]` stub for the sweep.
 - 17 issues reopened ahead of work (GitHub action).
 
+## Phase 1 Result — 2026-05-03
+
+3 sub-agents dispatched in parallel (worktree isolation), 5 issues
+landed via 5 commits cherry-picked onto `release/v0.8.4`.
+
+### Sub-agent A (`feat/v0.8.4-187-192`) — backend wiring
+- `6edfb9b` `feat(memory): add per-session memory size + cost to SessionState` — Closes #187
+  - `SessionState.memoryEntryCount` + `memoryBytes` (optional fields)
+  - `runtime-support.ts` exposes `summarizeSessionMemoryFootprint`
+  - `GET /api/sessions` and `GET /api/sessions/:id` enrich responses
+  - `tests/sessions-memory-fields.test.ts` — 3 cases pass
+- `eac85fb` `feat(runtime-node): paginate + filter sessions list` — Closes #192
+  - `?search=`, `?status=`, `?limit=`, `?cursor=` query params
+  - Response shape `{ sessions, nextCursor, totalCount }`
+  - status: `active` / `completed` / `failed` / `all`
+  - keyset pagination on `(updatedAt DESC, sessionId DESC)`
+  - `tests/sessions-list-pagination.test.ts` — 8 cases pass
+
+### Sub-agent B (`feat/v0.8.4-272-254`) — CLI / CI
+- `f68063d` `chore(ci): close #254 — fail build on workspace version drift`
+  - `.github/workflows/ci.yml` step runs `sync-versions.mjs` + `git diff --exit-code`
+  - `tests/version-drift.test.ts` — 3 cases pass (idempotent + workspace + wrangler)
+- `fac1775` `feat(cli): close #272 — add batch --eval flag + accuracy threshold exit`
+  - `--eval` flag enables expected/accuracy mode in `batch-runner`
+  - `--threshold <n>` (default 1.0) — non-zero exit when `accuracy < threshold`
+  - `tests/cli-batch.test.ts` — 12 cases pass
+
+### Sub-agent C (`feat/v0.8.4-189`) — plugin UI
+- `18d55aa` `feat(web): close #189 — add plugin catalog + install UI to Connect view`
+  - Installed list + Browse catalog + search input
+  - Install modal with permission summary, Configure modal with form/JSON, Uninstall confirm
+  - Pattern mirrors existing MCP install UX
+  - `tests/dashboard-contract.test.ts` — 24 cases pass (1 new block)
+
+### Verification
+- `tsc -b --force --pretty false` — clean (all packages strict-pass)
+- `npx vitest run tests/sessions-memory-fields.test.ts tests/sessions-list-pagination.test.ts tests/version-drift.test.ts tests/cli-batch.test.ts` — **26 / 26 pass**
+- LSP-only stale diagnostics on packages internals (cleared by `--force` rebuild) and on `dashboard-contract.test.ts` casing conflict between `/Users/subinium/Projects/CrowClaw` and the lowercase additional working dir — both non-blocking.
+
+### Phase 1 issue tally
+- Closed (this phase, code changes): #187, #189, #192, #254, #272 (5)
+- Remaining (Phase 2-5): #181, #184, #185, #197, #200, #227, #233, #240, #244, #245, #250, #274 (12)
+
 ## Next Update Slot
 
-Use this section for the next live batch before editing code.
-
-- Batch: Phase 1 — backend / data wiring batch (#187, #189-backend,
-  #192-backend, #272, #254).
-- Subagents: TBD.
-- Files expected: `packages/runtime-node/src/route-handlers.ts`,
-  `packages/cli/src/index.ts`, `packages/learning/src/batch-runner.ts`,
-  `.github/workflows/ci.yml`, `tests/runtime-routes.test.ts`,
-  `tests/cli-commands.test.ts`.
-- Verification plan: focused tests per touched surface, then full
-  `npm test`.
+- Batch: Phase 2 — Web UX surfaces (#181, #184, #185, #192-UI follow-up, #197, #200, #227, #250).
+- Subagents: planned 4 parallel worktree agents split by file ownership.
+- Files expected: `packages/web/ui/src/views/{chat-view,settings-view,automate-view,onboarding-view}.ts`, `packages/web/ui/src/app.ts`, plus event-bus types.
+- Verification plan: focused web tests + dashboard build + full vitest.
 - Result: TBD

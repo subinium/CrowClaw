@@ -36,7 +36,14 @@ Working ledger: `docs/release-v0.8.4-worklog.md`.
 - **#272** batch-runner CLI `--eval` flag + `accuracy < threshold` non-zero exit
 - **#274** `gpt-tokenizer` npm dep + ±5% precision equivalence test
 
-(... per-issue CHANGELOG entries follow as the sweep batches land ...)
+### Phase 1 landed (5 issues — backend / data wiring)
+- **#187** `SessionState.memoryEntryCount` + `memoryBytes` populated on `GET /api/sessions` and `GET /api/sessions/:id`. New `summarizeSessionMemoryFootprint` helper in `runtime-support.ts`. (`6edfb9b`)
+- **#192** `GET /api/sessions` adds `?search=`, `?status=` (`active` | `completed` | `failed` | `all`), `?limit=`, `?cursor=` keyset pagination; response is `{ sessions, nextCursor, totalCount }`. (`eac85fb`)
+- **#254** CI step runs `node scripts/sync-versions.mjs` + `git diff --exit-code` between Install and Typecheck, so PRs that skip a workspace bump fail fast. New `tests/version-drift.test.ts` (3 cases). (`f68063d`)
+- **#272** CLI `batch --eval --threshold <n>` flag (default `1.0`); non-zero exit when accuracy falls below threshold. (`fac1775`)
+- **#189** `connect-view.ts` Plugins surface — Installed list, Browse catalog with search, Install modal with permission summary, Configure modal (typed form or JSON fallback), Uninstall confirm. Mirrors MCP install UX. (`18d55aa`)
+
+(... Phase 2-5 entries follow as further batches land ...)
 
 ## [0.8.3] — 2026-05-03 — GitHub-close pass: 52 verifier-confirmed issues
 
