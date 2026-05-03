@@ -16,6 +16,9 @@
   "files": [
     "dist"
   ],
+  "dependencies": {
+    "@crowclaw/learning": "0.8.4"
+  },
   "publishConfig": {
     "access": "public"
   },
