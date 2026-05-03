@@ -162,7 +162,12 @@ describe('empty-state wiring per view (#176)', () => {
 
   it('settings-view: feedback empty uses the no-CTA explanatory variant', () => {
     const view = read('views/settings-view.ts');
-    expect(view).toMatch(/this\.feedbackEntries\.length\s*>\s*0[\s\S]{0,2500}<crowclaw-empty[\s\S]{0,400}icon=["']feedback["']/);
+    // v0.8.4 (#250 Phase A) widened the gap: the feedback list now has both
+    // a virtualized branch (>50 rows) and the table branch, which inflates
+    // the byte distance between the gate and the empty-state. Bump the
+    // upper bound so the regression invariant ("empty branch uses the
+    // no-CTA crowclaw-empty") still pins.
+    expect(view).toMatch(/this\.feedbackEntries\.length\s*>\s*0[\s\S]{0,5000}<crowclaw-empty[\s\S]{0,400}icon=["']feedback["']/);
     expect(view).toContain('No tool feedback yet');
   });
 

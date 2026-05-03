@@ -1,6 +1,12 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state, query } from 'lit/decorators.js';
 import { unsafeHTML } from 'lit/directives/unsafe-html.js';
+// v0.8.4 (#250 Phase A): list virtualization. Imported as a side-effect so
+// `<lit-virtualizer>` registers as a custom element before chat-view's
+// template tries to mount it. Only sessions lists with > 50 rows hit the
+// virtualized path so small lists keep their plain DOM (matches the
+// audit's "small lists render normally for clean DOM in tests" rule).
+import '@lit-labs/virtualizer';
 import { api } from '../lib/api.js';
 import { streamMessage, type StreamCallbacks } from '../lib/sse.js';
 import { renderMarkdown, highlightCodeBlocks, attachCopyHandlers } from '../lib/markdown.js';
@@ -255,6 +261,9 @@ export class ChatView extends LitElement {
       }
 
       .sess-list { flex: 1; overflow-y: auto; }
+      /* v0.8.4 (#250 Phase A): the virtualizer manages its own scroller, so
+         it must fill the list container without imposing a second overflow. */
+      .sess-virt { display: block; height: 100%; }
 
       .sess-item {
         padding: var(--sp-3) var(--sp-4);
@@ -2788,7 +2797,21 @@ export class ChatView extends LitElement {
                       @cc-empty-new-session=${this._createSession}
                     ></crowclaw-empty>`
                   : html`<div class="empty" style="padding:20px 0"><div class="empty-subtitle">No matching sessions</div></div>`
-                : this._pagedSessions.map((s, idx) => this._renderSessionCard(s, idx))}
+                : this._pagedSessions.length > 50
+                  ? html`
+                      <!-- v0.8.4 (#250 Phase A): virtualize once we cross
+                           50 rows so a 1000-row scroll stays at 60fps.
+                           Smaller lists keep their plain DOM so unit tests
+                           that snapshot the sidebar see the full row set. -->
+                      <lit-virtualizer
+                        class="sess-virt"
+                        scroller
+                        .items=${this._pagedSessions}
+                        .renderItem=${(s: SessionInfo, idx: number) => this._renderSessionCard(s, idx)}
+                        .keyFunction=${(s: SessionInfo) => s.id}
+                      ></lit-virtualizer>
+                    `
+                  : this._pagedSessions.map((s, idx) => this._renderSessionCard(s, idx))}
             </div>
             ${this.sessionsNextCursor
               ? html`

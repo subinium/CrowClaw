@@ -52,10 +52,15 @@ describe('Dashboard UX issue batch surface', () => {
   });
 
   it('contains session list filter and pagination controls for issue 192', () => {
-    expect(DASHBOARD_HTML).toContain('Filter sessions');
-    expect(DASHBOARD_HTML).toContain('Active only');
-    expect(DASHBOARD_HTML).toContain('Inactive only');
-    expect(DASHBOARD_HTML).toContain('Page ');
+    // v0.8.4 (#192-UI): the filter dropdown now mirrors the server status
+    // classifier (All/Active/Completed/Failed) instead of the legacy
+    // active|inactive client-only split. Pagination is cursor-based via
+    // a "Load more" button; the old "Page X / Y" controls are gone.
+    expect(DASHBOARD_HTML).toContain('Filter sessions by status');
+    expect(DASHBOARD_HTML).toContain('Active');
+    expect(DASHBOARD_HTML).toContain('Completed');
+    expect(DASHBOARD_HTML).toContain('Failed');
+    expect(DASHBOARD_HTML).toContain('Load more');
   });
 });
 

@@ -1,5 +1,10 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
+// v0.8.4 (#250 Phase A): virtualize the memory + feedback lists for large
+// snapshots. Side-effect import registers `<lit-virtualizer>`. Only the
+// rendering of these two lists changes — bulk-delete / redaction / pin
+// affordances stay where they are.
+import '@lit-labs/virtualizer';
 import {
   buttonStyles,
   cardStyles,
@@ -700,6 +705,40 @@ export class SettingsView extends LitElement {
         display: flex;
         flex-direction: column;
         gap: var(--sp-2);
+      }
+
+      /* v0.8.4 (#250 Phase A): the virtualizer needs a fixed height so the
+         scroller can compute the visible window. We bound it to 60vh so a
+         huge memory list doesn't push the detail editor off-screen. */
+      .mem-virt {
+        display: block;
+        height: min(60vh, 600px);
+      }
+
+      /* v0.8.4 (#250 Phase A): feedback-log virtualized rows. Mirrors the
+         columns from the table mode (Time / Tool / Status / Duration /
+         Session) but uses flex so we can virtualize without a tbody. */
+      .fb-virt-card {
+        padding: 0;
+      }
+      .fb-row {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-3);
+        border-bottom: 1px solid var(--border);
+      }
+      .fb-row.fb-head {
+        font-weight: 600;
+        font-size: var(--text-xs);
+        background: var(--bg-card);
+        position: sticky;
+        top: 0;
+        z-index: 1;
+      }
+      .fb-virt {
+        display: block;
+        height: min(60vh, 600px);
       }
 
       .mem-item {
@@ -3171,6 +3210,78 @@ export class SettingsView extends LitElement {
 
   /* ---- Memory Browser ---- */
 
+  /**
+   * v0.8.4 (#250 Phase A): a single feedback entry rendered as a flex row
+   * so the virtualized layout works without a `<table>` parent. Mirrors
+   * the columns from the table-mode renderer: Time / Tool / Status /
+   * Duration / Session. Used by the feedback-log virtualizer when the
+   * ledger crosses 50 rows.
+   */
+  private _renderFeedbackEntry(entry: FeedbackEntry) {
+    return html`
+      <div class="fb-row" role="row">
+        <span style="flex:1.2;font-family:var(--font-mono);font-size:var(--text-xs)">
+          ${formatTime(entry.timestamp)}
+        </span>
+        <span style="flex:1.2;font-family:var(--font-mono);font-size:var(--text-xs)">
+          ${entry.toolName}
+        </span>
+        <span style="flex:1.4">
+          <span class="tag" style="color:${entry.ok ? 'var(--success)' : 'var(--error)'}">
+            ${entry.ok ? 'OK' : 'FAIL'}
+          </span>
+          ${entry.error
+            ? html`<span style="font-size:var(--text-xs);color:var(--text-muted);margin-left:var(--sp-1)" title=${entry.error}>
+                ${entry.error.length > 40 ? `${entry.error.slice(0, 40)}...` : entry.error}
+              </span>`
+            : nothing}
+        </span>
+        <span style="flex:0.8;font-family:var(--font-mono);font-size:var(--text-xs)">
+          ${entry.durationMs != null ? `${entry.durationMs}ms` : '--'}
+        </span>
+        <span style="flex:1;font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
+          ${entry.sessionId.length > 8 ? `${entry.sessionId.slice(0, 8)}...` : entry.sessionId}
+        </span>
+      </div>
+    `;
+  }
+
+  /**
+   * v0.8.4 (#250 Phase A): single memory row factored out so `<lit-virtualizer>`
+   * and the plain `.map()` path share a single render. Click toggles the
+   * selection just like before; the surrounding redaction/bulk-delete
+   * affordances are untouched.
+   */
+  private _renderMemoryItem(m: MemoryRecord) {
+    return html`
+      <div
+        class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
+        @click=${() => {
+          const next = this.selectedMemoryId === m.id ? null : m.id;
+          this.selectedMemoryId = next;
+          this.memoryEditDraft = next ? m.value : '';
+        }}
+      >
+        <div class="mem-header">
+          <span class="mem-key">${m.key}</span>
+          <div class="mem-meta">
+            ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
+            <span class="tag">${m.scope}</span>
+            <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
+            <span style="font-size:var(--text-xs);color:var(--text-muted)">
+              ${formatTime(m.timestamp)}
+            </span>
+          </div>
+        </div>
+        <div class="mem-preview">
+          ${m.value.length > 120
+            ? `${m.value.slice(0, 120)}...`
+            : m.value}
+        </div>
+      </div>
+    `;
+  }
+
   private _renderMemory() {
     const selected = this.memories.find((m) => m.id === this.selectedMemoryId);
     const summary = this.memorySummary;
@@ -3268,35 +3379,22 @@ export class SettingsView extends LitElement {
               ${this.memories.length > 0
                 ? html`
                     <div class="mem-list">
-                      ${this.memories.map(
-                        (m) => html`
-                          <div
-                            class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
-                            @click=${() => {
-                              const next = this.selectedMemoryId === m.id ? null : m.id;
-                              this.selectedMemoryId = next;
-                              this.memoryEditDraft = next ? m.value : '';
-                            }}
-                          >
-                            <div class="mem-header">
-                              <span class="mem-key">${m.key}</span>
-                              <div class="mem-meta">
-                                ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
-                                <span class="tag">${m.scope}</span>
-                                <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
-                                <span style="font-size:var(--text-xs);color:var(--text-muted)">
-                                  ${formatTime(m.timestamp)}
-                                </span>
-                              </div>
-                            </div>
-                            <div class="mem-preview">
-                              ${m.value.length > 120
-                                ? `${m.value.slice(0, 120)}...`
-                                : m.value}
-                            </div>
-                          </div>
-                        `,
-                      )}
+                      ${this.memories.length > 50
+                        ? html`
+                            <!-- v0.8.4 (#250 Phase A): a 1000-record memory
+                                 snapshot used to jank scroll; virtualization
+                                 keeps every visible row in the DOM and pages
+                                 the rest. Threshold of 50 keeps short lists
+                                 in plain DOM for snapshot-style tests. -->
+                            <lit-virtualizer
+                              class="mem-virt"
+                              scroller
+                              .items=${this.memories}
+                              .renderItem=${(m: MemoryRecord) => this._renderMemoryItem(m)}
+                              .keyFunction=${(m: MemoryRecord) => m.id}
+                            ></lit-virtualizer>
+                          `
+                        : this.memories.map((m) => this._renderMemoryItem(m))}
                     </div>
 
                     ${selected
@@ -3461,51 +3559,75 @@ export class SettingsView extends LitElement {
         <!-- Recent entries -->
         <div class="sec-h">Recent Entries</div>
         ${this.feedbackEntries.length > 0
-          ? html`
-              <div class="sub-card" style="overflow-x:auto">
-                <table class="data-table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Tool</th>
-                      <th>Status</th>
-                      <th>Duration</th>
-                      <th>Session</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${this.feedbackEntries.slice(0, 50).map(
-                      (entry) => html`
-                        <tr>
-                          <td style="white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs)">
-                            ${formatTime(entry.timestamp)}
-                          </td>
-                          <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
-                            ${entry.toolName}
-                          </td>
-                          <td>
-                            <span class="tag" style="color:${entry.ok ? 'var(--success)' : 'var(--error)'}">
-                              ${entry.ok ? 'OK' : 'FAIL'}
-                            </span>
-                            ${entry.error
-                              ? html`<span style="font-size:var(--text-xs);color:var(--text-muted);margin-left:var(--sp-1)" title=${entry.error}>
-                                  ${entry.error.length > 40 ? `${entry.error.slice(0, 40)}...` : entry.error}
-                                </span>`
-                              : nothing}
-                          </td>
-                          <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
-                            ${entry.durationMs != null ? `${entry.durationMs}ms` : '--'}
-                          </td>
-                          <td style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
-                            ${entry.sessionId.length > 8 ? `${entry.sessionId.slice(0, 8)}...` : entry.sessionId}
-                          </td>
-                        </tr>
-                      `,
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            `
+          ? this.feedbackEntries.length > 50
+            ? html`
+                <!-- v0.8.4 (#250 Phase A): once the ledger crosses 50 rows
+                     (which happens fast with active agents) we drop the
+                     <table> in favour of a virtualized flex row layout so
+                     the entire window stays scrollable at 60fps. The header
+                     still renders as a sticky row above the virtualizer.  -->
+                <div class="sub-card fb-virt-card">
+                  <div class="fb-row fb-head" role="row">
+                    <span style="flex:1.2">Time</span>
+                    <span style="flex:1.2">Tool</span>
+                    <span style="flex:1.4">Status</span>
+                    <span style="flex:0.8">Duration</span>
+                    <span style="flex:1">Session</span>
+                  </div>
+                  <lit-virtualizer
+                    class="fb-virt"
+                    scroller
+                    .items=${this.feedbackEntries}
+                    .renderItem=${(entry: FeedbackEntry) => this._renderFeedbackEntry(entry)}
+                    .keyFunction=${(entry: FeedbackEntry, idx: number) => `${entry.timestamp}:${entry.toolName}:${idx}`}
+                  ></lit-virtualizer>
+                </div>
+              `
+            : html`
+                <div class="sub-card" style="overflow-x:auto">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th>Time</th>
+                        <th>Tool</th>
+                        <th>Status</th>
+                        <th>Duration</th>
+                        <th>Session</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${this.feedbackEntries.map(
+                        (entry) => html`
+                          <tr>
+                            <td style="white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs)">
+                              ${formatTime(entry.timestamp)}
+                            </td>
+                            <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                              ${entry.toolName}
+                            </td>
+                            <td>
+                              <span class="tag" style="color:${entry.ok ? 'var(--success)' : 'var(--error)'}">
+                                ${entry.ok ? 'OK' : 'FAIL'}
+                              </span>
+                              ${entry.error
+                                ? html`<span style="font-size:var(--text-xs);color:var(--text-muted);margin-left:var(--sp-1)" title=${entry.error}>
+                                    ${entry.error.length > 40 ? `${entry.error.slice(0, 40)}...` : entry.error}
+                                  </span>`
+                                : nothing}
+                            </td>
+                            <td style="font-family:var(--font-mono);font-size:var(--text-xs)">
+                              ${entry.durationMs != null ? `${entry.durationMs}ms` : '--'}
+                            </td>
+                            <td style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
+                              ${entry.sessionId.length > 8 ? `${entry.sessionId.slice(0, 8)}...` : entry.sessionId}
+                            </td>
+                          </tr>
+                        `,
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              `
           : html`<crowclaw-empty
               icon="feedback"
               title="No tool feedback yet"
