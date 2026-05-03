@@ -3525,24 +3525,53 @@ export class SettingsView extends LitElement {
   }
 
   /**
-   * v0.8.4 (#250 Phase A): single memory row factored out so `<lit-virtualizer>`
-   * and the plain `.map()` path share a single render. Click toggles the
-   * selection just like before; the surrounding redaction/bulk-delete
-   * affordances are untouched.
+   * v0.8.4 (#250 Phase A) + v0.8.4 carry-over: single memory row factored
+   * out so the `<lit-virtualizer>` path and the plain `.map()` path share
+   * one render. Includes the v0.8.4 (#184) bulk-multi-select checkbox and
+   * the redaction confidence badge, both of which need to live inside the
+   * row so the virtualized variant matches the non-virtualized DOM.
    */
   private _renderMemoryItem(m: MemoryRecord) {
+    const checked = this.memoryBulkSelected.has(m.id);
+    const redaction = assessRedaction(m);
     return html`
       <div
         class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
-        @click=${() => {
+        @click=${(e: Event) => {
+          // Don't toggle row selection if the click came from the
+          // checkbox — let the checkbox handler own that interaction.
+          const target = e.target as HTMLElement;
+          if (target.classList.contains('mem-row-checkbox') || target.tagName === 'INPUT') return;
           const next = this.selectedMemoryId === m.id ? null : m.id;
           this.selectedMemoryId = next;
           this.memoryEditDraft = next ? m.value : '';
         }}
       >
         <div class="mem-header">
+          <input
+            class="mem-row-checkbox"
+            type="checkbox"
+            aria-label="Select memory ${m.key}"
+            .checked=${checked}
+            @click=${(e: Event) => e.stopPropagation()}
+            @change=${(e: Event) => {
+              e.stopPropagation();
+              this._toggleBulkSelect(m.id);
+            }}
+          />
           <span class="mem-key">${m.key}</span>
           <div class="mem-meta">
+            ${redaction.level !== 'low'
+              ? html`<span
+                  class="mem-redaction ${redaction.level}"
+                  title="Patterns: ${redaction.reasons.join(', ') || 'none'}"
+                  aria-label="Redaction confidence ${redaction.level}"
+                >Redaction: ${redaction.level}</span>`
+              : html`<span
+                  class="mem-redaction low"
+                  title="No sensitive patterns detected"
+                  aria-label="Redaction confidence low"
+                >Redaction: low</span>`}
             ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
             <span class="tag">${m.scope}</span>
             <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
@@ -3731,61 +3760,23 @@ export class SettingsView extends LitElement {
         </div>
       </div>
       <div class="mem-list">
-        ${this.memories.map((m) => {
-          const checked = this.memoryBulkSelected.has(m.id);
-          const redaction = assessRedaction(m);
-          return html`
-            <div
-              class="mem-item ${this.selectedMemoryId === m.id ? 'selected' : ''}"
-              @click=${(e: Event) => {
-                // Don't toggle row selection if the click came from the
-                // checkbox — let the checkbox handler own that interaction.
-                const target = e.target as HTMLElement;
-                if (target.classList.contains('mem-row-checkbox') || target.tagName === 'INPUT') return;
-                const next = this.selectedMemoryId === m.id ? null : m.id;
-                this.selectedMemoryId = next;
-                this.memoryEditDraft = next ? m.value : '';
-              }}
-            >
-              <div class="mem-header">
-                <input
-                  class="mem-row-checkbox"
-                  type="checkbox"
-                  aria-label="Select memory ${m.key}"
-                  .checked=${checked}
-                  @click=${(e: Event) => e.stopPropagation()}
-                  @change=${(e: Event) => {
-                    e.stopPropagation();
-                    this._toggleBulkSelect(m.id);
-                  }}
-                />
-                <span class="mem-key">${m.key}</span>
-                <div class="mem-meta">
-                  ${redaction.level !== 'low'
-                    ? html`<span
-                        class="mem-redaction ${redaction.level}"
-                        title="Patterns: ${redaction.reasons.join(', ') || 'none'}"
-                        aria-label="Redaction confidence ${redaction.level}"
-                      >Redaction: ${redaction.level}</span>`
-                    : html`<span
-                        class="mem-redaction low"
-                        title="No sensitive patterns detected"
-                        aria-label="Redaction confidence low"
-                      >Redaction: low</span>`}
-                  ${m.pinned ? html`<span class="tag">Pinned</span>` : nothing}
-                  <span class="tag">${m.scope}</span>
-                  <span class="tag">${formatBytes(m.sizeBytes ?? 0)}</span>
-                  <span style="font-size:var(--text-xs);color:var(--text-muted)">
-                    ${formatTime(m.timestamp)}
-                  </span>
-                </div>
-              </div>
-              <div class="mem-preview">
-                ${m.value.length > 120 ? `${m.value.slice(0, 120)}...` : m.value}
-              </div>
-            </div>
-          `;
-        })}
+        ${this.memories.length > 50
+          ? html`
+              <!-- v0.8.4 #250 Phase A (carry-over): virtualize once we cross
+                   50 rows so a 1000-row scroll stays at 60fps. Smaller lists
+                   keep their plain DOM so unit tests that snapshot the
+                   memory list see the full row set. The redaction badge +
+                   bulk multi-select checkbox both live inside
+                   _renderMemoryItem so the virtualized DOM matches. -->
+              <lit-virtualizer
+                class="mem-virt"
+                scroller
+                .items=${this.memories}
+                .renderItem=${(m: MemoryRecord) => this._renderMemoryItem(m)}
+                .keyFunction=${(m: MemoryRecord) => m.id}
+              ></lit-virtualizer>
+            `
+          : this.memories.map((m) => this._renderMemoryItem(m))}
       </div>
 
       ${selected ? this._renderMemoryDetail(selected) : nothing}
