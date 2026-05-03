@@ -187,6 +187,14 @@ export interface SessionState {
    *  execution in this session. AgentLoop updates this after every tool call;
    *  the scheduler reads it to detect stalled sessions for idle-shutdown. */
   lastToolActivityAt?: number;
+  /** #187: number of memory records bound to this session. Populated by the
+   *  runtime when serializing the session for the dashboard so operators can
+   *  identify memory-heavy sessions. Storage-side persistence is optional —
+   *  consumers should treat absence as "not yet measured", not zero. */
+  memoryEntryCount?: number;
+  /** #187: total UTF-8 byte size of the memory record summaries bound to
+   *  this session. Same lifecycle/semantics as `memoryEntryCount`. */
+  memoryBytes?: number;
 }
 
 export interface SessionStore {

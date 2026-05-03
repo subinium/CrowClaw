@@ -304,7 +304,40 @@ export function summarizeSessionRecord(session: SessionState) {
     workspaceId: session.workspaceId,
     lastRole: lastMessage?.role ?? null,
     preview: lastMessage?.content.slice(0, 140) ?? '',
+    // #187: per-session memory size + cost. Surface these only when the
+    // runtime has measured them; the dashboard renders "—" for unmeasured.
+    memoryEntryCount: session.memoryEntryCount,
+    memoryBytes: session.memoryBytes,
   };
+}
+
+/**
+ * #187: compute a memory record's UTF-8 byte size, preferring an explicit
+ * `metadata.sizeBytes` if the producer pre-recorded it (matches the
+ * convention used by `withMemoryMetadata` in the route layer). Falls back to
+ * `Buffer.byteLength(summary)` so callers always get a non-negative number.
+ */
+export function memoryRecordSizeBytes(record: { summary?: string; metadata?: { sizeBytes?: unknown } }): number {
+  const declared = record.metadata?.sizeBytes;
+  if (typeof declared === 'number' && Number.isFinite(declared) && declared >= 0) {
+    return declared;
+  }
+  return Buffer.byteLength(record.summary ?? '', 'utf8');
+}
+
+/**
+ * #187: aggregate a session's memory size from its memory records. Used by
+ * the runtime to populate `SessionState.memoryEntryCount` and
+ * `SessionState.memoryBytes` when serializing for the dashboard.
+ */
+export function summarizeSessionMemoryFootprint(
+  records: Array<{ summary?: string; metadata?: { sizeBytes?: unknown } }>,
+): { memoryEntryCount: number; memoryBytes: number } {
+  let memoryBytes = 0;
+  for (const record of records) {
+    memoryBytes += memoryRecordSizeBytes(record);
+  }
+  return { memoryEntryCount: records.length, memoryBytes };
 }
 
 export function summarizeSessionTranscript(session?: CodeBridgeSession) {

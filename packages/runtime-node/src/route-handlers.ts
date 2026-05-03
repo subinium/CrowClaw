@@ -2373,11 +2373,32 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         const sessions = typeof listStore.listRecent === 'function'
           ? await listStore.listRecent(limit)
           : [];
+        // #187: enrich each session with its memory footprint
+        // (memoryEntryCount + memoryBytes). Best-effort — if
+        // memoryService.list() rejects (e.g. backend offline), surface the
+        // session without the metric rather than failing the whole request.
+        const enriched: SessionState[] = await Promise.all(sessions.map(async (session) => {
+          if (typeof memoryService?.list !== 'function') return session;
+          try {
+            const records = await memoryService.list(session.sessionId);
+            const arr = Array.isArray(records) ? records : [];
+            let memoryBytes = 0;
+            for (const r of arr) {
+              const declared = r?.metadata?.sizeBytes;
+              memoryBytes += typeof declared === 'number' && Number.isFinite(declared) && declared >= 0
+                ? declared
+                : Buffer.byteLength(r?.summary ?? '', 'utf8');
+            }
+            return { ...session, memoryEntryCount: arr.length, memoryBytes };
+          } catch {
+            return session;
+          }
+        }));
         return Response.json({
           ok: true,
           supported: typeof listStore.listRecent === 'function',
-          count: sessions.length,
-          sessions: sessions.map(summarizeSessionRecord)
+          count: enriched.length,
+          sessions: enriched.map(summarizeSessionRecord)
         });
       }
 
@@ -4138,10 +4159,36 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (parts[3] === 'history' || parts[3] === 'state' || parts.length === 3) {
           const session = sessionId ? await store.get(sessionId) : null;
           if (!session) return Response.json({ sessionId, messages: [] });
+          // #187: surface memoryEntryCount + memoryBytes alongside the raw
+          // session payload so the dashboard's per-session view doesn't have
+          // to issue a second `/memories` round-trip just to display the
+          // memory footprint. Best-effort — failures fall through with the
+          // fields absent so the response stays structurally compatible.
+          let memoryEntryCount: number | undefined;
+          let memoryBytes: number | undefined;
+          if (typeof memoryService?.list === 'function') {
+            try {
+              const records = await memoryService.list(session.sessionId);
+              const arr = Array.isArray(records) ? records : [];
+              let bytes = 0;
+              for (const r of arr) {
+                const declared = r?.metadata?.sizeBytes;
+                bytes += typeof declared === 'number' && Number.isFinite(declared) && declared >= 0
+                  ? declared
+                  : Buffer.byteLength(r?.summary ?? '', 'utf8');
+              }
+              memoryEntryCount = arr.length;
+              memoryBytes = bytes;
+            } catch {
+              // Leave memoryEntryCount/memoryBytes undefined.
+            }
+          }
           // Strip [session-meta] markers so the chat UI doesn't render them as
           // visible system messages.
           return Response.json({
             ...session,
+            ...(memoryEntryCount !== undefined ? { memoryEntryCount } : {}),
+            ...(memoryBytes !== undefined ? { memoryBytes } : {}),
             messages: session.messages.filter(
               (m) => !(m.role === 'system' && m.content?.startsWith('[session-meta]')),
             ),
