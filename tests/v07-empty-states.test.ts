@@ -142,7 +142,10 @@ describe('empty-state wiring per view (#176)', () => {
     const view = read('views/connect-view.ts');
     expect(view).toMatch(/this\.platforms\.length\s*===\s*0[\s\S]{0,400}<crowclaw-empty/);
     expect(view).toContain('No paired platforms');
-    expect(view).toMatch(/cta-label=["']Connect Telegram\/Slack\/Discord["']/);
+    // v0.8.4 (#200): single cta-label replaced by 3 separate <crowclaw-button> CTAs
+    // (Connect Telegram / Slack / Discord) inside a platform-actions row, plus
+    // descriptive copy referencing the new 4-step setup wizard.
+    expect(view).toContain('Pair Telegram, Slack, or Discord');
     expect(view).toMatch(/icon=["']pairing["']/);
   });
 

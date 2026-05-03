@@ -5,13 +5,14 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
-## [Unreleased] — release/v0.8.4 sweep — 17 reopened issues (in progress)
+## [0.8.4] — 2026-05-03 — Audit-debt closure: 17 issues from post-v0.8.3 audit
 
 After v0.8.3's GitHub-close pass closed 105 issues via verifier-only
 pass, a follow-up audit found that 17 of them were actually shipped
 incompletely — 6 FAIL (features missing entirely) plus 11 PARTIAL
-(acceptance criteria not fully met). Those 17 have been reopened on
-2026-05-03 and will be properly implemented in this sweep.
+(acceptance criteria not fully met). Those 17 were reopened on
+2026-05-03 and properly implemented across 5 phases via 11 parallel
+sub-agent worktree dispatches; 19 commits total.
 
 Working ledger: `docs/release-v0.8.4-worklog.md`.
 
