@@ -68,6 +68,9 @@ import {
   verifySlackSignature,
   type GatewayCallerScope,
 } from '@crowclaw/gateway';
+// v0.8.4 (#185) — derive learning-loop stages and per-skill metrics from
+// existing draft fields without changing the storage contract.
+import { countLearningStages, deriveLearningStage, summarizeSkillMetrics } from '@crowclaw/learning';
 import { listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { validatePluginManifest } from '@crowclaw/plugins';
 import {
@@ -3852,6 +3855,10 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           helpfulRatings += ratings?.helpful ?? 0;
           unhelpfulRatings += ratings?.unhelpful ?? 0;
         }
+        // v0.8.4 (#185) — derive the four-state stage and per-skill summary
+        // from existing fields. Helpers are imported statically at the top of
+        // this file so the dashboard route stays sync.
+        const stageCounts = countLearningStages(drafts);
         return Response.json({
           drafts: drafts.map((draft) => ({
             id: draft.id,
@@ -3860,16 +3867,25 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             summary: draft.summary,
             triggerPhrases: draft.triggerPhrases,
             status: draft.status,
+            stage: deriveLearningStage(draft),
             recurrenceCount: draft.sourceMessages,
+            ratings: draft.ratings ?? { helpful: 0, unhelpful: 0 },
             createdAt: draft.createdAt,
             updatedAt: draft.updatedAt,
           })),
+          // v0.8.4 (#185) — per-skill metrics row consumed by the learning
+          // dashboard's metrics panel (success rate, activations, last
+          // activity). Backed by draft fields today; will pivot to the
+          // SkillMetricsTracker once it's wired into the runtime.
+          skillMetrics: drafts.map((d) => summarizeSkillMetrics(d)),
           metrics: {
             totalDrafts: drafts.length,
             pendingDrafts: drafts.filter((draft) => draft.status === 'draft').length,
             publishedDrafts: drafts.filter((draft) => draft.status === 'published').length,
             helpfulRatings,
             unhelpfulRatings,
+            // v0.8.4 (#185) — 4-stage counts for the loop diagram.
+            stageCounts,
           },
         });
       }
@@ -3903,6 +3919,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       // v0.8.0 (#238) — Drafts tab pending list. Returns drafts that haven't
       // been promoted to published skills yet so the dashboard can render the
       // Skill Drafts section.
+      // v0.8.4 (#185) — also surface the derived four-state stage so the
+      // automate view can render colored status pills directly off the
+      // pending list (no second fetch).
       if (request.method === 'GET' && url.pathname === '/api/learning/drafts/pending') {
         const all = await learning.listDrafts();
         const pending = all
@@ -3919,6 +3938,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             // via SKILL.md on disk are surfaced through the skills API, not
             // this endpoint.
             source: 'auto-capture' as const,
+            stage: deriveLearningStage(d),
+            ratings: d.ratings ?? { helpful: 0, unhelpful: 0 },
             createdAt: d.createdAt,
             updatedAt: d.updatedAt,
           }));
