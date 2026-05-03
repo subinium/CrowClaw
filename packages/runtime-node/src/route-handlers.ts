@@ -5106,6 +5106,72 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         return Response.json(result);
       }
 
+      // #200 — Stateless validate-token endpoint used by the platform setup wizard.
+      // Unlike `/probe`, this never falls back to `configStore` — the caller must
+      // supply the credential under verification. This lets the wizard's Step 2
+      // "paste credentials → check identity" flow run before any config is saved.
+      const validateTokenMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/validate-token$/);
+      if (request.method === 'POST' && validateTokenMatch) {
+        const platform = getRouteCapture(validateTokenMatch, 1);
+        if (!platform) {
+          return Response.json({ ok: false, error: 'Invalid platform' }, { status: 400 });
+        }
+        const body = await request.json().catch(() => ({})) as {
+          token?: string;
+          webhookUrl?: string;
+          phoneNumberId?: string;
+          homeserverUrl?: string;
+        };
+        const token = typeof body.token === 'string' ? body.token.trim() : '';
+        const webhookUrl = typeof body.webhookUrl === 'string' ? body.webhookUrl.trim() : '';
+        const phoneNumberId = typeof body.phoneNumberId === 'string' ? body.phoneNumberId.trim() : '';
+        const homeserverUrl = typeof body.homeserverUrl === 'string' ? body.homeserverUrl.trim() : '';
+
+        let result: ProbeResult;
+        switch (platform) {
+          case 'telegram':
+            result = token
+              ? await probeTelegram(token)
+              : { ok: false, platform: 'telegram', error: 'Missing token' };
+            break;
+          case 'slack':
+            result = token
+              ? await probeSlack(token)
+              : { ok: false, platform: 'slack', error: 'Missing token' };
+            break;
+          case 'discord':
+            result = webhookUrl
+              ? await probeDiscord(webhookUrl)
+              : { ok: false, platform: 'discord', error: 'Missing webhookUrl' };
+            break;
+          case 'whatsapp':
+            result = token && phoneNumberId
+              ? await probeWhatsApp(token, phoneNumberId)
+              : { ok: false, platform: 'whatsapp', error: 'Missing token or phoneNumberId' };
+            break;
+          case 'matrix':
+            result = token && homeserverUrl
+              ? await probeMatrix(homeserverUrl, token)
+              : { ok: false, platform: 'matrix', error: 'Missing token or homeserverUrl' };
+            break;
+          default:
+            result = {
+              ok: false,
+              platform: platform as GatewayPlatform,
+              error: `Validate not supported for ${platform}`,
+            };
+        }
+        // Wizard-friendly envelope: top-level `ok` + flattened `identity` so the
+        // happy path of Step 2 reads `data.identity` without dipping into details.
+        return Response.json({
+          ok: result.ok,
+          platform: result.platform,
+          identity: result.identity,
+          details: result.details,
+          error: result.error,
+        });
+      }
+
       const policyMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/policy$/);
       if (request.method === 'POST' && policyMatch) {
         const platform = getRouteCapture(policyMatch, 1);

@@ -20,6 +20,9 @@ import '../components/icon.js';
 import '../components/empty.js';
 import '../components/skeleton.js';
 import '../components/modal.js';
+// v0.8.4 #200 — multi-step setup wizard for Telegram/Slack/Discord.
+import '../components/platform-wizard.js';
+import type { WizardPlatform } from '../components/platform-wizard.js';
 
 /* ------------------------------------------------------------------ */
 /*  Type definitions                                                  */
@@ -958,6 +961,10 @@ export class ConnectView extends LitElement {
   @state() private platformPolicyForm: PlatformPolicy = { dmPolicy: 'pairing', groupPolicy: 'open', requireMention: false };
   @state() private probingPlatform: string | null = null;
 
+  /* v0.8.4 #200 — setup wizard state. `wizardPlatform` is non-null while the
+   * wizard modal is open; closing the wizard resets it to null. */
+  @state() private wizardPlatform: WizardPlatform | null = null;
+
   /* Channels */
   @state() private channels: GatewayChannel[] = [];
 
@@ -1223,6 +1230,26 @@ export class ConnectView extends LitElement {
       ? { ...platform.policy }
       : { dmPolicy: 'pairing', groupPolicy: 'open', requireMention: false };
   }
+
+  /* v0.8.4 #200 — wizard open / close / completion handlers. */
+  private _openWizard(platform: WizardPlatform) {
+    this.wizardPlatform = platform;
+  }
+
+  private _closeWizard = () => {
+    this.wizardPlatform = null;
+  };
+
+  private _onWizardComplete = async () => {
+    // Refresh both the platform list and the Telegram webhook info so the
+    // Connect view shows the new credentials/webhook without needing a
+    // manual reload.
+    this.wizardPlatform = null;
+    await Promise.allSettled([
+      this._fetchPlatforms(),
+      this._fetchTelegramWebhook(),
+    ]);
+  };
 
   private async _savePlatformConfig(platform: GatewayPlatform) {
     try {
@@ -2041,6 +2068,23 @@ export class ConnectView extends LitElement {
       ${this._renderChannels()}
       ${this._renderRemoteAccess()}
       ${this._renderTools()}
+      ${this._renderPlatformWizard()}
+    `;
+  }
+
+  /* v0.8.4 #200 — render the active wizard, if any. We render only when a
+   * platform is selected so the modal mounts/unmounts and resets its state on
+   * each open. */
+  private _renderPlatformWizard() {
+    if (!this.wizardPlatform) return nothing;
+    return html`
+      <crowclaw-platform-wizard
+        platform=${this.wizardPlatform}
+        ?open=${true}
+        public-url=${this.publicUrlOverride}
+        @close=${this._closeWizard}
+        @wizard-complete=${this._onWizardComplete}
+      ></crowclaw-platform-wizard>
     `;
   }
 
@@ -2912,10 +2956,28 @@ export class ConnectView extends LitElement {
               <crowclaw-empty
                 icon="pairing"
                 title="No paired platforms"
-                description="Pair Telegram, Slack, or Discord to chat with your agent from anywhere."
-                cta-label="Connect Telegram/Slack/Discord"
-                cta-href="https://github.com/subinium/CrowClaw/blob/main/docs/gateway.md"
+                description="Pair Telegram, Slack, or Discord to chat with your agent from anywhere. The setup wizard walks you through bot creation, token validation, and webhook configuration in 4 steps."
               ></crowclaw-empty>
+              <div class="platform-actions" style="justify-content:center;margin-top:var(--sp-3)">
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open Telegram setup wizard"
+                  @click=${() => this._openWizard('telegram')}
+                >Connect Telegram</crowclaw-button>
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open Slack setup wizard"
+                  @click=${() => this._openWizard('slack')}
+                >Connect Slack</crowclaw-button>
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open Discord setup wizard"
+                  @click=${() => this._openWizard('discord')}
+                >Connect Discord</crowclaw-button>
+              </div>
             `
           : html`
               <div class="platform-grid">
@@ -2924,6 +2986,12 @@ export class ConnectView extends LitElement {
             `}
       </div>
     `;
+  }
+
+  /** v0.8.4 #200 — only Telegram/Slack/Discord get the wizard. Other gateway
+   * platforms (whatsapp/matrix/sms/email) keep the legacy expand-panel flow. */
+  private _isWizardPlatform(name: string): boolean {
+    return name === 'telegram' || name === 'slack' || name === 'discord';
   }
 
   private _renderPlatformCard(platform: GatewayPlatform) {
@@ -2992,6 +3060,16 @@ export class ConnectView extends LitElement {
             ?disabled=${isProbing}
             @click=${() => this._probePlatform(platform)}
           >${isProbing ? 'Probing' : 'Probe'}</crowclaw-button>
+          ${this._isWizardPlatform(platform.name)
+            ? html`
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open ${platform.name} setup wizard"
+                  @click=${() => this._openWizard(platform.name as WizardPlatform)}
+                >Setup Wizard</crowclaw-button>
+              `
+            : nothing}
           <crowclaw-button
             variant=${isExpanded ? 'primary' : 'ghost'}
             size="sm"
