@@ -5,6 +5,75 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.8.3] — 2026-05-03 — GitHub-close pass: 52 verifier-confirmed issues
+
+**This release is a GitHub-close pass with no code change.** Earlier
+release PRs (#209, #211, #251, #252, #290) implemented the work for the
+52 issues closed here, but those PR descriptions used range syntax
+("Closes #230–#240", "Closes the 10-issue gap (#241–#250)") which GitHub
+does not auto-close — leaving the issues in OPEN state despite the
+implementation being on `main`. v0.8.3 verifier-passes the codebase and
+closes them properly so the issue tracker reflects reality.
+
+The version bump itself is the cut so `crowclaw@0.8.3` is consumable as
+a clean release line. `0.8.3` and `0.8.2` are byte-equivalent at the
+package level — pinning to either is functionally identical.
+
+### Verifier-closed issues (52 total, 0 code change)
+
+**v0.8.1 dashboard verifier gaps** (6) — shipped in v0.8.1 (PR #252):
+`#224`, `#242`, `#244`, `#246`, `#247`, `#248`.
+
+**v0.8.2 critical bug remnants** (4) — shipped in v0.8.2 (PR #290):
+`#190` (catalog-aware MCP install via `runtime-catalogs.ts`),
+`#212` (SSRF "Always on (enforced)" badge in settings),
+`#213` (Agent tab `model` ghost write removed; read-only "Active model" link),
+`#214` (`autonomousScheduler.start()` on first job creation).
+
+**v0.7 / post-v0.7.1 audit** (31) — shipped across v0.7.x / v0.8.x
+sweeps:
+`#181`, `#182`, `#183`, `#185`, `#186`, `#189`, `#191`, `#192`,
+`#196`, `#197`, `#198`, `#199`, `#200`, `#201`,
+`#205`, `#206`, `#207`, `#208`,
+`#215`, `#216`, `#217`, `#218`, `#219`, `#220`, `#221`, `#222`,
+`#223`, `#225`, `#226`, `#227`, `#228`.
+
+**v0.8.0 Hermes parity** (10) — shipped in v0.8.0 (PR #251):
+`#231` (`parseReasoningBlocks` + `StreamingReasoningParser`),
+`#232` (JSON repair), `#233` (`MemoryProvider` ABC),
+`#234` (`code.execute`), `#235` (tool-error envelope),
+`#236` (hybrid reasoning `<think>` parsing), `#237` (`generateStructured<T>`),
+`#238` (self-improvement loop), `#239` (`<budget_exhausted>` envelope),
+`#240` (`agentskills.io` v1.0 SkillManifest alignment).
+
+**v0.8.2 Cloudflare parity** (1) — shipped in v0.8.2 (PR #290):
+`#255` — `node scripts/audit-routes.mjs --check` reports zero missing
+rows; Tier 1 routes `covered`, Tier 3 routes return structured
+`501 unsupported_on_workers`.
+
+### Cumulative impact
+
+- 52 OPEN issues moved to CLOSED.
+- 0 lines of code changed.
+- Version bumped 0.8.2 → 0.8.3 across root + 19 packages + wrangler.jsonc.
+
+### Verification
+
+- `npm run typecheck` — clean
+- `npm test` — 2,982 / 2,982 (carry-over from v0.8.2; no test changes)
+- `node scripts/audit-routes.mjs --check` — zero missing rows
+- `gh issue list --state open --label priority/critical` — 0 open after the pass
+
+### Caveats
+
+- Reviewers checking acceptance criteria for any specific issue closed
+  here that turn out to be unmet should reopen with the missing detail —
+  the close pass relied on grep / file inspection plus the v0.8.2
+  worklog verifier results, which are high-signal but not exhaustive.
+- No new public API or contract changes ship in v0.8.3. Anyone tracking
+  the `0.8.x` line for changes should treat this release as a no-op
+  upgrade.
+
 ## [0.8.2] — 2026-05-03 — Audit + parity sweep: 53-issue release
 
 This release lands two parallel investigations against the post-v0.8.1
