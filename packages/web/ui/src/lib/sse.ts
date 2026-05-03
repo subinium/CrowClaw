@@ -25,6 +25,10 @@ export interface StreamEvent {
     | 'reasoning-start'
     | 'reasoning-delta'
     | 'reasoning-end'
+    // v0.8.4 (#181): per-turn skill matching results from `matchSkillManifests`.
+    // Forwarded so the chat-view can render a "why this skill fired" chip row
+    // above the next assistant message.
+    | 'skill-matched'
     | 'error'
     | 'done';
   content?: string;
@@ -47,6 +51,13 @@ export interface StreamEvent {
   output?: string;
   /** v0.8.1 (#242): security-audit log id correlated with the tool call. */
   auditId?: string;
+  /**
+   * v0.8.4 (#181): on `skill-matched`, the user query that matched and the
+   * full per-skill explanation (skillSlug, name, score, matchedTriggers,
+   * matchedTools, reasons). Forwarded as-is from the runtime EventBus.
+   */
+  matches?: unknown;
+  query?: string;
 }
 
 export interface StreamCallbacks {
@@ -73,6 +84,13 @@ export interface StreamCallbacks {
    * runtime-side counterpart and carries the durationMs, audit id, etc.
    */
   onToolComplete?: (toolCallId: string, ok: boolean, output?: string, durationMs?: number, auditId?: string, error?: string) => void;
+  /**
+   * v0.8.4 (#181): per-turn skill matching results. Optional — existing
+   * clients that don't render the chip row simply ignore this callback.
+   * `matches` is the raw runtime payload (array of
+   * `{ skillSlug, name, score, matchedTriggers, matchedTools, reasons }`).
+   */
+  onSkillMatched?: (matches: unknown, query?: string) => void;
 }
 
 /**
@@ -196,6 +214,9 @@ const dispatchEvent = (event: StreamEvent, callbacks: StreamCallbacks): void => 
       break;
     case 'reasoning-end':
       callbacks.onReasoningEnd?.(event.reasoningTag ?? 'reasoning');
+      break;
+    case 'skill-matched':
+      callbacks.onSkillMatched?.(event.matches, event.query);
       break;
     case 'error':
       callbacks.onError(event.error ?? 'Unknown error');

@@ -83,7 +83,13 @@ export type RuntimeEventType =
   // v0.8.0 (#239) — agent termination reason discriminator. Fires once per
   // `AgentLoop.run` exit with `{ reason: 'natural'|'budget_exhausted_with_synthesis'|'tool_error_terminal'|'aborted' }`
   // so observability can distinguish "model stopped" from "harness stopped".
-  | 'agent:terminated';
+  | 'agent:terminated'
+  // v0.8.4 (#181) — per-turn skill matching results. Fires once per user
+  // message after `matchSkillManifests` runs in the agent loop, with the
+  // matched skill names + triggers + reasons + tools so the dashboard can
+  // render a "why this skill fired" chip row above the next assistant
+  // message and aggregate per-skill activation counters.
+  | 'skill:matched';
 
 export interface RuntimeEvent {
   type: RuntimeEventType;

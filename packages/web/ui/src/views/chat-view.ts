@@ -75,6 +75,28 @@ interface ChatMessage {
    * Rendered inline above the assistant text via `<crowclaw-reasoning-block>`.
    */
   reasoningBlocks?: Array<{ tag: string; content: string }>;
+  /**
+   * v0.8.4 (#181): per-turn skill matching results. The runtime emits
+   * `skill:matched` before the agent loop runs; we attach the explanation
+   * to the next assistant message so the chip row above the bubble can
+   * answer "why did 'git-commit-workflow' fire on my prompt?".
+   */
+  skillMatches?: SkillMatchEntry[];
+}
+
+/**
+ * v0.8.4 (#181): a single skill that matched the user's query, surfaced
+ * to the chat chip row + Settings activation counters. Mirrors the runtime
+ * `skill:matched` event payload (matches[] entries) one-for-one so we can
+ * forward it without a translation step.
+ */
+interface SkillMatchEntry {
+  skillSlug: string;
+  name: string;
+  score: number;
+  matchedTriggers: string[];
+  matchedTools: string[];
+  reasons: string[];
 }
 
 /** v0.8.0 (#231): live reasoning state during a single streaming turn. */
@@ -1233,6 +1255,73 @@ export class ChatView extends LitElement {
         text-align: right;
       }
 
+      /* v0.8.4 #181 — skill chip row above each assistant message. */
+      .skill-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 0 0 var(--sp-2) 0;
+        align-items: center;
+      }
+      .skill-chip-row .chip-prefix {
+        font-size: 10px;
+        color: var(--text-muted);
+        margin-right: 2px;
+      }
+      .skill-chip {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        font-size: 11px;
+        font-family: var(--font-mono, ui-monospace, monospace);
+        color: var(--accent, var(--text-primary));
+        background: var(--surface-2, rgba(255,255,255,0.04));
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        cursor: pointer;
+      }
+      .skill-chip:hover,
+      .skill-chip:focus-visible {
+        background: var(--bg-input, rgba(255,255,255,0.08));
+        outline: none;
+        border-color: var(--accent);
+      }
+      .skill-chip .chip-icon {
+        font-size: 10px;
+        opacity: 0.85;
+      }
+      .skill-chip-popover {
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 0;
+        z-index: 20;
+        min-width: 240px;
+        max-width: 360px;
+        background: var(--bg-secondary, var(--bg-primary));
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: var(--sp-2) var(--sp-3);
+        box-shadow: var(--shadow-md);
+        font-size: var(--text-xs);
+        color: var(--text-primary);
+        text-align: left;
+        cursor: default;
+      }
+      .skill-chip-popover .pop-h {
+        font-weight: 600;
+        margin-bottom: var(--sp-1);
+      }
+      .skill-chip-popover .pop-r {
+        color: var(--text-muted);
+        margin: 2px 0;
+      }
+      .skill-chip-popover .pop-r b {
+        color: var(--text-primary);
+        font-weight: 500;
+      }
+
       /* Responsive */
       @media (max-width: 768px) {
         .sess-sb { position: fixed; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: var(--shadow-md); }
@@ -1279,6 +1368,24 @@ export class ChatView extends LitElement {
   // so `showMemoryPanel` is no longer used; events still drive the rail's
   // memory tab content.
   @state() private memoryEvents: MemoryStreamEvent[] = [];
+
+  // v0.8.4 #181 — skill match explanation for the in-flight turn. Set when
+  // the runtime emits `skill:matched` (via the `crowclaw-event` bridge) and
+  // attached to the next assistant message that lands so the chip row can
+  // render "why these skills fired" above each bubble.
+  @state() private pendingSkillMatches: SkillMatchEntry[] | null = null;
+  /**
+   * v0.8.4 #181 — per-skill activation counter. Aggregated across every
+   * `skill:matched` event seen in this dashboard session. Surfaced as a
+   * tooltip-style summary above the chat composer ("git-commit-workflow x3,
+   * code-review x1") so the operator can spot over-eager triggers.
+   */
+  @state() private skillActivationCounts: Record<string, number> = {};
+  /**
+   * v0.8.4 #181 — tracks which skill chip the user has the popover open
+   * on. `null` = no popover; otherwise `${messageIndex}:${skillSlug}`.
+   */
+  @state() private openSkillChipKey: string | null = null;
 
   // v0.8.1 #242 — live tool-call trace state. Populated from SSE
   // `tool:start` / `tool:complete` events forwarded through the stream.
@@ -1381,6 +1488,56 @@ export class ChatView extends LitElement {
     };
     this.memoryEvents = [...this.memoryEvents, evt];
   };
+
+  /**
+   * v0.8.4 #181 — parse a raw `skill:matched` payload (either from the SSE
+   * stream during a streaming turn, or from a bridge event for non-stream
+   * paths) into the typed shape the chip row consumes.
+   */
+  private _ingestSkillMatches(rawMatches: unknown): void {
+    const arr = Array.isArray(rawMatches) ? rawMatches : [];
+    const parsed: SkillMatchEntry[] = arr
+      .map((raw): SkillMatchEntry | null => {
+        if (!raw || typeof raw !== 'object') return null;
+        const r = raw as Record<string, unknown>;
+        const name = typeof r.name === 'string' ? r.name : typeof r.skillSlug === 'string' ? r.skillSlug : '';
+        if (!name) return null;
+        return {
+          skillSlug: typeof r.skillSlug === 'string' ? r.skillSlug : name,
+          name,
+          score: typeof r.score === 'number' ? r.score : 0,
+          matchedTriggers: Array.isArray(r.matchedTriggers) ? (r.matchedTriggers as unknown[]).filter((t): t is string => typeof t === 'string') : [],
+          matchedTools: Array.isArray(r.matchedTools) ? (r.matchedTools as unknown[]).filter((t): t is string => typeof t === 'string') : [],
+          reasons: Array.isArray(r.reasons) ? (r.reasons as unknown[]).filter((t): t is string => typeof t === 'string') : [],
+        };
+      })
+      .filter((m): m is SkillMatchEntry => m !== null);
+    if (parsed.length === 0) return;
+    this.pendingSkillMatches = parsed;
+    // Update activation counters (per-dashboard-session aggregation).
+    const next = { ...this.skillActivationCounts };
+    for (const m of parsed) {
+      next[m.name] = (next[m.name] ?? 0) + 1;
+    }
+    this.skillActivationCounts = next;
+  }
+
+  /**
+   * v0.8.4 #181 — once an assistant message lands, attach the pending skill
+   * matches to it so the chip row anchors to the matching bubble. Called
+   * from both the streaming `onDone` path and the non-streaming reply path.
+   */
+  private _attachPendingSkillMatchesToLastAssistant() {
+    if (!this.pendingSkillMatches || this.pendingSkillMatches.length === 0) return;
+    if (this.messages.length === 0) return;
+    const lastIdx = this.messages.length - 1;
+    const last = this.messages[lastIdx];
+    if (!last || last.role !== 'assistant') return;
+    const next = [...this.messages];
+    next[lastIdx] = { ...last, skillMatches: this.pendingSkillMatches };
+    this.messages = next;
+    this.pendingSkillMatches = null;
+  }
 
   /**
    * Refresh on session lifecycle events emitted by the runtime EventBus
@@ -1513,6 +1670,10 @@ export class ChatView extends LitElement {
     if (this.contextMenuSessionId) {
       this.contextMenuSessionId = null;
     }
+    // v0.8.4 #181 — close the skill-chip popover when clicking outside.
+    if (this.openSkillChipKey) {
+      this.openSkillChipKey = null;
+    }
   }
 
   // --- Active session polling ---
@@ -1602,6 +1763,9 @@ export class ChatView extends LitElement {
     localStorage.setItem('cc_sid', id);
     this.messageRenderLimit = INITIAL_MESSAGE_RENDER_LIMIT;
     this.sessions = [...this.sessions];
+    // v0.8.4 #181 — drop any pending chip-row state from a previous session.
+    this.pendingSkillMatches = null;
+    this.openSkillChipKey = null;
     this._closeAllOverlays();
     this._loadHistory();
     // Refresh the checkpoint badge for the new session so the header
@@ -2062,6 +2226,13 @@ export class ChatView extends LitElement {
         next[idx] = { ...next[idx], open: false };
         this.streamReasoning = next;
       },
+      // v0.8.4 (#181): per-turn skill matching. Emitted by the runtime once
+      // skills are matched against the user message. We stash the matches
+      // on `pendingSkillMatches` and attach them to the assistant message
+      // produced by THIS turn in `onDone`.
+      onSkillMatched: (matches, _query) => {
+        this._ingestSkillMatches(matches);
+      },
       onDone: () => {
         this.thinking = false;
         // Flush any buffered deltas before closing out the stream so the
@@ -2077,6 +2248,9 @@ export class ChatView extends LitElement {
               reasoningBlocks: this._snapshotReasoning(),
             },
           ];
+          // v0.8.4 #181 — anchor any `skill:matched` event from this turn
+          // to the assistant message that just landed.
+          this._attachPendingSkillMatchesToLastAssistant();
         }
         this.streaming = false;
         this.streamText = '';
@@ -2784,6 +2958,61 @@ export class ChatView extends LitElement {
 
   // --- Message rendering ---
 
+  /**
+   * v0.8.4 #181 — render the skill chip row above an assistant message.
+   * Each chip shows the matched skill's name. Clicking a chip toggles a
+   * popover with full match reasons (matched triggers, tools, scoring
+   * signals) so the operator can answer "why did 'git-commit-workflow'
+   * match my 'fix this typo' prompt?". Mirrored on the message index +
+   * skillSlug so two adjacent messages with the same skill don't collide.
+   */
+  private _renderSkillChipRow(matches: SkillMatchEntry[], index: number) {
+    return html`
+      <div class="skill-chip-row" role="list" aria-label="Matched skills for this turn">
+        <span class="chip-prefix" aria-hidden="true">skills</span>
+        ${matches.map((m) => {
+          const key = `${index}:${m.skillSlug}`;
+          const open = this.openSkillChipKey === key;
+          return html`
+            <button
+              class="skill-chip"
+              type="button"
+              role="listitem"
+              aria-expanded=${open ? 'true' : 'false'}
+              aria-label=${`Skill ${m.name} matched (score ${m.score})`}
+              @click=${(e: Event) => {
+                e.stopPropagation();
+                this.openSkillChipKey = open ? null : key;
+              }}
+            >
+              <span class="chip-icon" aria-hidden="true">&#9733;</span>
+              ${m.name}
+              ${m.matchedTriggers.length > 0
+                ? html`<span style="opacity:0.7">&middot; ${m.matchedTriggers[0]}${m.matchedTriggers.length > 1 ? ` +${m.matchedTriggers.length - 1}` : ''}</span>`
+                : nothing}
+              ${open
+                ? html`
+                    <div class="skill-chip-popover" role="dialog" aria-label=${`${m.name} match details`}>
+                      <div class="pop-h">${m.name} <span style="opacity:0.6;font-weight:400">(score ${m.score})</span></div>
+                      ${m.reasons.length > 0
+                        ? m.reasons.map((r) => html`<div class="pop-r">${r}</div>`)
+                        : html`<div class="pop-r">matched (no detailed reasons)</div>`}
+                      ${m.matchedTools.length > 0
+                        ? html`<div class="pop-r"><b>Tools</b>: ${m.matchedTools.join(', ')}</div>`
+                        : nothing}
+                      <div class="pop-r" style="margin-top:6px">
+                        <b>Activated</b> ${this.skillActivationCounts[m.name] ?? 1} time${(this.skillActivationCounts[m.name] ?? 1) === 1 ? '' : 's'} this session
+                      </div>
+                    </div>
+                  `
+                : nothing}
+            </button>
+          `;
+        })}
+      </div>
+    `;
+  }
+
   private _renderMessage(msg: ChatMessage, index: number) {
     if (msg.role === 'iteration') {
       return html`<div class="iter-sep">${msg.content}</div>`;
@@ -2883,6 +3112,11 @@ export class ChatView extends LitElement {
     // chain of thought without the harness re-injecting it into the prompt.
     const reasoningBlocks = msg.role === 'assistant' ? msg.reasoningBlocks ?? [] : [];
 
+    // v0.8.4 #181 — skill chip row above the assistant bubble. Chips show
+    // the matched skill names; clicking expands a popover with full match
+    // reasons so the operator can answer "why did this skill fire?".
+    const skillMatches = msg.role === 'assistant' ? msg.skillMatches ?? [] : [];
+
     // v0.8.1 #241 — system rows keep the legacy role-tag for visual parity.
     // Assistant + user rows get the hover-revealed `.role-indicator` instead.
     const showLegacyRoleTag = msg.role === 'system';
@@ -2896,6 +3130,7 @@ export class ChatView extends LitElement {
           : html`<span class="role-indicator" aria-label=${tagLabel}>
               <span class="ri-dot" aria-hidden="true"></span>${tagLabel}
             </span>`}
+        ${skillMatches.length > 0 ? this._renderSkillChipRow(skillMatches, index) : nothing}
         ${reasoningBlocks.length > 0
           ? reasoningBlocks.map((rb) => html`
               <crowclaw-reasoning-block

@@ -1573,6 +1573,24 @@ export class AgentLoop {
           };
         });
 
+        // #181 (v0.8.4): publish per-match explanation so the dashboard can
+        // render a "why this skill fired" chip row above the next assistant
+        // message and aggregate per-skill activation counters. Best-effort —
+        // listener errors are swallowed by EventBus.emit.
+        this.eventBus?.emit('skill:matched', {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          query: input.userMessage,
+          matches: skillMatches.map(({ skill, score, matchedTriggers, matchedTools, reasons }) => ({
+            skillSlug: skill.manifest.name,
+            name: skill.manifest.name,
+            score,
+            matchedTriggers,
+            matchedTools,
+            reasons,
+          })),
+        });
+
         // Warn about required tools that aren't registered
         const registeredToolNames = new Set(toolList.map(t => t.name));
         for (const ms of matchedSkills) {
@@ -2191,6 +2209,21 @@ export class AgentLoop {
             instructions: localized.instructions,
             tools: skill.manifest.tools,
           };
+        });
+
+        // #181 (v0.8.4): publish per-match explanation (streaming path).
+        this.eventBus?.emit('skill:matched', {
+          sessionId: session.sessionId,
+          agentId: session.agentId,
+          query: userMessage,
+          matches: skillMatches.map(({ skill, score, matchedTriggers, matchedTools, reasons }) => ({
+            skillSlug: skill.manifest.name,
+            name: skill.manifest.name,
+            score,
+            matchedTriggers,
+            matchedTools,
+            reasons,
+          })),
         });
 
         // Warn about required tools that aren't registered
@@ -2953,7 +2986,7 @@ export { DetailedUsageTracker, type UsageEntry, type UsageSummary } from './usag
 export { setTelemetryHooks, getTelemetryHooks, type TelemetryHooks, type TelemetrySpan } from './telemetry.js';
 export { ConversationTree, type ConversationBranch, type BranchComparison } from './branching.js';
 
-export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, localizeSkillFile, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult } from './skill-manifest.js';
+export { parseSkillFile, renderSkillFile, loadSkillsFromDirectory, matchSkillManifests, filterAndBudgetSkills, checkSkillGates, validateSkillManifest, localizeSkillFile, type SkillManifest, type ParsedSkillFile, type SkillFileSystem, type SkillDirectoryEntry, type SkillConfigRequirements, type SkillValidationResult, type SkillMatchExplanation } from './skill-manifest.js';
 
 export { agentPresets, getAgentPreset, listAgentPresets, listAgentPresetNames, type AgentPreset } from './agent-presets.js';
 

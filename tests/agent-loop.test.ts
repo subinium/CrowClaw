@@ -599,4 +599,57 @@ describe('AgentLoop v0.8.0 Hermes parity', () => {
       expect(m.content.includes('<budget_exhausted')).toBe(false);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // #181 (v0.8.4) — skill:matched event for the dashboard chip row
+  // -------------------------------------------------------------------------
+  it('#181: emits skill:matched with matched triggers + reasons before the loop runs', async () => {
+    const skill = makeSkillFile('vercel-deploy', ['deploy']);
+    const tools = new ToolRegistry().register(createEchoTool());
+    const provider = new EchoProvider();
+    const store = new InMemorySessionStore();
+    const eventBus = new RecordingEventBus();
+    const agent = new AgentLoop(provider, tools, store, {
+      skills: [skill],
+      eventBus,
+    });
+
+    await agent.run({
+      agentId: 'a',
+      sessionId: 's-181-event',
+      userMessage: 'please deploy to production',
+    });
+
+    const matched = eventBus.events.find((e) => e.type === 'skill:matched');
+    expect(matched).toBeTruthy();
+    expect(matched?.data.sessionId).toBe('s-181-event');
+    const matches = matched?.data.matches as Array<{ name: string; matchedTriggers: string[]; reasons: string[]; score: number }>;
+    expect(Array.isArray(matches)).toBe(true);
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.name).toBe('vercel-deploy');
+    expect(matches[0]!.matchedTriggers).toContain('deploy');
+    expect(matches[0]!.score).toBeGreaterThan(0);
+    expect(matches[0]!.reasons.length).toBeGreaterThan(0);
+  });
+
+  it('#181: does NOT emit skill:matched when no skills match', async () => {
+    const skill = makeSkillFile('git-commit-workflow', ['commit code']);
+    const tools = new ToolRegistry().register(createEchoTool());
+    const provider = new EchoProvider();
+    const store = new InMemorySessionStore();
+    const eventBus = new RecordingEventBus();
+    const agent = new AgentLoop(provider, tools, store, {
+      skills: [skill],
+      eventBus,
+    });
+
+    await agent.run({
+      agentId: 'a',
+      sessionId: 's-181-no-match',
+      userMessage: 'tell me a joke about ducks',
+    });
+
+    const matched = eventBus.events.find((e) => e.type === 'skill:matched');
+    expect(matched).toBeFalsy();
+  });
 });

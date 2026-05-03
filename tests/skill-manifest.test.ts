@@ -490,6 +490,32 @@ describe('matchSkillManifests — regression (algorithm must remain stable)', ()
   });
 });
 
+// --- v0.8.4 #181: per-match explanation fields -----------------------------
+
+describe('matchSkillManifests — explanation fields (#181)', () => {
+  it('returns matched triggers, tools (from manifest.tools), and reasons alongside the score', () => {
+    // LEGACY_SKILL declares manifest.tools at the top level.
+    const skills = [parseSkillFile(LEGACY_SKILL)!];
+    const matches = matchSkillManifests('please deploy to vercel now', skills);
+    expect(matches.length).toBe(1);
+    const m = matches[0]!;
+    expect(m.matchedTriggers).toContain('deploy to vercel');
+    expect(m.matchedTools).toEqual(expect.arrayContaining(['terminal.exec']));
+    expect(Array.isArray(m.reasons)).toBe(true);
+    expect(m.reasons.some((r) => r.toLowerCase().includes('trigger'))).toBe(true);
+  });
+
+  it('returns empty matchedTools when manifest.tools is undefined', () => {
+    // NEW_FORMAT_SKILL uses config_requirements.tools, not manifest.tools.
+    const skills = [parseSkillFile(NEW_FORMAT_SKILL)!];
+    const matches = matchSkillManifests('please deploy to vercel now', skills);
+    expect(matches.length).toBe(1);
+    const m = matches[0]!;
+    expect(m.matchedTools).toEqual([]);
+    expect(m.matchedTriggers).toContain('deploy to vercel');
+  });
+});
+
 // --- Render round-trip -----------------------------------------------------
 
 describe('renderSkillFile + parseSkillFile round-trip', () => {

@@ -4668,6 +4668,23 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           const stream = new ReadableStream({
             async start(controller) {
               unsubscribeToolEvents = eventBus.subscribe((event) => {
+                // #181 (v0.8.4): forward `skill:matched` so the chat-view chip
+                // row can render the matching skills above the next assistant
+                // message. Same per-session filter as tool:* events.
+                if (event.type === 'skill:matched') {
+                  if ((event.data as { sessionId?: string }).sessionId !== sessionId) return;
+                  try {
+                    const d = event.data as { matches?: unknown; query?: string };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'skill-matched',
+                      matches: d.matches,
+                      query: d.query,
+                    })}\n\n`));
+                  } catch {
+                    // Controller closed mid-turn — swallow.
+                  }
+                  return;
+                }
                 if (event.type !== 'tool:start' && event.type !== 'tool:complete') return;
                 if ((event.data as { sessionId?: string }).sessionId !== sessionId) return;
                 try {
