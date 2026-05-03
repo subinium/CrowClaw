@@ -442,15 +442,11 @@ export class ChatView extends LitElement {
         padding-right: 40px;
       }
 
-      .sess-toggle-btn {
-        background: var(--bg-tertiary);
-        border: 1px solid var(--border);
-        color: var(--text-primary);
-        cursor: pointer;
-        padding: 4px 8px;
+      /* v0.8.4 #244: .sess-toggle-btn is now a positioning hook for the
+         crowclaw-button sidebar toggle (margin only). Visual styling comes
+         from the component. */
+      crowclaw-button.sess-toggle-btn {
         margin: var(--sp-2);
-        font-size: 14px;
-        border-radius: var(--radius-sm);
         width: fit-content;
       }
 
@@ -474,7 +470,10 @@ export class ChatView extends LitElement {
         margin-right: var(--sp-1);
       }
 
-      .ops-btn {
+      /* v0.8.4 #244: legacy .ops-btn rule removed in favour of
+         crowclaw-button. Inline ops chips (e.g. the passive Checkpoints
+         count badge) keep a small chip style that is NOT a button. */
+      .ops-chip {
         display: inline-flex;
         align-items: center;
         gap: var(--sp-1);
@@ -485,35 +484,7 @@ export class ChatView extends LitElement {
         font-size: var(--text-xs);
         font-weight: 500;
         font-family: inherit;
-        cursor: pointer;
         border-radius: var(--radius-sm);
-        transition: background var(--duration-fast), border-color var(--duration-fast);
-      }
-
-      .ops-btn:hover {
-        background: var(--bg-card-hover);
-        border-color: rgba(255, 255, 255, 0.15);
-        color: var(--text-primary);
-      }
-
-      .ops-btn:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
-      }
-
-      .ops-btn.danger {
-        border-color: rgba(255, 69, 58, 0.3);
-        color: var(--error);
-      }
-
-      .ops-btn.danger:hover {
-        background: rgba(255, 69, 58, 0.1);
-      }
-
-      .ops-btn.aborting {
-        border-color: rgba(255, 214, 10, 0.3);
-        color: var(--warning);
-        animation: pulse 1s infinite;
       }
 
       .ops-sep {
@@ -559,30 +530,10 @@ export class ChatView extends LitElement {
         gap: var(--sp-2);
       }
 
-      .steer-sticky-btn {
+      /* v0.8.4 #244: legacy .steer-sticky-btn rule removed in favour of
+         crowclaw-button variant=secondary size=sm with a leading icon. */
+      crowclaw-button.steer-sticky {
         align-self: flex-end;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 12px;
-        border: 1px solid rgba(255, 214, 10, 0.3);
-        background: rgba(255, 214, 10, 0.08);
-        color: var(--warning);
-        font-size: var(--text-xs);
-        font-weight: 600;
-        font-family: inherit;
-        cursor: pointer;
-        border-radius: var(--radius-sm);
-        transition: background var(--duration-fast);
-      }
-
-      .steer-sticky-btn:hover {
-        background: rgba(255, 214, 10, 0.14);
-      }
-
-      .steer-sticky-btn svg {
-        width: 12px;
-        height: 12px;
       }
 
       /* Search overlay */
@@ -639,63 +590,10 @@ export class ChatView extends LitElement {
         color: var(--text-secondary);
       }
 
-      /* Checkpoint list overlay */
-      .checkpoint-overlay {
-        padding: var(--sp-2) var(--sp-4);
-        border-bottom: 1px solid var(--border);
-        background: rgba(100, 210, 255, 0.04);
-        max-height: 200px;
-        overflow-y: auto;
-      }
-
-      .checkpoint-overlay .cp-hdr {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: var(--sp-2);
-      }
-
-      .checkpoint-overlay .cp-hdr span {
-        font-size: var(--text-xs);
-        font-weight: 600;
-        color: var(--text-secondary);
-      }
-
-      .cp-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: var(--sp-1) var(--sp-2);
-        border-bottom: 1px solid var(--border);
-        font-size: var(--text-xs);
-      }
-
-      .cp-item:last-child { border-bottom: none; }
-
-      .cp-item .cp-label {
-        color: var(--text-primary);
-        font-family: var(--font-mono);
-      }
-
-      .cp-item .cp-time {
-        color: var(--text-muted);
-      }
-
-      .cp-item .cp-restore {
-        padding: 2px 6px;
-        border: 1px solid var(--border);
-        background: none;
-        color: var(--text-secondary);
-        font-size: 10px;
-        cursor: pointer;
-        border-radius: var(--radius-sm);
-        font-family: inherit;
-      }
-
-      .cp-item .cp-restore:hover {
-        background: var(--bg-card-hover);
-        color: var(--text-primary);
-      }
+      /* v0.8.4 #244: legacy checkpoint-overlay/cp-* styles dropped because
+         checkpoints live in crowclaw-checkpoint-panel mounted in the
+         inspector rail. The chat-view never rendered an inline overlay
+         since v0.8.1 #247. */
 
       /* Rename dialog */
       .rename-overlay {
@@ -733,21 +631,8 @@ export class ChatView extends LitElement {
         margin-bottom: var(--sp-3);
       }
 
-      .message-window-btn {
-        border: 1px solid var(--border);
-        background: var(--surface-1);
-        color: var(--text-secondary);
-        border-radius: var(--radius-sm);
-        cursor: pointer;
-        font: inherit;
-        font-size: var(--text-xs);
-        padding: var(--sp-2) var(--sp-3);
-      }
-
-      .message-window-btn:hover {
-        background: var(--bg-card-hover);
-        color: var(--text-primary);
-      }
+      /* v0.8.4 #244: message-window-btn migrated to crowclaw-button with
+         secondary variant; the wrapper now only owns the layout context. */
 
       /* v0.8.1 #241 — chat surface overhaul. Assistant blocks render
          full-width with a 24px left margin reserved for a subtle role
@@ -2779,10 +2664,10 @@ export class ChatView extends LitElement {
             ${this.sessionsSelected.size > 0 ? html`
               <div class="sess-bulk-bar" role="toolbar" aria-label="Bulk session actions">
                 <span class="sess-bulk-count">${this.sessionsSelected.size} selected</span>
-                <button class="btn btn-danger" @click=${this._bulkDeleteSelected}>
+                <crowclaw-button variant="danger" size="sm" @click=${this._bulkDeleteSelected}>
                   Delete ${this.sessionsSelected.size}
-                </button>
-                <button class="btn" @click=${this._clearSessionSelection}>Clear</button>
+                </crowclaw-button>
+                <crowclaw-button variant="secondary" size="sm" @click=${this._clearSessionSelection}>Clear</crowclaw-button>
               </div>
             ` : nothing}
             <div class="sess-list" role="listbox" aria-label="Sessions" tabindex="0">
@@ -2816,9 +2701,9 @@ export class ChatView extends LitElement {
             ${this.sessionsNextCursor
               ? html`
                   <div class="sess-page">
-                    <button class="btn" ?disabled=${this.sessionsLoadingMore} @click=${this._loadMoreSessions}>
+                    <crowclaw-button variant="secondary" size="sm" ?disabled=${this.sessionsLoadingMore} ?loading=${this.sessionsLoadingMore} @click=${this._loadMoreSessions}>
                       ${this.sessionsLoadingMore ? 'Loading...' : 'Load more'}
-                    </button>
+                    </crowclaw-button>
                     <span>${this._filteredSessions.length} of ${this.sessionsTotalCount}</span>
                   </div>
                 `
@@ -2828,13 +2713,17 @@ export class ChatView extends LitElement {
 
         <!-- Chat Content -->
         <div class="chat-content" style="position:relative">
-          <button class="sess-toggle-btn"
-                  @click=${() => { this.sessSidebarOpen = !this.sessSidebarOpen; }}
-                  aria-label="Toggle sidebar"
-                  aria-expanded=${this.sessSidebarOpen ? 'true' : 'false'}
-                  title="Toggle session sidebar">
-            <crowclaw-icon name="menu" size="14" aria-hidden="true"></crowclaw-icon>
-          </button>
+          <crowclaw-button
+            class="sess-toggle-btn"
+            variant="secondary"
+            size="sm"
+            @click=${() => { this.sessSidebarOpen = !this.sessSidebarOpen; }}
+            aria-label="Toggle sidebar"
+            aria-expanded=${this.sessSidebarOpen ? 'true' : 'false'}
+            title="Toggle session sidebar"
+          >
+            <crowclaw-icon slot="icon" name="menu" size="14" aria-hidden="true"></crowclaw-icon>
+          </crowclaw-button>
 
           <!-- Operations Toolbar -->
           ${this.currentSessionId ? this._renderOpsToolbar() : nothing}
@@ -2850,13 +2739,14 @@ export class ChatView extends LitElement {
                 : html`
                     ${this._messageWindowStart > 0 ? html`
                       <div class="message-window-control">
-                        <button
-                          class="message-window-btn"
+                        <crowclaw-button
+                          variant="secondary"
+                          size="sm"
                           @click=${this._expandMessageWindow}
                           aria-label=${`Show ${Math.min(MESSAGE_RENDER_INCREMENT, this._messageWindowStart)} earlier messages`}
                         >
                           Show earlier messages (${this._messageWindowStart} hidden)
-                        </button>
+                        </crowclaw-button>
                       </div>
                     ` : nothing}
                     ${this._visibleMessages.map((m, i) => this._renderMessage(m, this._messageWindowStart + i))}
@@ -2913,17 +2803,17 @@ export class ChatView extends LitElement {
           ${this.currentSessionId && (this.streaming || this._isSessionActive(this.currentSessionId)) ? html`
             <div class="steer-sticky-wrap">
               ${!this.showSteerComposer ? html`
-                <button class="steer-sticky-btn"
-                        @click=${this._toggleSteerComposer}
-                        aria-label="Steer the running agent"
-                        title="Send mid-run guidance">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M5 12h14"/>
-                    <path d="m12 5 7 7-7 7"/>
-                  </svg>
+                <crowclaw-button
+                  class="steer-sticky"
+                  variant="secondary"
+                  size="sm"
+                  @click=${this._toggleSteerComposer}
+                  aria-label="Steer the running agent"
+                  title="Send mid-run guidance"
+                >
+                  <crowclaw-icon slot="icon" name="chevron-right" size="12" aria-hidden="true"></crowclaw-icon>
                   Steer
-                </button>
+                </crowclaw-button>
               ` : nothing}
               <crowclaw-steer-composer
                 ?open=${this.showSteerComposer}
@@ -3080,22 +2970,30 @@ export class ChatView extends LitElement {
       <div class="ops-toolbar">
         <span class="ops-label">Ops</span>
         ${canAbort ? html`
-          <button class="ops-btn ${this.aborting ? 'aborting' : 'danger'}"
-                  @click=${this._abortSession}
-                  ?disabled=${this.aborting}
-                  aria-label="Abort session">
+          <crowclaw-button
+            variant=${this.aborting ? 'secondary' : 'danger'}
+            size="sm"
+            @click=${this._abortSession}
+            ?disabled=${this.aborting}
+            ?loading=${this.aborting}
+            aria-label="Abort session"
+          >
             ${this.aborting ? 'Aborting...' : 'Abort'}
-          </button>
+          </crowclaw-button>
         ` : nothing}
-        <button class="ops-btn"
-                @click=${() => { this._closeAllOverlays(); this.showSearchOverlay = !this.showSearchOverlay; this.searchResults = []; }}
-                aria-label="Search messages">
+        <crowclaw-button
+          variant="secondary"
+          size="sm"
+          @click=${() => { this._closeAllOverlays(); this.showSearchOverlay = !this.showSearchOverlay; this.searchResults = []; }}
+          aria-label="Search messages"
+        >
           Search
-        </button>
+        </crowclaw-button>
         <!-- v0.8.1 #247 — Checkpoints management moved into the inspector
              rail's slot=checkpoints. The badge stays here as a passive
-             count so operators glance the number without opening the rail. -->
-        <span class="ops-btn" aria-label="Checkpoint count" title="Saved checkpoints (open the inspector rail to manage)">
+             count so operators glance the number without opening the rail.
+             v0.8.4 #244 — passive label kept as a non-interactive chip. -->
+        <span class="ops-chip" aria-label="Checkpoint count" title="Saved checkpoints (open the inspector rail to manage)">
           Checkpoints (${this.checkpointCount})
         </span>
       </div>
@@ -3109,8 +3007,8 @@ export class ChatView extends LitElement {
       ${this.showConfirmCompact ? html`
         <div class="confirm-overlay">
           <span class="confirm-msg">Compact this session? This will summarize and reduce message count.</span>
-          <button class="ops-btn danger" @click=${this._compactSession} aria-label="Confirm compact">Confirm</button>
-          <button class="ops-btn" @click=${() => { this.showConfirmCompact = false; }} aria-label="Cancel compact">Cancel</button>
+          <crowclaw-button variant="danger" size="sm" @click=${this._compactSession} aria-label="Confirm compact">Confirm</crowclaw-button>
+          <crowclaw-button variant="secondary" size="sm" @click=${() => { this.showConfirmCompact = false; }} aria-label="Cancel compact">Cancel</crowclaw-button>
         </div>
       ` : nothing}
 
@@ -3125,13 +3023,14 @@ export class ChatView extends LitElement {
                      this.renameSessionId = null;
                    }
                  }}>
-          <button class="ops-btn" @click=${(e: Event) => {
-            const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
+          <crowclaw-button variant="secondary" size="sm" @click=${(e: Event) => {
+            const root = (e.currentTarget as HTMLElement).parentElement;
+            const input = root?.querySelector('input') as HTMLInputElement | null;
             if (input && this.renameSessionId) this._renameSession(this.renameSessionId, input.value);
-          }} aria-label="Confirm rename">Rename</button>
-          <button class="ops-btn" @click=${() => { this.showRenameInput = false; this.renameSessionId = null; }} aria-label="Cancel rename" title="Cancel">
-            <crowclaw-icon name="x" size="12" aria-hidden="true"></crowclaw-icon>
-          </button>
+          }} aria-label="Confirm rename">Rename</crowclaw-button>
+          <crowclaw-button variant="ghost" size="sm" @click=${() => { this.showRenameInput = false; this.renameSessionId = null; }} aria-label="Cancel rename" title="Cancel">
+            <crowclaw-icon slot="icon" name="x" size="12" aria-hidden="true"></crowclaw-icon>
+          </crowclaw-button>
         </div>
       ` : nothing}
 
@@ -3147,13 +3046,14 @@ export class ChatView extends LitElement {
                        this.searchResults = [];
                      }
                    }}>
-            <button class="ops-btn" @click=${(e: Event) => {
-              const input = (e.target as HTMLElement).previousElementSibling as HTMLInputElement;
+            <crowclaw-button variant="secondary" size="sm" @click=${(e: Event) => {
+              const root = (e.currentTarget as HTMLElement).parentElement;
+              const input = root?.querySelector('input') as HTMLInputElement | null;
               if (input) this._searchSession(input.value);
-            }} aria-label="Search">Go</button>
-            <button class="ops-btn" @click=${() => { this.showSearchOverlay = false; this.searchResults = []; }} aria-label="Close search" title="Close">
-              <crowclaw-icon name="x" size="12" aria-hidden="true"></crowclaw-icon>
-            </button>
+            }} aria-label="Search">Go</crowclaw-button>
+            <crowclaw-button variant="ghost" size="sm" @click=${() => { this.showSearchOverlay = false; this.searchResults = []; }} aria-label="Close search" title="Close">
+              <crowclaw-icon slot="icon" name="x" size="12" aria-hidden="true"></crowclaw-icon>
+            </crowclaw-button>
           </div>
           ${this.searchResults.length > 0 ? html`
             <div class="search-results">
