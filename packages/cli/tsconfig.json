@@ -8,6 +8,9 @@
   "references": [
     {
       "path": "../runtime-node"
+    },
+    {
+      "path": "../learning"
     }
   ],
   "include": ["src/**/*.ts"]

@@ -161,7 +161,8 @@ export type CliCommandName =
   | 'presets'
   | 'providers'
   | 'skill'
-  | 'migrate';
+  | 'migrate'
+  | 'batch';
 
 export interface ParsedCliCommand {
   command: CliCommandName;
@@ -186,6 +187,18 @@ export interface ParsedCliCommand {
   migrateArgs?: string[];
   /** Forwarded `--dry-run` flag (used by `skill publish`) */
   dryRun?: boolean;
+  /** v0.8.4 #272: `crowclaw batch <jsonl>` flags */
+  batchInput?: string;
+  /** When set, batch reports accuracy and exits non-zero below threshold (#272). */
+  batchEval?: boolean;
+  /** Accuracy threshold for `--eval` exit code. Default: 1.0 (100%). */
+  batchThreshold?: number;
+  batchOut?: string;
+  batchRunName?: string;
+  batchConcurrency?: number;
+  batchMaxTurns?: number;
+  batchTimeoutMs?: number;
+  batchResumeFromId?: string;
 }
 
 export interface CliRuntimeLike {
@@ -638,6 +651,85 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     return { command: 'migrate', migrateSubcommand, migrateArgs, dryRun, noOnboarding, noResume };
   }
 
+  // batch — v0.8.4 #272: replay/eval JSONL prompts via the runtime agent
+  // Usage: crowclaw batch <input.jsonl> [--eval] [--threshold N] [--out path]
+  //                       [--run-name NAME] [--concurrency N] [--max-turns N]
+  //                       [--timeout-ms N] [--resume-from ID]
+  if (first === 'batch') {
+    let batchInput: string | undefined;
+    let batchEval = false;
+    let batchThreshold: number | undefined;
+    let batchOut: string | undefined;
+    let batchRunName: string | undefined;
+    let batchConcurrency: number | undefined;
+    let batchMaxTurns: number | undefined;
+    let batchTimeoutMs: number | undefined;
+    let batchResumeFromId: string | undefined;
+    for (let i = 0; i < rest.length; i += 1) {
+      const value = rest[i]!;
+      if (value === '--eval') {
+        batchEval = true;
+        continue;
+      }
+      if (value === '--threshold' && rest[i + 1] !== undefined) {
+        const parsed = Number(rest[i + 1]);
+        if (Number.isFinite(parsed)) batchThreshold = parsed;
+        i += 1;
+        continue;
+      }
+      if (value === '--out' && rest[i + 1] !== undefined) {
+        batchOut = rest[i + 1];
+        i += 1;
+        continue;
+      }
+      if (value === '--run-name' && rest[i + 1] !== undefined) {
+        batchRunName = rest[i + 1];
+        i += 1;
+        continue;
+      }
+      if (value === '--concurrency' && rest[i + 1] !== undefined) {
+        const parsed = parseInt(rest[i + 1]!, 10);
+        if (Number.isFinite(parsed) && parsed > 0) batchConcurrency = parsed;
+        i += 1;
+        continue;
+      }
+      if (value === '--max-turns' && rest[i + 1] !== undefined) {
+        const parsed = parseInt(rest[i + 1]!, 10);
+        if (Number.isFinite(parsed) && parsed > 0) batchMaxTurns = parsed;
+        i += 1;
+        continue;
+      }
+      if (value === '--timeout-ms' && rest[i + 1] !== undefined) {
+        const parsed = parseInt(rest[i + 1]!, 10);
+        if (Number.isFinite(parsed) && parsed > 0) batchTimeoutMs = parsed;
+        i += 1;
+        continue;
+      }
+      if (value === '--resume-from' && rest[i + 1] !== undefined) {
+        batchResumeFromId = rest[i + 1];
+        i += 1;
+        continue;
+      }
+      if (!value.startsWith('-') && batchInput === undefined) {
+        batchInput = value;
+      }
+    }
+    return {
+      command: 'batch',
+      batchInput,
+      batchEval,
+      batchThreshold,
+      batchOut,
+      batchRunName,
+      batchConcurrency,
+      batchMaxTurns,
+      batchTimeoutMs,
+      batchResumeFromId,
+      noOnboarding,
+      noResume,
+    };
+  }
+
   // serve — supports --port
   if (first === 'serve') {
     let port: number | undefined;
@@ -732,6 +824,7 @@ export function renderCliHelp(): string {
     '  skills              List skills with status',
     '  tools               List registered tools',
     '  jobs                List scheduled jobs',
+    '  batch <file.jsonl>  Replay JSONL prompts (--eval --threshold N for accuracy gating)',
     '  help                Show this help',
     '',
     'Options:',
@@ -868,6 +961,166 @@ async function runChat(runtime: CliRuntimeLike, parsed: ParsedCliCommand): Promi
   }));
   const payload = await response.json() as { finalResponse: string; session: { sessionId: string } };
   return `[${payload.session.sessionId}] ${payload.finalResponse}`;
+}
+
+// --- Batch runner (v0.8.4 #272) ---
+// `crowclaw batch <input.jsonl> [--eval] [--threshold N]` replays JSONL prompts
+// through the runtime agent. With `--eval`, the JSONL's `expected` field drives
+// per-entry assertions; the summary reports accuracy and the CLI exits non-zero
+// when accuracy < threshold (default 1.0). The core batch-runner already does
+// the assertion + accuracy math (see packages/learning/src/batch-runner.ts);
+// this is the CLI surface around it.
+
+export interface BatchCliExitOptions {
+  exitCode: number;
+  output: string;
+}
+
+interface BatchSessionPayload {
+  finalResponse?: unknown;
+  toolResults?: unknown;
+  session?: { messages?: unknown };
+}
+
+function coerceToolResults(value: unknown): Array<{ toolName: string; ok: boolean; output: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is { toolName: unknown; ok: unknown; output: unknown } =>
+      typeof entry === 'object' && entry !== null,
+    )
+    .map((entry) => ({
+      toolName: typeof entry.toolName === 'string' ? entry.toolName : 'unknown',
+      ok: Boolean(entry.ok),
+      output: typeof entry.output === 'string' ? entry.output : '',
+    }));
+}
+
+function coerceMessages(value: unknown): Array<import('@crowclaw/core').ConversationMessage> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is import('@crowclaw/core').ConversationMessage =>
+    typeof entry === 'object' && entry !== null && typeof (entry as { role?: unknown }).role === 'string',
+  );
+}
+
+export async function runBatchCommand(
+  runtime: CliRuntimeLike,
+  parsed: ParsedCliCommand,
+): Promise<BatchCliExitOptions> {
+  const inputPath = parsed.batchInput;
+  if (!inputPath) {
+    return {
+      exitCode: 1,
+      output: 'usage: crowclaw batch <input.jsonl> [--eval] [--threshold N] [--out path] [--run-name NAME] [--concurrency N] [--max-turns N] [--timeout-ms N] [--resume-from ID]',
+    };
+  }
+
+  let raw: string;
+  try {
+    raw = await readFile(inputPath, 'utf-8');
+  } catch (err: unknown) {
+    return {
+      exitCode: 1,
+      output: `error: failed to read ${inputPath}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const { parseJsonlPrompts, runBatch } = await import('@crowclaw/learning');
+  const prompts = parseJsonlPrompts(raw);
+  if (prompts.length === 0) {
+    return { exitCode: 1, output: `error: no prompts parsed from ${inputPath}` };
+  }
+
+  const runName = parsed.batchRunName ?? `batch-${Date.now()}`;
+  const threshold = parsed.batchThreshold ?? 1.0;
+
+  const runAgent = async (input: {
+    sessionId: string;
+    userMessage: string;
+    systemPrompt?: string;
+    signal?: AbortSignal;
+  }): Promise<{
+    finalResponse: string;
+    toolResults: Array<{ toolName: string; ok: boolean; output: string }>;
+    session: { messages: import('@crowclaw/core').ConversationMessage[] };
+  }> => {
+    const init: RequestInit & { signal?: AbortSignal } = {
+      method: 'POST',
+      body: JSON.stringify({
+        userMessage: input.userMessage,
+        ...(input.systemPrompt !== undefined ? { systemPrompt: input.systemPrompt } : {}),
+      }),
+    };
+    if (input.signal) {
+      init.signal = input.signal;
+    }
+    const response = await runtime.fetch(
+      cliRequest(`http://localhost/api/sessions/${input.sessionId}`, init),
+    );
+    if (!response.ok) {
+      throw new Error(`session POST failed: ${response.status} ${response.statusText}`);
+    }
+    const payload = (await response.json()) as BatchSessionPayload;
+    const finalResponse =
+      typeof payload.finalResponse === 'string' ? payload.finalResponse : '';
+    return {
+      finalResponse,
+      toolResults: coerceToolResults(payload.toolResults),
+      session: { messages: coerceMessages(payload.session?.messages) },
+    };
+  };
+
+  const summary = await runBatch(prompts, runAgent, {
+    runName,
+    ...(parsed.batchMaxTurns !== undefined ? { maxTurns: parsed.batchMaxTurns } : {}),
+    ...(parsed.batchConcurrency !== undefined ? { concurrency: parsed.batchConcurrency } : {}),
+    ...(parsed.batchTimeoutMs !== undefined ? { timeoutMs: parsed.batchTimeoutMs } : {}),
+    ...(parsed.batchResumeFromId !== undefined ? { resumeFromId: parsed.batchResumeFromId } : {}),
+  });
+
+  if (parsed.batchOut) {
+    try {
+      await mkdir(dirname(parsed.batchOut), { recursive: true });
+      await writeFile(parsed.batchOut, JSON.stringify(summary, null, 2), 'utf-8');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { exitCode: 1, output: `error: failed to write ${parsed.batchOut}: ${msg}` };
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push(`Run: ${summary.runName}`);
+  lines.push(`Total: ${summary.total}, succeeded: ${summary.succeeded}, failed: ${summary.failed}, skipped: ${summary.skipped}`);
+  lines.push(`Duration: total ${summary.totalDurationMs}ms, avg ${summary.avgDurationMs}ms`);
+
+  if (parsed.batchEval) {
+    if (summary.accuracy === undefined) {
+      lines.push('Eval: no prompts had `expected` set; accuracy not computed.');
+      // No assertions to evaluate — we treat this as a soft pass so harness
+      // misconfiguration still surfaces (exit 1) rather than silently 0.
+      return { exitCode: 1, output: lines.join('\n') };
+    }
+    const accuracyPct = Math.round(summary.accuracy * 1000) / 10;
+    lines.push(`Accuracy: ${accuracyPct}% (${summary.accuracy.toFixed(3)}) — threshold ${threshold}`);
+    const failed = summary.results.filter((r) => r.assertions?.evaluated && r.assertions.passed === false);
+    if (failed.length > 0) {
+      lines.push(`Failures (${failed.length}):`);
+      for (const r of failed.slice(0, 10)) {
+        const reasons = r.assertions?.failures?.join('; ') ?? 'unknown';
+        lines.push(`  - ${r.promptId}: ${reasons}`);
+      }
+      if (failed.length > 10) {
+        lines.push(`  ... and ${failed.length - 10} more`);
+      }
+    }
+    const exitCode = summary.accuracy < threshold ? 1 : 0;
+    return { exitCode, output: lines.join('\n') };
+  }
+
+  if (summary.accuracy !== undefined) {
+    const accuracyPct = Math.round(summary.accuracy * 1000) / 10;
+    lines.push(`Accuracy: ${accuracyPct}% (${summary.accuracy.toFixed(3)})`);
+  }
+  return { exitCode: 0, output: lines.join('\n') };
 }
 
 // --- Health check types ---
@@ -2633,6 +2886,10 @@ export async function runCli(argv: string[], options: CliRunOptions = {}): Promi
     case 'skill':
       // v0.8.0 #240: agentskills.io install/publish handled in main() (interactive I/O).
       return 'Run `crowclaw skill <subcommand>` directly (not via runCli).';
+    case 'batch': {
+      // v0.8.4 #272: handled in main() so process.exitCode reflects --threshold.
+      return 'Run `crowclaw batch <input.jsonl>` directly (not via runCli).';
+    }
     default: {
       const exhaustive: never = parsed.command as never;
       return `Unknown command: ${String(exhaustive)}`;
@@ -3403,6 +3660,24 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     case 'migrate': {
       const output = await runMigrateCommand(parsed);
       stdout.write(output + '\n');
+      return;
+    }
+
+    case 'batch': {
+      // v0.8.4 #272: replay/eval JSONL prompts. With --eval, exit non-zero
+      // when accuracy < threshold (default 1.0).
+      await applyConfigToEnv(argv);
+      const runtime = await lazyCreateRuntime(runtimeOptions);
+      const result = await runBatchCommand(runtime, parsed);
+      stdout.write(result.output + '\n');
+      if (result.exitCode !== 0) {
+        process.exitCode = result.exitCode;
+      }
+      try {
+        await runtime.close?.();
+      } catch {
+        // best-effort cleanup
+      }
       return;
     }
 

@@ -131,7 +131,7 @@ export class CrowClawCodeExecuteTrace extends LitElement {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
       animation: pulse 1.4s ease-in-out infinite;
     }
 

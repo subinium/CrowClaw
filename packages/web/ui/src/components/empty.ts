@@ -41,7 +41,7 @@ export class CrowClawEmpty extends LitElement {
       height: 150px;
       opacity: 0.55;
       flex-shrink: 0;
-      color: var(--accent, #e05545);
+      color: var(--accent, #5b8def);
     }
 
     .title {
@@ -64,9 +64,9 @@ export class CrowClawEmpty extends LitElement {
       align-items: center;
       justify-content: center;
       padding: var(--sp-2, 8px) var(--sp-4, 16px);
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
       color: #fff;
-      border: 1px solid var(--accent, #e05545);
+      border: 1px solid var(--accent, #5b8def);
       border-radius: var(--radius-sm, 4px);
       font-size: var(--text-sm, 13px);
       font-weight: 500;

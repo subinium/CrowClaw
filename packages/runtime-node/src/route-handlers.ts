@@ -68,6 +68,9 @@ import {
   verifySlackSignature,
   type GatewayCallerScope,
 } from '@crowclaw/gateway';
+// v0.8.4 (#185) — derive learning-loop stages and per-skill metrics from
+// existing draft fields without changing the storage contract.
+import { countLearningStages, deriveLearningStage, summarizeSkillMetrics } from '@crowclaw/learning';
 import { listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from '@crowclaw/mcp';
 import { validatePluginManifest } from '@crowclaw/plugins';
 import {
@@ -2367,17 +2370,115 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       }
 
       if (request.method === 'GET' && url.pathname === '/api/sessions') {
-        const limitParam = Number(url.searchParams.get('limit') ?? '50');
-        const limit = Number.isFinite(limitParam) ? limitParam : 50;
+        // #192: paginated, searchable, status-filtered sessions list.
+        // Query params:
+        //   ?search=     substring match against title or first user message
+        //   ?status=     active | completed | failed | all (default: all)
+        //   ?limit=      page size (default 50, capped at 200)
+        //   ?cursor=     last sessionId of the previous page (keyset on
+        //                (updatedAt DESC, sessionId DESC))
+        const DEFAULT_LIMIT = 50;
+        const MAX_LIMIT = 200;
+        const limitRaw = Number(url.searchParams.get('limit') ?? String(DEFAULT_LIMIT));
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0
+          ? Math.min(Math.floor(limitRaw), MAX_LIMIT)
+          : DEFAULT_LIMIT;
+        const searchRaw = url.searchParams.get('search') ?? '';
+        const search = searchRaw.trim().toLowerCase();
+        const statusParam = (url.searchParams.get('status') ?? 'all').toLowerCase();
+        const status = (['active', 'completed', 'failed', 'all'] as const).includes(statusParam as never)
+          ? (statusParam as 'active' | 'completed' | 'failed' | 'all')
+          : 'all';
+        const cursor = url.searchParams.get('cursor');
+
         const listStore = store as InMemorySessionStore & SessionListStore;
-        const sessions = typeof listStore.listRecent === 'function'
-          ? await listStore.listRecent(limit)
-          : [];
+        const supported = typeof listStore.listRecent === 'function';
+        // #192: fetch a wide window so we can filter and paginate in-route
+        // without depending on storage-layer cursor support. The 1000-row cap
+        // matches existing dashboard scale and keeps memory bounded.
+        const FETCH_CAP = 1000;
+        const allRecent = supported ? await listStore.listRecent(FETCH_CAP) : [];
+
+        // #192: status classification.
+        //  - active: session is currently running or aborting
+        //    (sessionController tracks this in-process)
+        //  - failed: last non-system message is a tool call with ok=false
+        //  - completed: any other persisted state
+        const classifyStatus = (s: { sessionId: string; messages: ReadonlyArray<{ role: string; metadata?: { ok?: boolean } }> }): 'active' | 'completed' | 'failed' => {
+          if (sessionController.isActive(s.sessionId)) return 'active';
+          for (let i = s.messages.length - 1; i >= 0; i--) {
+            const m = s.messages[i];
+            if (!m || m.role === 'system') continue;
+            if (m.role === 'tool' && m.metadata && m.metadata.ok === false) {
+              return 'failed';
+            }
+            break;
+          }
+          return 'completed';
+        };
+
+        const matchesSearch = (s: { messages: ReadonlyArray<{ role: string; content?: string }> }): boolean => {
+          if (!search) return true;
+          // Reuse the same title-derivation rules as summarizeSessionRecord
+          // so search behaves consistently with what the UI displays.
+          const renameMeta = s.messages.find(
+            (m) => m.role === 'system' && typeof m.content === 'string' && m.content.startsWith('[session-meta] name='),
+          );
+          const title = renameMeta?.content?.replace('[session-meta] name=', '').trim() ?? '';
+          const firstUser = s.messages.find((m) => m.role === 'user');
+          const firstUserContent = firstUser?.content ?? '';
+          return title.toLowerCase().includes(search) || firstUserContent.toLowerCase().includes(search);
+        };
+
+        // #187: enrich each session with its memory footprint. Best-effort —
+        // if memoryService.list() rejects (e.g. backend offline), surface the
+        // session without the metric rather than failing the whole request.
+        const enriched: SessionState[] = await Promise.all(allRecent.map(async (session) => {
+          if (typeof memoryService?.list !== 'function') return session;
+          try {
+            const records = await memoryService.list(session.sessionId);
+            const arr = Array.isArray(records) ? records : [];
+            let memoryBytes = 0;
+            for (const r of arr) {
+              const declared = r?.metadata?.sizeBytes;
+              memoryBytes += typeof declared === 'number' && Number.isFinite(declared) && declared >= 0
+                ? declared
+                : Buffer.byteLength(r?.summary ?? '', 'utf8');
+            }
+            return { ...session, memoryEntryCount: arr.length, memoryBytes };
+          } catch {
+            return session;
+          }
+        }));
+
+        // Filter, then paginate. Order is already updatedAt DESC from
+        // listRecent; we add a sessionId tiebreaker so the cursor stays
+        // deterministic across calls (listRecent does not promise this).
+        const filtered = enriched
+          .filter((s) => (status === 'all' ? true : classifyStatus(s) === status))
+          .filter(matchesSearch)
+          .sort((a, b) => {
+            const cmp = b.updatedAt.localeCompare(a.updatedAt);
+            return cmp !== 0 ? cmp : b.sessionId.localeCompare(a.sessionId);
+          });
+
+        let startIndex = 0;
+        if (cursor) {
+          const idx = filtered.findIndex((s) => s.sessionId === cursor);
+          startIndex = idx >= 0 ? idx + 1 : filtered.length;
+        }
+        const pageRecords = filtered.slice(startIndex, startIndex + limit);
+        const nextCursor = startIndex + pageRecords.length < filtered.length
+          ? (pageRecords[pageRecords.length - 1]?.sessionId ?? null)
+          : null;
+
         return Response.json({
           ok: true,
-          supported: typeof listStore.listRecent === 'function',
-          count: sessions.length,
-          sessions: sessions.map(summarizeSessionRecord)
+          supported,
+          count: pageRecords.length,
+          totalCount: filtered.length,
+          nextCursor,
+          sessions: pageRecords.map(summarizeSessionRecord),
         });
       }
 
@@ -3754,6 +3855,10 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           helpfulRatings += ratings?.helpful ?? 0;
           unhelpfulRatings += ratings?.unhelpful ?? 0;
         }
+        // v0.8.4 (#185) — derive the four-state stage and per-skill summary
+        // from existing fields. Helpers are imported statically at the top of
+        // this file so the dashboard route stays sync.
+        const stageCounts = countLearningStages(drafts);
         return Response.json({
           drafts: drafts.map((draft) => ({
             id: draft.id,
@@ -3762,16 +3867,25 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             summary: draft.summary,
             triggerPhrases: draft.triggerPhrases,
             status: draft.status,
+            stage: deriveLearningStage(draft),
             recurrenceCount: draft.sourceMessages,
+            ratings: draft.ratings ?? { helpful: 0, unhelpful: 0 },
             createdAt: draft.createdAt,
             updatedAt: draft.updatedAt,
           })),
+          // v0.8.4 (#185) — per-skill metrics row consumed by the learning
+          // dashboard's metrics panel (success rate, activations, last
+          // activity). Backed by draft fields today; will pivot to the
+          // SkillMetricsTracker once it's wired into the runtime.
+          skillMetrics: drafts.map((d) => summarizeSkillMetrics(d)),
           metrics: {
             totalDrafts: drafts.length,
             pendingDrafts: drafts.filter((draft) => draft.status === 'draft').length,
             publishedDrafts: drafts.filter((draft) => draft.status === 'published').length,
             helpfulRatings,
             unhelpfulRatings,
+            // v0.8.4 (#185) — 4-stage counts for the loop diagram.
+            stageCounts,
           },
         });
       }
@@ -3805,6 +3919,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       // v0.8.0 (#238) — Drafts tab pending list. Returns drafts that haven't
       // been promoted to published skills yet so the dashboard can render the
       // Skill Drafts section.
+      // v0.8.4 (#185) — also surface the derived four-state stage so the
+      // automate view can render colored status pills directly off the
+      // pending list (no second fetch).
       if (request.method === 'GET' && url.pathname === '/api/learning/drafts/pending') {
         const all = await learning.listDrafts();
         const pending = all
@@ -3821,6 +3938,8 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             // via SKILL.md on disk are surfaced through the skills API, not
             // this endpoint.
             source: 'auto-capture' as const,
+            stage: deriveLearningStage(d),
+            ratings: d.ratings ?? { helpful: 0, unhelpful: 0 },
             createdAt: d.createdAt,
             updatedAt: d.updatedAt,
           }));
@@ -4138,10 +4257,36 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (parts[3] === 'history' || parts[3] === 'state' || parts.length === 3) {
           const session = sessionId ? await store.get(sessionId) : null;
           if (!session) return Response.json({ sessionId, messages: [] });
+          // #187: surface memoryEntryCount + memoryBytes alongside the raw
+          // session payload so the dashboard's per-session view doesn't have
+          // to issue a second `/memories` round-trip just to display the
+          // memory footprint. Best-effort — failures fall through with the
+          // fields absent so the response stays structurally compatible.
+          let memoryEntryCount: number | undefined;
+          let memoryBytes: number | undefined;
+          if (typeof memoryService?.list === 'function') {
+            try {
+              const records = await memoryService.list(session.sessionId);
+              const arr = Array.isArray(records) ? records : [];
+              let bytes = 0;
+              for (const r of arr) {
+                const declared = r?.metadata?.sizeBytes;
+                bytes += typeof declared === 'number' && Number.isFinite(declared) && declared >= 0
+                  ? declared
+                  : Buffer.byteLength(r?.summary ?? '', 'utf8');
+              }
+              memoryEntryCount = arr.length;
+              memoryBytes = bytes;
+            } catch {
+              // Leave memoryEntryCount/memoryBytes undefined.
+            }
+          }
           // Strip [session-meta] markers so the chat UI doesn't render them as
           // visible system messages.
           return Response.json({
             ...session,
+            ...(memoryEntryCount !== undefined ? { memoryEntryCount } : {}),
+            ...(memoryBytes !== undefined ? { memoryBytes } : {}),
             messages: session.messages.filter(
               (m) => !(m.role === 'system' && m.content?.startsWith('[session-meta]')),
             ),
@@ -4544,6 +4689,23 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           const stream = new ReadableStream({
             async start(controller) {
               unsubscribeToolEvents = eventBus.subscribe((event) => {
+                // #181 (v0.8.4): forward `skill:matched` so the chat-view chip
+                // row can render the matching skills above the next assistant
+                // message. Same per-session filter as tool:* events.
+                if (event.type === 'skill:matched') {
+                  if ((event.data as { sessionId?: string }).sessionId !== sessionId) return;
+                  try {
+                    const d = event.data as { matches?: unknown; query?: string };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'skill-matched',
+                      matches: d.matches,
+                      query: d.query,
+                    })}\n\n`));
+                  } catch {
+                    // Controller closed mid-turn — swallow.
+                  }
+                  return;
+                }
                 if (event.type !== 'tool:start' && event.type !== 'tool:complete') return;
                 if ((event.data as { sessionId?: string }).sessionId !== sessionId) return;
                 try {
@@ -4942,6 +5104,72 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             result = { ok: false, platform: platform as GatewayPlatform, error: `Probe not supported for ${platform}` };
         }
         return Response.json(result);
+      }
+
+      // #200 — Stateless validate-token endpoint used by the platform setup wizard.
+      // Unlike `/probe`, this never falls back to `configStore` — the caller must
+      // supply the credential under verification. This lets the wizard's Step 2
+      // "paste credentials → check identity" flow run before any config is saved.
+      const validateTokenMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/validate-token$/);
+      if (request.method === 'POST' && validateTokenMatch) {
+        const platform = getRouteCapture(validateTokenMatch, 1);
+        if (!platform) {
+          return Response.json({ ok: false, error: 'Invalid platform' }, { status: 400 });
+        }
+        const body = await request.json().catch(() => ({})) as {
+          token?: string;
+          webhookUrl?: string;
+          phoneNumberId?: string;
+          homeserverUrl?: string;
+        };
+        const token = typeof body.token === 'string' ? body.token.trim() : '';
+        const webhookUrl = typeof body.webhookUrl === 'string' ? body.webhookUrl.trim() : '';
+        const phoneNumberId = typeof body.phoneNumberId === 'string' ? body.phoneNumberId.trim() : '';
+        const homeserverUrl = typeof body.homeserverUrl === 'string' ? body.homeserverUrl.trim() : '';
+
+        let result: ProbeResult;
+        switch (platform) {
+          case 'telegram':
+            result = token
+              ? await probeTelegram(token)
+              : { ok: false, platform: 'telegram', error: 'Missing token' };
+            break;
+          case 'slack':
+            result = token
+              ? await probeSlack(token)
+              : { ok: false, platform: 'slack', error: 'Missing token' };
+            break;
+          case 'discord':
+            result = webhookUrl
+              ? await probeDiscord(webhookUrl)
+              : { ok: false, platform: 'discord', error: 'Missing webhookUrl' };
+            break;
+          case 'whatsapp':
+            result = token && phoneNumberId
+              ? await probeWhatsApp(token, phoneNumberId)
+              : { ok: false, platform: 'whatsapp', error: 'Missing token or phoneNumberId' };
+            break;
+          case 'matrix':
+            result = token && homeserverUrl
+              ? await probeMatrix(homeserverUrl, token)
+              : { ok: false, platform: 'matrix', error: 'Missing token or homeserverUrl' };
+            break;
+          default:
+            result = {
+              ok: false,
+              platform: platform as GatewayPlatform,
+              error: `Validate not supported for ${platform}`,
+            };
+        }
+        // Wizard-friendly envelope: top-level `ok` + flattened `identity` so the
+        // happy path of Step 2 reads `data.identity` without dipping into details.
+        return Response.json({
+          ok: result.ok,
+          platform: result.platform,
+          identity: result.identity,
+          details: result.details,
+          error: result.error,
+        });
       }
 
       const policyMatch = url.pathname.match(/^\/api\/gateway\/([^/]+)\/policy$/);

@@ -62,8 +62,54 @@ interface PendingDraft {
   triggerPhrases?: string[];
   recurrenceCount?: number;
   source?: 'auto-capture' | 'agent-proposed' | 'explicit';
+  /** v0.8.4 (#185) — derived four-state status. Older runtimes omit it. */
+  stage?: LearningStage;
+  ratings?: { helpful?: number; unhelpful?: number };
   createdAt?: string;
   updatedAt?: string;
+}
+
+/**
+ * v0.8.4 (#185) — four-state learning loop:
+ *   captured → reviewed → published
+ *                    ↘ rejected
+ * The backend derives the stage from existing draft fields; the UI only
+ * needs to render colored pills + loop counts.
+ */
+type LearningStage = 'captured' | 'reviewed' | 'published' | 'rejected';
+
+const LEARNING_STAGES: readonly LearningStage[] = ['captured', 'reviewed', 'published', 'rejected'];
+
+/** Maps to GET /api/learning/dashboard response. */
+interface LearningDashboardResponse {
+  drafts: Array<{
+    id: string;
+    slug?: string;
+    title: string;
+    summary?: string;
+    status: 'draft' | 'published';
+    stage: LearningStage;
+    recurrenceCount?: number;
+    ratings?: { helpful: number; unhelpful: number };
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  skillMetrics: Array<{
+    slug: string;
+    stage: LearningStage;
+    totalRatings: number;
+    successRate: number | null;
+    lastActivityAt: string;
+    activations: number;
+  }>;
+  metrics: {
+    totalDrafts: number;
+    pendingDrafts: number;
+    publishedDrafts: number;
+    helpfulRatings?: number;
+    unhelpfulRatings?: number;
+    stageCounts?: Record<LearningStage, number>;
+  };
 }
 
 const timeAgo = (d: string) => {
@@ -492,6 +538,190 @@ export class AutomateView extends LitElement {
         border: 1px solid rgba(48, 209, 88, 0.35);
         color: var(--success);
       }
+
+      /* v0.8.4 (#185) — Learning loop dashboard styles. */
+
+      .stage-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 1px 8px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        border-radius: var(--radius-sm);
+        border: 1px solid transparent;
+        font-family: var(--font-mono);
+      }
+
+      .stage-pill.captured {
+        color: var(--text-secondary);
+        background: var(--surface-1);
+        border-color: var(--border);
+      }
+
+      .stage-pill.reviewed {
+        color: var(--accent);
+        background: var(--accent-soft);
+        border-color: rgba(91, 141, 239, 0.35);
+      }
+
+      .stage-pill.published {
+        color: var(--success);
+        background: rgba(48, 209, 88, 0.1);
+        border-color: rgba(48, 209, 88, 0.35);
+      }
+
+      .stage-pill.rejected {
+        color: var(--error);
+        background: rgba(255, 69, 58, 0.1);
+        border-color: rgba(255, 69, 58, 0.35);
+      }
+
+      /* Loop diagram — four nodes laid out horizontally with arrows. */
+      .loop-diagram-wrap {
+        margin-top: var(--sp-3);
+        margin-bottom: var(--sp-4);
+        padding: var(--sp-4) var(--sp-5);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+      }
+
+      .loop-diagram-title {
+        font-size: var(--text-xs);
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        color: var(--text-muted);
+        margin-bottom: var(--sp-3);
+        font-weight: 600;
+      }
+
+      .loop-diagram {
+        width: 100%;
+        max-width: 760px;
+        height: 130px;
+        display: block;
+      }
+
+      .loop-node text.label {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        fill: var(--text-primary);
+        text-anchor: middle;
+        dominant-baseline: middle;
+      }
+
+      .loop-node text.count {
+        font-family: var(--font-mono);
+        font-size: 16px;
+        font-weight: 700;
+        text-anchor: middle;
+        dominant-baseline: middle;
+      }
+
+      .loop-node rect {
+        stroke-width: 1.5;
+        rx: 6;
+        ry: 6;
+      }
+
+      .loop-node.captured rect { fill: var(--surface-2, rgba(255,255,255,0.04)); stroke: var(--border, rgba(255,255,255,0.12)); }
+      .loop-node.captured text.count { fill: var(--text-secondary); }
+      .loop-node.reviewed rect { fill: rgba(91, 141, 239, 0.1); stroke: rgba(91, 141, 239, 0.35); }
+      .loop-node.reviewed text.count { fill: var(--accent); }
+      .loop-node.published rect { fill: rgba(48, 209, 88, 0.1); stroke: rgba(48, 209, 88, 0.4); }
+      .loop-node.published text.count { fill: var(--success); }
+      .loop-node.rejected rect { fill: rgba(255, 69, 58, 0.1); stroke: rgba(255, 69, 58, 0.4); }
+      .loop-node.rejected text.count { fill: var(--error); }
+
+      .loop-arrow {
+        stroke: var(--text-muted);
+        stroke-width: 1.4;
+        fill: none;
+        marker-end: url(#cc-loop-arrowhead);
+      }
+
+      .loop-arrow.reject {
+        stroke: var(--error);
+        stroke-dasharray: 4 3;
+        opacity: 0.7;
+      }
+
+      .loop-empty-hint {
+        margin-top: var(--sp-2);
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+      }
+
+      /* Per-skill metrics table */
+      .metrics-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: var(--sp-3);
+      }
+
+      .metrics-table th {
+        text-align: left;
+        font-size: var(--text-xs);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        color: var(--text-muted);
+        padding: var(--sp-2) var(--sp-3);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .metrics-table td {
+        font-size: var(--text-sm);
+        color: var(--text-primary);
+        padding: var(--sp-2) var(--sp-3);
+        border-bottom: 1px solid var(--border);
+        vertical-align: middle;
+      }
+
+      .metrics-table td.numeric {
+        font-family: var(--font-mono);
+        text-align: right;
+      }
+
+      .metrics-table .slug {
+        font-family: var(--font-mono);
+        font-size: var(--text-xs);
+        color: var(--text-secondary);
+      }
+
+      .metrics-empty {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        padding: var(--sp-3) 0;
+      }
+
+      .stage-counts-row {
+        display: flex;
+        gap: var(--sp-2);
+        flex-wrap: wrap;
+        margin-top: var(--sp-2);
+      }
+
+      .stage-count-chip {
+        font-family: var(--font-mono);
+        font-size: var(--text-xs);
+        padding: 4px var(--sp-2);
+        border-radius: var(--radius-sm);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+      }
+
+      .stage-count-chip strong {
+        color: var(--text-primary);
+        font-weight: 700;
+      }
     `,
   ];
 
@@ -529,6 +759,10 @@ export class AutomateView extends LitElement {
   @state() private draftsLoading = false;
   @state() private draftActionInFlight: Set<string> = new Set();
 
+  // v0.8.4 (#185) — Learning loop dashboard state
+  @state() private learningDashboard: LearningDashboardResponse | null = null;
+  @state() private learningDashboardLoading = false;
+
   private _refreshInterval?: ReturnType<typeof setInterval>;
   private _draftsRefreshInterval?: ReturnType<typeof setInterval>;
   private _learningEventHandler?: (e: Event) => void;
@@ -544,9 +778,13 @@ export class AutomateView extends LitElement {
 
     // v0.8.0 (#238) — Drafts tab: poll the pending drafts every 10s so the
     // tab stays current even on transports where SSE doesn't reach this view.
+    // v0.8.4 (#185) — also pull /api/learning/dashboard alongside it so the
+    // loop diagram + per-skill metrics panel stay in sync.
     void this._fetchPendingDrafts();
+    void this._fetchLearningDashboard();
     this._draftsRefreshInterval = setInterval(() => {
       void this._fetchPendingDrafts();
+      void this._fetchLearningDashboard();
     }, 10_000);
 
     // Live updates: bridge `crowclaw-event` (window-scoped) for learning:*
@@ -557,6 +795,8 @@ export class AutomateView extends LitElement {
       const detail = (e as CustomEvent<{ type?: string }>).detail;
       if (detail && typeof detail.type === 'string' && detail.type.startsWith('learning:')) {
         void this._fetchPendingDrafts();
+        // v0.8.4 (#185) — keep the loop diagram in sync with promote/reject events.
+        void this._fetchLearningDashboard();
       }
     };
     window.addEventListener('crowclaw-event', this._learningEventHandler);
@@ -652,6 +892,23 @@ export class AutomateView extends LitElement {
       this.pendingDrafts = [];
     } finally {
       this.draftsLoading = false;
+    }
+  }
+
+  /**
+   * v0.8.4 (#185) — GET /api/learning/dashboard. Returns the four-state
+   * stage counts, per-skill metrics, and richer draft metadata. Failures
+   * fall back to a `null` dashboard so the existing pending-drafts list
+   * still renders without a loop diagram.
+   */
+  private async _fetchLearningDashboard() {
+    this.learningDashboardLoading = true;
+    try {
+      this.learningDashboard = await api<LearningDashboardResponse>('/api/learning/dashboard');
+    } catch {
+      this.learningDashboard = null;
+    } finally {
+      this.learningDashboardLoading = false;
     }
   }
 
@@ -936,10 +1193,18 @@ export class AutomateView extends LitElement {
    * v0.8.0 (#238) — Skill Drafts section. Renders pending drafts surfaced by
    * the auto-capture + agent-proposed flows, with Promote / Edit / Reject
    * actions per row.
+   * v0.8.4 (#185) — Now also renders the learning loop diagram + per-skill
+   * metrics panel above the drafts list, so operators can see the full
+   * captured → reviewed → published / rejected flow in one place.
    */
   private _renderDraftsSection() {
     const drafts = this.pendingDrafts;
     return html`
+      <div class="section-block drafts-section">
+        <div class="section-header">Learning Loop</div>
+        ${this._renderLoopDiagram()}
+        ${this._renderSkillMetricsPanel()}
+      </div>
       <div class="section-block drafts-section">
         <div class="section-header">Skill Drafts</div>
         ${this.draftsLoading && drafts.length === 0
@@ -961,6 +1226,168 @@ export class AutomateView extends LitElement {
     `;
   }
 
+  /**
+   * v0.8.4 (#185) — Loop diagram. Static SVG, dynamically populated with
+   * per-stage counts. Layout: four nodes laid out left-to-right with
+   * arrows showing the canonical flow plus a dashed reject edge from
+   * `reviewed → rejected`.
+   */
+  private _renderLoopDiagram() {
+    const counts: Record<LearningStage, number> =
+      this.learningDashboard?.metrics.stageCounts ?? this._fallbackStageCounts();
+    const total = LEARNING_STAGES.reduce((sum, s) => sum + (counts[s] ?? 0), 0);
+
+    // Node positions on a 760x130 canvas. The y-axis splits the main
+    // (captured → reviewed → published) row from the rejected branch
+    // so the dashed reject arrow is legible.
+    const nodeW = 140;
+    const nodeH = 56;
+    const yMain = 16;
+    const yReject = 16 + nodeH + 22;
+    const positions: Record<LearningStage, { x: number; y: number }> = {
+      captured: { x: 10, y: yMain },
+      reviewed: { x: 200, y: yMain },
+      published: { x: 600, y: yMain },
+      rejected: { x: 600, y: yReject },
+    };
+
+    return html`
+      <div class="loop-diagram-wrap" role="figure" aria-label="Learning loop diagram">
+        <div class="loop-diagram-title">Loop overview · ${total} total drafts</div>
+        <svg
+          class="loop-diagram"
+          viewBox="0 0 760 130"
+          xmlns="http://www.w3.org/2000/svg"
+          role="img"
+          aria-label="Captured to reviewed to published, with rejected branch"
+        >
+          <defs>
+            <marker
+              id="cc-loop-arrowhead"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="7"
+              markerHeight="7"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+            </marker>
+          </defs>
+
+          <!-- Captured → Reviewed -->
+          <path
+            class="loop-arrow"
+            d="M ${positions.captured.x + nodeW} ${positions.captured.y + nodeH / 2}
+               L ${positions.reviewed.x} ${positions.reviewed.y + nodeH / 2}"
+          />
+          <!-- Reviewed → Published -->
+          <path
+            class="loop-arrow"
+            d="M ${positions.reviewed.x + nodeW} ${positions.reviewed.y + nodeH / 2}
+               L ${positions.published.x} ${positions.published.y + nodeH / 2}"
+          />
+          <!-- Reviewed → Rejected (branch) -->
+          <path
+            class="loop-arrow reject"
+            d="M ${positions.reviewed.x + nodeW / 2} ${positions.reviewed.y + nodeH}
+               C ${positions.reviewed.x + nodeW / 2} ${(positions.reviewed.y + positions.rejected.y) / 2 + nodeH / 2},
+                 ${positions.rejected.x} ${(positions.reviewed.y + positions.rejected.y) / 2 + nodeH / 2},
+                 ${positions.rejected.x} ${positions.rejected.y}"
+          />
+
+          ${LEARNING_STAGES.map((stage) => {
+            const p = positions[stage];
+            return html`
+              <g class="loop-node ${stage}" transform="translate(${p.x},${p.y})">
+                <rect width="${nodeW}" height="${nodeH}" />
+                <text class="count" x="${nodeW / 2}" y="${nodeH / 2 - 6}">${counts[stage] ?? 0}</text>
+                <text class="label" x="${nodeW / 2}" y="${nodeH / 2 + 12}">${stage}</text>
+              </g>
+            `;
+          })}
+        </svg>
+        ${total === 0
+          ? html`<div class="loop-empty-hint">
+              No drafts captured yet — start a chat that uses tools and the agent will surface auto-capture proposals here.
+            </div>`
+          : html`
+              <div class="stage-counts-row" aria-label="Stage counts">
+                ${LEARNING_STAGES.map((s) => html`
+                  <span class="stage-count-chip">
+                    ${s}: <strong>${counts[s] ?? 0}</strong>
+                  </span>
+                `)}
+              </div>
+            `}
+      </div>
+    `;
+  }
+
+  /**
+   * v0.8.4 (#185) — Per-skill metrics panel. Sourced from the dashboard
+   * endpoint's `skillMetrics` array. Currently backed by draft-derived
+   * signals (success-rate from helpful/unhelpful ratings, activations
+   * from `sourceMessages`); will pivot to `SkillMetricsTracker` data
+   * once that's wired into the runtime.
+   */
+  private _renderSkillMetricsPanel() {
+    const rows = this.learningDashboard?.skillMetrics ?? [];
+    if (this.learningDashboardLoading && rows.length === 0) {
+      return html`<crowclaw-skeleton-list rows="3" aria-label="Loading skill metrics"></crowclaw-skeleton-list>`;
+    }
+    if (rows.length === 0) {
+      return html`<div class="metrics-empty">No per-skill metrics yet — promote a draft to start collecting data.</div>`;
+    }
+    // Show top 8 by activations descending.
+    const sorted = [...rows].sort((a, b) => b.activations - a.activations).slice(0, 8);
+    return html`
+      <table class="metrics-table" aria-label="Per-skill metrics">
+        <thead>
+          <tr>
+            <th>Skill</th>
+            <th>Stage</th>
+            <th class="numeric">Activations</th>
+            <th class="numeric">Success</th>
+            <th class="numeric">Ratings</th>
+            <th>Last activity</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${sorted.map((m) => html`
+            <tr>
+              <td><span class="slug" title=${m.slug}>${m.slug}</span></td>
+              <td><span class="stage-pill ${m.stage}">${m.stage}</span></td>
+              <td class="numeric">${m.activations}</td>
+              <td class="numeric">${m.successRate === null ? '--' : `${Math.round(m.successRate * 100)}%`}</td>
+              <td class="numeric">${m.totalRatings}</td>
+              <td>${timeAgo(m.lastActivityAt)}</td>
+            </tr>
+          `)}
+        </tbody>
+      </table>
+    `;
+  }
+
+  /**
+   * Best-effort fallback when /api/learning/dashboard fails or hasn't
+   * loaded yet. Counts purely off the pending-drafts list so the diagram
+   * still shows something useful.
+   */
+  private _fallbackStageCounts(): Record<LearningStage, number> {
+    const counts: Record<LearningStage, number> = {
+      captured: 0,
+      reviewed: 0,
+      published: 0,
+      rejected: 0,
+    };
+    for (const d of this.pendingDrafts) {
+      const stage: LearningStage = d.stage ?? 'captured';
+      counts[stage] = (counts[stage] ?? 0) + 1;
+    }
+    return counts;
+  }
+
   private _renderDraftCard(draft: PendingDraft) {
     const sourceLabel: Record<NonNullable<PendingDraft['source']>, string> = {
       'auto-capture': 'auto-capture',
@@ -970,10 +1397,19 @@ export class AutomateView extends LitElement {
     const source = draft.source ?? 'auto-capture';
     const inFlight = this.draftActionInFlight.has(draft.id);
     const triggerPreview = (draft.triggerPhrases ?? []).slice(0, 3).join(', ');
+    // v0.8.4 (#185) — derive a stage at the row level if the backend
+    // omitted it (older runtime). Treat anything without ratings as
+    // 'captured' so the pill is never blank.
+    const stage: LearningStage = draft.stage ?? 'captured';
     return html`
       <div class="job-card">
         <div class="job-card-header">
           <span class="job-name" title=${draft.title || draft.slug}>${draft.title || draft.slug}</span>
+          <span
+            class="stage-pill ${stage}"
+            aria-label="Learning stage ${stage}"
+            title="Learning stage: ${stage}"
+          >${stage}</span>
           <span class="tag">${sourceLabel[source] ?? source}</span>
         </div>
         <div class="job-meta">

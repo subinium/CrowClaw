@@ -297,6 +297,97 @@ describe('Dashboard contract: provider test endpoint', () => {
   });
 });
 
+describe('Dashboard contract: plugin catalog (#189)', () => {
+  it('GET /api/plugins returns InstalledPlugin[] with manifest + config', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const res = await runtime.fetch(get('/api/plugins'));
+    expect(res.ok).toBe(true);
+    const data = await res.json() as Array<{
+      name: string;
+      manifest: { name: string; hooks?: string[]; permissions?: Record<string, unknown> };
+      config: Record<string, unknown>;
+      installedAt?: string;
+    }>;
+    expect(Array.isArray(data)).toBe(true);
+    if (data.length > 0) {
+      const plugin = data[0];
+      expect(plugin).toHaveProperty('name');
+      expect(plugin).toHaveProperty('manifest');
+      expect(plugin.manifest).toHaveProperty('name');
+      expect(plugin).toHaveProperty('config');
+      expect(typeof plugin.config).toBe('object');
+    }
+  });
+
+  it('GET /api/plugins/catalog returns {catalog: PluginCatalogEntry[]} with installed flag', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const res = await runtime.fetch(get('/api/plugins/catalog'));
+    expect(res.ok).toBe(true);
+    const data = await res.json() as {
+      catalog: Array<{
+        slug: string;
+        manifest: { name: string; description?: string; permissions?: Record<string, unknown> };
+        source: string;
+        installed?: boolean;
+      }>;
+      source?: string;
+    };
+    expect(Array.isArray(data.catalog)).toBe(true);
+    expect(data.catalog.length).toBeGreaterThan(0);
+    const entry = data.catalog[0];
+    expect(entry).toHaveProperty('slug');
+    expect(entry).toHaveProperty('manifest');
+    expect(entry.manifest).toHaveProperty('name');
+    expect(entry).toHaveProperty('source');
+    // The UI distinguishes installed vs not — runtime must surface the boolean.
+    expect(typeof entry.installed === 'boolean').toBe(true);
+  });
+
+  it('POST /api/plugins/install accepts {slug} and registers the plugin', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    const installRes = await runtime.fetch(post('/api/plugins/install', { slug: 'reference-pre-tool-call' }));
+    expect(installRes.ok).toBe(true);
+    const installed = await installRes.json() as {
+      ok: boolean;
+      plugin: { name: string; manifest: { name: string } };
+    };
+    expect(installed.ok).toBe(true);
+    expect(installed.plugin).toBeDefined();
+    expect(installed.plugin.name).toBe('reference-pre-tool-call');
+
+    const listRes = await runtime.fetch(get('/api/plugins'));
+    const list = await listRes.json() as Array<{ name: string }>;
+    expect(list.some((p) => p.name === 'reference-pre-tool-call')).toBe(true);
+  });
+
+  it('POST /api/plugins/configure persists the config payload', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    await runtime.fetch(post('/api/plugins/install', { slug: 'reference-pre-tool-call' }));
+    const configRes = await runtime.fetch(post('/api/plugins/configure', {
+      name: 'reference-pre-tool-call',
+      config: { denyTools: ['shell.exec'] },
+    }));
+    expect(configRes.ok).toBe(true);
+    const data = await configRes.json() as { ok: boolean; plugin: { config: { denyTools?: string[] } } };
+    expect(data.ok).toBe(true);
+    expect(data.plugin.config.denyTools).toEqual(['shell.exec']);
+  });
+
+  it('POST /api/plugins/uninstall removes the plugin', async () => {
+    const runtime = createNodeRuntime({ configStorePath: null });
+    await runtime.fetch(post('/api/plugins/install', { slug: 'reference-tool-result' }));
+    const res = await runtime.fetch(post('/api/plugins/uninstall', { name: 'reference-tool-result' }));
+    expect(res.ok).toBe(true);
+    const data = await res.json() as { ok: boolean; name: string };
+    expect(data.ok).toBe(true);
+    expect(data.name).toBe('reference-tool-result');
+
+    const listRes = await runtime.fetch(get('/api/plugins'));
+    const list = await listRes.json() as Array<{ name: string }>;
+    expect(list.some((p) => p.name === 'reference-tool-result')).toBe(false);
+  });
+});
+
 describe('Dashboard contract: WebSocket transport', () => {
   it('server listens on /ws (matches buildWsUrl in packages/web/ui/src/lib/ws.ts)', async () => {
     // We can't open a real WS in unit tests, but we can verify the route exists.

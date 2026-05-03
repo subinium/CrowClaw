@@ -2,6 +2,12 @@ import type { ConversationMessage, ProviderAdapter, ProviderRequest, ProviderRes
 import { parseSlashToolCall } from '@crowclaw/core';
 import type { StreamChunk, StreamingProviderAdapter } from '@crowclaw/core/streaming';
 import { collectStream } from '@crowclaw/core/streaming';
+// v0.8.4 (#274) — pure-JS BPE tokenizer for ±5% token-count precision against
+// tiktoken reference vectors. Pulled from `gpt-tokenizer`'s per-encoding
+// subpath exports so we only ship the BPE table for the encodings we use
+// (cl100k_base + o200k_base) and never depend on native `.node` bindings.
+import { encode as encodeCl100k } from 'gpt-tokenizer/encoding/cl100k_base';
+import { encode as encodeO200k } from 'gpt-tokenizer/encoding/o200k_base';
 // v0.8.0 (#232) — JSON repair for malformed tool-call arguments.
 import { repairJson, type RepairResult } from './json-repair.js';
 // v0.8.0 (#231 / #236) — reasoning-block parser. Wraps streaming text deltas so
@@ -705,25 +711,34 @@ function countMessageChars(messages: ConversationMessage[]): number {
   return chars;
 }
 
+/**
+ * v0.8.4 (#274): Per-model encoding family. Models in the GPT-4o, GPT-5,
+ * o-series, and codex families use OpenAI's `o200k_base` BPE vocabulary
+ * (~200k tokens, much better non-ASCII coverage). Everything else routes to
+ * `cl100k_base` (GPT-3.5 / GPT-4 / GPT-4-Turbo). Unknown models fall through
+ * to `cl100k` — that matches OpenAI's tokenizer playground default and gives
+ * reasonable behavior for OpenAI-compatible third-party providers.
+ */
 function getOpenAIEncodingFamily(model: string): 'o200k' | 'cl100k' {
   const id = model.toLowerCase();
   return /^(?:gpt-4o|gpt-5|o1|o3|o4|codex)/.test(id) ? 'o200k' : 'cl100k';
 }
 
+/**
+ * v0.8.4 (#274): Encode `text` with the actual `gpt-tokenizer` BPE table for
+ * the given encoding family and return the token count. This replaces the
+ * pre-v0.8.4 char/4 + Unicode-chunk heuristic, which drifted by 30%+ on
+ * code-heavy and non-ASCII inputs.
+ *
+ * `gpt-tokenizer` is a pure-JS implementation — no native `.node` bindings,
+ * no postinstall step that runs anything beyond the package's own dev
+ * tooling — so this stays safe to ship to Workers / Bun / Deno targets and
+ * to import in the browser bundle that powers the dashboard.
+ */
 function countEncodedTextTokens(text: string, family: 'o200k' | 'cl100k'): number {
   if (!text) return 0;
-  const chunks = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[A-Za-z]+|\d+|[^\s]/gu) ?? [];
-  let total = 0;
-  for (const chunk of chunks) {
-    if (/^[A-Za-z]+$/.test(chunk)) {
-      total += Math.max(1, Math.ceil(chunk.length / (family === 'o200k' ? 4 : 3.5)));
-    } else if (/^\d+$/.test(chunk)) {
-      total += Math.max(1, Math.ceil(chunk.length / 3));
-    } else {
-      total += 1;
-    }
-  }
-  return total;
+  const encode = family === 'o200k' ? encodeO200k : encodeCl100k;
+  return encode(text).length;
 }
 
 function countOpenAIMessageTokens(messages: ConversationMessage[], model: string): number {

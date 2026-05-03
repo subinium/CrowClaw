@@ -521,50 +521,91 @@ export async function loadSkillsFromDirectory(
 }
 
 /**
+ * #181 (v0.8.4): per-match explanation surfaced through the runtime EventBus
+ * as `skill:matched` so the dashboard can render a "why this skill fired"
+ * chip row above each assistant turn. Additive — existing consumers keep
+ * receiving `{ skill, score }` and can ignore the new fields.
+ */
+export interface SkillMatchExplanation {
+  /** Trigger phrases that matched the query (substring or reverse-substring). */
+  matchedTriggers: string[];
+  /** Tools the skill required (from manifest.tools), if any. */
+  matchedTools: string[];
+  /** Human-readable reasons for the match — used by the chat chip popover. */
+  reasons: string[];
+}
+
+/**
  * Match a user query against loaded skill manifests.
  *
- * UNCHANGED for v0.8.0 — algorithm is intentionally stable so that adding
- * the agentskills.io fields cannot regress the matching behaviour.
+ * Algorithm UNCHANGED — the additive `matchedTriggers` / `matchedTools` /
+ * `reasons` fields are computed alongside the score so the runtime can
+ * publish a `skill:matched` event without re-running the match logic in a
+ * second place.
  */
 export function matchSkillManifests(
   query: string,
   skills: ParsedSkillFile[],
   limit = 5
-): Array<{ skill: ParsedSkillFile; score: number }> {
+): Array<{ skill: ParsedSkillFile; score: number } & SkillMatchExplanation> {
   const queryLower = query.toLowerCase();
   const queryWords = queryLower.split(/\s+/).filter(Boolean);
 
   const scored = skills.map((skill) => {
     let score = 0;
+    const matchedTriggers: string[] = [];
+    const reasons: string[] = [];
 
     // Trigger phrase match (highest weight)
     const localizedTriggers = Object.values(skill.manifest.i18n ?? {})
       .flatMap((entry) => entry?.triggers ?? []);
     for (const trigger of [...skill.manifest.triggers, ...localizedTriggers]) {
-      if (queryLower.includes(trigger.toLowerCase())) score += 10;
-      else if (trigger.toLowerCase().includes(queryLower)) score += 5;
+      if (queryLower.includes(trigger.toLowerCase())) {
+        score += 10;
+        matchedTriggers.push(trigger);
+      } else if (trigger.toLowerCase().includes(queryLower)) {
+        score += 5;
+        matchedTriggers.push(trigger);
+      }
+    }
+    if (matchedTriggers.length > 0) {
+      reasons.push(`triggers: ${matchedTriggers.map(t => `'${t}'`).join(', ')}`);
     }
 
     // Name match
-    if (queryLower.includes(skill.manifest.name.toLowerCase())) score += 8;
+    if (queryLower.includes(skill.manifest.name.toLowerCase())) {
+      score += 8;
+      reasons.push(`name '${skill.manifest.name}' is in query`);
+    }
 
     // Description word overlap
     const localizedDescriptions = Object.values(skill.manifest.i18n ?? {})
       .map((entry) => entry?.description)
       .filter((value): value is string => typeof value === 'string');
     const descWords = [skill.manifest.description, ...localizedDescriptions].join(' ').toLowerCase().split(/\s+/);
+    let descMatches = 0;
     for (const word of queryWords) {
-      if (descWords.includes(word)) score += 2;
+      if (descWords.includes(word)) {
+        score += 2;
+        descMatches += 1;
+      }
+    }
+    if (descMatches > 0) {
+      reasons.push(`description shares ${descMatches} word${descMatches === 1 ? '' : 's'} with query`);
     }
 
     // Category match
     if (
       skill.manifest.category &&
       queryLower.includes(skill.manifest.category.toLowerCase())
-    )
+    ) {
       score += 3;
+      reasons.push(`category '${skill.manifest.category}' is in query`);
+    }
 
-    return { skill, score };
+    const matchedTools = skill.manifest.tools ? [...skill.manifest.tools] : [];
+
+    return { skill, score, matchedTriggers, matchedTools, reasons };
   });
 
   return scored

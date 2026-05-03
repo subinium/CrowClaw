@@ -155,12 +155,12 @@ export class CrowClawCheckpointPanel extends LitElement {
       border-radius: var(--radius-sm, 6px);
     }
 
-    .save-row input:focus { border-color: var(--accent, #e05545); }
+    .save-row input:focus { border-color: var(--accent, #5b8def); }
     .save-row input::placeholder { color: var(--text-muted, #48484a); }
 
     .save-btn {
       padding: 6px 12px;
-      border: 1px solid var(--accent, #e05545);
+      border: 1px solid var(--accent, #5b8def);
       background: var(--accent-soft, rgba(224, 85, 69, 0.15));
       color: var(--accent-hover, #ff6b5b);
       font-size: var(--text-xs, 11px);

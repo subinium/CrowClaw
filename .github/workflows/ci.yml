@@ -24,6 +24,14 @@ jobs:
       - name: Install
         run: npm install
 
+      - name: Version drift check
+        run: |
+          node scripts/sync-versions.mjs
+          if ! git diff --exit-code; then
+            echo "::error::Version drift detected. Run 'node scripts/sync-versions.mjs' locally and commit the changes."
+            exit 1
+          fi
+
       - name: Typecheck
         run: npm run typecheck
 

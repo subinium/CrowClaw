@@ -443,6 +443,33 @@ export class CrowClawOnboarding extends LitElement {
         font-size: var(--text-xs);
         margin-top: var(--sp-2);
       }
+
+      /* #227 — wizard footer note: after onboarding the canonical place to
+         edit providers is Connect → Providers. The hint is rendered under
+         step 1 (and below the persona panel) so the user knows where to go
+         next without re-opening the wizard. */
+      .canonical-hint {
+        display: flex;
+        align-items: center;
+        gap: var(--sp-2);
+        margin-top: var(--sp-3);
+        padding: var(--sp-2) var(--sp-3);
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+      }
+
+      .canonical-hint a {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 500;
+      }
+
+      .canonical-hint a:hover {
+        text-decoration: underline;
+      }
     `,
   ];
 
@@ -571,6 +598,10 @@ export class CrowClawOnboarding extends LitElement {
         }),
       });
       showToast('Provider saved', 'success');
+      // #227 — broadcast the provider mutation so the chat-header active
+      // model badge re-fetches without waiting for a remount. Other
+      // surfaces (Connect view, settings agent tab) can subscribe too.
+      document.dispatchEvent(new CustomEvent('crowclaw:provider-config-changed'));
       this.currentStep = 2;
       // Lazy-load personas the moment we transition into step 2. Done after
       // `currentStep = 2` so the panel shows a brief loading state instead
@@ -698,6 +729,21 @@ export class CrowClawOnboarding extends LitElement {
     );
   }
 
+  /**
+   * #227 — wizard step 1 footer link routes the user to Connect → Providers
+   * which is the canonical surface for further provider edits. We let the
+   * anchor handle the hash mutation, but emit an additional skip event so
+   * the orchestrator (which gates onboarding via shouldShowOnboarding) can
+   * tear down the wizard immediately rather than waiting for the next
+   * `/api/system/status` refresh.
+   */
+  private _gotoConnectProviders(e: Event): void {
+    void e;
+    this.dispatchEvent(
+      new CustomEvent('crowclaw:onboarding-skip', { bubbles: true, composed: true }),
+    );
+  }
+
   /* ---------------------------- Render ---------------------------- */
 
   private _renderStepper() {
@@ -776,6 +822,16 @@ export class CrowClawOnboarding extends LitElement {
         </div>
 
         ${this.step1Error ? html`<div class="err">${this.step1Error}</div>` : nothing}
+
+        <!-- #227 — Connect → Providers is the canonical surface for any
+             further provider edits. This footer steers the user there
+             instead of training them to come back to the wizard. -->
+        <div class="canonical-hint">
+          <span>
+            Edit anytime in
+            <a href="#connect" @click=${this._gotoConnectProviders}>Connect → Providers</a>.
+          </span>
+        </div>
 
         <div class="actions">
           <button class="skip" @click=${this._skip}>I know what I'm doing — skip</button>

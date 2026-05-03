@@ -9,14 +9,14 @@
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License" /></a>
     <a href="#5-minute-quickstart"><img src="https://img.shields.io/badge/node-%3E%3D22-blue.svg" alt="Node 22+" /></a>
     <a href="#packages"><img src="https://img.shields.io/badge/packages-19-purple.svg" alt="19 packages" /></a>
-    <img src="https://img.shields.io/badge/tests-2982%20passed-brightgreen.svg" alt="Tests" />
-    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.8.3-blue.svg" alt="Changelog" /></a>
+    <img src="https://img.shields.io/badge/tests-3184%20passed-brightgreen.svg" alt="Tests" />
+    <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-v0.8.4-blue.svg" alt="Changelog" /></a>
   </p>
 </p>
 
 ---
 
-> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (2,982 tests as of v0.8.3, 52-issue v0.8.3 GitHub-close pass + 53-issue v0.8.2 audit + parity sweep + 10-issue v0.8.1 dashboard overhaul + 11-issue v0.8.0 Hermes parity sweep + 18-issue v0.7.1 dashboard audit + 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
+> **Beta. Single-maintainer, moving fast.** Pin exact versions. The agent loop and security surface are well-tested (3,184 tests as of v0.8.4, 17-issue v0.8.4 audit-debt closure + 52-issue v0.8.3 GitHub-close pass + 53-issue v0.8.2 audit + parity sweep + 10-issue v0.8.1 dashboard overhaul + 11-issue v0.8.0 Hermes parity sweep + 18-issue v0.7.1 dashboard audit + 26-issue v0.6.1 follow-up + 103-issue v0.6.0 sweep + 38-issue v0.5.0 sweep). Several subsystems are still partial — see [Feature status](#feature-status).
 
 CrowClaw gives you an agent loop, 50+ tools, skill learning, scheduled jobs, multi-channel webhooks, and a dashboard — without wiring the whole stack yourself.
 

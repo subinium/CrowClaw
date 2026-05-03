@@ -631,3 +631,14 @@ export {
   type PromotionStateStore,
   type SkillPromotionEngineOptions,
 } from './promotion.js';
+
+// v0.8.4 (#185) — learning loop dashboard state machine + per-skill metrics.
+export {
+  ALL_LEARNING_STAGES,
+  deriveLearningStage,
+  countLearningStages,
+  summarizeSkillMetrics,
+  type LearningStage,
+  type LearningStageOptions,
+  type PerSkillMetricsSummary,
+} from './state-machine.js';

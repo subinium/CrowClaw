@@ -55,7 +55,7 @@ export class CrowClawButton extends LitElement {
 
     button:focus { outline: none; }
     button:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: 2px;
     }
 
@@ -78,8 +78,8 @@ export class CrowClawButton extends LitElement {
 
     /* Variants */
     button.primary {
-      background: var(--accent, #e05545);
-      border-color: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
+      border-color: var(--accent, #5b8def);
       color: #fff;
     }
     button.primary:hover:not(:disabled) {

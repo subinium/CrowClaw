@@ -132,6 +132,8 @@ export class CrowClawCommandPalette extends LitElement {
     }
 
     .overlay {
+      /* v0.8.4 #245: dropped the legacy glass blur per the visual-reset
+         (no glass surfaces). The bg-overlay token carries the contrast. */
       position: fixed;
       inset: 0;
       z-index: 1500;
@@ -140,8 +142,6 @@ export class CrowClawCommandPalette extends LitElement {
       justify-content: center;
       padding-top: 14vh;
       background: var(--bg-overlay, rgba(0, 0, 0, 0.55));
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
     }
     .overlay.on { display: flex; }
 
@@ -215,8 +215,8 @@ export class CrowClawCommandPalette extends LitElement {
       font-family: inherit;
     }
     .tab.active {
-      color: var(--accent, #e05545);
-      border-bottom-color: var(--accent, #e05545);
+      color: var(--accent, #5b8def);
+      border-bottom-color: var(--accent, #5b8def);
     }
     .tab .count {
       margin-left: 6px;
@@ -245,7 +245,7 @@ export class CrowClawCommandPalette extends LitElement {
     }
     .row.active {
       background: var(--surface-1, rgba(255, 255, 255, 0.04));
-      border-left-color: var(--accent, #e05545);
+      border-left-color: var(--accent, #5b8def);
     }
     .row .ic {
       width: 18px;

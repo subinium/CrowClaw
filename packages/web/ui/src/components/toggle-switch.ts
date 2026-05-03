@@ -27,7 +27,7 @@ export class CrowClawToggle extends LitElement {
     }
 
     .track[aria-checked='true'] {
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
     }
 
     .thumb {

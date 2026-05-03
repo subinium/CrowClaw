@@ -19,6 +19,10 @@ import '../components/status-dot.js';
 import '../components/icon.js';
 import '../components/empty.js';
 import '../components/skeleton.js';
+import '../components/modal.js';
+// v0.8.4 #200 — multi-step setup wizard for Telegram/Slack/Discord.
+import '../components/platform-wizard.js';
+import type { WizardPlatform } from '../components/platform-wizard.js';
 
 /* ------------------------------------------------------------------ */
 /*  Type definitions                                                  */
@@ -79,6 +83,20 @@ interface McpCatalogEntry {
   installed?: boolean;
 }
 
+interface PluginConfigSchemaProperty {
+  type?: 'string' | 'number' | 'integer' | 'boolean' | 'array';
+  description?: string;
+  default?: unknown;
+  items?: { type?: 'string' | 'number' | 'integer' };
+  enum?: Array<string | number>;
+}
+
+interface PluginConfigSchema {
+  type?: 'object';
+  properties?: Record<string, PluginConfigSchemaProperty>;
+  required?: string[];
+}
+
 interface PluginManifest {
   name: string;
   version?: string;
@@ -87,6 +105,7 @@ interface PluginManifest {
   repo?: string;
   hooks?: string[];
   tools?: string[];
+  defaultConfigSchema?: PluginConfigSchema;
   permissions?: {
     tools?: string[];
     memory?: string;
@@ -922,11 +941,29 @@ export class ConnectView extends LitElement {
   @state() private installingPluginSlug: string | null = null;
   @state() private configuringPlugin: string | null = null;
 
+  /* #189 — modal-driven plugin install / configure / uninstall flows.
+   * - selectedPluginToInstall: catalog entry whose permissions modal is open.
+   * - pluginToConfigure: installed plugin whose config form modal is open.
+   * - pluginToUninstall: installed plugin whose confirm-uninstall modal is open.
+   * - pluginConfigForm: in-progress config draft, keyed by schema property name.
+   *   Values are stored as the user-typed strings; coerced to typed values on submit.
+   * - pluginConfigJson: raw JSON draft used when a plugin lacks a config schema. */
+  @state() private selectedPluginToInstall: PluginCatalogEntry | null = null;
+  @state() private pluginToConfigure: InstalledPlugin | null = null;
+  @state() private pluginToUninstall: InstalledPlugin | null = null;
+  @state() private pluginConfigForm: Record<string, string | boolean> = {};
+  @state() private pluginConfigJson = '';
+  @state() private pluginConfigError = '';
+
   /* Platform config expand */
   @state() private expandedPlatform: string | null = null;
   @state() private platformConfigForm: Record<string, string> = {};
   @state() private platformPolicyForm: PlatformPolicy = { dmPolicy: 'pairing', groupPolicy: 'open', requireMention: false };
   @state() private probingPlatform: string | null = null;
+
+  /* v0.8.4 #200 — setup wizard state. `wizardPlatform` is non-null while the
+   * wizard modal is open; closing the wizard resets it to null. */
+  @state() private wizardPlatform: WizardPlatform | null = null;
 
   /* Channels */
   @state() private channels: GatewayChannel[] = [];
@@ -1193,6 +1230,26 @@ export class ConnectView extends LitElement {
       ? { ...platform.policy }
       : { dmPolicy: 'pairing', groupPolicy: 'open', requireMention: false };
   }
+
+  /* v0.8.4 #200 — wizard open / close / completion handlers. */
+  private _openWizard(platform: WizardPlatform) {
+    this.wizardPlatform = platform;
+  }
+
+  private _closeWizard = () => {
+    this.wizardPlatform = null;
+  };
+
+  private _onWizardComplete = async () => {
+    // Refresh both the platform list and the Telegram webhook info so the
+    // Connect view shows the new credentials/webhook without needing a
+    // manual reload.
+    this.wizardPlatform = null;
+    await Promise.allSettled([
+      this._fetchPlatforms(),
+      this._fetchTelegramWebhook(),
+    ]);
+  };
 
   private async _savePlatformConfig(platform: GatewayPlatform) {
     try {
@@ -1669,8 +1726,23 @@ export class ConnectView extends LitElement {
     return parts.length > 0 ? parts.join(', ') : 'no declared permissions';
   }
 
-  private async _installPlugin(entry: PluginCatalogEntry) {
-    if (!window.confirm(`Install plugin "${entry.manifest.name}"?\n\nPermissions: ${this._pluginPermissionSummary(entry.manifest)}`)) return;
+  /* #189 — All three plugin actions go through Lit modals so the user reviews
+   * permissions / edits typed config / confirms uninstall in-app rather than
+   * via `window.confirm` / `window.prompt`. The async submit handlers below
+   * are what actually hit the runtime — the open/close handlers only manage
+   * modal state. */
+
+  private _openInstallPluginModal(entry: PluginCatalogEntry) {
+    this.selectedPluginToInstall = entry;
+  }
+
+  private _closeInstallPluginModal() {
+    this.selectedPluginToInstall = null;
+  }
+
+  private async _confirmInstallPlugin() {
+    const entry = this.selectedPluginToInstall;
+    if (!entry) return;
     this.installingPluginSlug = entry.slug;
     try {
       await api('/api/plugins/install', {
@@ -1679,6 +1751,7 @@ export class ConnectView extends LitElement {
       });
       await Promise.all([this._fetchPlugins(), this._fetchPluginCatalog()]);
       showToast(`Installed ${entry.manifest.name}`, 'success');
+      this.selectedPluginToInstall = null;
     } catch (error: unknown) {
       showToast(error instanceof Error ? error.message : 'Failed to install plugin', 'error');
     } finally {
@@ -1686,16 +1759,153 @@ export class ConnectView extends LitElement {
     }
   }
 
-  private async _configurePlugin(plugin: InstalledPlugin) {
-    const raw = window.prompt(`Config JSON for ${plugin.name}`, JSON.stringify(plugin.config ?? {}, null, 2));
-    if (raw === null) return;
-    let config: Record<string, unknown>;
-    try {
-      config = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      showToast('Plugin config must be valid JSON', 'error');
-      return;
+  private _openConfigurePluginModal(plugin: InstalledPlugin) {
+    this.pluginToConfigure = plugin;
+    this.pluginConfigError = '';
+    const schema = plugin.manifest.defaultConfigSchema;
+    if (this._isFormSchema(schema)) {
+      this.pluginConfigForm = this._initialFormValues(schema, plugin.config ?? {});
+      this.pluginConfigJson = '';
+    } else {
+      this.pluginConfigForm = {};
+      this.pluginConfigJson = JSON.stringify(plugin.config ?? {}, null, 2);
     }
+  }
+
+  private _closeConfigurePluginModal() {
+    this.pluginToConfigure = null;
+    this.pluginConfigForm = {};
+    this.pluginConfigJson = '';
+    this.pluginConfigError = '';
+  }
+
+  /** Whether a manifest schema can drive the form-builder. We support a flat
+   * `type:'object'` schema with primitive / `array<string|number>` properties.
+   * Anything more elaborate falls back to the JSON textarea. */
+  private _isFormSchema(schema: PluginConfigSchema | undefined): schema is PluginConfigSchema {
+    if (!schema || schema.type !== 'object') return false;
+    const props = schema.properties;
+    if (!props || Object.keys(props).length === 0) return false;
+    return true;
+  }
+
+  private _initialFormValues(
+    schema: PluginConfigSchema,
+    existing: Record<string, unknown>,
+  ): Record<string, string | boolean> {
+    const out: Record<string, string | boolean> = {};
+    for (const [key, prop] of Object.entries(schema.properties ?? {})) {
+      const current = existing[key];
+      if (prop.type === 'boolean') {
+        out[key] = typeof current === 'boolean'
+          ? current
+          : prop.default === true;
+        continue;
+      }
+      if (prop.type === 'array') {
+        if (Array.isArray(current)) {
+          out[key] = current.map((v) => String(v)).join(', ');
+        } else if (Array.isArray(prop.default)) {
+          out[key] = prop.default.map((v) => String(v)).join(', ');
+        } else {
+          out[key] = '';
+        }
+        continue;
+      }
+      if (current !== undefined && current !== null) {
+        out[key] = String(current);
+      } else if (prop.default !== undefined && prop.default !== null) {
+        out[key] = String(prop.default);
+      } else {
+        out[key] = '';
+      }
+    }
+    return out;
+  }
+
+  /** Coerce form values back to typed JSON per the schema. Returns null and
+   * sets `pluginConfigError` if a required field is missing or a number cannot
+   * be parsed. */
+  private _coerceFormConfig(
+    schema: PluginConfigSchema,
+    form: Record<string, string | boolean>,
+  ): Record<string, unknown> | null {
+    const out: Record<string, unknown> = {};
+    const required = new Set(schema.required ?? []);
+    for (const [key, prop] of Object.entries(schema.properties ?? {})) {
+      const raw = form[key];
+      if (prop.type === 'boolean') {
+        out[key] = Boolean(raw);
+        continue;
+      }
+      const text = typeof raw === 'string' ? raw.trim() : '';
+      if (text === '') {
+        if (required.has(key)) {
+          this.pluginConfigError = `${key} is required`;
+          return null;
+        }
+        continue;
+      }
+      if (prop.type === 'number' || prop.type === 'integer') {
+        const num = Number(text);
+        if (Number.isNaN(num)) {
+          this.pluginConfigError = `${key} must be a number`;
+          return null;
+        }
+        out[key] = prop.type === 'integer' ? Math.trunc(num) : num;
+        continue;
+      }
+      if (prop.type === 'array') {
+        const items = text.split(',').map((s) => s.trim()).filter(Boolean);
+        if (prop.items?.type === 'number' || prop.items?.type === 'integer') {
+          const nums: number[] = [];
+          for (const item of items) {
+            const n = Number(item);
+            if (Number.isNaN(n)) {
+              this.pluginConfigError = `${key} contains a non-numeric item: ${item}`;
+              return null;
+            }
+            nums.push(prop.items?.type === 'integer' ? Math.trunc(n) : n);
+          }
+          out[key] = nums;
+        } else {
+          out[key] = items;
+        }
+        continue;
+      }
+      out[key] = text;
+    }
+    return out;
+  }
+
+  private async _confirmConfigurePlugin() {
+    const plugin = this.pluginToConfigure;
+    if (!plugin) return;
+    let config: Record<string, unknown>;
+    const schema = plugin.manifest.defaultConfigSchema;
+    if (this._isFormSchema(schema)) {
+      const coerced = this._coerceFormConfig(schema, this.pluginConfigForm);
+      if (!coerced) return;
+      config = coerced;
+    } else {
+      const raw = this.pluginConfigJson.trim();
+      if (raw === '') {
+        config = {};
+      } else {
+        try {
+          const parsed: unknown = JSON.parse(raw);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            this.pluginConfigError = 'Config must be a JSON object';
+            return;
+          }
+          config = parsed as Record<string, unknown>;
+        } catch {
+          this.pluginConfigError = 'Plugin config must be valid JSON';
+          return;
+        }
+      }
+    }
+    this.pluginConfigError = '';
     this.configuringPlugin = plugin.name;
     try {
       await api('/api/plugins/configure', {
@@ -1704,6 +1914,7 @@ export class ConnectView extends LitElement {
       });
       await this._fetchPlugins();
       showToast(`Configured ${plugin.name}`, 'success');
+      this._closeConfigurePluginModal();
     } catch (error: unknown) {
       showToast(error instanceof Error ? error.message : 'Failed to configure plugin', 'error');
     } finally {
@@ -1711,8 +1922,17 @@ export class ConnectView extends LitElement {
     }
   }
 
-  private async _uninstallPlugin(plugin: InstalledPlugin) {
-    if (!window.confirm(`Uninstall plugin "${plugin.name}"?`)) return;
+  private _openUninstallPluginModal(plugin: InstalledPlugin) {
+    this.pluginToUninstall = plugin;
+  }
+
+  private _closeUninstallPluginModal() {
+    this.pluginToUninstall = null;
+  }
+
+  private async _confirmUninstallPlugin() {
+    const plugin = this.pluginToUninstall;
+    if (!plugin) return;
     try {
       await api('/api/plugins/uninstall', {
         method: 'POST',
@@ -1720,6 +1940,7 @@ export class ConnectView extends LitElement {
       });
       await Promise.all([this._fetchPlugins(), this._fetchPluginCatalog()]);
       showToast(`Uninstalled ${plugin.name}`, 'success');
+      this.pluginToUninstall = null;
     } catch (error: unknown) {
       showToast(error instanceof Error ? error.message : 'Failed to uninstall plugin', 'error');
     }
@@ -1847,6 +2068,23 @@ export class ConnectView extends LitElement {
       ${this._renderChannels()}
       ${this._renderRemoteAccess()}
       ${this._renderTools()}
+      ${this._renderPlatformWizard()}
+    `;
+  }
+
+  /* v0.8.4 #200 — render the active wizard, if any. We render only when a
+   * platform is selected so the modal mounts/unmounts and resets its state on
+   * each open. */
+  private _renderPlatformWizard() {
+    if (!this.wizardPlatform) return nothing;
+    return html`
+      <crowclaw-platform-wizard
+        platform=${this.wizardPlatform}
+        ?open=${true}
+        public-url=${this.publicUrlOverride}
+        @close=${this._closeWizard}
+        @wizard-complete=${this._onWizardComplete}
+      ></crowclaw-platform-wizard>
     `;
   }
 
@@ -2332,7 +2570,7 @@ export class ConnectView extends LitElement {
     const query = this.pluginCatalogQuery.trim().toLowerCase();
     const catalog = this.pluginCatalog
       .filter((entry) => !query || `${entry.manifest.name} ${entry.manifest.description ?? ''}`.toLowerCase().includes(query))
-      .slice(0, 8);
+      .slice(0, 12);
     return html`
       <div class="section-block">
         <div class="section-header">Plugins</div>
@@ -2342,31 +2580,7 @@ export class ConnectView extends LitElement {
             ? html`<div class="status-msg" style="color:var(--text-muted)">No plugins installed.</div>`
             : html`
                 <div class="mcp-list">
-                  ${this.installedPlugins.map((plugin) => html`
-                    <div class="mcp-item">
-                      <div class="mcp-info">
-                        <div class="mcp-name">${plugin.manifest.name}</div>
-                        <div class="mcp-desc">${plugin.manifest.description ?? 'Runtime plugin'}</div>
-                        <div class="tag-row">
-                          ${(plugin.manifest.hooks ?? []).map((hook) => html`<span class="tag">${hook}</span>`)}
-                        </div>
-                      </div>
-                      <crowclaw-button
-                        variant="ghost"
-                        size="sm"
-                        aria-label="Configure ${plugin.name}"
-                        ?loading=${this.configuringPlugin === plugin.name}
-                        ?disabled=${this.configuringPlugin === plugin.name}
-                        @click=${() => this._configurePlugin(plugin)}
-                      >Configure</crowclaw-button>
-                      <crowclaw-button
-                        variant="danger"
-                        size="sm"
-                        aria-label="Uninstall ${plugin.name}"
-                        @click=${() => this._uninstallPlugin(plugin)}
-                      >Uninstall</crowclaw-button>
-                    </div>
-                  `)}
+                  ${this.installedPlugins.map((plugin) => this._renderInstalledPluginItem(plugin))}
                 </div>
               `}
         </div>
@@ -2382,34 +2596,344 @@ export class ConnectView extends LitElement {
               @input=${(e: InputEvent) => { this.pluginCatalogQuery = (e.target as HTMLInputElement).value; }}
             />
           </div>
-          <div class="mcp-list">
-            ${catalog.map((entry) => {
-              const installed = Boolean(entry.installed || installedNames.has(entry.manifest.name));
-              return html`
-                <div class="mcp-item">
-                  <div class="mcp-info">
-                    <div class="mcp-name">${entry.manifest.name}</div>
-                    <div class="mcp-desc">${entry.manifest.description ?? ''}</div>
-                    <div class="tag-row">
-                      ${(entry.manifest.hooks ?? []).map((hook) => html`<span class="tag">${hook}</span>`)}
-                      <span class="tag">${this._pluginPermissionSummary(entry.manifest)}</span>
-                      ${installed ? html`<span class="tag ok">installed</span>` : nothing}
-                    </div>
-                  </div>
-                  <crowclaw-button
-                    variant="primary"
-                    size="sm"
-                    aria-label="Install ${entry.manifest.name}"
-                    ?loading=${this.installingPluginSlug === entry.slug}
-                    ?disabled=${installed || this.installingPluginSlug === entry.slug}
-                    @click=${() => this._installPlugin(entry)}
-                  >${this.installingPluginSlug === entry.slug ? 'Installing' : 'Install'}</crowclaw-button>
+          ${catalog.length === 0
+            ? html`<div class="status-msg" style="color:var(--text-muted)">${this.pluginCatalog.length === 0 ? 'No catalog entries available.' : 'No matches.'}</div>`
+            : html`
+                <div class="mcp-list">
+                  ${catalog.map((entry) => this._renderCatalogPluginItem(entry, installedNames))}
                 </div>
-              `;
-            })}
-          </div>
+              `}
         </div>
       </div>
+      ${this._renderPluginInstallModal()}
+      ${this._renderPluginConfigureModal()}
+      ${this._renderPluginUninstallModal()}
+    `;
+  }
+
+  private _renderInstalledPluginItem(plugin: InstalledPlugin) {
+    /* The runtime registers plugins on install and unregisters on uninstall.
+     * It has no enable/disable toggle today, so any plugin returned by
+     * `GET /api/plugins` is by definition `active`. We surface an explicit
+     * status pill so the AC's "active / disabled" requirement is met and to
+     * leave a hook for a future toggle without further UI churn. */
+    const status: 'active' | 'disabled' = 'active';
+    return html`
+      <div class="mcp-item">
+        <div class="mcp-info">
+          <div class="mcp-name">
+            ${plugin.manifest.name}
+            ${plugin.manifest.version
+              ? html`<span class="tag" style="margin-left:var(--sp-2)">v${plugin.manifest.version}</span>`
+              : nothing}
+            <span class="tag ${status === 'active' ? 'ok' : 'wn'}" style="margin-left:var(--sp-2)">${status}</span>
+          </div>
+          <div class="mcp-desc">${plugin.manifest.description ?? 'Runtime plugin'}</div>
+          <div class="tag-row">
+            ${(plugin.manifest.hooks ?? []).map((hook) => html`<span class="tag">${hook}</span>`)}
+            ${(plugin.manifest.permissions?.tools ?? []).map((tool) => html`<span class="tag">tool:${tool}</span>`)}
+            ${plugin.manifest.permissions?.memory
+              ? html`<span class="tag">memory:${plugin.manifest.permissions.memory}</span>`
+              : nothing}
+            ${plugin.manifest.permissions?.network ? html`<span class="tag">network</span>` : nothing}
+          </div>
+        </div>
+        <crowclaw-button
+          variant="ghost"
+          size="sm"
+          aria-label="Configure ${plugin.name}"
+          ?loading=${this.configuringPlugin === plugin.name}
+          ?disabled=${this.configuringPlugin === plugin.name}
+          @click=${() => this._openConfigurePluginModal(plugin)}
+        >Configure</crowclaw-button>
+        <crowclaw-button
+          variant="danger"
+          size="sm"
+          aria-label="Uninstall ${plugin.name}"
+          @click=${() => this._openUninstallPluginModal(plugin)}
+        >Uninstall</crowclaw-button>
+      </div>
+    `;
+  }
+
+  private _renderCatalogPluginItem(entry: PluginCatalogEntry, installedNames: Set<string>) {
+    const installed = Boolean(entry.installed || installedNames.has(entry.manifest.name));
+    return html`
+      <div class="mcp-item">
+        <div class="mcp-info">
+          <div class="mcp-name">
+            ${entry.manifest.name}
+            ${entry.manifest.version
+              ? html`<span class="tag" style="margin-left:var(--sp-2)">v${entry.manifest.version}</span>`
+              : nothing}
+            <span class="tag ${entry.source === 'community' ? 'ac' : ''}" style="margin-left:var(--sp-2)">${entry.source}</span>
+          </div>
+          <div class="mcp-desc">${entry.manifest.description ?? ''}</div>
+          <div class="tag-row">
+            ${(entry.manifest.hooks ?? []).map((hook) => html`<span class="tag">${hook}</span>`)}
+            <span class="tag">${this._pluginPermissionSummary(entry.manifest)}</span>
+            ${installed ? html`<span class="tag ok">installed</span>` : nothing}
+          </div>
+        </div>
+        <crowclaw-button
+          variant="primary"
+          size="sm"
+          aria-label="Install ${entry.manifest.name}"
+          ?loading=${this.installingPluginSlug === entry.slug}
+          ?disabled=${installed || this.installingPluginSlug === entry.slug}
+          @click=${() => this._openInstallPluginModal(entry)}
+        >${installed ? 'Installed' : (this.installingPluginSlug === entry.slug ? 'Installing' : 'Install')}</crowclaw-button>
+      </div>
+    `;
+  }
+
+  /* #189 — Permission-review modal. Mirrors the MCP install flow's
+   * "selectedMcpCatalog -> permissions card -> Confirm" UX, except plugins
+   * don't have env vars so the modal only renders manifest metadata + the
+   * declared `permissions` block + `hooks`. */
+  private _renderPluginInstallModal() {
+    const entry = this.selectedPluginToInstall;
+    if (!entry) return nothing;
+    const installing = this.installingPluginSlug === entry.slug;
+    return html`
+      <crowclaw-modal
+        ?open=${true}
+        title="Install ${entry.manifest.name}"
+        size="md"
+        @close=${this._closeInstallPluginModal}
+      >
+        <div>
+          <div class="mcp-desc" style="margin-bottom:var(--sp-3)">
+            ${entry.manifest.description ?? 'Runtime plugin'}
+          </div>
+          ${entry.manifest.author
+            ? html`<div class="form-hint" style="margin-bottom:var(--sp-2)">Author: ${entry.manifest.author}</div>`
+            : nothing}
+          ${entry.manifest.version
+            ? html`<div class="form-hint" style="margin-bottom:var(--sp-2)">Version: v${entry.manifest.version}</div>`
+            : nothing}
+          ${entry.manifest.repo
+            ? html`<div class="form-hint" style="margin-bottom:var(--sp-3)">Repo: <a href=${entry.manifest.repo} target="_blank" rel="noopener">${entry.manifest.repo}</a></div>`
+            : nothing}
+          <div class="sec-h">Requested permissions</div>
+          <div class="tag-row" style="margin-bottom:var(--sp-3)">
+            ${(entry.manifest.hooks ?? []).map((hook) => html`<span class="tag">hook:${hook}</span>`)}
+            ${(entry.manifest.permissions?.tools ?? []).map((tool) => html`<span class="tag">tool:${tool}</span>`)}
+            ${entry.manifest.permissions?.memory
+              ? html`<span class="tag">memory:${entry.manifest.permissions.memory}</span>`
+              : nothing}
+            ${entry.manifest.permissions?.network ? html`<span class="tag wn">network</span>` : nothing}
+            ${(entry.manifest.hooks?.length ?? 0) === 0
+              && (entry.manifest.permissions?.tools?.length ?? 0) === 0
+              && !entry.manifest.permissions?.memory
+              && !entry.manifest.permissions?.network
+              ? html`<span class="tag">no declared permissions</span>`
+              : nothing}
+          </div>
+          <div class="form-hint">
+            Installing this plugin grants the runtime the listed capabilities for every session.
+          </div>
+        </div>
+        <div slot="footer" style="display:flex;gap:var(--sp-2);justify-content:flex-end">
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
+            aria-label="Cancel install"
+            ?disabled=${installing}
+            @click=${this._closeInstallPluginModal}
+          >Cancel</crowclaw-button>
+          <crowclaw-button
+            variant="primary"
+            size="sm"
+            aria-label="Confirm install ${entry.manifest.name}"
+            ?loading=${installing}
+            ?disabled=${installing}
+            @click=${this._confirmInstallPlugin}
+          >${installing ? 'Installing' : 'Confirm install'}</crowclaw-button>
+        </div>
+      </crowclaw-modal>
+    `;
+  }
+
+  /* #189 — Configure modal. Renders a typed form when the manifest exposes a
+   * supported `defaultConfigSchema`; otherwise falls back to a JSON textarea so
+   * arbitrary manifest shapes still work. */
+  private _renderPluginConfigureModal() {
+    const plugin = this.pluginToConfigure;
+    if (!plugin) return nothing;
+    const schema = plugin.manifest.defaultConfigSchema;
+    const useForm = this._isFormSchema(schema);
+    const submitting = this.configuringPlugin === plugin.name;
+    return html`
+      <crowclaw-modal
+        ?open=${true}
+        title="Configure ${plugin.manifest.name}"
+        size="md"
+        @close=${this._closeConfigurePluginModal}
+      >
+        <div>
+          ${plugin.manifest.description
+            ? html`<div class="mcp-desc" style="margin-bottom:var(--sp-3)">${plugin.manifest.description}</div>`
+            : nothing}
+          ${useForm && schema
+            ? this._renderPluginConfigForm(schema)
+            : html`
+                <div class="form-group">
+                  <label class="form-label" for="plugin-config-json">Config JSON</label>
+                  <textarea
+                    id="plugin-config-json"
+                    class="form-input"
+                    rows="10"
+                    spellcheck="false"
+                    .value=${this.pluginConfigJson}
+                    @input=${(e: InputEvent) => { this.pluginConfigJson = (e.target as HTMLTextAreaElement).value; }}
+                  ></textarea>
+                  <div class="form-hint">This plugin does not declare a config schema, so config is edited as raw JSON.</div>
+                </div>
+              `}
+          ${this.pluginConfigError
+            ? html`<div class="err-msg" role="alert" aria-live="polite" style="color:var(--error)">${this.pluginConfigError}</div>`
+            : nothing}
+        </div>
+        <div slot="footer" style="display:flex;gap:var(--sp-2);justify-content:flex-end">
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
+            aria-label="Cancel configure"
+            ?disabled=${submitting}
+            @click=${this._closeConfigurePluginModal}
+          >Cancel</crowclaw-button>
+          <crowclaw-button
+            variant="primary"
+            size="sm"
+            aria-label="Save configuration for ${plugin.manifest.name}"
+            ?loading=${submitting}
+            ?disabled=${submitting}
+            @click=${this._confirmConfigurePlugin}
+          >${submitting ? 'Saving' : 'Save'}</crowclaw-button>
+        </div>
+      </crowclaw-modal>
+    `;
+  }
+
+  private _renderPluginConfigForm(schema: PluginConfigSchema) {
+    const required = new Set(schema.required ?? []);
+    const entries = Object.entries(schema.properties ?? {});
+    return html`
+      ${entries.map(([key, prop]) => {
+        const inputId = `plugin-config-${key}`;
+        const value = this.pluginConfigForm[key];
+        const isRequired = required.has(key);
+        if (prop.type === 'boolean') {
+          return html`
+            <div class="form-group">
+              <label class="form-label" for=${inputId}>${key}${isRequired ? ' *' : ''}</label>
+              <label style="display:flex;gap:var(--sp-2);align-items:center;cursor:pointer">
+                <input
+                  id=${inputId}
+                  type="checkbox"
+                  .checked=${Boolean(value)}
+                  @change=${(e: Event) => {
+                    this.pluginConfigForm = {
+                      ...this.pluginConfigForm,
+                      [key]: (e.target as HTMLInputElement).checked,
+                    };
+                  }}
+                />
+                <span class="form-hint">${prop.description ?? ''}</span>
+              </label>
+            </div>
+          `;
+        }
+        if (prop.enum && prop.enum.length > 0) {
+          const stringValue = typeof value === 'string' ? value : '';
+          return html`
+            <div class="form-group">
+              <label class="form-label" for=${inputId}>${key}${isRequired ? ' *' : ''}</label>
+              <select
+                id=${inputId}
+                class="form-input"
+                .value=${stringValue}
+                @change=${(e: Event) => {
+                  this.pluginConfigForm = {
+                    ...this.pluginConfigForm,
+                    [key]: (e.target as HTMLSelectElement).value,
+                  };
+                }}
+              >
+                ${(prop.enum ?? []).map((option) => html`<option value=${String(option)}>${String(option)}</option>`)}
+              </select>
+              ${prop.description ? html`<div class="form-hint">${prop.description}</div>` : nothing}
+            </div>
+          `;
+        }
+        const stringValue = typeof value === 'string' ? value : '';
+        const placeholder = prop.type === 'array'
+          ? 'comma-separated values'
+          : (prop.type === 'number' || prop.type === 'integer')
+            ? 'number'
+            : (prop.description ?? '');
+        return html`
+          <div class="form-group">
+            <label class="form-label" for=${inputId}>${key}${isRequired ? ' *' : ''}</label>
+            <input
+              id=${inputId}
+              class="form-input"
+              type=${prop.type === 'number' || prop.type === 'integer' ? 'number' : 'text'}
+              placeholder=${placeholder}
+              .value=${stringValue}
+              @input=${(e: InputEvent) => {
+                this.pluginConfigForm = {
+                  ...this.pluginConfigForm,
+                  [key]: (e.target as HTMLInputElement).value,
+                };
+              }}
+            />
+            ${prop.description ? html`<div class="form-hint">${prop.description}</div>` : nothing}
+          </div>
+        `;
+      })}
+    `;
+  }
+
+  /* #189 — Uninstall confirmation modal. Replaces `window.confirm` so the
+   * danger button stays in-app and can show what's being removed. */
+  private _renderPluginUninstallModal() {
+    const plugin = this.pluginToUninstall;
+    if (!plugin) return nothing;
+    return html`
+      <crowclaw-modal
+        ?open=${true}
+        title="Uninstall ${plugin.manifest.name}"
+        size="sm"
+        @close=${this._closeUninstallPluginModal}
+      >
+        <div>
+          <p style="margin:0 0 var(--sp-3) 0">
+            Remove <strong>${plugin.manifest.name}</strong>${plugin.manifest.version ? html` (v${plugin.manifest.version})` : nothing} from the runtime?
+          </p>
+          ${plugin.manifest.description
+            ? html`<div class="mcp-desc">${plugin.manifest.description}</div>`
+            : nothing}
+          <div class="form-hint" style="margin-top:var(--sp-3)">
+            Hooks the plugin registered will no longer fire after uninstall. The plugin can be reinstalled from the catalog at any time.
+          </div>
+        </div>
+        <div slot="footer" style="display:flex;gap:var(--sp-2);justify-content:flex-end">
+          <crowclaw-button
+            variant="secondary"
+            size="sm"
+            aria-label="Cancel uninstall"
+            @click=${this._closeUninstallPluginModal}
+          >Cancel</crowclaw-button>
+          <crowclaw-button
+            variant="danger"
+            size="sm"
+            aria-label="Confirm uninstall ${plugin.manifest.name}"
+            @click=${this._confirmUninstallPlugin}
+          >Uninstall</crowclaw-button>
+        </div>
+      </crowclaw-modal>
     `;
   }
 
@@ -2432,10 +2956,28 @@ export class ConnectView extends LitElement {
               <crowclaw-empty
                 icon="pairing"
                 title="No paired platforms"
-                description="Pair Telegram, Slack, or Discord to chat with your agent from anywhere."
-                cta-label="Connect Telegram/Slack/Discord"
-                cta-href="https://github.com/subinium/CrowClaw/blob/main/docs/gateway.md"
+                description="Pair Telegram, Slack, or Discord to chat with your agent from anywhere. The setup wizard walks you through bot creation, token validation, and webhook configuration in 4 steps."
               ></crowclaw-empty>
+              <div class="platform-actions" style="justify-content:center;margin-top:var(--sp-3)">
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open Telegram setup wizard"
+                  @click=${() => this._openWizard('telegram')}
+                >Connect Telegram</crowclaw-button>
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open Slack setup wizard"
+                  @click=${() => this._openWizard('slack')}
+                >Connect Slack</crowclaw-button>
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open Discord setup wizard"
+                  @click=${() => this._openWizard('discord')}
+                >Connect Discord</crowclaw-button>
+              </div>
             `
           : html`
               <div class="platform-grid">
@@ -2444,6 +2986,12 @@ export class ConnectView extends LitElement {
             `}
       </div>
     `;
+  }
+
+  /** v0.8.4 #200 — only Telegram/Slack/Discord get the wizard. Other gateway
+   * platforms (whatsapp/matrix/sms/email) keep the legacy expand-panel flow. */
+  private _isWizardPlatform(name: string): boolean {
+    return name === 'telegram' || name === 'slack' || name === 'discord';
   }
 
   private _renderPlatformCard(platform: GatewayPlatform) {
@@ -2512,6 +3060,16 @@ export class ConnectView extends LitElement {
             ?disabled=${isProbing}
             @click=${() => this._probePlatform(platform)}
           >${isProbing ? 'Probing' : 'Probe'}</crowclaw-button>
+          ${this._isWizardPlatform(platform.name)
+            ? html`
+                <crowclaw-button
+                  variant="primary"
+                  size="sm"
+                  aria-label="Open ${platform.name} setup wizard"
+                  @click=${() => this._openWizard(platform.name as WizardPlatform)}
+                >Setup Wizard</crowclaw-button>
+              `
+            : nothing}
           <crowclaw-button
             variant=${isExpanded ? 'primary' : 'ghost'}
             size="sm"

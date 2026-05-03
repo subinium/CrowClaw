@@ -66,7 +66,7 @@ export class CrowClawReasoningBlock extends LitElement {
     }
 
     button.toggle:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: -2px;
     }
 
@@ -103,7 +103,7 @@ export class CrowClawReasoningBlock extends LitElement {
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
       animation: pulse 1s ease-in-out infinite;
       flex-shrink: 0;
     }

@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/cli",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -16,6 +16,9 @@
   "files": [
     "dist"
   ],
+  "dependencies": {
+    "@crowclaw/learning": "0.8.4"
+  },
   "publishConfig": {
     "access": "public"
   },

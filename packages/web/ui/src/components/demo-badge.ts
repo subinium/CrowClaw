@@ -21,18 +21,22 @@ export class CrowClawDemoBadge extends LitElement {
       display: none;
     }
 
+    /* v0.8.4 #245: switched the demo badge from the legacy warning-red
+       brand surface to the muted-blue accent. The badge now reads as an
+       info chip rather than an error chip — it's a status indicator,
+       not an alert. */
     .badge {
       display: inline-flex;
       align-items: center;
       gap: var(--sp-2, 8px);
       padding: 4px 10px;
       border-radius: var(--radius-pill, 999px);
-      background: rgba(224, 85, 69, 0.12);
-      border: 1px solid rgba(224, 85, 69, 0.45);
+      background: var(--accent-soft, rgba(91, 141, 239, 0.12));
+      border: 1px solid var(--accent, #5b8def);
       font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, 'Inter', sans-serif);
       font-size: var(--text-xs, 11px);
       font-weight: 600;
-      color: var(--accent, #e05545);
+      color: var(--accent, #5b8def);
       letter-spacing: 0.04em;
       text-transform: uppercase;
       user-select: none;
@@ -42,8 +46,8 @@ export class CrowClawDemoBadge extends LitElement {
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: var(--accent, #e05545);
-      box-shadow: 0 0 6px rgba(224, 85, 69, 0.7);
+      background: var(--accent, #5b8def);
+      box-shadow: 0 0 6px rgba(91, 141, 239, 0.7);
       animation: pulse 1.6s ease-in-out infinite;
     }
 
@@ -52,14 +56,14 @@ export class CrowClawDemoBadge extends LitElement {
     }
 
     .link {
-      color: var(--accent, #e05545);
+      color: var(--accent, #5b8def);
       text-decoration: none;
       font-weight: 500;
       text-transform: none;
       letter-spacing: 0;
       font-size: var(--text-xs, 11px);
       cursor: pointer;
-      border-left: 1px solid rgba(224, 85, 69, 0.35);
+      border-left: 1px solid rgba(91, 141, 239, 0.35);
       padding-left: var(--sp-2, 8px);
       margin-left: var(--sp-1, 4px);
     }

@@ -78,7 +78,7 @@ export class CrowClawSidebar extends LitElement {
     .nav-item.active {
       color: var(--text-primary, #ededef);
       background: var(--accent-soft, rgba(224, 85, 69, 0.15));
-      border-left-color: var(--accent, #e05545);
+      border-left-color: var(--accent, #5b8def);
     }
 
     .nav-item.active:hover {
@@ -298,7 +298,7 @@ export class CrowClawSidebar extends LitElement {
 
   private get _logoIcon() {
     return html`<svg viewBox="0 0 28 28" fill="none">
-      <rect width="28" height="28" rx="6" fill="var(--accent, #e05545)" />
+      <rect width="28" height="28" rx="6" fill="var(--accent, #5b8def)" />
       <path
         d="M8 10.5C8 9.67 8.67 9 9.5 9h9c.83 0 1.5.67 1.5 1.5v5c0 .83-.67 1.5-1.5 1.5H16l-3 2.5V17H9.5C8.67 17 8 16.33 8 15.5v-5z"
         fill="#fff"

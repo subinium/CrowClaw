@@ -9,6 +9,12 @@ import { showToast } from './components/toast.js';
 // type/build error rather than a silent runtime drift between emitter
 // and listener (#177 agent A4).
 import { STATUS_PILL_ACTIONS } from './components/status-pill.js';
+// v0.8.4 (#197 / #227) — header surfaces. Side-effect imports register the
+// `<crowclaw-persona-pill>` (header persona switcher with preview modal) and
+// `<crowclaw-active-model-badge>` (provider/model badge that links to Connect)
+// custom elements before app.ts boots.
+import './components/persona-pill.js';
+import './components/active-model-badge.js';
 
 /* ------------------------------------------------------------------ */
 /*  v0.7.0 component contracts (defensive)                             */
@@ -514,20 +520,18 @@ export class CrowClawApp extends LitElement {
         font-size: var(--text-xs);
       }
 
+      /* v0.8.4 #245: dropped warning-red top-of-header gradient and the
+         gradient-text trick on h2. Visual reset uses solid colors. */
       .mh {
         padding: var(--sp-5) var(--sp-8) 0;
         flex-shrink: 0;
-        background: linear-gradient(180deg, rgba(224,85,69,.02) 0%, transparent 100%);
       }
 
       .mh h2 {
         font-size: var(--text-xl);
         font-weight: 600;
         letter-spacing: -0.01em;
-        background: linear-gradient(90deg, var(--text-primary) 0%, var(--text-secondary) 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
+        color: var(--text);
       }
 
       .mh p { font-size: var(--text-xs); color: var(--text-muted); font-weight: 500; margin-top: 1px; }
@@ -542,14 +546,15 @@ export class CrowClawApp extends LitElement {
         height: 100%; color: var(--text-muted); font-size: var(--text-sm);
       }
 
-      /* Auth Overlay — login dialog, follows design tokens */
+      /* Auth Overlay — login dialog, follows design tokens.
+         v0.8.4 #245: dropped the legacy glass blur per the visual-reset
+         (no glass surfaces). Solid bg-overlay token now carries the
+         contrast on its own. */
       .auth-overlay {
         display: none;
         position: fixed;
         inset: 0;
         background: var(--bg-overlay);
-        backdrop-filter: blur(8px);
-        -webkit-backdrop-filter: blur(8px);
         z-index: 200;
         padding: var(--sp-6);
         box-sizing: border-box;
@@ -913,6 +918,29 @@ export class CrowClawApp extends LitElement {
   };
 
   /**
+   * #227 — wizard's "Edit anytime in Connect → Providers" link emits
+   * `crowclaw:onboarding-skip`. We tear down the onboarding overlay
+   * immediately so the user lands on the destination route the link's
+   * `<a href>` already mutated. Same handler is used by the existing
+   * step-1 "I know what I'm doing — skip" button.
+   */
+  private _onboardingSkipHandler = () => {
+    this.showOnboarding = false;
+    if (this.currentView === 'onboarding') {
+      // The link handler may have already updated `location.hash`; if it
+      // did not, fall back to the chat view as the safe default.
+      const raw = location.hash.slice(1);
+      const view = raw.split('/')[0] as ViewName;
+      if (['chat', 'connect', 'automate', 'settings'].includes(view)) {
+        this.currentView = view;
+      } else {
+        this.currentView = 'chat';
+        location.hash = 'chat';
+      }
+    }
+  };
+
+  /**
    * #174: when the onboarding wizard reports completion we re-fetch system
    * status (so the demo badge / hasProvider flags reflect the new key) and
    * route to the chat view. We never re-enter onboarding from the same
@@ -929,6 +957,10 @@ export class CrowClawApp extends LitElement {
       // user isn't stuck on the wizard. Next page load will reconcile.
       this.showOnboarding = false;
     }
+    // #227 — the wizard saves a provider during step 1; broadcast the
+    // mutation so the chat-header active-model badge picks it up without
+    // waiting for its next mount cycle.
+    document.dispatchEvent(new CustomEvent('crowclaw:provider-config-changed'));
     if (!this.showOnboarding) {
       this.currentView = 'chat';
       location.hash = 'chat';
@@ -962,6 +994,9 @@ export class CrowClawApp extends LitElement {
     document.addEventListener(STATUS_PILL_ACTIONS.resumeScheduler, this._resumeSchedulerHandler);
     // #174 onboarding-view emits this when the user completes the wizard.
     document.addEventListener('crowclaw:onboarding-complete', this._onboardingCompleteHandler);
+    // #227 onboarding-view's footer link / skip button emits this when the
+    // user wants to leave the wizard (e.g. to edit providers in Connect).
+    document.addEventListener('crowclaw:onboarding-skip', this._onboardingSkipHandler);
     // #248 (v0.8.1): command palette → orchestrator action bus. Listening on
     // window because the palette is mounted under document.body, outside
     // this shell's shadow DOM.
@@ -1054,6 +1089,7 @@ export class CrowClawApp extends LitElement {
     document.removeEventListener(STATUS_PILL_ACTIONS.testProvider, this._testProviderHandler);
     document.removeEventListener(STATUS_PILL_ACTIONS.resumeScheduler, this._resumeSchedulerHandler);
     document.removeEventListener('crowclaw:onboarding-complete', this._onboardingCompleteHandler);
+    document.removeEventListener('crowclaw:onboarding-skip', this._onboardingSkipHandler);
     window.removeEventListener('crowclaw:cmdk-action', this._cmdkActionHandler);
     window.removeEventListener('crowclaw:open-shortcut-help', this._shortcutHelpOpenHandler);
     window.removeEventListener('crowclaw:close-shortcut-help', this._shortcutHelpCloseHandler);
@@ -1155,10 +1191,14 @@ export class CrowClawApp extends LitElement {
             // `crowclaw-event` bridge for `memory:captured` / `memory:recalled`.
             // Without this allowlist entry the bridge silently drops every
             // memory event and the panel never updates outside its polling tick.
-            event.type.startsWith('memory:'))
+            event.type.startsWith('memory:') ||
+            // v0.8.4 (#181) — chat-view subscribes to `skill:matched` to
+            // render the chip row above the next assistant message and to
+            // aggregate per-skill activation counters.
+            event.type.startsWith('skill:'))
         ) {
           window.dispatchEvent(new CustomEvent('crowclaw-event', {
-            detail: { type: event.type },
+            detail: { type: event.type, data: event.data },
           }));
           if (event.type.startsWith('session:')) return; // already handled above
         }
@@ -1421,7 +1461,7 @@ export class CrowClawApp extends LitElement {
         <main class="mn" id="main-content" tabindex="-1">
           ${this.authenticated
             ? html`
-                <!-- v0.7.0 header strip: status pill, demo badge, persona, theme -->
+                <!-- v0.7.0+ header strip: status pill, demo badge, persona, model, theme -->
                 <header class="app-header" role="banner">
                   <div class="app-header-right">
                     <!-- Issue #177 (agent A4) — pill self-polls /api/diagnostics
@@ -1435,6 +1475,25 @@ export class CrowClawApp extends LitElement {
                          renders nothing when .active is false, so we set
                          the property and let it self-hide. -->
                     <crowclaw-demo-badge .active=${this.demoMode}></crowclaw-demo-badge>
+
+                    <!-- v0.8.4 (#197) - persona switcher pill. Self-fetches
+                         the persona registry; opens a dropdown + preview
+                         modal before activation. Dispatches a custom
+                         persona-switched event the orchestrator relays
+                         to settings / onboarding surfaces so they refresh
+                         their active marker without polling. -->
+                    <crowclaw-persona-pill
+                      @persona-switched=${(e: CustomEvent<{ name: string }>) => this._onPersonaSwitched(e)}
+                    ></crowclaw-persona-pill>
+
+                    <!-- v0.8.4 (#227) - active provider/model badge. Reads
+                         /api/providers/config and links to Connect to
+                         Providers; navigation goes through _navigateTo so
+                         the SPA hash router stays consistent. -->
+                    <crowclaw-active-model-badge
+                      .connectHref=${'#connect'}
+                      @navigate-providers=${(e: CustomEvent<{ href: string }>) => this._onActiveModelClick(e)}
+                    ></crowclaw-active-model-badge>
 
                     <select
                       class="header-select"
@@ -1551,6 +1610,42 @@ export class CrowClawApp extends LitElement {
     this.currentView = view;
     this.mobileOpen = false;
     location.hash = view;
+  }
+
+  /**
+   * v0.8.4 (#197) — persona pill bubbles a `persona-switched` CustomEvent
+   * after a successful `/api/persona/switch`. The shell reflects the new
+   * value in the sidebar's modelName proxy (which is repurposed here as a
+   * coarse "active persona" tag for the sidebar footer) and re-fetches
+   * `/api/system/status` so any provider/persona-derived state stays
+   * consistent. We swallow refresh errors so a transient network blip
+   * doesn't undo a successful switch in the UI.
+   */
+  private async _onPersonaSwitched(e: CustomEvent<{ name: string }>): Promise<void> {
+    const name = e.detail?.name;
+    if (typeof name === 'string' && name) {
+      this.modelName = name;
+    }
+    try {
+      const status = await api<SystemStatus>('/api/system/status');
+      this.systemStatus = status;
+      this.demoMode = (status.provider ?? '').toLowerCase() === 'echo';
+    } catch {
+      // Non-fatal: pill / settings already reflect the switch via the
+      // event broadcast, and the next status tick will reconcile.
+    }
+  }
+
+  /**
+   * v0.8.4 (#227) — active-model badge click. The badge already mutates
+   * `location.hash` via its anchor, but routing through `_navigateTo`
+   * keeps the in-memory currentView in sync immediately (avoids a race
+   * with the hashchange listener) and closes the mobile sidebar like
+   * every other internal nav.
+   */
+  private _onActiveModelClick(e: CustomEvent<{ href: string }>): void {
+    void e;
+    this._navigateTo('connect');
   }
 
   // #246 Phase B: the inline `_nav` row helper and per-view SVG getters were

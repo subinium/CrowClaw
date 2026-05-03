@@ -97,7 +97,7 @@ export class CrowClawInspectorRail extends LitElement {
     .tab:hover { color: var(--text, var(--text-primary, #ededef)); }
     .tab:focus { outline: none; }
     .tab:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: -2px;
     }
     .tab[aria-selected='true'] {
@@ -111,7 +111,7 @@ export class CrowClawInspectorRail extends LitElement {
       bottom: 8px;
       width: 3px;
       border-radius: 0 2px 2px 0;
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
     }
 
     .tab-label {
@@ -169,12 +169,12 @@ export class CrowClawInspectorRail extends LitElement {
     }
     .lock:hover { color: var(--text, var(--text-primary, #ededef)); }
     .lock[aria-pressed='true'] {
-      color: var(--accent, #e05545);
-      border-color: var(--accent, #e05545);
+      color: var(--accent, #5b8def);
+      border-color: var(--accent, #5b8def);
     }
     .lock:focus { outline: none; }
     .lock:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: 2px;
     }
 

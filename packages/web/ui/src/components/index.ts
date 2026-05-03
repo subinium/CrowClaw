@@ -116,3 +116,29 @@ import './inspector-rail.js';
 export { CrowClawShortcutHelp } from './shortcut-help.js';
 export type { ShortcutBinding } from './shortcut-help.js';
 import './shortcut-help.js';
+
+/**
+ * v0.8.4 (#197) — `<crowclaw-persona-pill>`. Header switcher that lists every
+ * registered persona with a Preview affordance. Side-effect import keeps the
+ * tag registered before the app shell mounts; named exports make the pure
+ * formatter helpers reachable from the focused unit tests in
+ * `tests/app-header-controls.test.ts`.
+ */
+export {
+  CrowClawPersonaPill,
+  personaPillLabel,
+  sampleGreetingFor,
+} from './persona-pill.js';
+import './persona-pill.js';
+
+/**
+ * v0.8.4 (#227) — `<crowclaw-active-model-badge>`. Header badge showing the
+ * primary provider/model so the user can verify what's powering chat without
+ * leaving the surface.
+ */
+export {
+  CrowClawActiveModelBadge,
+  formatActiveModel,
+} from './active-model-badge.js';
+export type { ProviderBadgeSlot } from './active-model-badge.js';
+import './active-model-badge.js';
