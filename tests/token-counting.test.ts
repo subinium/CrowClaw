@@ -21,11 +21,15 @@ describe('OpenAICompatibleProvider.countTokens', () => {
     model: 'gpt-4o',
   });
 
+  // v0.8.4 (#274): expected counts come from gpt-tokenizer's o200k_base
+  // encoding (the BPE table gpt-4o actually uses) plus the +3-per-message
+  // chat framing overhead OpenAI documents.
   it('estimates tokens for simple text messages with model encoding overhead', () => {
     const messages: ConversationMessage[] = [
       { role: 'user', content: 'Hello world', createdAt: now },
     ];
-    expect(provider.countTokens(messages)).toBe(8);
+    // role=user(1) + content=2 + framing=3 = 6
+    expect(provider.countTokens(messages)).toBe(6);
   });
 
   it('estimates tokens for multiple messages', () => {
@@ -33,14 +37,16 @@ describe('OpenAICompatibleProvider.countTokens', () => {
       { role: 'user', content: 'Hello world', createdAt: now },
       { role: 'assistant', content: 'Hi there! How can I help you today?', createdAt: now },
     ];
-    expect(provider.countTokens(messages)).toBe(26);
+    // (1 + 2 + 3) + (1 + 10 + 3) = 20
+    expect(provider.countTokens(messages)).toBe(20);
   });
 
   it('counts tool result content', () => {
     const messages: ConversationMessage[] = [
       { role: 'tool', content: 'Result of running command', createdAt: now, name: 'terminal.exec' },
     ];
-    expect(provider.countTokens(messages)).toBe(15);
+    // role=tool(1) + content=4 + name=terminal.exec(2) + framing=3 = 10
+    expect(provider.countTokens(messages)).toBe(10);
   });
 
   it('returns 0 for empty messages', () => {
@@ -56,12 +62,17 @@ describe('OpenAICompatibleProvider.countTokens', () => {
         metadata: { toolCount: 2, iteration: 1 },
       },
     ];
-    // content: 4 chars + metadata values serialized
+    // Issue #51: metadata is intentionally NOT counted (internal bookkeeping
+    // does not flow to the LLM). content alone produces a non-zero count.
     const count = provider.countTokens(messages);
     expect(count).toBeGreaterThan(0);
   });
 
   it('uses different encoding families for older OpenAI-compatible models', () => {
+    // v0.8.4 (#274): cl100k_base and o200k_base diverge sharply on non-ASCII
+    // inputs (o200k has substantially better Korean/Chinese/Japanese token
+    // budget). antidisestablishmentarianism happens to tokenize identically
+    // under both, so we use a Korean string instead.
     const older = new OpenAICompatibleProvider({
       apiKey: 'test',
       baseUrl: 'https://api.example.com/v1',
@@ -73,7 +84,7 @@ describe('OpenAICompatibleProvider.countTokens', () => {
       model: 'gpt-5.5',
     });
     const messages: ConversationMessage[] = [
-      { role: 'user', content: 'antidisestablishmentarianism', createdAt: now },
+      { role: 'user', content: '안녕하세요, 반갑습니다. 오늘 날씨가 좋네요.', createdAt: now },
     ];
     expect(older.countTokens(messages)).toBeGreaterThan(newer.countTokens(messages));
   });

@@ -17,7 +17,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.8.4"
+    "@crowclaw/core": "0.8.4",
+    "gpt-tokenizer": "^3.4.0"
   },
   "repository": {
     "type": "git",
