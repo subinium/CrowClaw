@@ -43,7 +43,17 @@ Working ledger: `docs/release-v0.8.4-worklog.md`.
 - **#272** CLI `batch --eval --threshold <n>` flag (default `1.0`); non-zero exit when accuracy falls below threshold. (`fac1775`)
 - **#189** `connect-view.ts` Plugins surface — Installed list, Browse catalog with search, Install modal with permission summary, Configure modal (typed form or JSON fallback), Uninstall confirm. Mirrors MCP install UX. (`18d55aa`)
 
-(... Phase 2-5 entries follow as further batches land ...)
+### Phase 2 landed (8 issues — Web UX surfaces)
+- **#181** Chat view shows a skill chip row above each assistant message; runtime emits `skill:matched` over the session SSE stream; per-skill activation counter surfaces in the chip popover. (`838ec63`)
+- **#184** Memory list rows carry a redaction-confidence badge (low / medium / high) computed by `assessRedaction()`; tri-state bulk multi-select with "Delete N selected" + count-aware confirm. (`1ceec15`)
+- **#185** Learning loop dashboard renders the 4-stage state machine (captured → reviewed → published → rejected), per-skill metrics panel (success rate, latency, last-fired, activations), and a static SVG loop diagram. New `/api/learning/dashboard` shape with `stage`, `stageCounts`, `skillMetrics`. (`2b9d378`)
+- **#192** (UI) Sessions list wires backend pagination/search/status filter into `chat-view.ts` — search input, status dropdown, "Load more" cursor pagination, bulk multi-select with delete, sort dropdown, hover preview tooltip. (`2ad9d5e`)
+- **#197** Header persona pill — new `<crowclaw-persona-pill>` component with dropdown + preview modal showing system prompt + identity + sample greeting before activation. (`de0fe96`)
+- **#200** Telegram / Slack / Discord setup wizard — new `<crowclaw-platform-wizard>` 4-step modal (create-bot links → paste credentials → webhook auto-config → test). New `POST /api/gateway/<platform>/validate-token` stateless route. (`3ed84d8`)
+- **#227** Chat header active model badge (`<crowclaw-active-model-badge>`) reads `/api/providers/config` and links to Connect → Providers; onboarding wizard adds "Edit anytime in Connect → Providers" footer. (`6a6aeeb`)
+- **#250** Phase A list virtualization via `@lit-labs/virtualizer` for sessions list (chat-view) and feedback log (settings-view) at >50 items. (Memory list virtualization is a residual TODO carried into Phase 3 because of a `_renderMemoryList` extraction overlap with #184.) (`59db878`)
+
+(... Phase 3-5 entries follow as further batches land ...)
 
 ## [0.8.3] — 2026-05-03 — GitHub-close pass: 52 verifier-confirmed issues
 

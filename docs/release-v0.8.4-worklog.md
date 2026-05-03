@@ -149,10 +149,66 @@ landed via 5 commits cherry-picked onto `release/v0.8.4`.
 - Closed (this phase, code changes): #187, #189, #192, #254, #272 (5)
 - Remaining (Phase 2-5): #181, #184, #185, #197, #200, #227, #233, #240, #244, #245, #250, #274 (12)
 
+## Phase 2 Result — 2026-05-03
+
+4 sub-agents dispatched in parallel (worktree isolation), 8 issues
+landed via 8 commits cherry-picked onto `release/v0.8.4`.
+
+### Sub-agent A (`feat/v0.8.4-181-192ui-250`) — chat-view + virtualization
+- `838ec63` `feat(web): close #181 — skill chip row in chat + skill:matched event + counters`
+  - `parseReasoningBlocks` companion: `core/skill-manifest.ts` adds `SkillMatchExplanation`
+  - `event-bus.ts` `skill:matched` event type
+  - `route-handlers.ts` SSE bridge forward (per-session)
+  - `chat-view.ts` chip row + popover with activation counters
+- `2ad9d5e` `feat(web): close #192 — sessions list search/filter/pagination/bulk UI`
+  - `chat-view.ts` wires backend `?search`/`?status`/`?cursor` to UI
+  - Sort dropdown, bulk multi-select with "Delete N selected", hover preview tooltip
+- `59db878` `perf(web): close #250 — Phase A list virtualization with @lit-labs/virtualizer`
+  - sessions list (chat-view), feedback log (settings-view) virtualize at >50 items
+  - **Memory list virtualization superseded by #184's `_renderMemoryList` extraction at cherry-pick conflict; virtualization within the new method is a follow-up TODO.**
+
+### Sub-agent B (`feat/v0.8.4-197-227`) — header components + onboarding
+- `de0fe96` `feat(web): close #197 — header persona switcher with preview modal`
+  - new `<crowclaw-persona-pill>` component (pill / dropdown / preview modal)
+  - `app.ts` mount + `crowclaw:persona-switched` event broadcast
+- `6a6aeeb` `feat(web): close #227 — onboarding → Connect redirect + chat header active model badge`
+  - new `<crowclaw-active-model-badge>` reads `/api/providers/config`
+  - `onboarding-view.ts` "Edit anytime in Connect → Providers" footer link
+
+### Sub-agent C (`feat/v0.8.4-184-185`) — settings memory + automate learning loop
+- `1ceec15` `feat(web): close #184 — memory delete UX (redaction confidence + bulk multi-select)`
+  - `assessRedaction()` helper (low/medium/high) — pattern-detect on row content
+  - tri-state checkbox + bulk delete modal with count-aware confirm
+  - extracted `_renderMemoryList` method
+- `2b9d378` `feat(web): close #185 — learning loop dashboard (status state machine + metrics + diagram)`
+  - new `learning/state-machine.ts` derives 4-stage status (`captured`→`reviewed`→`published`→`rejected`)
+  - `/api/learning/dashboard` enriched with `stage`, `stageCounts`, `skillMetrics`
+  - Per-skill metrics panel + static SVG loop diagram
+
+### Sub-agent D (`feat/v0.8.4-200`) — connect-view setup wizard
+- `3ed84d8` `feat(web): close #200 — Telegram/Slack/Discord setup wizard with token validation + webhook auto-config`
+  - new `<crowclaw-platform-wizard>` 4-step modal flow
+  - `POST /api/gateway/<platform>/validate-token` stateless route hits platform auth-test endpoints
+
+### Cherry-pick conflicts resolved
+- `packages/web/src/generated.ts` — auto-conflict on every commit; took theirs each time, then ran `npm run build:ui` + `npm run build:html` to regenerate cleanly at the tip.
+- `packages/web/ui/src/views/settings-view.ts` — memory list region overlapped between #250 (inline virtualizer) and #184 (method extraction). Took #184's `_renderMemoryList(selected)` invocation; #250's memory-list virtualization is a residual TODO.
+
+### Verification
+- `npx tsc -b --force --pretty false` — clean (all packages strict-pass)
+- `npm run build:ui --workspace @crowclaw/web` — clean (1,680.60 kB / 469.14 kB gz)
+- `npm run build:html --workspace @crowclaw/web` — clean
+- `npm test` — running in background; will record final tally on completion.
+- LSP-only stale diagnostics (cross-resolution `Cannot find module`, test-file `node:` import warnings, unused-import notes) all non-blocking — `tsc -b --force` is the gate.
+
+### Phase 2 issue tally
+- Closed (this phase): #181, #184, #185, #192-UI, #197, #200, #227, #250 (8)
+- Remaining (Phase 3-5): #244, #245, #274, #233, #240 (5) + memory virtualizer TODO
+
 ## Next Update Slot
 
-- Batch: Phase 2 — Web UX surfaces (#181, #184, #185, #192-UI follow-up, #197, #200, #227, #250).
-- Subagents: planned 4 parallel worktree agents split by file ownership.
-- Files expected: `packages/web/ui/src/views/{chat-view,settings-view,automate-view,onboarding-view}.ts`, `packages/web/ui/src/app.ts`, plus event-bus types.
-- Verification plan: focused web tests + dashboard build + full vitest.
+- Batch: Phase 3 — component / visual cleanup (#244 chat-view ops button consolidation, #245 backdrop-filter + warning-red removal). Plus the memory list virtualizer follow-up from Phase 2.
+- Subagents: planned 1-2 parallel worktree agents (low file-overlap).
+- Files expected: `packages/web/ui/src/views/chat-view.ts`, `packages/web/ui/src/components/{demo-badge,toggle-switch,tool-call-trace,status-dot}.ts`, `packages/web/ui/src/app.ts`, `packages/web/ui/src/views/settings-view.ts` (memory virtualizer TODO).
+- Verification plan: typecheck + dashboard build + grep for residual `#e05545` / `backdrop-filter`.
 - Result: TBD
