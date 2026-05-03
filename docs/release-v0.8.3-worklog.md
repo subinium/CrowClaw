@@ -101,12 +101,97 @@ Settings / Connect / Chat structural fixes and missing UIs.
 - CHANGELOG `[Unreleased]` stub for the sweep.
 - Verifier-closed #224, #242, #244, #246, #247, #248 (no code change).
 
-## Next Update Slot
+## Final Result — 2026-05-03
 
-Use this section for the next live batch before editing code.
+All 8 phases resolved as a **GitHub-close pass with zero code change**.
+Verifier audit on `main` (commit 72fa31b) revealed every issue in the
+v0.8.3 scope had already been implemented and shipped via earlier
+release PRs (#209, #211, #251, #252, #290), but those PRs used range
+syntax in their close clauses which GitHub does not auto-process.
+v0.8.3's contribution is restoring issue tracker fidelity and bumping
+the version line to a clean cut.
 
-- Batch: Phase 2 — critical bugs (#190, #212, #213, #214)
-- Subagents: TBD (planned: 4 parallel sub-agents, one per issue)
-- Files expected: TBD
-- Verification plan: focused tests per touched surface, then full `npm test`.
-- Result: TBD
+### Phase 1 — Verifier-close (6) ✅
+
+Closed `#224`, `#242`, `#244`, `#246`, `#247`, `#248` — shipped in
+v0.8.1 (PR #252). Bootstrap commit `5a6d53a`.
+
+### Phase 2 — Critical bugs (4) ✅
+
+Closed `#190`, `#212`, `#213`, `#214` — shipped in v0.8.2 (PR #290):
+
+- `#190` `runtime-catalogs.ts` `BUILTIN_MCP_CATALOG` +
+  `POST /api/mcp/servers/install` + `connect-view.ts` install UI.
+- `#212` `settings-view.ts:2640` SSRF row as
+  `<span class="protection-badge">Always on (enforced)</span>`.
+- `#213` `settings-view.ts:1949-1970` Agent tab `model` field removed;
+  read-only "Active model:" line linking to Connect → Providers.
+- `#214` `route-handlers.ts:3934-3942` explicit
+  `// #214 — autostart the autonomous scheduler` comment plus
+  `wasRunningBefore` / `start()` / `wasStarted` flow.
+
+### Phase 3 — Critical Hermes harness (1) ✅
+
+Closed `#231` — `parseReasoningBlocks` + `StreamingReasoningParser` in
+`packages/core/src/reasoning-blocks.ts` (v0.8.0 PR #251).
+
+### Phase 4 — Wiring (3) ✅
+
+Closed `#215`, `#216`, `#218` — gateway / runtime route wiring across
+v0.7.x and v0.8.x sweeps. `#218` has an explicit `// #218 —` inline
+comment at `route-handlers.ts:1291`.
+
+### Phase 5 — Hermes parity (9) ✅
+
+Closed `#232`–`#240` — all shipped in v0.8.0 (PR #251). Verified
+markers across `core/src/structured-output.ts` (`generateStructured<T>`),
+`core/src/skill-manifest.ts` (agentskills.io v1.0 alignment),
+`core/src/security.ts` (`#234` `code.execute` audit hooks),
+`core/src/index.ts` (`budget_exhausted_with_synthesis` termination
+reason and inline `<budget_exhausted>` synthesis comment).
+
+### Phase 6 — Web UX wave (26) ✅
+
+Closed `#181`, `#182`, `#183`, `#185`, `#189`, `#192`, `#196`, `#197`,
+`#198`, `#199`, `#200`, `#201`, `#205`, `#206`, `#207`, `#208`,
+`#217`, `#219`, `#220`, `#221`, `#222`, `#223`, `#225`, `#226`, `#227`,
+`#228` — shipped across v0.7.x / v0.8.x sweeps. Verified markers:
+`settings-view.ts` (`matchReasons`, `pinned`, `themeMode`, `Active
+Profile`, advanced disclosure), `connect-view.ts` (`pluginCatalog`,
+`pairings`, `secret/rotate`), `chat-view.ts` (`_exportSession` /
+`_importSessionFile`).
+
+### Phase 7 — Memory / Plugins (2) ✅
+
+Closed `#186`, `#191` — `memory.pinned` in `settings-view.ts:113`;
+plugin examples in `packages/plugins/examples/` (`auto-redact-pii`,
+`block-rm-rf-everything`, `metric-tap`).
+(Note: `#189` plugin catalog UI accounted for in Phase 6.)
+
+### Phase 8 — Cloudflare parity (1) ✅
+
+Closed `#255` — `node scripts/audit-routes.mjs --check` exits 0 with
+zero missing rows. parity doc, Tier 3 `501 unsupported_on_workers`
+envelope, and CI audit job all confirmed in place from v0.8.2 (PR
+#290).
+
+## Cumulative
+
+- 52 OPEN issues moved to CLOSED.
+- 0 lines of code changed in v0.8.3 source.
+- 23 files modified by the bootstrap commit (version bump on root +
+  19 packages + `wrangler.jsonc`, plus this worklog and CHANGELOG
+  stub).
+- Bootstrap commit: `5a6d53a chore(release): bootstrap v0.8.3 sweep`.
+- Final commit: TBD (CHANGELOG consolidation + README badge bump +
+  this worklog finalization).
+
+## Followup
+
+- `git tag v0.8.3 && git push --tags`
+- `gh release create v0.8.3 --notes-file -` (notes from CHANGELOG
+  `[0.8.3]`).
+- npm publish via the `release` event auto-trigger
+  (`.github/workflows/publish.yml`).
+- Branch `release/v0.8.3` is preserved on origin (matches
+  `release/v0.5.0`–`release/v0.8.2` retention pattern).
