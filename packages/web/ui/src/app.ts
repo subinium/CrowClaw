@@ -9,6 +9,11 @@ import { showToast } from './components/toast.js';
 // type/build error rather than a silent runtime drift between emitter
 // and listener (#177 agent A4).
 import { STATUS_PILL_ACTIONS } from './components/status-pill.js';
+// v0.8.4 (#197) — side-effect import registers <crowclaw-persona-pill>
+// (header persona switcher with dropdown + preview modal) before app.ts
+// boots so the header markup below resolves the custom element on first
+// render.
+import './components/persona-pill.js';
 
 /* ------------------------------------------------------------------ */
 /*  v0.7.0 component contracts (defensive)                             */
@@ -1155,10 +1160,14 @@ export class CrowClawApp extends LitElement {
             // `crowclaw-event` bridge for `memory:captured` / `memory:recalled`.
             // Without this allowlist entry the bridge silently drops every
             // memory event and the panel never updates outside its polling tick.
-            event.type.startsWith('memory:'))
+            event.type.startsWith('memory:') ||
+            // v0.8.4 (#181) — chat-view subscribes to `skill:matched` to
+            // render the chip row above the next assistant message and to
+            // aggregate per-skill activation counters.
+            event.type.startsWith('skill:'))
         ) {
           window.dispatchEvent(new CustomEvent('crowclaw-event', {
-            detail: { type: event.type },
+            detail: { type: event.type, data: event.data },
           }));
           if (event.type.startsWith('session:')) return; // already handled above
         }
@@ -1421,7 +1430,7 @@ export class CrowClawApp extends LitElement {
         <main class="mn" id="main-content" tabindex="-1">
           ${this.authenticated
             ? html`
-                <!-- v0.7.0 header strip: status pill, demo badge, persona, theme -->
+                <!-- v0.7.0+ header strip: status pill, demo badge, persona, model, theme -->
                 <header class="app-header" role="banner">
                   <div class="app-header-right">
                     <!-- Issue #177 (agent A4) — pill self-polls /api/diagnostics
@@ -1435,6 +1444,16 @@ export class CrowClawApp extends LitElement {
                          renders nothing when .active is false, so we set
                          the property and let it self-hide. -->
                     <crowclaw-demo-badge .active=${this.demoMode}></crowclaw-demo-badge>
+
+                    <!-- v0.8.4 (#197) - persona switcher pill. Self-fetches
+                         the persona registry; opens a dropdown + preview
+                         modal before activation. Dispatches a custom
+                         persona-switched event the orchestrator relays
+                         to settings / onboarding surfaces so they refresh
+                         their active marker without polling. -->
+                    <crowclaw-persona-pill
+                      @persona-switched=${(e: CustomEvent<{ name: string }>) => this._onPersonaSwitched(e)}
+                    ></crowclaw-persona-pill>
 
                     <select
                       class="header-select"
@@ -1552,6 +1571,31 @@ export class CrowClawApp extends LitElement {
     this.mobileOpen = false;
     location.hash = view;
   }
+
+  /**
+   * v0.8.4 (#197) — persona pill bubbles a `persona-switched` CustomEvent
+   * after a successful `/api/persona/switch`. The shell reflects the new
+   * value in the sidebar's modelName proxy (which is repurposed here as a
+   * coarse "active persona" tag for the sidebar footer) and re-fetches
+   * `/api/system/status` so any provider/persona-derived state stays
+   * consistent. We swallow refresh errors so a transient network blip
+   * doesn't undo a successful switch in the UI.
+   */
+  private async _onPersonaSwitched(e: CustomEvent<{ name: string }>): Promise<void> {
+    const name = e.detail?.name;
+    if (typeof name === 'string' && name) {
+      this.modelName = name;
+    }
+    try {
+      const status = await api<SystemStatus>('/api/system/status');
+      this.systemStatus = status;
+      this.demoMode = (status.provider ?? '').toLowerCase() === 'echo';
+    } catch {
+      // Non-fatal: pill / settings already reflect the switch via the
+      // event broadcast, and the next status tick will reconcile.
+    }
+  }
+
 
   // #246 Phase B: the inline `_nav` row helper and per-view SVG getters were
   // deleted along with `aside.sb`; nav rendering now lives in

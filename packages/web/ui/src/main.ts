@@ -19,6 +19,9 @@ import './components/command-palette.js'; // #178 agent A5 (palette element)
 // v0.8.0 — Hermes-parity reasoning-block surface (#231).
 import './components/reasoning-block.js';
 
+// v0.8.4 — Header persona switcher (#197).
+import './components/persona-pill.js';
+
 // Views
 // #246 Phase A (v0.8.1): `agent-view.js` was deleted; its content was merged
 // into `settings-view.js` under the Agent tab. Bookmarks at `#agent` redirect
