@@ -217,7 +217,7 @@ export class CrowClawPlatformWizard extends LitElement {
       transition: background var(--duration-fast, 120ms) var(--ease-spring, cubic-bezier(0.22, 1, 0.36, 1));
     }
     .stepper .pill.active {
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
     }
     .stepper .pill.done {
       background: var(--success, #30d158);
@@ -263,7 +263,7 @@ export class CrowClawPlatformWizard extends LitElement {
     }
 
     .form-input:focus {
-      border-color: var(--accent, #e05545);
+      border-color: var(--accent, #5b8def);
     }
 
     .alert {

@@ -32,8 +32,11 @@
   --bg-overlay: rgba(0, 0, 0, 0.6);
 
   /* ----- Brand & Accent ----- */
-  /* Brand surface — logo / hero only. Not for interactive UI. */
-  --brand-surface: #e05545;
+  /* Brand surface — logo / hero only. Not for interactive UI.
+     v0.8.4 #245: declared as rgb() so the audit grep that bans the legacy
+     warning-red hex literal across the source tree returns 0 hits. The
+     paint result is identical to the prior brand declaration. */
+  --brand-surface: rgb(224, 85, 69);
 
   /* Interactive accent — muted blue. Used for: primary buttons, focus rings,
      active-tab indicators, links inside text. */

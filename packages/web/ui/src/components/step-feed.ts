@@ -52,7 +52,7 @@ export class CrowClawStepFeed extends LitElement {
     }
 
     .indicator.running {
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
       animation: pulse 1.4s ease-in-out infinite;
     }
 
@@ -90,7 +90,7 @@ export class CrowClawStepFeed extends LitElement {
       letter-spacing: 0.4px;
     }
 
-    .status-label.running { color: var(--accent, #e05545); }
+    .status-label.running { color: var(--accent, #5b8def); }
     .status-label.done { color: var(--success, #30d158); }
     .status-label.error { color: var(--error, #ff453a); }
 

@@ -108,11 +108,11 @@ export class CrowClawPersonaPill extends LitElement {
     }
 
     .pill:hover {
-      border-color: var(--accent, #e05545);
+      border-color: var(--accent, #5b8def);
     }
 
     .pill:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: 1px;
     }
 
@@ -208,7 +208,7 @@ export class CrowClawPersonaPill extends LitElement {
 
     .preview-btn:hover {
       color: var(--text-primary, #ededef);
-      border-color: var(--accent, #e05545);
+      border-color: var(--accent, #5b8def);
     }
 
     .menu-empty {
@@ -235,13 +235,12 @@ export class CrowClawPersonaPill extends LitElement {
       color: var(--text-primary, #ededef);
     }
 
-    /* Modal */
+    /* Modal — v0.8.4 #245: dropped the legacy glass blur per the
+       visual-reset (no glass surfaces). */
     .overlay {
       position: fixed;
       inset: 0;
       background: var(--bg-overlay, rgba(0, 0, 0, 0.6));
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
       z-index: 320;
       display: none;
       align-items: center;
@@ -346,7 +345,7 @@ export class CrowClawPersonaPill extends LitElement {
       color: var(--text-secondary, #b0b0b6);
       font-size: var(--text-sm, 13px);
       padding: var(--sp-2, 8px) var(--sp-3, 12px);
-      border-left: 2px solid var(--accent, #e05545);
+      border-left: 2px solid var(--accent, #5b8def);
       background: rgba(224, 85, 69, 0.06);
       border-radius: 0 var(--radius-sm, 6px) var(--radius-sm, 6px) 0;
     }
@@ -373,7 +372,7 @@ export class CrowClawPersonaPill extends LitElement {
     }
 
     .btn:hover {
-      border-color: var(--accent, #e05545);
+      border-color: var(--accent, #5b8def);
     }
 
     .btn[disabled] {
@@ -382,8 +381,8 @@ export class CrowClawPersonaPill extends LitElement {
     }
 
     .btn-p {
-      background: var(--accent, #e05545);
-      border-color: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
+      border-color: var(--accent, #5b8def);
       color: #fff;
     }
 

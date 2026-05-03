@@ -16,6 +16,9 @@ export class CrowClawModal extends LitElement {
       display: contents;
     }
 
+    /* v0.8.4 #245: dropped the legacy glass blur per the visual-reset
+       (no glass surfaces). The bg-overlay token now carries the contrast
+       on its own. */
     .overlay {
       position: fixed;
       inset: 0;
@@ -24,8 +27,6 @@ export class CrowClawModal extends LitElement {
       align-items: center;
       justify-content: center;
       background: var(--bg-overlay, rgba(0, 0, 0, 0.6));
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
       opacity: 0;
       pointer-events: none;
       transition: opacity var(--duration-normal, 200ms) var(--ease-spring, cubic-bezier(0.22, 1, 0.36, 1));

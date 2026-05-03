@@ -117,7 +117,7 @@ export class CrowClawForkModal extends LitElement {
       box-sizing: border-box;
     }
 
-    textarea:focus { border-color: var(--accent, #e05545); }
+    textarea:focus { border-color: var(--accent, #5b8def); }
     textarea::placeholder { color: var(--text-muted, #48484a); }
 
     .toolset-chips {
@@ -145,7 +145,7 @@ export class CrowClawForkModal extends LitElement {
 
     .chip.selected {
       background: var(--accent-soft, rgba(224, 85, 69, 0.15));
-      border-color: var(--accent, #e05545);
+      border-color: var(--accent, #5b8def);
       color: var(--accent-hover, #ff6b5b);
     }
 
@@ -180,8 +180,8 @@ export class CrowClawForkModal extends LitElement {
     }
 
     .footer-actions button.primary {
-      background: var(--accent, #e05545);
-      border-color: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
+      border-color: var(--accent, #5b8def);
       color: #fff;
     }
 

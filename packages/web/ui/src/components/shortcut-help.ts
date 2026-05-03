@@ -61,6 +61,8 @@ export class CrowClawShortcutHelp extends LitElement {
       font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, 'Inter', sans-serif);
     }
 
+    /* v0.8.4 #245: dropped the legacy glass blur per the visual-reset
+       (no glass surfaces). The bg-overlay token carries the contrast. */
     .overlay {
       position: fixed;
       inset: 0;
@@ -70,8 +72,6 @@ export class CrowClawShortcutHelp extends LitElement {
       justify-content: center;
       padding-top: 12vh;
       background: var(--bg-overlay, rgba(0, 0, 0, 0.55));
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
     }
     .overlay.on { display: flex; }
 
@@ -120,7 +120,7 @@ export class CrowClawShortcutHelp extends LitElement {
     }
     .close:focus { outline: none; }
     .close:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: 2px;
     }
 

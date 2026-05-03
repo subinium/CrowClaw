@@ -69,8 +69,10 @@ export class CrowClawToolCallTrace extends LitElement {
       box-shadow: inset 2px 0 0 0 var(--error, #ff453a);
     }
 
+    /* v0.8.4 #245: running state now uses the muted-blue accent ring
+       (was the legacy warning-red surface). */
     .trace.running {
-      border-color: rgba(224, 85, 69, 0.25);
+      border-color: rgba(91, 141, 239, 0.3);
     }
 
     /* --- Header (always visible) --- */
@@ -131,7 +133,7 @@ export class CrowClawToolCallTrace extends LitElement {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: var(--accent, #e05545);
+      background: var(--accent, #5b8def);
       animation: pulse 1.4s ease-in-out infinite;
     }
 

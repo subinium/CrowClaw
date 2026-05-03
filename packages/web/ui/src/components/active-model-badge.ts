@@ -86,11 +86,11 @@ export class CrowClawActiveModelBadge extends LitElement {
     }
 
     .badge:hover {
-      border-color: var(--accent, #e05545);
+      border-color: var(--accent, #5b8def);
     }
 
     .badge:focus-visible {
-      outline: 2px solid var(--accent, #e05545);
+      outline: 2px solid var(--accent, #5b8def);
       outline-offset: 1px;
     }
 

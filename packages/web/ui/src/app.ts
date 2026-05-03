@@ -520,20 +520,18 @@ export class CrowClawApp extends LitElement {
         font-size: var(--text-xs);
       }
 
+      /* v0.8.4 #245: dropped warning-red top-of-header gradient and the
+         gradient-text trick on h2. Visual reset uses solid colors. */
       .mh {
         padding: var(--sp-5) var(--sp-8) 0;
         flex-shrink: 0;
-        background: linear-gradient(180deg, rgba(224,85,69,.02) 0%, transparent 100%);
       }
 
       .mh h2 {
         font-size: var(--text-xl);
         font-weight: 600;
         letter-spacing: -0.01em;
-        background: linear-gradient(90deg, var(--text-primary) 0%, var(--text-secondary) 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
+        color: var(--text);
       }
 
       .mh p { font-size: var(--text-xs); color: var(--text-muted); font-weight: 500; margin-top: 1px; }
@@ -548,14 +546,15 @@ export class CrowClawApp extends LitElement {
         height: 100%; color: var(--text-muted); font-size: var(--text-sm);
       }
 
-      /* Auth Overlay — login dialog, follows design tokens */
+      /* Auth Overlay — login dialog, follows design tokens.
+         v0.8.4 #245: dropped the legacy glass blur per the visual-reset
+         (no glass surfaces). Solid bg-overlay token now carries the
+         contrast on its own. */
       .auth-overlay {
         display: none;
         position: fixed;
         inset: 0;
         background: var(--bg-overlay);
-        backdrop-filter: blur(8px);
-        -webkit-backdrop-filter: blur(8px);
         z-index: 200;
         padding: var(--sp-6);
         box-sizing: border-box;

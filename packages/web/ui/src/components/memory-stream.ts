@@ -137,7 +137,7 @@ export class CrowClawMemoryStream extends LitElement {
     /* Capture/recall pulse animation per spec: highlight on insert. */
     @keyframes pulse-in {
       0% {
-        background: var(--accent, #e05545);
+        background: var(--accent, #5b8def);
         opacity: 0.6;
       }
       40% {
@@ -162,7 +162,7 @@ export class CrowClawMemoryStream extends LitElement {
     }
 
     .arrow.recalled {
-      color: var(--accent, #e05545);
+      color: var(--accent, #5b8def);
     }
 
     .body {
@@ -182,7 +182,7 @@ export class CrowClawMemoryStream extends LitElement {
     }
 
     .label.captured { color: var(--success, #30d158); }
-    .label.recalled { color: var(--accent, #e05545); }
+    .label.recalled { color: var(--accent, #5b8def); }
 
     .summary {
       font-size: var(--text-sm, 13px);

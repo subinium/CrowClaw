@@ -36,7 +36,7 @@ export class CrowClawStatusDot extends LitElement {
     .dot.sm { width: 8px; height: 8px; }
     .dot.md { width: 10px; height: 10px; }
 
-    .dot.running { background: var(--accent, #e05545); }
+    .dot.running { background: var(--accent, #5b8def); }
     .dot.ok      { background: var(--success, #30d158); }
     .dot.warn    { background: var(--warn, var(--warning, #ffd60a)); }
     .dot.error   { background: var(--error, #ff453a); }
@@ -55,7 +55,7 @@ export class CrowClawStatusDot extends LitElement {
       animation: cc-dot-pulse 1.6s ease-out infinite;
       pointer-events: none;
     }
-    .dot.running.pulse::after { color: var(--accent, #e05545); }
+    .dot.running.pulse::after { color: var(--accent, #5b8def); }
     .dot.ok.pulse::after      { color: var(--success, #30d158); }
     .dot.warn.pulse::after    { color: var(--warn, var(--warning, #ffd60a)); }
     .dot.error.pulse::after   { color: var(--error, #ff453a); }
