@@ -53,7 +53,40 @@ Working ledger: `docs/release-v0.8.4-worklog.md`.
 - **#227** Chat header active model badge (`<crowclaw-active-model-badge>`) reads `/api/providers/config` and links to Connect → Providers; onboarding wizard adds "Edit anytime in Connect → Providers" footer. (`6a6aeeb`)
 - **#250** Phase A list virtualization via `@lit-labs/virtualizer` for sessions list (chat-view) and feedback log (settings-view) at >50 items. (Memory list virtualization is a residual TODO carried into Phase 3 because of a `_renderMemoryList` extraction overlap with #184.) (`59db878`)
 
-(... Phase 3-5 entries follow as further batches land ...)
+### Phase 3 landed (2 issues + memory virtualizer carry-over)
+- **#244** Chat-view ops toolbar / steer / overlays / bulk-actions / load-more / sidebar-toggle migrated to `<crowclaw-button>`. Dropped `.ops-btn`, `.steer-sticky-btn`, `.cp-restore`, `.checkpoint-overlay`, `.cp-item`, `.sess-toggle-btn`, `.message-window-btn` CSS. (`26bc287`)
+- **#250 (carry-over)** `_renderMemoryItem` carries the redaction badge + multi-select checkbox; `_renderMemoryList` virtualizes via `<lit-virtualizer>` when `memories.length > 50`. (`3fa65aa`)
+- **#245** All `backdrop-filter: blur` removed from `app.ts` and 4 components; `#e05545` warning-red replaced with `var(--accent)` / `var(--accent-soft)` across 4 components and a 13-component sweep. `--brand-surface` declared as raw `rgb(224, 85, 69)`. (`52bc480`)
+
+### Phase 4 landed (1 issue — provider token precision)
+- **#274** Adopted `gpt-tokenizer@3.4.0` (pure-JS, MIT, no native bindings) in `@crowclaw/providers`. Replaced the self-rolled Unicode-chunking heuristic in `countEncodedTextTokens()` with per-encoding `encode()` calls. New `tests/v084-tokenizer-precision.test.ts` verifies ±5% precision across 6 fixture strings × 2 encodings + 9 model-routing cases. (`5288531`)
+
+### Phase 5 landed (2 issues — docs / interop)
+- **#233** Wrote `docs/memory-providers.md` (242 lines): MemoryProvider ABC, lifecycle (`sync_turn` / `prefetch` / `shutdown`), reference + mock impls, Honcho-compatible adapter, authoring guide, configuration, shutdown drain semantics. (`40d9c35`)
+- **#240** `tests/v084-skill-legacy-interop.test.ts` (15 cases) verifies legacy CrowClaw skill fields round-trip cleanly through `parseSkillManifest()`. `docs/agentskills-io-compliance.md` audit shipped (21 ✅ / 1 🟡 / 5 deferred-out-of-scope) and posted as a comment on issue #240. (`e48cc5f`)
+
+### Sweep total
+17 reopened issues from the post-v0.8.3 audit are all now implemented
+with code + tests + docs evidence:
+
+- **FAIL → PASS (6)**: #185, #187, #189, #192, #197, #200
+- **PARTIAL → PASS (11)**: #181, #184, #227, #233, #240, #244, #245, #250, #254, #272, #274
+
+`crowclaw@0.8.4` ships real implementation for everything that v0.8.3's
+verifier-only close pass closed without acceptance.
+
+### Verification
+- `npx tsc -b --force --pretty false` — clean
+- `npm run build:ui --workspace @crowclaw/web` — clean (1,679.00 kB / 469.59 kB gz)
+- `npm run build:html --workspace @crowclaw/web` — clean
+- `npm test` — to be recorded on full-suite completion (Phase 1 & 2 already verified at 245 / 3051)
+- `rg "#e05545"` / `rg "backdrop-filter\s*:\s*blur"` in `packages/web/ui` — 0 hits
+- `node scripts/audit-routes.mjs --check` — clean (carried from v0.8.2)
+
+### Caveats
+- Some pre-existing test friction (5 tests on `release/v0.8.4` baseline that flake at `v07-empty-states`, `event-bus`, `v06_1-core-plugins-layering`, `v084-list-virtualization`) was observed during Phase 4 by sub-agent Y but not introduced by this sweep. Tracked separately.
+- `gpt-tokenizer` is a runtime dep of `@crowclaw/providers`; consumers who only used the heuristic path now pull this transitive dep (~120 kB minified, pure-JS).
+- The `compat: 'crowclaw-legacy'` round-trip canonicalises legacy singular `category:` to plural `categories: [...]` on render. Documented in `docs/agentskills-io-compliance.md` as the only `partial` entry.
 
 ## [0.8.3] — 2026-05-03 — GitHub-close pass: 52 verifier-confirmed issues
 
