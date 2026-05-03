@@ -2367,17 +2367,70 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
       }
 
       if (request.method === 'GET' && url.pathname === '/api/sessions') {
-        const limitParam = Number(url.searchParams.get('limit') ?? '50');
-        const limit = Number.isFinite(limitParam) ? limitParam : 50;
+        // #192: paginated, searchable, status-filtered sessions list.
+        // Query params:
+        //   ?search=     substring match against title or first user message
+        //   ?status=     active | completed | failed | all (default: all)
+        //   ?limit=      page size (default 50, capped at 200)
+        //   ?cursor=     last sessionId of the previous page (keyset on
+        //                (updatedAt DESC, sessionId DESC))
+        const DEFAULT_LIMIT = 50;
+        const MAX_LIMIT = 200;
+        const limitRaw = Number(url.searchParams.get('limit') ?? String(DEFAULT_LIMIT));
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0
+          ? Math.min(Math.floor(limitRaw), MAX_LIMIT)
+          : DEFAULT_LIMIT;
+        const searchRaw = url.searchParams.get('search') ?? '';
+        const search = searchRaw.trim().toLowerCase();
+        const statusParam = (url.searchParams.get('status') ?? 'all').toLowerCase();
+        const status = (['active', 'completed', 'failed', 'all'] as const).includes(statusParam as never)
+          ? (statusParam as 'active' | 'completed' | 'failed' | 'all')
+          : 'all';
+        const cursor = url.searchParams.get('cursor');
+
         const listStore = store as InMemorySessionStore & SessionListStore;
-        const sessions = typeof listStore.listRecent === 'function'
-          ? await listStore.listRecent(limit)
-          : [];
-        // #187: enrich each session with its memory footprint
-        // (memoryEntryCount + memoryBytes). Best-effort — if
-        // memoryService.list() rejects (e.g. backend offline), surface the
+        const supported = typeof listStore.listRecent === 'function';
+        // #192: fetch a wide window so we can filter and paginate in-route
+        // without depending on storage-layer cursor support. The 1000-row cap
+        // matches existing dashboard scale and keeps memory bounded.
+        const FETCH_CAP = 1000;
+        const allRecent = supported ? await listStore.listRecent(FETCH_CAP) : [];
+
+        // #192: status classification.
+        //  - active: session is currently running or aborting
+        //    (sessionController tracks this in-process)
+        //  - failed: last non-system message is a tool call with ok=false
+        //  - completed: any other persisted state
+        const classifyStatus = (s: { sessionId: string; messages: ReadonlyArray<{ role: string; metadata?: { ok?: boolean } }> }): 'active' | 'completed' | 'failed' => {
+          if (sessionController.isActive(s.sessionId)) return 'active';
+          for (let i = s.messages.length - 1; i >= 0; i--) {
+            const m = s.messages[i];
+            if (!m || m.role === 'system') continue;
+            if (m.role === 'tool' && m.metadata && m.metadata.ok === false) {
+              return 'failed';
+            }
+            break;
+          }
+          return 'completed';
+        };
+
+        const matchesSearch = (s: { messages: ReadonlyArray<{ role: string; content?: string }> }): boolean => {
+          if (!search) return true;
+          // Reuse the same title-derivation rules as summarizeSessionRecord
+          // so search behaves consistently with what the UI displays.
+          const renameMeta = s.messages.find(
+            (m) => m.role === 'system' && typeof m.content === 'string' && m.content.startsWith('[session-meta] name='),
+          );
+          const title = renameMeta?.content?.replace('[session-meta] name=', '').trim() ?? '';
+          const firstUser = s.messages.find((m) => m.role === 'user');
+          const firstUserContent = firstUser?.content ?? '';
+          return title.toLowerCase().includes(search) || firstUserContent.toLowerCase().includes(search);
+        };
+
+        // #187: enrich each session with its memory footprint. Best-effort —
+        // if memoryService.list() rejects (e.g. backend offline), surface the
         // session without the metric rather than failing the whole request.
-        const enriched: SessionState[] = await Promise.all(sessions.map(async (session) => {
+        const enriched: SessionState[] = await Promise.all(allRecent.map(async (session) => {
           if (typeof memoryService?.list !== 'function') return session;
           try {
             const records = await memoryService.list(session.sessionId);
@@ -2394,11 +2447,35 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
             return session;
           }
         }));
+
+        // Filter, then paginate. Order is already updatedAt DESC from
+        // listRecent; we add a sessionId tiebreaker so the cursor stays
+        // deterministic across calls (listRecent does not promise this).
+        const filtered = enriched
+          .filter((s) => (status === 'all' ? true : classifyStatus(s) === status))
+          .filter(matchesSearch)
+          .sort((a, b) => {
+            const cmp = b.updatedAt.localeCompare(a.updatedAt);
+            return cmp !== 0 ? cmp : b.sessionId.localeCompare(a.sessionId);
+          });
+
+        let startIndex = 0;
+        if (cursor) {
+          const idx = filtered.findIndex((s) => s.sessionId === cursor);
+          startIndex = idx >= 0 ? idx + 1 : filtered.length;
+        }
+        const pageRecords = filtered.slice(startIndex, startIndex + limit);
+        const nextCursor = startIndex + pageRecords.length < filtered.length
+          ? (pageRecords[pageRecords.length - 1]?.sessionId ?? null)
+          : null;
+
         return Response.json({
           ok: true,
-          supported: typeof listStore.listRecent === 'function',
-          count: enriched.length,
-          sessions: enriched.map(summarizeSessionRecord)
+          supported,
+          count: pageRecords.length,
+          totalCount: filtered.length,
+          nextCursor,
+          sessions: pageRecords.map(summarizeSessionRecord),
         });
       }
 
