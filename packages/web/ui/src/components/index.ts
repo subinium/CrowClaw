@@ -131,3 +131,14 @@ export {
 } from './persona-pill.js';
 import './persona-pill.js';
 
+/**
+ * v0.8.4 (#227) — `<crowclaw-active-model-badge>`. Header badge showing the
+ * primary provider/model so the user can verify what's powering chat without
+ * leaving the surface.
+ */
+export {
+  CrowClawActiveModelBadge,
+  formatActiveModel,
+} from './active-model-badge.js';
+export type { ProviderBadgeSlot } from './active-model-badge.js';
+import './active-model-badge.js';
