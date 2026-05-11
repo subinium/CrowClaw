@@ -48,6 +48,62 @@ export interface PluginHookPayloads {
   'tool:beforeExecute': { toolName: string; input: Record<string, unknown>; sessionId: string; agentId: string };
   'tool:result': { result: { toolName: string; ok: boolean; output: string }; sessionId: string; agentId: string };
   'tool:error': { result: { toolName: string; ok: boolean; output: string }; sessionId: string; agentId: string };
+  /**
+   * #302 (v0.9.0 Hermes parity): observer hook fired when the
+   * `transformLLMOutput` chain drops a turn (any plugin returned `null`).
+   * The agent loop logs this and treats it as a retry trigger.
+   */
+  'plugin:llm_output_dropped': {
+    sessionId: string;
+    agentId: string;
+    iteration: number;
+    pluginName: string;
+    /** Optional reason string the plugin can return alongside `null`. */
+    reason?: string;
+  };
+}
+
+/**
+ * #302 (v0.9.0 Hermes parity): minimal shape of the assistant message a
+ * plugin can reshape via `transformLLMOutput`. Mirrors the runtime
+ * `ProviderResponse` surface but is intentionally restated here so the
+ * plugin contract stays a leaf module (no upward import of the agent loop
+ * types).
+ */
+export interface AssistantMessage {
+  /** Stripped assistant text. May be empty when only `toolCalls` are present. */
+  assistantMessage?: string;
+  /** Tool calls extracted from the provider response, if any. */
+  toolCalls?: Array<{ name: string; input: Record<string, unknown> }>;
+  /** Optional reasoning blocks (Hermes-style XML) parsed by the provider. */
+  reasoningBlocks?: unknown[];
+}
+
+/**
+ * #302: return shape for `transformLLMOutput`.
+ *
+ *   - return an `AssistantMessage` to replace the running message body
+ *   - return `null` to drop the turn entirely (agent loop retries and emits
+ *     `plugin:llm_output_dropped`)
+ *   - return `undefined` (or no value) to leave the running message unchanged
+ *
+ * `reason` is an optional log/debug hint surfaced via the dropped-turn event.
+ */
+export type LLMOutputTransform = AssistantMessage | { drop: true; reason?: string } | null | void;
+
+/**
+ * #302 (v0.9.0): per-turn context handed to `transformLLMOutput` plugins.
+ * Mirrors what providers see at generate time plus the iteration index so
+ * plugins can branch on early vs late iterations.
+ */
+export interface LLMOutputTurn {
+  sessionId: string;
+  agentId: string;
+  /** 0-based agent-loop iteration. First call (before the first tool round
+   *  trip) is iteration 0; subsequent retries reuse the same index. */
+  iteration: number;
+  /** Snapshot of the prompt messages sent to the provider for this turn. */
+  messages: Array<{ role: string; content: string }>;
 }
 
 /**
@@ -71,6 +127,16 @@ export interface PluginInvocationPayloads {
       agentId: string;
     };
     result: ToolResultTransform | void;
+  };
+  /**
+   * #302 (v0.9.0 Hermes parity): post-generation transform on the raw
+   * assistant message. Runs in registration order; later plugins see the
+   * output of earlier ones. Returning `null` drops the turn entirely and
+   * triggers a retry.
+   */
+  'llm:transformOutput': {
+    payload: { turn: LLMOutputTurn; raw: AssistantMessage };
+    result: LLMOutputTransform;
   };
 }
 
@@ -100,6 +166,40 @@ export interface Plugin {
     payload: PluginInvocationPayloads['tool:transformResult']['payload'],
     context: PluginContext,
   ): Promise<ToolResultTransform | void> | ToolResultTransform | void;
+  /**
+   * #302 (v0.9.0 Hermes parity): post-generation transform on the raw
+   * assistant message. Sibling to `transformToolResult` but for the LLM
+   * response stream — runs AFTER the provider returns but BEFORE the agent
+   * loop appends to `session.messages` and BEFORE tool extraction. Plugins
+   * see the prior plugin's output (registration-order chain) and may:
+   *
+   *   - return an `AssistantMessage` to replace the running message
+   *   - return `null` (or `{ drop: true, reason }`) to drop the turn — the
+   *     loop retries up to `maxLLMOutputRetries` and emits
+   *     `plugin:llm_output_dropped`
+   *   - return `undefined` to leave the running message untouched
+   *
+   * Throwing here passes the prior message through unchanged (parity with
+   * `transformToolResult`). Plugins cannot un-redact secrets — the core
+   * redaction pass runs AFTER the chain so injected credentials still get
+   * scrubbed.
+   */
+  transformLLMOutput?(
+    payload: PluginInvocationPayloads['llm:transformOutput']['payload'],
+    context: PluginContext,
+  ): Promise<LLMOutputTransform> | LLMOutputTransform;
+}
+
+/**
+ * #302 (v0.9.0): canonical "turn was dropped" outcome returned by
+ * `PluginManager.transformLLMOutput` when any plugin in the chain asked
+ * to drop. Carries the dropping plugin's name + optional reason so the
+ * agent loop can populate the `plugin:llm_output_dropped` event.
+ */
+export interface LLMOutputDroppedOutcome {
+  dropped: true;
+  pluginName: string;
+  reason?: string;
 }
 
 export class PluginManager {
@@ -184,6 +284,61 @@ export class PluginManager {
         };
       } catch (error) {
         // Plugin error: keep prior result, continue with the next plugin.
+        void error;
+      }
+    }
+    return current;
+  }
+
+  /**
+   * #302 (v0.9.0 Hermes parity): run post-generation transforms across all
+   * registered plugins. Chain semantics mirror `transformToolResult`:
+   *
+   *   - Plugins execute in registration order
+   *   - Each plugin sees the output of the previous transform
+   *   - `void` / `undefined` leaves the running message unchanged
+   *   - A plugin that returns `null` (or `{ drop: true }`) short-circuits
+   *     the chain and the manager returns `{ dropped: true, pluginName }`
+   *   - A plugin that throws is logged-and-skipped; the chain continues
+   *     with the prior message intact (matches `transformToolResult`
+   *     resilience contract — a buggy plugin must not lock out turns)
+   *
+   * The caller is responsible for the subsequent redaction pass — this
+   * keeps the manager free of the security imports that would otherwise
+   * create an upward dependency.
+   */
+  async transformLLMOutput(
+    payload: PluginInvocationPayloads['llm:transformOutput']['payload'],
+    context: PluginContext,
+  ): Promise<AssistantMessage | LLMOutputDroppedOutcome> {
+    let current: AssistantMessage = payload.raw;
+    for (const plugin of this.plugins.values()) {
+      if (!plugin.transformLLMOutput) continue;
+      try {
+        const transform = await plugin.transformLLMOutput(
+          { turn: payload.turn, raw: current },
+          context,
+        );
+        if (transform === undefined) continue;
+        if (transform === null) {
+          return { dropped: true, pluginName: plugin.name };
+        }
+        if (typeof transform === 'object' && 'drop' in transform && transform.drop === true) {
+          return { dropped: true, pluginName: plugin.name, reason: transform.reason };
+        }
+        // Object return: replace the running message. Fields the plugin
+        // omits fall back to the prior message so partial transforms don't
+        // accidentally erase toolCalls.
+        const asMessage = transform as AssistantMessage;
+        current = {
+          assistantMessage: asMessage.assistantMessage ?? current.assistantMessage,
+          toolCalls: asMessage.toolCalls ?? current.toolCalls,
+          reasoningBlocks: asMessage.reasoningBlocks ?? current.reasoningBlocks,
+        };
+      } catch (error) {
+        // Plugin error: keep prior message, continue with the next plugin.
+        // (Parity with `transformToolResult` — a buggy plugin cannot stall
+        // the loop.)
         void error;
       }
     }

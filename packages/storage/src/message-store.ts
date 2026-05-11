@@ -196,7 +196,12 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
+-- #337 (v0.9.0 Hermes parity): tokenize='trigram' replaces the default
+-- unicode61 tokenizer so CJK substring search hits the FTS5 index instead
+-- of degrading to LIKE. Existing deployments migrate at startup via
+-- runFts5TrigramMigration in @crowclaw/storage.
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-  content, session_id UNINDEXED, id UNINDEXED
+  content, session_id UNINDEXED, id UNINDEXED,
+  tokenize='trigram'
 );
 `;

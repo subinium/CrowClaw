@@ -682,6 +682,7 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
     setPersonaPrompt,
     trackLearning,
     getRequestLocale,
+    getRequestSessionKey,
     normalizeCheckpointTrigger,
     directToolAliases,
     summarizeDirectTools,
@@ -4826,8 +4827,12 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           });
         }
 
-        const body = (await request.json()) as { userMessage: string; userId?: string; workspaceId?: string; locale?: unknown };
+        const body = (await request.json()) as { userMessage: string; userId?: string; workspaceId?: string; locale?: unknown; sessionKey?: unknown };
         const locale = getRequestLocale(request, body);
+        // #304 (v0.9.0 Hermes parity): plumb the stable client memory key
+        // from the X-CrowClaw-Session-Key header (or `body.sessionKey`) so
+        // memory recall survives sessionId rotation.
+        const sessionKey = getRequestSessionKey(request, body);
         eventBus.emit('chat:message', { sessionId, userMessage: body.userMessage });
         const result = await runConfiguredAgent({
           sessionId,
@@ -4835,6 +4840,7 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           userId: body.userId,
           workspaceId: body.workspaceId,
           locale,
+          sessionKey,
           systemPrompt: 'You are CrowClaw, an AI assistant with tool-use capabilities. You can search the web, read/write files, manage scheduled tasks and reminders, and more. Use your available tools proactively to fulfill user requests.'
         });
         const capturedSync = await memoryService.captureSessionSummary(sessionId, result.session.messages);

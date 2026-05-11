@@ -12,6 +12,10 @@ export type {
   PluginInvocationPayloads,
   PreToolCallVeto,
   ToolResultTransform,
+  AssistantMessage,
+  LLMOutputTransform,
+  LLMOutputTurn,
+  LLMOutputDroppedOutcome,
 } from './plugins.js';
 import { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
 import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, localizeSkillFile, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
@@ -217,6 +221,23 @@ export interface AgentRunInput {
   memories?: string[];
   /** Preferred UI/user locale for dynamic system prompt language. */
   locale?: SupportedLocale;
+  /**
+   * #304 (v0.9.0 Hermes parity): stable per-client memory namespace key.
+   * Propagated through `MemoryProvider.recall / store / prefetch` so adapters
+   * can bind long-term memory to a client-supplied identifier (Telegram
+   * chat_id, desktop install ID, browser fingerprint) that survives
+   * `/new`-style sessionId rotation.
+   *
+   * Sourced (in order of precedence) from:
+   *   1. `X-CrowClaw-Session-Key` request header
+   *   2. `body.sessionKey` on the inbound HTTP/WS payload
+   *   3. undefined — providers fall back to sessionId/userId as today
+   *
+   * Adapters that don't recognise `sessionKey` keep working unchanged
+   * (backward compatible). See `getRequestSessionKey` in
+   * `packages/runtime-node/src/runtime-support.ts` for the wire extractor.
+   */
+  sessionKey?: string;
 }
 
 /**
@@ -360,6 +381,12 @@ export interface AgentLoopOptions {
   /** #235 (v0.8.0): consecutive identical (toolName, errorCode) failures that
    *  trigger a terminal exit. Default: 3 (Hermes pattern). */
   toolFailureStreakLimit?: number;
+  /** #302 (v0.9.0 Hermes parity): how many times the loop will re-fetch the
+   *  LLM output after a plugin in the `transformLLMOutput` chain returns
+   *  `null` (drop). Default: 2. Each drop emits
+   *  `plugin:llm_output_dropped`; after the cap the loop falls through with
+   *  the last received message. */
+  maxLLMOutputRetries?: number;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -659,6 +686,9 @@ export class AgentLoop {
   private readonly eventBus?: AgentEventEmitter;
   /** #235 (v0.8.0): consecutive identical (toolName, errorCode) cap. */
   private readonly toolFailureStreakLimit: number;
+  /** #302 (v0.9.0): how many times `applyLLMOutputPipeline` will refetch when
+   *  a plugin in the chain returns null. */
+  private readonly maxLLMOutputRetries: number;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -713,6 +743,7 @@ export class AgentLoop {
     this.fallbackProviderNames = options.fallbackProviderNames ?? [];
     this.eventBus = options.eventBus;
     this.toolFailureStreakLimit = options.toolFailureStreakLimit ?? 3;
+    this.maxLLMOutputRetries = options.maxLLMOutputRetries ?? 2;
   }
 
   private auditProvenance(input?: { agentId?: string; sessionId?: string }): {
@@ -1361,6 +1392,141 @@ export class AgentLoop {
     };
   }
 
+  // ───────────────────────────────────────────────────────────────────────
+  // #302 (v0.9.0) BEGIN — applyLLMOutputPipeline / response-merge section.
+  // This block wires the new `transformLLMOutput` plugin hook into the
+  // agent loop. Agent D (steer/queue) should not touch the helpers below;
+  // they live deliberately adjacent to `applyResultPipeline` so the two
+  // pipelines stay symmetric.
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * #302 (v0.9.0 Hermes parity): sibling of `applyResultPipeline` for the
+   * LLM response stream. Order is:
+   *
+   *   1. Plugin `transformLLMOutput` chain — registration-order, exception-
+   *      resilient. Plugins may rewrite the message, drop the turn, or pass
+   *      through. Drops trigger a refetch up to `maxLLMOutputRetries`.
+   *   2. Core redaction (credentials/PII + indirect-injection wrap) of the
+   *      final assistant text — guarantees plugins cannot un-redact or
+   *      smuggle credentials into the prompt history.
+   *
+   * The refetch loop calls `regenerate` (passed in by the caller) to obtain
+   * a fresh `ProviderResponse` after a drop. Returning `null` from the
+   * pipeline means we exhausted retries with the final attempt also
+   * dropped — the caller falls through to the most recent non-dropped
+   * message (legacy behaviour) and the loop continues so the user still
+   * sees a response.
+   */
+  private async applyLLMOutputPipeline(
+    initial: ProviderResponse,
+    turn: { sessionId: string; agentId: string; iteration: number; messages: ConversationMessage[] },
+    regenerate: () => Promise<ProviderResponse>,
+  ): Promise<ProviderResponse> {
+    let current = initial;
+    let attempt = 0;
+    const maxRetries = this.maxLLMOutputRetries;
+
+    while (true) {
+      // Plugin chain. Run only when plugins are wired AND at least one plugin
+      // exposes `transformLLMOutput`. Avoids the per-iteration object alloc
+      // for the common case of no LLM-output plugins.
+      if (this.plugins) {
+        const hasTransform = this.plugins.list().some((p) => typeof p.transformLLMOutput === 'function');
+        if (hasTransform) {
+          const result = await this.plugins.transformLLMOutput(
+            {
+              turn: {
+                sessionId: turn.sessionId,
+                agentId: turn.agentId,
+                iteration: turn.iteration,
+                messages: turn.messages.map((m) => ({ role: m.role, content: m.content })),
+              },
+              raw: {
+                assistantMessage: current.assistantMessage,
+                toolCalls: current.toolCalls,
+                reasoningBlocks: current.reasoningBlocks,
+              },
+            },
+            { runtime: this.runtimeName, sessionId: turn.sessionId, agentId: turn.agentId },
+          );
+
+          // Discriminate via `dropped`. The manager guarantees that field is
+          // ONLY set on the drop outcome — narrow with an explicit cast so
+          // TS resolves the two arms without us writing a user-defined
+          // type guard (the field name is unique enough).
+          const isDropped = (value: typeof result): value is { dropped: true; pluginName: string; reason?: string } =>
+            (value as { dropped?: unknown }).dropped === true;
+          if (isDropped(result)) {
+            // Emit observer hook so operators can audit dropped turns.
+            await this.plugins.emit(
+              'plugin:llm_output_dropped',
+              {
+                sessionId: turn.sessionId,
+                agentId: turn.agentId,
+                iteration: turn.iteration,
+                pluginName: result.pluginName,
+                reason: result.reason,
+              },
+              { runtime: this.runtimeName, sessionId: turn.sessionId, agentId: turn.agentId },
+            );
+            this.eventBus?.emit('plugin:llm_output_dropped', {
+              sessionId: turn.sessionId,
+              agentId: turn.agentId,
+              iteration: turn.iteration,
+              pluginName: result.pluginName,
+              reason: result.reason ?? '',
+              attempt,
+            });
+
+            if (attempt < maxRetries) {
+              attempt += 1;
+              current = await regenerate();
+              continue;
+            }
+            // Exhausted: fall through with the most recent message body so
+            // the agent can still produce something. Plugins that need a
+            // hard fail should throw, not drop.
+            break;
+          }
+
+          // Plugin chain produced a (possibly rewritten) message. Carry over
+          // the usage/reasoning fields that the plugins don't own.
+          current = {
+            ...current,
+            assistantMessage: result.assistantMessage,
+            toolCalls: result.toolCalls ?? current.toolCalls,
+            reasoningBlocks: (result.reasoningBlocks as ProviderResponse['reasoningBlocks']) ?? current.reasoningBlocks,
+          };
+        }
+      }
+      break;
+    }
+
+    // Redaction pass. Plugins are intentionally never trusted to scrub
+    // secrets — this guarantees that even a plugin that injects a fake API
+    // key into the assistant text gets the credential redacted before it
+    // reaches the conversation history or the next provider call.
+    if (this.securityPolicy.redactToolOutput && current.assistantMessage) {
+      const redacted = redactToolOutputFn(current.assistantMessage);
+      if (redacted !== current.assistantMessage) {
+        this.securityAuditLog?.record({
+          type: 'credential_redacted',
+          severity: 'info',
+          detail: `Credentials/PII redacted in assistant message (plugin transform pipeline)`,
+          ...this.auditProvenance({ agentId: turn.agentId, sessionId: turn.sessionId }),
+        });
+        current = { ...current, assistantMessage: redacted };
+      }
+    }
+
+    return current;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // #302 (v0.9.0) END — applyLLMOutputPipeline / response-merge section.
+  // ───────────────────────────────────────────────────────────────────────
+
   /**
    * #235 (v0.8.0): execute a single tool call, but FIRST validate its input
    * against the tool's `inputSchema` (if declared). On validation failure,
@@ -1688,6 +1854,16 @@ export class AgentLoop {
       }
     }
 
+    // #302 (v0.9.0): plugin transformLLMOutput chain + redaction.
+    // Runs once per generated message before tool extraction / history
+    // append. A plugin that returns null forces a refetch up to
+    // `maxLLMOutputRetries`.
+    currentResponse = await this.applyLLMOutputPipeline(
+      currentResponse,
+      { sessionId: input.sessionId, agentId: input.agentId, iteration: 0, messages: nextMessages },
+      () => this.generateWithFallbacks(buildRequest(nextMessages), pluginCtx),
+    );
+
     // Track 1.2: Record usage from initial provider call
     let totalTokensConsumed = this.recordUsage(currentResponse);
 
@@ -1988,15 +2164,28 @@ export class AgentLoop {
 
       // #43/#44 perf: reuse cachedSystemPrompt + toolList instead of rebuilding.
       // #54: prepend any drained steer messages for *this turn only*.
-      currentResponse = await this.generateWithFallbacks({
+      const iterationMessages = turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages;
+      const fetchIterationResponse = () => this.generateWithFallbacks({
         systemPrompt: cachedSystemPrompt,
-        messages: turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages,
+        messages: iterationMessages,
         availableTools: toolList,
-        signal: input.signal
+        signal: input.signal,
       }, {
         sessionId: input.sessionId,
-        agentId: input.agentId
+        agentId: input.agentId,
       });
+      currentResponse = await fetchIterationResponse();
+
+      // #302 (v0.9.0): rerun the plugin transformLLMOutput chain + redaction
+      // on every iteration's fresh response. Drops trigger a regenerate
+      // bounded by `maxLLMOutputRetries`; the supplied closure rebuilds the
+      // exact same request the loop just issued so retries see the same
+      // context.
+      currentResponse = await this.applyLLMOutputPipeline(
+        currentResponse,
+        { sessionId: input.sessionId, agentId: input.agentId, iteration: iteration + 1, messages: iterationMessages },
+        fetchIterationResponse,
+      );
 
       // Track 1.2: Record usage from subsequent provider calls
       totalTokensConsumed = this.recordUsage(currentResponse);
@@ -2029,7 +2218,7 @@ export class AgentLoop {
           createdAt: nowIso(),
           metadata: { ephemeral: true, kind: 'budget-exhausted', reason },
         });
-        const synthesisResponse = await this.generateWithFallbacks({
+        const synthesisRequest = {
           systemPrompt: this.buildSystemPromptForRequest({
             basePrompt: input.systemPrompt, runtimeName: this.runtimeName,
             sessionId: input.sessionId, availableTools: [],
@@ -2038,7 +2227,16 @@ export class AgentLoop {
           messages: nextMessages,
           availableTools: [], // No tools — force text response
           signal: input.signal,
-        }, { sessionId: input.sessionId, agentId: input.agentId });
+        };
+        const fetchSynthesis = () => this.generateWithFallbacks(synthesisRequest, { sessionId: input.sessionId, agentId: input.agentId });
+        let synthesisResponse = await fetchSynthesis();
+        // #302 (v0.9.0): apply plugin LLM-output pipeline + redaction to the
+        // synthesis turn so it stays symmetric with regular iterations.
+        synthesisResponse = await this.applyLLMOutputPipeline(
+          synthesisResponse,
+          { sessionId: input.sessionId, agentId: input.agentId, iteration: iterationsCompleted + 1, messages: nextMessages },
+          fetchSynthesis,
+        );
         finalResponse = synthesisResponse.assistantMessage ?? finalResponse ?? 'Reached maximum tool iterations.';
         terminationReason = 'budget_exhausted_with_synthesis';
       } else {

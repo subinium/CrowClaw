@@ -858,9 +858,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   payload TEXT NOT NULL
 );
 
+-- #337 (v0.9.0 Hermes parity): tokenize='trigram' replaces the default
+-- unicode61 tokenizer so CJK (Chinese/Japanese/Korean) substring search
+-- hits the FTS5 index instead of falling back to a LIKE scan. Existing
+-- deployments are migrated by \`runFts5TrigramMigration\` at startup.
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
   session_id UNINDEXED,
-  content
+  content,
+  tokenize='trigram'
 );
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -873,6 +878,185 @@ CREATE TABLE IF NOT EXISTS memories (
   created_at TEXT NOT NULL,
   metadata_json TEXT
 );
+
+-- #337 (v0.9.0): companion FTS5 index for the memories table. Same trigram
+-- tokenizer so summary text indexed for fast CJK substring search.
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  memory_id UNINDEXED,
+  session_id UNINDEXED,
+  scope UNINDEXED,
+  summary,
+  tokenize='trigram'
+);
 `;
 
 export { InMemoryMessageStore, MESSAGE_STORE_SCHEMA, type StoredMessage, type MessageQuery, type MessageStats, type MessageStore } from './message-store.js';
+export {
+  pruneOrphanCheckpoints,
+  formatPruneSummary,
+  type OrphanPrunerOptions,
+  type OrphanPruneResult,
+} from './orphan-pruner.js';
+
+// ---------------------------------------------------------------------------
+// #337 (v0.9.0 Hermes parity) — FTS5 trigram migration
+// ---------------------------------------------------------------------------
+
+/**
+ * #337 (v0.9.0): one-shot, idempotent FTS5 trigram migration. Old SQLite
+ * deployments may have FTS5 virtual tables built with the default
+ * unicode61 tokenizer, which treats CJK strings as single tokens and
+ * degrades substring search to a LIKE scan. This helper detects each
+ * affected virtual table, drops it, recreates it with `tokenize='trigram'`,
+ * and rebuilds the index from the canonical row source.
+ *
+ * Idempotency: we inspect `sqlite_master.sql` for the table; if it
+ * already contains `tokenize='trigram'` we skip. So calling the helper
+ * on every cold start is safe (the documented contract from #337).
+ *
+ * Returns per-table outcomes so the runtime startup log can print
+ * something like `pruned ... ; fts5: sessions_fts=migrated,
+ * memories_fts=already-trigram, messages_fts=skipped(no rows)`.
+ */
+export interface Fts5TrigramMigrationResult {
+  table: string;
+  status: 'migrated' | 'already-trigram' | 'absent';
+  rowsIndexed?: number;
+}
+
+interface MigrationCandidate {
+  /** FTS5 virtual table name (e.g. `sessions_fts`). */
+  ftsTable: string;
+  /** Tokenizer-bearing column declarations the recreate uses. Mirrors the
+   *  bootstrap schema in this file / `MESSAGE_STORE_SCHEMA`. */
+  recreateSql: string;
+  /** SQL that selects the rows to rebuild the FTS index from. The columns
+   *  must match the FTS5 column ordering in `recreateSql`. */
+  rebuildSelect?: string;
+  /** Optional column count in the INSERT statement when rebuilding. */
+  rebuildColumns?: string[];
+}
+
+const MIGRATION_CANDIDATES: MigrationCandidate[] = [
+  {
+    ftsTable: 'sessions_fts',
+    recreateSql: `CREATE VIRTUAL TABLE sessions_fts USING fts5(
+      session_id UNINDEXED,
+      content,
+      tokenize='trigram'
+    )`,
+    // sessions_fts is fed from `sessions.payload` (JSON-serialized session)
+    // — the historical D1SessionStore.indexSession path projects message
+    // content into the FTS row. We rebuild by walking the sessions table
+    // and pulling the transcript out of payload JSON.
+    rebuildSelect: 'SELECT id, payload FROM sessions',
+    rebuildColumns: ['session_id', 'content'],
+  },
+  {
+    ftsTable: 'memories_fts',
+    recreateSql: `CREATE VIRTUAL TABLE memories_fts USING fts5(
+      memory_id UNINDEXED,
+      session_id UNINDEXED,
+      scope UNINDEXED,
+      summary,
+      tokenize='trigram'
+    )`,
+    // SELECT AS to map source `memories.id` → FTS column `memory_id`. The
+    // migration code reads `row[col]` for each rebuildColumn, so the SELECT
+    // aliases must mirror the FTS column ordering exactly.
+    rebuildSelect: 'SELECT id AS memory_id, session_id, scope, summary FROM memories',
+    rebuildColumns: ['memory_id', 'session_id', 'scope', 'summary'],
+  },
+  {
+    ftsTable: 'messages_fts',
+    recreateSql: `CREATE VIRTUAL TABLE messages_fts USING fts5(
+      content, session_id UNINDEXED, id UNINDEXED,
+      tokenize='trigram'
+    )`,
+    rebuildSelect: 'SELECT content, session_id, id FROM messages',
+    rebuildColumns: ['content', 'session_id', 'id'],
+  },
+];
+
+export async function runFts5TrigramMigration(db: D1DatabaseLike): Promise<Fts5TrigramMigrationResult[]> {
+  const results: Fts5TrigramMigrationResult[] = [];
+  for (const candidate of MIGRATION_CANDIDATES) {
+    const stmt = db.prepare(`SELECT sql FROM sqlite_master WHERE type IN ('table','view') AND name = ?1`).bind(candidate.ftsTable);
+    let row: { sql?: string } | null = null;
+    try {
+      if (stmt.first) {
+        row = await stmt.first<{ sql?: string }>();
+      }
+    } catch {
+      // sqlite_master may not exist in fake D1s. Treat as absent.
+    }
+
+    if (!row || !row.sql) {
+      results.push({ table: candidate.ftsTable, status: 'absent' });
+      continue;
+    }
+
+    if (/tokenize\s*=\s*['"]?trigram['"]?/i.test(row.sql)) {
+      results.push({ table: candidate.ftsTable, status: 'already-trigram' });
+      continue;
+    }
+
+    // Drop & recreate. We deliberately do NOT wrap this in a transaction
+    // — D1's batch path doesn't accept DDL, and the migration is
+    // restart-safe (idempotent re-run rebuilds from canonical rows).
+    await db.prepare(`DROP TABLE IF EXISTS ${candidate.ftsTable}`).bind().run();
+    await db.prepare(candidate.recreateSql).bind().run();
+
+    let rowsIndexed = 0;
+    if (candidate.rebuildSelect && candidate.rebuildColumns) {
+      const selectStmt = db.prepare(candidate.rebuildSelect).bind();
+      let rows: Record<string, unknown>[] = [];
+      try {
+        if (selectStmt.all) {
+          const result = await selectStmt.all<Record<string, unknown>>();
+          rows = result.results;
+        }
+      } catch {
+        rows = [];
+      }
+
+      if (rows.length > 0) {
+        const placeholders = candidate.rebuildColumns.map((_, i) => `?${i + 1}`).join(', ');
+        const insertSql = `INSERT INTO ${candidate.ftsTable} (${candidate.rebuildColumns.join(', ')}) VALUES (${placeholders})`;
+
+        for (const row of rows) {
+          // For sessions_fts the source has `id, payload` and we need to
+          // derive `session_id, content` from the payload's message list.
+          // For memories_fts and messages_fts the column names map 1:1
+          // already.
+          const values = candidate.ftsTable === 'sessions_fts'
+            ? deriveSessionFtsRow(row)
+            : candidate.rebuildColumns.map((col) => row[col] ?? '');
+          if (!values) continue;
+          await db.prepare(insertSql).bind(...values).run();
+          rowsIndexed += 1;
+        }
+      }
+    }
+
+    results.push({ table: candidate.ftsTable, status: 'migrated', rowsIndexed });
+  }
+  return results;
+}
+
+function deriveSessionFtsRow(row: Record<string, unknown>): [string, string] | null {
+  const id = typeof row.id === 'string' ? row.id : null;
+  const payload = typeof row.payload === 'string' ? row.payload : null;
+  if (!id || !payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as { messages?: Array<{ content?: string }> };
+    const transcript = (parsed.messages ?? [])
+      .map((m) => (typeof m?.content === 'string' ? m.content : ''))
+      .join('\n');
+    return [id, transcript];
+  } catch {
+    // Malformed payload — index the raw blob so we at least get keyword
+    // recall instead of dropping the row.
+    return [id, payload];
+  }
+}

@@ -61,8 +61,24 @@ export interface AgentBootstrapContext {
   getContextEngineResult: () => ContextEngineResult | null;
   frozenMemoryReady: Promise<unknown>;
   memoryProvider: {
-    recall(sessionId: string, query: string, limit: number): Promise<Array<{ id: string; summary: string }>>;
-    prefetch?: (sessionId: string, query: string, limit: number) => Promise<Array<{ id: string; summary: string }>>;
+    // #304 (v0.9.0 Hermes parity): recall/prefetch accept an optional
+    // `options.sessionKey` so adapters that namespace by stable client key
+    // can bind cross-/new/ recall to the right bucket. The extra arg is
+    // optional — older provider implementations without it keep working.
+    recall(
+      sessionId: string,
+      query: string,
+      limit: number,
+      scope?: unknown,
+      scopeKey?: unknown,
+      options?: { sessionKey?: string },
+    ): Promise<Array<{ id: string; summary: string }>>;
+    prefetch?: (
+      sessionId: string,
+      query: string,
+      limit: number,
+      options?: { sessionKey?: string },
+    ) => Promise<Array<{ id: string; summary: string }>>;
   };
   userModelService: {
     getProfile(sessionId: string, userId: string): Promise<{ expertise: string[]; preferences: string[] }>;
@@ -321,6 +337,12 @@ export function createAgentBootstrap(ctx: AgentBootstrapContext) {
     workspaceId?: string;
     systemPrompt: string;
     locale?: SupportedLocale;
+    /**
+     * #304 (v0.9.0 Hermes parity): stable client-supplied memory namespace
+     * key (Telegram chat_id, install ID, etc.). Plumbed into the memory
+     * provider so cross-/new/ recall hits the same bucket.
+     */
+    sessionKey?: string;
   }, overrides?: ExecutionOverrides) {
     let memories: string[] = [];
     const contextAssembleStartedAt = performance.now();
@@ -330,9 +352,14 @@ export function createAgentBootstrap(ctx: AgentBootstrapContext) {
     await autoResumeFromInProgressCheckpoint(input.sessionId);
 
     try {
+      // #304 (v0.9.0): forward sessionKey so adapters that namespace by
+      // stable client identity (instead of rotating sessionId) bind recall
+      // to the right bucket. Optional — providers without the extra arg
+      // ignore it and keep the v0.8 behaviour.
+      const memoryOptions = input.sessionKey ? { sessionKey: input.sessionKey } : undefined;
       const recallPromise = ctx.memoryProvider.prefetch
-        ? ctx.memoryProvider.prefetch(input.sessionId, input.userMessage, 5)
-        : ctx.memoryProvider.recall(input.sessionId, input.userMessage, 5);
+        ? ctx.memoryProvider.prefetch(input.sessionId, input.userMessage, 5, memoryOptions)
+        : ctx.memoryProvider.recall(input.sessionId, input.userMessage, 5, undefined, undefined, memoryOptions);
       const [recalled, profile] = await Promise.all([
         recallPromise,
         ctx.userModelService.getProfile(input.sessionId, input.userId ?? 'default-user'),

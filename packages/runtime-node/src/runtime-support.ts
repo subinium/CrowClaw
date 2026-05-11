@@ -27,6 +27,39 @@ export function getRequestLocale(request: Request, body?: { locale?: unknown }):
     ?? normalizeRequestLocale(request.headers.get('accept-language'));
 }
 
+/**
+ * #304 (v0.9.0 Hermes parity): extract a stable per-client memory key from
+ * the inbound request. Mirrors `getRequestLocale` (header precedence ▸ body
+ * field ▸ undefined). The returned value is plumbed into `AgentRunInput.
+ * sessionKey` and onward into `MemoryProvider.recall/store/prefetch`, where
+ * adapters may use it as a long-term memory namespace that survives
+ * `/new`-style sessionId rotation.
+ *
+ * Header precedence:
+ *   1. `X-CrowClaw-Session-Key` request header (case-insensitive lookup)
+ *   2. `body.sessionKey` field
+ *   3. undefined — providers fall back to `sessionId`/`userId` as today
+ *
+ * Whitespace-only / empty values are treated as undefined so a stale
+ * `X-CrowClaw-Session-Key:` header doesn't accidentally namespace memory
+ * to the empty string.
+ */
+export function getRequestSessionKey(request: Request, body?: { sessionKey?: unknown }): string | undefined {
+  const fromHeader = normalizeSessionKey(request.headers.get('x-crowclaw-session-key'));
+  if (fromHeader) return fromHeader;
+  return normalizeSessionKey(body?.sessionKey);
+}
+
+function normalizeSessionKey(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  // Cap at 256 chars to keep the key safe as a DB column / cache key. Longer
+  // values almost certainly indicate a bug or accidental dump of an opaque
+  // blob into the header. Truncating is friendlier than rejecting outright.
+  return trimmed.length > 256 ? trimmed.slice(0, 256) : trimmed;
+}
+
 export const directToolAliases = {
   'browser.wait': 'browser.waitFor',
   'browser.wait-for': 'browser.waitFor',
