@@ -667,7 +667,15 @@ export type SecurityEventType =
   // runaway sandbox can't suppress its own audit row. The detail string is
   // the truncated source + allowed-tool list; the severity is `info` for
   // benign runs and `warning` when the call requested any destructive tool.
-  | 'tool.code-execute';
+  | 'tool.code-execute'
+  // v0.9.0 (#293, Hermes v0.13 parity) — emitted on first config load when
+  // the stored config did NOT explicitly set `redactToolOutput`. v0.8.x
+  // already defaulted in-code to `true`, but persisted configs from v0.7.x
+  // or upgrades from a misconfigured deploy could have the field unset.
+  // Hermes #21193 reverted the default to ON after #16794 made it off in
+  // v0.12; this event surfaces the migration so operators see the flip
+  // (and can audit that no plaintext-output workflow regressed).
+  | 'security:redaction_default_applied';
 
 export type SecurityEventSeverity = 'info' | 'warning' | 'critical';
 
@@ -953,5 +961,52 @@ export function recordCodeExecuteAudit(
     ...(payload.provider ? { provider: payload.provider } : {}),
     ...(payload.presetId ? { presetId: payload.presetId } : {}),
     detail: `code.execute language=${payload.language} allowedTools=[${allowedList}]\n----- source -----\n${truncated}\n----- end source -----`,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.0 (#293) — redaction-default migration audit helper.
+//
+// Hermes v0.13 (NousResearch/hermes-agent#21193) restored secret redaction
+// to on-by-default after the v0.12 patch-corruption fix (#16794) made it
+// off. CrowClaw v0.8.x always defaulted redactToolOutput=true in code, but
+// persisted configs from earlier installs (or operators who hand-edited
+// runtime-config.json) could ship without an explicit value. On first
+// load with such a config we now apply the secure default AND record this
+// event so the operator can see why their previously-plaintext output is
+// suddenly being scrubbed.
+//
+// The detail string includes which keys were defaulted, so an operator
+// reading the audit log can opt back out with a precise explicit-false
+// override (`redactToolOutput: false`) for any flow that genuinely needs
+// raw bytes (e.g. binary patch tooling where the redactor's string match
+// would corrupt the patch).
+// ---------------------------------------------------------------------------
+
+export interface RedactionDefaultAppliedPayload {
+  /** Keys that were missing from the loaded config and received the secure default. */
+  appliedKeys: ReadonlyArray<string>;
+  /** Provenance fields surfaced into the audit row. */
+  sessionId?: string;
+  agentId?: string;
+  presetId?: string;
+}
+
+export function recordRedactionDefaultApplied(
+  log: SecurityAuditLog,
+  payload: RedactionDefaultAppliedPayload,
+): void {
+  const keys = payload.appliedKeys.length > 0 ? payload.appliedKeys.join(', ') : '(none)';
+  log.record({
+    type: 'security:redaction_default_applied',
+    severity: 'info',
+    ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    ...(payload.agentId ? { agentId: payload.agentId } : {}),
+    ...(payload.presetId ? { presetId: payload.presetId } : {}),
+    detail:
+      `Secure default applied for missing security policy key(s): [${keys}]. ` +
+      `Set the key explicitly in runtime-config.json to silence this event. ` +
+      `Note: redactToolOutput may corrupt patch-tool outputs that embed key-shaped substrings; ` +
+      `opt out per-deployment if needed.`,
   });
 }

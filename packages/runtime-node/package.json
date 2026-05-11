@@ -43,6 +43,7 @@
     "@crowclaw/plugins": "0.8.4",
     "@crowclaw/providers": "0.8.4",
     "@crowclaw/scheduler": "0.8.4",
+    "@crowclaw/shared": "0.8.4",
     "@crowclaw/storage": "0.8.4",
     "@crowclaw/tools": "0.8.4",
     "@crowclaw/workspace": "0.8.4"

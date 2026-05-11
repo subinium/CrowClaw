@@ -147,7 +147,7 @@ describe('saveOAuthToken', () => {
     // Clean up the test token
     try {
       const { removeToken } = await import('../packages/mcp/src/oauth.js');
-      removeToken(testProvider);
+      await removeToken(testProvider);
     } catch {
       // Ignore cleanup errors
     }
