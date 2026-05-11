@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/acp",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,7 +17,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.8.4"
+    "@crowclaw/core": "0.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

@@ -5,6 +5,139 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.9.0] — 2026-05-11 — Hermes v0.12/v0.13 parity wave 1: 24-issue sweep
+
+The first wave of the 49-issue Hermes v0.12 ("Curator") + v0.13 ("Tenacity") parity
+backlog (#293–#341). Ships in this release: 24 issues across security, core
+contracts, scheduler/ACP, tools/skills, providers, gateway channels, and CLI.
+32 commits across 7 parallel sub-agents with strict file ownership; ~81 files
+changed, +15,062 / -86 lines, **3,575 tests passing** (up from 3,184 — +391
+new tests).
+
+The remaining 25 issues (Multi-agent Kanban, Autonomous Curator, ProviderProfile
+ABC + 5 providers stacking on it, Google Chat / Teams / Yuanbao channels, Google
+Meet plugin, video_analyze, SearXNG, Checkpoints v2, session auto-resume, MCP
+SSE, models dashboard tab, 7-locale i18n, etc.) are deferred to v0.9.1+ — see
+"Deferred" at the bottom of this entry.
+
+### Security (CRITICAL — 8 issues, but 3 ship as primitives only — see Caveats)
+
+- **Secret redaction default flipped to ON** (#293). `securityPolicy.redaction.enabled` now defaults `true` in fresh installs; explicit `false` honored on upgrade via `recordRedactionDefaultApplied` audit event. Closes the "I shared my prod transcript and it had my key in it" failure mode the v0.12 off-by-default change introduced. Hermes PR [#21193](https://github.com/NousResearch/hermes-agent/pull/21193). (`packages/runtime-node/src/config-schema.ts`, `packages/core/src/security.ts`.)
+
+- **Discord guild-scoped role allowlist primitive** (#294, CVSS 8.1 — *primitive only*). New `checkDiscordAcl((guildId, roleIds), config)` tuple-matches, fails closed on missing guild_id (DMs) unless `allowDirectMessages: true`. Legacy name-based config → deny-all + warn migration. **Runtime enforcement at webhook ingress deferred to v0.9.1 — see [#342](https://github.com/subinium/CrowClaw/issues/342).** Hermes PR [#21241](https://github.com/NousResearch/hermes-agent/pull/21241). (`packages/gateway/src/discord-acl.ts`.)
+
+- **WhatsApp stranger reject + self-chat ban primitive** (#295 — *primitive only*). `checkWhatsAppAcl` returns silent-drop on bot-self wa_id, deny on non-allowlisted contacts when `allowStrangers: false` (new default). **Webhook wiring deferred to [#342](https://github.com/subinium/CrowClaw/issues/342).** Hermes PR [#21291](https://github.com/NousResearch/hermes-agent/pull/21291). (`packages/gateway/src/whatsapp-acl.ts`.)
+
+- **MCP OAuth credential writes are atomic + symlink-safe** (#296). New `packages/shared/src/atomic-secret-write.ts` — `writeSecretAtomic(path, data, { mode: 0o600 })` uses `fs.open(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW)` with atomic temp-rename. Closes the TOCTOU window between `path.exists()` and the write where a symlink could redirect the file. Helper wired into `packages/mcp/src/oauth.ts`. Hermes PR [#21176](https://github.com/NousResearch/hermes-agent/pull/21176).
+
+- **`auth.json` / `config.json` writers use the atomic helper** (#297). CLI auth + config persistence stops creating world-readable secrets under default umask. `crowclaw doctor fix-perms` walks the data dir and chmods to `0600`. Startup permission check warns when secrets are world-readable. Hermes PR [#21194](https://github.com/NousResearch/hermes-agent/pull/21194). (`packages/cli/src/commands/secret-write.ts`, `packages/cli/src/commands/doctor.ts`.)
+
+- **Cloud-metadata SSRF floor centralized** (#298). New `packages/tools/src/ssrf-blocklist.ts` exports `assertSafeUrl(url, { kind: 'fetch' | 'browser' | 'vision' | 'image' })` covering `169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`, `metadata.azure.com`, `100.100.100.200` — DNS-aware (post-resolution IP also checked). Cloud-metadata check runs **before** the general private-network check so denied requests get the dedicated `SSRF_CLOUD_METADATA` forensic code. Applied to `vision.analyze` and via the central helper to `web.fetch`. Hermes PR [#21228](https://github.com/NousResearch/hermes-agent/pull/21228).
+
+- **Cron prompt-injection scan covers assembled skill content** (#299). New `scanAssembledPrompt(parts: PromptPart[])` runs on the concatenated cron prompt (config + injected skills + memory) with per-part offset attribution. Per-cron `injectionPolicy: 'block' | 'warn' | 'off'` defaults to `'block'`. On finding: `security:cron_injection_blocked` event + refuse to dispatch + owner notification. Hermes PR [#21350](https://github.com/NousResearch/hermes-agent/pull/21350). (`packages/scheduler/src/injection-scan.ts`, `packages/core/src/security.ts:scanAssembledPrompt`.)
+
+- **`crowclaw debug share` redacts at upload time** (#300). New CLI command bundles transcript + config + recent audit log, runs `redactPII` + credential redaction unconditionally regardless of runtime config. Default is local stdout print (no auto-upload). Hermes PR [#19318](https://github.com/NousResearch/hermes-agent/pull/19318). (`packages/cli/src/commands/debug-share.ts`.)
+
+- **`gateway:acl_denied` audit sink wired at runtime startup** (this release). `setAclEventSink` (from `@crowclaw/gateway`) installed on the runtime event bus so adapter-level ACL deny events flow onto `RuntimeEventBus` → dashboard + observability bridges. New `RuntimeEventType` `'gateway:acl_denied'`. (`packages/runtime-node/src/index.ts`, `packages/runtime-node/src/event-bus.ts`.)
+
+### Core contracts (4)
+
+- **`Plugin.transformLLMOutput` lifecycle hook** (#302). New plugin hook called after the provider returns but before tool extraction. `null` return drops the turn + triggers retry + logs `plugin:llm_output_dropped`. Chain in registration order, plugin-throw resilient. Core redaction runs **after** the chain (invariant preserved from v0.6.0 #95 — plugins cannot un-redact). New `AgentLoopOptions.maxLLMOutputRetries?: number` (default `2`). Section-marked with `// ── #302 (v0.9.0) BEGIN/END ──` in `packages/core/src/index.ts:applyLLMOutputPipeline`. Hermes PR [#21235](https://github.com/NousResearch/hermes-agent/pull/21235).
+
+- **`X-CrowClaw-Session-Key` header for stable per-session memory keying** (#304). New `getRequestSessionKey` in `runtime-support.ts` mirrors `getRequestLocale`. Plumbs through `AgentRunInput.sessionKey` → `MemoryProvider.recall/store/prefetch`. Header > body field > undefined. Memory providers can choose to key on `sessionKey` (stable across `/new`) or `sessionId` (per-conversation). Hermes PR [#20199](https://github.com/NousResearch/hermes-agent/pull/20199).
+
+- **SQLite FTS5 trigram tokenizer for CJK search** (#337). Memory + transcript FTS5 virtual tables rebuilt with `tokenize='trigram'`. Korean/Japanese/Chinese substring search now uses the index instead of `LIKE %query%` scans. One-shot migration `runFts5TrigramMigration` at runtime startup, idempotent. Hermes PR [#16651](https://github.com/NousResearch/hermes-agent/pull/16651).
+
+- **Orphan + stale checkpoint pruner at startup** (#338). New `packages/storage/src/orphan-pruner.ts` walks the checkpoint store at boot, identifies orphans (sessionId no longer in session index) + stale (last-touched > `staleAfterDays`, default 60). Two-cycle eviction via `.trash/` for recovery. Startup log: pruned/trashed counts via `formatPruneSummary`. Hermes PR [#16303](https://github.com/NousResearch/hermes-agent/pull/16303).
+
+### Scheduler + ACP (3)
+
+- **`no_agent` cron mode — script-only watchdog jobs** (#309). `CronJob.mode: 'agent' | 'no_agent'` (default `'agent'`). New `packages/scheduler/src/no-agent-runner.ts` (`NoAgentRunner` + `NoAgentSandboxClient` duck-type) runs the shell command via injected sandbox client (`LocalProcessExecutor`/`DockerExecutor`/`CloudflareSandbox`); empty stdout = silent, non-empty = delivered verbatim. Non-zero exit emits `cron:no_agent_failed`. Cuts cost to zero for watchdog-class jobs. Hermes PR [#19709](https://github.com/NousResearch/hermes-agent/pull/19709).
+
+- **ACP `acp.steer` + `acp.queue` (Ralph-loop predecessor)** (#314). v0.5.0 #54 `/steer` already shipped over WS; ACP now exposes it for IDE integrations (Zed, VS Code, JetBrains). `acp.queue({ sessionId, message })` appends to per-session `pendingQueue` (`packages/core/src/queue.ts`), drained between iterations into the next user-turn message. `SessionState.pendingQueue` + `reasoningHistory` persisted for atomic session-state survival across restarts. Hermes PRs [#18114](https://github.com/NousResearch/hermes-agent/pull/18114), [#20279](https://github.com/NousResearch/hermes-agent/pull/20279), [#20296](https://github.com/NousResearch/hermes-agent/pull/20296), [#20433](https://github.com/NousResearch/hermes-agent/pull/20433).
+
+(`security(scheduler)` #299 listed under Security.)
+
+### Tools + skills (5)
+
+- **Post-write linting on `workspace.write`** (#310). After successful write, dispatches on extension via `packages/tools/src/syntax-validators.ts`: `.json` → `JSON.parse`, `.yaml`/`.yml` → js-yaml, `.toml` → @iarna/toml, `.py` → `python3 -c "import ast"` (graceful skip if unavailable). Returns `SYNTAX_ERROR` envelope (v0.8.0 #235 retry-instruction shape) with line/col. File NOT rolled back so the agent sees the diff. Config: `tools.workspace.postWriteValidation: 'block' | 'warn' | 'off'` (default `'warn'`). Hermes PR [#20191](https://github.com/NousResearch/hermes-agent/pull/20191).
+
+- **TTS provider registry + Piper local TTS** (#325). New `packages/tools/src/tts-registry.ts` exposes `TTSProvider { name, displayName, synthesize(text, voiceId) -> AudioBuffer }` registry (eager + lazy registration). Piper provider (`packages/tools/src/tts-piper.ts`) spawns `piper --model <path> --output_file -` via sandbox-executor (stdin/stdout WAV). Hermes PRs [#17843](https://github.com/NousResearch/hermes-agent/pull/17843), [#17885](https://github.com/NousResearch/hermes-agent/pull/17885).
+
+- **xAI Custom Voices TTS + voice cloning** (#324). Stacks on the #325 registry: `voice.tts({ text, voiceId, provider: 'xai' })`, `voice.clone({ sampleUrl | samplePath, name })`. Audit-log captures SHA-256 sample hash on clone. SSRF preflight via `assertSafeUrl({ kind: 'image' })`. Hermes PR [#18776](https://github.com/NousResearch/hermes-agent/pull/18776). (`packages/tools/src/voice-tts.ts`, `packages/tools/src/voice-clone.ts`.)
+
+- **`[[as_document]]` skill media-routing directive** (#329). Skill front-matter or inline `[[as_document]]` flips delivery mode (`detectSkillDeliveryDirective` + `applyDeliveryDirective`). `OutgoingMessage.deliveryMode: 'inline' | 'document'` echoed under `metadata.deliveryMode`. Channels without document support fall back to inline + audit-log warning (per-channel send-branch wiring tracked alongside `OutgoingMessage` rollout). Hermes PR [#21210](https://github.com/NousResearch/hermes-agent/pull/21210). (`packages/tools/src/skill-directives.ts`.)
+
+(SSRF floor #298 listed under Security.)
+
+### Providers (2)
+
+- **OpenRouter response caching** (#330). `OpenAICompatibleProvider` detects OpenRouter endpoint (`isOpenRouterEndpoint`) and attaches `cache_control: { type: 'ephemeral' }` + `stream_options.include_usage` + `usage.include` on requests. Config: `providers.openrouter.responseCache: boolean` (default `true`). `ProviderCacheTelemetry` callback fires once per response (non-streaming) or once per trailing usage chunk (streaming) with `cacheReadTokens` / `cacheWriteTokens` from `usage.prompt_tokens_details`. Hermes PR [#19132](https://github.com/NousResearch/hermes-agent/pull/19132).
+
+- **Configurable Anthropic prompt-cache TTL** (#336). `cache_control: { ttl: '5m' | '1h' }` on cache breakpoints (`resolveAnthropicCacheControl`), configured via `providers.anthropic.cacheTtl` (default `'5m'`). `buildCachedAnthropicSystem` lifts the system string to content-block array form so the cache marker attaches; `applyAnthropicCacheControlToTools` stamps the trailing tool (matches v0.8.2 #275 stable system+tools prefix). `extended-cache-ttl-2025-04-11` beta header opt-in. Telemetry fires on `message_start` for streaming and end-of-message for non-streaming. Direct cost saving for bursty paid-tier sessions. Hermes PR [#15065](https://github.com/NousResearch/hermes-agent/pull/15065).
+
+### Gateway channels (4 — partly security-overlap)
+
+- **Cross-platform `allowed_channels` / `allowed_chats` / `allowed_rooms` primitive** (#318 — *primitive only*). Shared `checkDestinationAcl` primitive in `packages/gateway/src/destination-acl.ts`. Empty allowlist preserves current behavior; non-empty enforces strict allowlist with `gateway:acl_denied` audit. Channel adapters (Slack/Telegram/Matrix/Mattermost/DingTalk/Email/Signal) implement `checkAccess` that delegates to the primitive. **Webhook handler invocation deferred to [#342](https://github.com/subinium/CrowClaw/issues/342).** Hermes PR [#21251](https://github.com/NousResearch/hermes-agent/pull/21251).
+
+- **Native multi-image sending across all channels** (#328). `OutgoingMessage.attachments: Attachment[]` standardized; new optional `ChannelAdapter.buildOutboundMessage` hook composes per-channel multi-attachment payloads (Telegram `mediaGroup` up to 10, Discord multi-embed, Slack `files.upload` + thread, Email multi-part, Signal multi-attachment, Matrix/Mattermost/DingTalk/Email new adapter shells). Backward compat: single attachment still works. Hermes PRs [#17909](https://github.com/NousResearch/hermes-agent/pull/17909), [#17833](https://github.com/NousResearch/hermes-agent/pull/17833).
+
+(Discord ACL #294 + WhatsApp ACL #295 listed under Security.)
+
+### CLI / DX (3)
+
+- **`crowclaw -z` non-interactive one-shot + `update --check` preflight + opt-in backup** (#332). `crowclaw -z "<prompt>" [--model X] [--provider Y]` runs the agent loop once, prints final output, exits 0 (or reads stdin if no positional). `crowclaw update --check` prints version diff without applying. `crowclaw update --backup` tars data dir to `~/.crowclaw/backups/<timestamp>.tgz` (POSIX tar writer, no shell dependency) before update. Hermes PRs [#15702](https://github.com/NousResearch/hermes-agent/pull/15702), [#15704](https://github.com/NousResearch/hermes-agent/pull/15704), [#15841](https://github.com/NousResearch/hermes-agent/pull/15841), [#16539](https://github.com/NousResearch/hermes-agent/pull/16539), [#16566](https://github.com/NousResearch/hermes-agent/pull/16566).
+
+- **Skill install from HTTP(S) URL + `/reload-skills`** (#333). `crowclaw skills install <urlOrPath>` fetches via `validateFetchUrl` (SSRF-guarded; will swap to `assertSafeUrl` from #298 in v0.9.1), validates manifest sha256 inline, unpacks to `~/.crowclaw/skills/<name>/`. New `POST /api/skills/reload` route + `/reload-skills` slash command rebuild the in-memory skill index without restart. `BUNDLED_SKILL_SLUGS` guard prevents overwriting bundled skills. Hermes PRs [#16323](https://github.com/NousResearch/hermes-agent/pull/16323), [#17744](https://github.com/NousResearch/hermes-agent/pull/17744).
+
+(auth.json TOCTOU #297 listed under Security.)
+
+### Cross-package contracts (added this release)
+
+- `writeSecretAtomic(path, data, { mode: 0o600 })` — `@crowclaw/shared`
+- `recordRedactionDefaultApplied(log, { appliedKeys })` + `RedactionDefaultAppliedPayload` — `@crowclaw/core/security`
+- `assertSafeUrl(url, { kind: 'fetch' | 'browser' | 'vision' | 'image' })` + `CLOUD_METADATA_HOSTS` — `@crowclaw/tools`
+- `Plugin.transformLLMOutput?(turn, raw) => Promise<AssistantMessage | null>` + `LLMOutputTurn` / `LLMOutputTransform` / `LLMOutputDroppedOutcome` — `@crowclaw/plugins` + `@crowclaw/core`
+- `AgentRunInput.sessionKey?: string` and `MemoryProvider.recall/store/prefetch({ sessionId, sessionKey, ... })` — `@crowclaw/core` + `@crowclaw/memory`
+- `getRequestSessionKey(request, body?)` — `@crowclaw/runtime-node`
+- `AgentLoopOptions.maxLLMOutputRetries?: number` — `@crowclaw/core`
+- `TTSProvider { name, displayName, synthesize }` + `TTSProviderRegistry` — `@crowclaw/tools`
+- `DestinationAclDecision`, `AclDeniedEvent`, `setAclEventSink`, `emitAclDenied`, `buildAclDeniedEvent`, `ChannelAdapter.checkAccess?(payload, normalized, config)` + `ChannelAccessResult` + `NormalizedChannelMessage` — `@crowclaw/gateway`
+- `OutgoingMessage.attachments: Attachment[]`, `OutgoingMessage.deliveryMode: 'inline' | 'document'`, `ChannelAdapter.buildOutboundMessage?` — `@crowclaw/gateway`
+- `CronJob.mode: 'agent' | 'no_agent'`, `command`, `commandTimeoutMs`, `noAgentFailurePolicy`, `injectionPolicy`, `NoAgentRunner`, `NoAgentSandboxClient` — `@crowclaw/scheduler`
+- `acp.steer({sessionId, guidance})`, `acp.queue({sessionId, message})`, `acp.queue.list` JSON-RPC methods + `AcpAgentLoop.steer/queue/peekQueue` optional hooks — `@crowclaw/acp`
+- `scanAssembledPrompt(parts) → AssembledInjectionFinding[]` — `@crowclaw/core/security`
+- `gateway:acl_denied`, `security:cron_injection_blocked`, `security:redaction_default_applied`, `plugin:llm_output_dropped`, `skills:reloaded` event-bus types — `@crowclaw/core` + `@crowclaw/runtime-node`
+- `pruneOrphanCheckpoints`, `formatPruneSummary`, `runFts5TrigramMigration`, `OrphanPruneResult` — `@crowclaw/storage`
+- `ProviderCacheTelemetry`, `OpenAICompatibleConfig.openRouterResponseCache`, `AnthropicConfig.cacheTtl` — `@crowclaw/providers`
+- `crowclaw doctor fix-perms`, `crowclaw -z`, `crowclaw update --check`, `crowclaw update --backup`, `crowclaw skills install <url>`, `crowclaw debug share`, `/reload-skills` + `/fix-perms` slash commands — `@crowclaw/cli`
+- `POST /api/skills/reload` route — `@crowclaw/runtime-node`
+
+### Verification
+- `npm run build` — clean
+- `npm run typecheck` — clean (exit 0)
+- `npm test` — **3,575 tests passing** across 280 test files (+391 new). One pre-existing `decimal.js` worker-pool resolution quirk in `tests/markdown-renderer.test.ts` (not a regression — fails identically on `main`).
+- `npm audit --audit-level=moderate` — 0 vulnerabilities
+
+### Caveats
+
+- **Wave 1 scope is intentional.** 25 of the 49 filed Hermes v0.12/v0.13 parity issues (#301, #303, #305, #306, #307, #308, #311, #312, #313, #315, #316, #317, #319–#323, #326, #327, #331, #334, #335, #339, #340, #341) are deferred to v0.9.1+. They include the L/XL items (Multi-agent Kanban, Autonomous Curator, `ProviderProfile` ABC refactor, Google Meet plugin, Google Chat plugin host, Checkpoints v2 store rewrite, video_analyze with ffmpeg fallback) plus M-tier items that need separate design sessions (i18n 7 locales, `/goal` Ralph loop, SearXNG split web tools, models dashboard tab, etc.).
+
+- **ACL runtime enforcement is partial.** Issues #294 (CVSS 8.1 Discord), #295 (WhatsApp), and #318 (cross-platform) ship the **primitives** (78 vitest cases prove the primitive logic). The `gateway:acl_denied` audit sink is wired to the runtime event bus. **What's deferred to v0.9.1:** each per-channel webhook handler in `packages/runtime-node/src/route-handlers.ts` needs to call `adapter.checkAccess(payload, normalized, config)` between `enforceGatewayAccess()` and the agent dispatch. Tracked as [#342](https://github.com/subinium/CrowClaw/issues/342). Until that lands, hosts using built-in webhook routes are NOT yet protected by the new ACL — they must wire `adapter.checkAccess` themselves or wait for v0.9.1.
+
+- **Agent G's local `writeSecretAtomic`** in `packages/cli/src/commands/secret-write.ts` duplicates the canonical `@crowclaw/shared` helper because branches landed in parallel. v0.9.1 will replace the local implementation with a re-export. Behaviour is identical.
+
+- **Agent A's `recordRedactionDefaultApplied`** helper is exported from `@crowclaw/core/security` but not yet called inside `config-store.ts:hydrateFrom` (out of Agent A's file scope). The audit event for the first-run default-flip is therefore NOT emitted in v0.9.0 — primitive is shipped, runtime hook lands in v0.9.1.
+
+- **#298 `assertSafeUrl`** ships as a central helper; Agent G's `packages/cli/src/commands/skills.ts` and Agent A's `packages/tools/src/voice-clone.ts` use `validateFetchUrl`/local SSRF as a stopgap. v0.9.1 will switch both call sites to `assertSafeUrl({ kind: ... })` for consistent forensic codes.
+
+- **Post-write linting** ships defaulted to `'warn'`, not `'block'`. Flipping to `'block'` is operator-opt-in after one release cycle of telemetry.
+
+### Sources
+
+- NousResearch/hermes-agent v0.12.0 (2026-04-30, "Curator") + v0.13.0 (2026-05-07, "Tenacity") — 24 issues from the 49 filed in this sweep (#293–#341).
+- Wave 1 selection rationale: P0 security (all 8 primitives) + S/M-tier contracts and features that fit strict file-ownership across 7 parallel sub-agents. L/XL deferred to subsequent waves to avoid shallow implementation.
+
 ## [0.8.4] — 2026-05-03 — Audit-debt closure: 17 issues from post-v0.8.3 audit
 
 After v0.8.3's GitHub-close pass closed 105 issues via verifier-only
