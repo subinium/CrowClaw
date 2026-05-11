@@ -27,6 +27,22 @@ import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanC
 import { splitWithPairPreservation, extractPreflightFacts } from './compression-utils.js';
 import { isHardlineBlocked, HARDLINE_BLOCKLIST } from './hardline-blocklist.js';
 import { stripReasoningContent } from './provider-switch.js';
+// #314 — per-session pending-queue primitive. Used by ACP `acp.queue`, the
+// REST/WS handlers, and the iteration-end drain in this file.
+import {
+  type PendingQueueStore,
+  type QueuedUserMessage,
+  type SerializedQueueEntry,
+  createPendingQueueStore,
+  enqueueMessage,
+  drainPendingQueue,
+  pendingQueueLength,
+  peekPendingQueue,
+  buildQueueAnnotation,
+  serializeQueue,
+  restoreQueue,
+  OPERATOR_QUEUE_SEPARATOR,
+} from './queue.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -199,6 +215,24 @@ export interface SessionState {
   /** #187: total UTF-8 byte size of the memory record summaries bound to
    *  this session. Same lifecycle/semantics as `memoryEntryCount`. */
   memoryBytes?: number;
+  /**
+   * #314 — Pending `/queue` messages awaiting drain into the next user turn.
+   * Persisted alongside the session so a host restart preserves operator
+   * follow-up messages. The AgentLoop drains this at iteration-end (after
+   * the model produces text) and concatenates the entries into the next
+   * user-turn message with `OPERATOR_QUEUE_SEPARATOR`. Empty when no
+   * follow-ups are queued — storage adapters MAY omit the field.
+   */
+  pendingQueue?: import('./queue.js').QueuedUserMessage[];
+  /**
+   * #314 — Per-iteration reasoning blocks preserved across session restore
+   * (companion to v0.6.0 reasoning-content scrub). When the provider
+   * surfaces `<plan>`, `<reasoning>`, `<reflection>` blocks the AgentLoop
+   * appends a trimmed record here so a restored session still sees the
+   * planning context that produced its current state. Treated as
+   * append-only metadata — never re-fed into the model on its own.
+   */
+  reasoningHistory?: import('./reasoning-blocks.js').ReasoningBlock[];
 }
 
 export interface SessionStore {
@@ -673,6 +707,12 @@ export class AgentLoop {
    *  every loop iteration and prepended as a one-shot system message — never
    *  written to session.messages, so the same nudge isn't replayed on restore. */
   private readonly pendingSteers = new Map<string, string[]>();
+  /** #314: queue of pending /queue follow-up user messages per session. Distinct
+   *  from `pendingSteers`: queue entries are drained at iteration *end* and
+   *  concatenated into the next user-turn message via `OPERATOR_QUEUE_SEPARATOR`.
+   *  Persisted with the session (atomic-rename) so a host restart preserves
+   *  operator follow-ups. ACP `acp.queue`, REST, and WS handlers all push here. */
+  private readonly pendingQueue: PendingQueueStore = createPendingQueueStore();
   /** #53: extra hardline patterns supplied by the operator at construction
    *  time (e.g., loaded from env config). Merged with the static defaults. */
   private readonly hardlineBlocklist: ReadonlyArray<{ pattern: RegExp; description: string }>;
@@ -790,6 +830,77 @@ export class AgentLoop {
     if (!queue || queue.length === 0) return [];
     this.pendingSteers.delete(sessionId);
     return queue;
+  }
+
+  // -------------------------------------------------------------------------
+  // #314 — `/queue` follow-up messages
+  //
+  // Distinct from `/steer`:
+  //  - `/steer` fires at iteration *start* as a one-shot system nudge.
+  //  - `/queue` fires at iteration *end* and concatenates into the *next*
+  //    user-turn message so the model sees the follow-up as part of the
+  //    user conversation, not as an out-of-band override.
+  //
+  // The queue MUST be persisted with the session so a host restart preserves
+  // operator follow-ups. Storage adapters call `serializePendingQueue` /
+  // `restorePendingQueue` at the same boundary they persist session state.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Queue a follow-up user message for the next iteration. Mirrors `steer`
+   * but the entry lands in the next *user-turn* content, not as a system
+   * nudge. Empty content is dropped; returns `true` when the message was
+   * actually queued.
+   */
+  queue(sessionId: string, message: string, options?: { source?: string; id?: string }): boolean {
+    return enqueueMessage(this.pendingQueue, sessionId, {
+      content: message,
+      queuedAt: nowIso(),
+      ...(options?.source ? { source: options.source } : {}),
+      ...(options?.id ? { id: options.id } : {}),
+    });
+  }
+
+  /**
+   * Peek at the current pending queue for a session without draining. Used
+   * by the dashboard "in-flight session" view and the ACP `acp.queue.list`
+   * method.
+   */
+  peekQueue(sessionId: string): QueuedUserMessage[] {
+    return peekPendingQueue(this.pendingQueue, sessionId);
+  }
+
+  /** Number of pending queue messages for the session. O(1) check. */
+  queueLength(sessionId: string): number {
+    return pendingQueueLength(this.pendingQueue, sessionId);
+  }
+
+  /**
+   * Drain and return the current pending queue for `sessionId`. Called from
+   * the iteration-end drain block in `run`/`runStream` — exposed publicly so
+   * the ACP server can also drain on operator request (`acp.queue.flush`).
+   */
+  drainQueue(sessionId: string): QueuedUserMessage[] {
+    return drainPendingQueue(this.pendingQueue, sessionId);
+  }
+
+  /**
+   * Serialize the pending queue across all sessions. Storage adapters call
+   * this when snapshotting state to disk / Durable Object storage. Pairs
+   * with `restorePendingQueue` on rehydrate.
+   */
+  serializePendingQueue(): SerializedQueueEntry[] {
+    return serializeQueue(this.pendingQueue);
+  }
+
+  /**
+   * Restore the pending queue from a previously serialized snapshot. Called
+   * on session-store rehydrate. Idempotent — existing in-memory entries for
+   * a session ARE overwritten, so callers should restore before any new
+   * `queue()` call lands.
+   */
+  restorePendingQueue(data: SerializedQueueEntry[] | null | undefined): void {
+    restoreQueue(this.pendingQueue, data);
   }
 
   /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
@@ -1670,6 +1781,21 @@ export class AgentLoop {
       }
     } satisfies SessionState;
 
+    // #314: rehydrate the in-memory pending queue from the persisted session.
+    // Skipped when in-memory entries already exist for this session — runtime
+    // calls (`acp.queue`, REST, WS) that landed before `run()` was invoked
+    // must not be clobbered by the stored snapshot. We only seed when the
+    // in-memory store is empty for this session.
+    if (
+      session.pendingQueue
+      && session.pendingQueue.length > 0
+      && pendingQueueLength(this.pendingQueue, input.sessionId) === 0
+    ) {
+      for (const queued of session.pendingQueue) {
+        enqueueMessage(this.pendingQueue, input.sessionId, queued);
+      }
+    }
+
     // Inject recalled memories as untrusted context prefix (not in system prompt)
     const memoryPrefix = buildMemoryPrefix(input.memories ?? []);
     const memoryMessages: ConversationMessage[] = memoryPrefix
@@ -2162,6 +2288,32 @@ export class AgentLoop {
         nextMessages.push({ role: 'system', content: budgetHint, createdAt: nowIso(), metadata: { budgetHint: true } });
       }
 
+      // #314: iteration-end drain of `/queue` follow-up messages. Distinct
+      // from the steer drain (line ~1730) which fires at iteration START as
+      // a one-shot system nudge. Queue entries land in the *next user turn*
+      // so the model sees them as conversational follow-ups, not as
+      // out-of-band overrides. The drain happens AFTER the budget hint so
+      // the operator's queued text appears closest to the next LLM call.
+      // Section boundary — Agent A owns redactToolOutput, Agent C owns the
+      // applyResultPipeline / response-merge section further below.
+      const drainedQueueMessages = this.drainQueue(input.sessionId);
+      if (drainedQueueMessages.length > 0) {
+        const annotation = buildQueueAnnotation(drainedQueueMessages);
+        if (annotation) nextMessages.push(annotation);
+        nextMessages.push({
+          role: 'user',
+          content: drainedQueueMessages
+            .map((m) => `${OPERATOR_QUEUE_SEPARATOR}${m.content.trim()}`)
+            .join('')
+            .trimStart(),
+          createdAt: nowIso(),
+          metadata: {
+            kind: 'queue-drain',
+            count: drainedQueueMessages.length,
+          },
+        });
+      }
+
       // #43/#44 perf: reuse cachedSystemPrompt + toolList instead of rebuilding.
       // #54: prepend any drained steer messages for *this turn only*.
       const iterationMessages = turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages;
@@ -2186,6 +2338,15 @@ export class AgentLoop {
         { sessionId: input.sessionId, agentId: input.agentId, iteration: iteration + 1, messages: iterationMessages },
         fetchIterationResponse,
       );
+
+      // #314: preserve reasoning metadata across restore. Append to the
+      // session's `reasoningHistory` so a host restart can still surface
+      // the planning blocks that led to the current state. Append-only;
+      // we never re-feed history into the model on its own.
+      if (currentResponse.reasoningBlocks && currentResponse.reasoningBlocks.length > 0) {
+        if (!session.reasoningHistory) session.reasoningHistory = [];
+        session.reasoningHistory.push(...currentResponse.reasoningBlocks);
+      }
 
       // Track 1.2: Record usage from subsequent provider calls
       totalTokensConsumed = this.recordUsage(currentResponse);
@@ -2280,6 +2441,13 @@ export class AgentLoop {
       compressionCount: 0
     };
 
+    // #314: snapshot the still-pending queue (after the iteration-end drain,
+    // any messages arriving during the *current* turn remain unprocessed).
+    // The atomic SessionStore put pairs the queue snapshot with the rest of
+    // session state so a host restart cannot drop or duplicate queued
+    // messages — same atomic-rename pattern as checkpoint persistence.
+    const persistedPendingQueue = peekPendingQueue(this.pendingQueue, input.sessionId);
+
     const nextSession: SessionState = {
       ...session,
       userId: input.userId ?? session.userId,
@@ -2289,6 +2457,13 @@ export class AgentLoop {
       // #57: forward lastToolActivityAt so persisted session reflects when
       // the agent last did real tool work (not just when it last responded).
       lastToolActivityAt: session.lastToolActivityAt,
+      // #314: persist pending queue + reasoning history across restore.
+      // The queue field is omitted entirely when empty so storage adapters
+      // don't have to special-case empty arrays vs absent fields.
+      ...(persistedPendingQueue.length > 0 ? { pendingQueue: persistedPendingQueue } : {}),
+      ...(session.reasoningHistory && session.reasoningHistory.length > 0
+        ? { reasoningHistory: session.reasoningHistory }
+        : {}),
       lineage: compression.compressedCount > 0
         ? {
             ...baseLineage,
@@ -3145,6 +3320,23 @@ export function isToolAllowedForFork(session: SessionState, toolName: string): b
 
 export { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type MatchedSkill, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
 
+// #314 — pending-queue primitive (ACP `acp.queue`, REST, WS, dashboard share it).
+export {
+  type QueuedUserMessage,
+  type SerializedQueueEntry,
+  type PendingQueueStore,
+  OPERATOR_QUEUE_SEPARATOR,
+  createPendingQueueStore,
+  enqueueMessage,
+  drainPendingQueue,
+  peekPendingQueue,
+  pendingQueueLength,
+  assembleNextUserMessage,
+  buildQueueAnnotation,
+  serializeQueue,
+  restoreQueue,
+} from './queue.js';
+
 export {
   isPrivateUrl,
   isPrivateIpAddress,
@@ -3158,6 +3350,12 @@ export {
   redactToolOutput,
   redactStructuredData,
   scanForEnhancedInjection,
+  // #299 — assembled-prompt injection scan with per-part attribution.
+  // Used by the cron runner to catch poisoned skill content even when the
+  // cron config itself is clean. Sibling to `scanForEnhancedInjection`.
+  scanAssembledPrompt,
+  type AssembledPromptPart,
+  type AssembledInjectionFinding,
   scanCommand,
   type InjectionScanResult,
   type RedactionResult,
