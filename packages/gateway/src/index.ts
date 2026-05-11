@@ -2295,7 +2295,51 @@ export async function getTelegramWebhookInfo(
 
 export const normalizeTelegramUpdate = normalizeTelegramWebhook;
 
-export { channels, type ChannelAdapter, type NormalizedChannelMessage, telegramChannel, discordChannel, slackChannel, whatsappChannel, signalChannel, genericChannel } from './channel-registry.js';
+export {
+  channels,
+  type ChannelAdapter,
+  type ChannelAccessResult,
+  type NormalizedChannelMessage,
+  type Attachment,
+  type OutgoingMessage,
+  telegramChannel,
+  discordChannel,
+  slackChannel,
+  whatsappChannel,
+  signalChannel,
+  matrixChannel,
+  mattermostChannel,
+  dingtalkChannel,
+  emailChannel,
+  genericChannel,
+  // ACL primitives (#294, #295, #318)
+  checkDestinationAcl,
+  buildAclDeniedEvent,
+  emitAclDenied,
+  setAclEventSink,
+  type DestinationAclConfig,
+  type DestinationAclDecision,
+  type DestinationAclReason,
+  type AclDeniedEvent,
+  type AclEventSink,
+  checkDiscordAcl,
+  loadDiscordAclConfig,
+  isLegacyAllowedRolesShape,
+  extractDiscordAclInput,
+  emitDiscordAclDenied,
+  type DiscordAclConfig,
+  type DiscordAclDecision,
+  type DiscordAclInput,
+  type DiscordAclReason,
+  type DiscordGuildRoleEntry,
+  checkWhatsAppAcl,
+  loadWhatsAppAclConfig,
+  emitWhatsAppAclDenied,
+  type WhatsAppAclConfig,
+  type WhatsAppAclDecision,
+  type WhatsAppAclInput,
+  type WhatsAppAclReason,
+} from './channel-registry.js';
 
 export async function normalizeGatewayRequest(platform: GatewayPlatform, request: Request): Promise<NormalizedInboundMessage | null> {
   const payload = await request.json();
