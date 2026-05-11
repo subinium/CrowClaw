@@ -26,6 +26,25 @@ export {
   type SsrfAllowedResult,
 } from './ssrf-blocklist.js';
 
+// v0.9.0 (#310) — post-write syntax validators are exported so consumers can
+// reuse them outside workspace.write (e.g. text.patch could call them too).
+export {
+  validateJson,
+  validateYaml,
+  validateToml,
+  validatePython,
+  validateSyntax,
+  pickValidator,
+  type PostWriteValidationMode,
+  type SyntaxErrorDetail,
+  type SupportedSyntaxLanguage,
+  type ValidatorResult,
+} from './syntax-validators.js';
+import {
+  validateSyntax,
+  type PostWriteValidationMode,
+} from './syntax-validators.js';
+
 export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
 export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js';
 import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision.js';
@@ -2179,7 +2198,22 @@ export function createWorkspaceSearchFilesTool(workspace: WorkspaceStore): ToolD
   };
 }
 
-export function createWorkspaceWriteTool(workspace: WorkspaceStore): ToolDefinition {
+/**
+ * Per-`createWorkspaceWriteTool` options. v0.9.0 (#310) adds opt-in post-write
+ * syntax validation. Defaults to `'warn'` per the issue spec — broken content
+ * is *not* rolled back regardless of mode (the agent sees the diff to fix it).
+ */
+export interface WorkspaceWriteToolOptions {
+  /** `'block'` → SYNTAX_ERROR envelope (`ok: false`). `'warn'` → ok:true with
+   *  metadata.syntaxWarning. `'off'` → skip validation entirely. */
+  postWriteValidation?: PostWriteValidationMode;
+}
+
+export function createWorkspaceWriteTool(
+  workspace: WorkspaceStore,
+  options?: WorkspaceWriteToolOptions,
+): ToolDefinition {
+  const mode: PostWriteValidationMode = options?.postWriteValidation ?? 'warn';
   return {
     manifest: {
       name: 'workspace.write',
@@ -2196,12 +2230,75 @@ export function createWorkspaceWriteTool(workspace: WorkspaceStore): ToolDefinit
       const path = typeof input.path === 'string' ? input.path : '';
       const content = typeof input.content === 'string' ? input.content : '';
       const file = await workspace.write(path, content);
+
+      // v0.9.0 (#310) — post-write syntax validation. Runs *after* the
+      // bytes are persisted (issue spec: don't roll back). On failure with
+      // mode='block', the envelope flips to ok:false with a SYNTAX_ERROR
+      // shape so the agent's retry path activates. Mode='warn' surfaces
+      // the same shape under metadata.syntaxWarning while keeping ok:true.
+      const baseMetadata: Record<string, unknown> = { path: file.path, updatedAt: file.updatedAt };
+      if (mode === 'off') {
+        return {
+          toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
+        };
+      }
+      const validation = await validateSyntax(path, content);
+      if (validation.language === null) {
+        // No validator registered — emit unchanged envelope.
+        return {
+          toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
+        };
+      }
+      baseMetadata.postWriteValidation = mode;
+      baseMetadata.validatedAs = validation.language;
+      if (validation.skipped) {
+        baseMetadata.syntaxValidatorSkipped = true;
+        baseMetadata.syntaxValidatorSkipReason = validation.skipReason;
+        return {
+          toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
+        };
+      }
+      if (!validation.ok && validation.error) {
+        const err = validation.error;
+        if (mode === 'block') {
+          return {
+            toolName: 'workspace.write',
+            runtime: 'worker',
+            ok: false,
+            output: err.message,
+            metadata: {
+              ...baseMetadata,
+              error: {
+                code: err.code,
+                message: err.message,
+                line: err.line,
+                col: err.col,
+                validator: err.validator,
+              },
+              retry_instruction: 'fix the syntax error and re-write',
+            },
+          };
+        }
+        // mode === 'warn' (default): ok stays true; caller learns from metadata.
+        return {
+          toolName: 'workspace.write',
+          runtime: 'worker',
+          ok: true,
+          output: file.content,
+          metadata: {
+            ...baseMetadata,
+            syntaxWarning: {
+              code: err.code,
+              message: err.message,
+              line: err.line,
+              col: err.col,
+              validator: err.validator,
+            },
+          },
+        };
+      }
       return {
-        toolName: 'workspace.write',
-        runtime: 'worker',
-        ok: true,
-        output: file.content,
-        metadata: { path: file.path, updatedAt: file.updatedAt }
+        toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
       };
     }
   };
