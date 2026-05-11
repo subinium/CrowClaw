@@ -1,4 +1,5 @@
-import { resolveAndValidateUrl, validateFetchUrl, type ToolDefinition, type ToolExecutionResult } from '@crowclaw/core';
+import { type ToolDefinition, type ToolExecutionResult } from '@crowclaw/core';
+import { assertSafeUrl } from './ssrf-blocklist.js';
 
 export interface VisionAnalysisOptions {
   providerBaseUrl?: string;
@@ -38,8 +39,12 @@ async function loadDnsLookup(): Promise<((host: string) => Promise<string[]>) | 
 }
 
 async function safeImageUrlPreflight(url: string): Promise<{ safe: boolean; reason?: string }> {
+  // v0.9.0 (#298) — route through central choke point with kind=vision so
+  // cloud-metadata hostnames (e.g. metadata.google.internal) are rejected
+  // even when the regex-only blocklist would let them through.
   const lookup = await loadDnsLookup();
-  return lookup ? resolveAndValidateUrl(url, lookup) : validateFetchUrl(url);
+  const result = await assertSafeUrl(url, { kind: 'vision', dnsLookup: lookup });
+  return result.safe ? { safe: true } : { safe: false, reason: result.reason };
 }
 
 /**

@@ -1,6 +1,30 @@
 import type { ParsedSkillFile, SkillManifest, ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
 import { parseSkillFile } from '@crowclaw/core';
-import { resolveAndValidateUrl, validateFetchUrl } from '@crowclaw/core';
+// v0.9.0 (#298) — single SSRF preflight choke point. `safeFetchPreflight`
+// below now delegates to `assertSafeUrl` so every web tool gets the
+// cloud-metadata floor for free. The legacy `validateFetchUrl` /
+// `resolveAndValidateUrl` primitives still live in `@crowclaw/core/security`
+// and are consumed inside `ssrf-blocklist.ts`; this barrel doesn't need them.
+import {
+  CLOUD_METADATA_HOSTS,
+  assertSafeUrl,
+  ssrfDenialMessage,
+  type AssertSafeUrlResult,
+  type SsrfDeniedResult,
+  type SsrfKind,
+} from './ssrf-blocklist.js';
+
+export {
+  CLOUD_METADATA_HOSTS,
+  assertSafeUrl,
+  ssrfDenialMessage,
+  ssrfAuditDetail,
+  type SsrfKind,
+  type AssertSafeUrlResult,
+  type AssertSafeUrlOptions,
+  type SsrfDeniedResult,
+  type SsrfAllowedResult,
+} from './ssrf-blocklist.js';
 
 export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
 export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js';
@@ -436,13 +460,21 @@ async function loadDnsLookup(): Promise<((hostname: string) => Promise<string[]>
  * Run validateFetchUrl + (when available) DNS-rebinding-aware re-validation.
  * Callers should pair with `redirect: 'manual'` so the resolved IP can't be
  * bypassed via a 30x to a private host.
+ *
+ * v0.9.0 (#298) — now routes through the central `assertSafeUrl` so cloud-
+ * metadata hosts are blocked even when the legacy private-network regex
+ * misses them (e.g. `metadata.google.internal`). The boolean-shaped return
+ * is preserved so existing call sites (web.fetch, web.search, web.crawl,
+ * web.extract*) don't have to change today.
  */
-async function safeFetchPreflight(url: string): Promise<{ safe: boolean; reason?: string }> {
+async function safeFetchPreflight(
+  url: string,
+  kind: SsrfKind = 'fetch',
+): Promise<{ safe: boolean; reason?: string; ssrf?: SsrfDeniedResult }> {
   const lookup = await loadDnsLookup();
-  if (!lookup) {
-    return validateFetchUrl(url);
-  }
-  return resolveAndValidateUrl(url, lookup);
+  const result = await assertSafeUrl(url, { kind, dnsLookup: lookup });
+  if (result.safe) return { safe: true };
+  return { safe: false, reason: result.reason, ssrf: result };
 }
 
 // #128 — Defensive in-tool approval gate. AgentLoop already checks
