@@ -5726,6 +5726,57 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         }
       }
 
+      // v0.9.0 Hermes parity (#333): rebuild in-memory skill index without
+      // restarting the runtime. Re-runs the learned-skill refresh AND
+      // re-scans the local skill dir / installed dir. Emits `skills:reloaded`
+      // via the telemetry event log so dashboard subscribers can react.
+      if (request.method === 'POST' && url.pathname === '/api/skills/reload') {
+        try {
+          await skillRegistry.refreshLearned();
+          // Re-scan the local + installed skill dirs if configured. We
+          // bypass the dedicated runtime-init helper to keep the surface
+          // tiny — just read both dirs, parse SKILL.md files, push into
+          // setLocalSkills.
+          try {
+            const { loadSkillsFromDirectory } = await import('@crowclaw/core');
+            const { readdir } = await import('node:fs/promises');
+            const { readFile } = await import('node:fs/promises');
+            const nodeFs = {
+              async readDir(dirPath: string) {
+                const ents = await readdir(dirPath, { withFileTypes: true });
+                return ents.map((e: { name: string; isDirectory(): boolean }) => ({
+                  name: e.name,
+                  isDirectory: e.isDirectory(),
+                }));
+              },
+              async readFile(filePath: string) {
+                return readFile(filePath, 'utf-8');
+              },
+              joinPath(...parts: string[]) {
+                return parts.join('/').replace(/\/+/g, '/');
+              },
+            };
+            const installedDir = joinPath(homedir(), '.crowclaw', 'skills', 'installed');
+            const installed = await loadSkillsFromDirectory(installedDir, nodeFs).catch(() => []);
+            if (installed.length > 0) {
+              skillRegistry.setLocalSkills(installed);
+            }
+          } catch { /* non-fatal */ }
+          const stats = skillRegistry.stats();
+          return Response.json({
+            ok: true,
+            builtin: stats.builtin,
+            learned: stats.learned,
+            local: stats.local,
+            total: stats.total,
+            installed: stats.local,
+          });
+        } catch (error: unknown) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return Response.json({ ok: false, error: msg }, { status: 500 });
+        }
+      }
+
       {
         const skillDetailMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
         if (request.method === 'GET' && skillDetailMatch) {
