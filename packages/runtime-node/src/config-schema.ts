@@ -121,13 +121,24 @@ function securitySection(): ConfigSectionSchema {
   return {
     id: 'security',
     label: 'Security Policy',
-    description: 'Security and privacy controls for tool execution and data handling.',
+    description:
+      'Security and privacy controls for tool execution and data handling. ' +
+      'Defaults are tuned for safety; opt out per field only if your workflow needs raw output.',
     fields: [
       {
         key: 'redactToolOutput',
         type: 'boolean',
         label: 'Redact Tool Output',
-        description: 'Redact sensitive patterns from tool output before displaying.',
+        description:
+          'Redact API keys, OAuth tokens, JWTs, AWS keys, and other credential-shaped strings ' +
+          'from tool output before it reaches the LLM, dashboard, or transcript. ' +
+          // v0.9.0 (#293, Hermes v0.13 parity) — surface the corruption risk so an
+          // operator who flips this off knows the tradeoff. Hermes #16794 made the
+          // default off in v0.12 specifically because key-shaped substrings inside
+          // patch tool outputs were being corrupted by the redactor.
+          'WARNING: may corrupt patch-tool outputs that legitimately contain ' +
+          'key-shaped substrings (e.g. base64 blobs in diff bodies). Turn off only ' +
+          'when the downstream consumer needs byte-exact tool output.',
         required: true,
         default: true,
         section: 'security',

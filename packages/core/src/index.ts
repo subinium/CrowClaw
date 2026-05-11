@@ -2979,6 +2979,12 @@ export {
   // a runaway sandbox can't suppress its own audit row.
   recordCodeExecuteAudit,
   type CodeExecuteAuditPayload,
+  // v0.9.0 (#293) — Hermes v0.13 parity: secret redaction default re-asserted
+  // to ON. Helper records the migration audit row when a persisted config
+  // omits `redactToolOutput` and we apply the secure default. Wired from
+  // the runtime config-store on first load.
+  recordRedactionDefaultApplied,
+  type RedactionDefaultAppliedPayload,
 } from './security.js';
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';
