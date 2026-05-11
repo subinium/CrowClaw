@@ -38,3 +38,5 @@ export interface R2BucketLike {
   put(key: string, value: string, options?: Record<string, unknown>): Promise<unknown>;
   get(key: string): Promise<R2ObjectLike | null>;
 }
+
+export { writeSecretAtomic, type WriteSecretAtomicOptions } from './atomic-secret-write.js';

@@ -17,7 +17,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/sandbox-executor": "0.8.4"
+    "@crowclaw/sandbox-executor": "0.8.4",
+    "@crowclaw/shared": "0.8.4"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

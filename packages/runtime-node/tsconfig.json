@@ -16,6 +16,7 @@
     { "path": "../plugins" },
     { "path": "../providers" },
     { "path": "../scheduler" },
+    { "path": "../shared" },
     { "path": "../storage" },
     { "path": "../tools" },
     { "path": "../workspace" }
