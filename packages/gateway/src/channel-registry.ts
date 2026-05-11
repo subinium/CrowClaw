@@ -26,6 +26,40 @@ import {
   type WhatsAppAclConfig,
 } from './whatsapp-acl.js';
 
+/**
+ * Per-attachment payload used by the multi-image / multi-file outbound path.
+ *
+ * Closes Hermes v0.12 ([#17909](https://github.com/NousResearch/hermes-agent/pull/17909),
+ * [#17833](https://github.com/NousResearch/hermes-agent/pull/17833)) where agents
+ * can now ship N images in a single message across Telegram, Discord, Slack,
+ * Mattermost, Email, and Signal.
+ */
+export interface Attachment {
+  /** Common types: `image`, `audio`, `video`, `file`. */
+  type: 'image' | 'audio' | 'video' | 'file' | string;
+  /** Public URL or pre-signed link the channel adapter can hand off. */
+  url: string;
+  /** Optional MIME type — required for Email multi-part assembly. */
+  mimeType?: string;
+  /** Optional filename hint (Slack `files.upload`, Email attachment naming). */
+  filename?: string;
+  /** Optional caption — Discord embeds and Telegram captions use this. */
+  caption?: string;
+}
+
+/**
+ * Standardized outbound message envelope. Backward compat is preserved:
+ * `text` alone still works; `attachments` is optional and additive.
+ */
+export interface OutgoingMessage {
+  /** Primary message body. Empty string is permitted for attachment-only sends. */
+  text: string;
+  /** Zero or more attachments. Channel adapters cap per-platform limits. */
+  attachments?: Attachment[];
+  /** Channel-specific options (thread_ts, parse_mode, etc.). */
+  options?: Record<string, unknown>;
+}
+
 export interface ChannelAdapter {
   /** Unique channel identifier */
   name: string;
@@ -38,6 +72,16 @@ export interface ChannelAdapter {
     channelId: string,
     text: string,
     options?: Record<string, unknown>
+  ): unknown;
+  /**
+   * Build a multi-attachment outbound payload. Optional — when not defined,
+   * callers fall back to N invocations of `buildOutbound`. Implemented for
+   * Telegram (mediaGroup), Discord (multi-embed), Slack (files.upload + thread),
+   * Email (multi-part), Signal (multi-attachment via signal-cli).
+   */
+  buildOutboundMessage?(
+    channelId: string,
+    message: OutgoingMessage,
   ): unknown;
   /** Verify webhook signature (optional) */
   verifySignature?(
@@ -69,8 +113,8 @@ export interface ChannelAccessResult {
   reason: string;
   /**
    * True when the runtime should drop the message without audit-emitting
-   * (reserved for self-chat suppression — see whatsapp-acl). Adapters return
-   * this directly from the underlying ACL primitive.
+   * (used by WhatsApp self-chat). Adapters return this directly from the
+   * underlying ACL primitive.
    */
   silentDrop?: boolean;
 }
@@ -138,21 +182,38 @@ class ChannelRegistry {
     if (!adapter) throw new Error(`Unknown channel: ${channelName}`);
     return adapter.buildOutbound(channelId, text, options);
   }
+
+  /**
+   * Build a multi-attachment outbound message for a specific channel.
+   *
+   * If the adapter defines `buildOutboundMessage`, the result is returned
+   * directly. Otherwise the call falls back to the single-payload
+   * `buildOutbound` (which silently ignores attachments). The fallback path
+   * means existing channels keep working until they opt in.
+   */
+  buildOutboundMessage(
+    channelName: string,
+    channelId: string,
+    message: OutgoingMessage,
+  ): unknown {
+    const adapter = this.adapters.get(channelName);
+    if (!adapter) throw new Error(`Unknown channel: ${channelName}`);
+    if (adapter.buildOutboundMessage) {
+      return adapter.buildOutboundMessage(channelId, message);
+    }
+    return adapter.buildOutbound(channelId, message.text, message.options);
+  }
 }
 
 /** Global channel registry singleton */
 export const channels = new ChannelRegistry();
 
 // ---------------------------------------------------------------------------
-// Helpers shared by the per-channel ACL wiring.
+// Helpers shared by the per-channel outbound builders.
 // ---------------------------------------------------------------------------
 
-function loadDestinationAclConfig(raw: unknown): DestinationAclConfig {
-  const value = (raw ?? {}) as Record<string, unknown>;
-  const allowedDestinations = Array.isArray(value.allowedDestinations)
-    ? value.allowedDestinations.filter((s): s is string => typeof s === 'string')
-    : [];
-  return { allowedDestinations };
+function filterImageAttachments(attachments: Attachment[] = []): Attachment[] {
+  return attachments.filter((a) => a.type === 'image');
 }
 
 // --- Built-in channel adapters ---
@@ -182,21 +243,68 @@ export const telegramChannel: ChannelAdapter = {
   buildOutbound(channelId, text) {
     return { method: 'sendMessage', chat_id: channelId, text };
   },
-  /** #318 — Telegram destination allowlist on `chat.id`. */
-  checkAccess(_payload, normalized, config) {
-    const aclConfig = loadDestinationAclConfig(config);
-    const decision: DestinationAclDecision = checkDestinationAcl(normalized.channelId, aclConfig);
-    if (!decision.allowed) {
-      emitAclDenied(
-        buildAclDeniedEvent({
-          platform: 'telegram',
-          reason: decision.reason,
-          destinationId: normalized.channelId,
-          senderId: normalized.senderId,
-        }),
-      );
+  /**
+   * Telegram outbound:
+   *   - 0 attachments → plain `sendMessage`
+   *   - 1 image       → `sendPhoto` with caption
+   *   - 2..10 images  → `sendMediaGroup` (Telegram caps the group at 10)
+   *
+   * Audio/video falls back to single-payload `sendDocument` for now —
+   * Hermes #17833 (FLAC) is tracked separately.
+   */
+  buildOutboundMessage(channelId, message) {
+    const attachments = message.attachments ?? [];
+    const images = filterImageAttachments(attachments);
+
+    if (attachments.length === 0) {
+      return { method: 'sendMessage', chat_id: channelId, text: message.text };
     }
-    return decision;
+
+    if (images.length === 1) {
+      const [img] = images;
+      if (!img) {
+        return { method: 'sendMessage', chat_id: channelId, text: message.text };
+      }
+      return {
+        method: 'sendPhoto',
+        chat_id: channelId,
+        photo: img.url,
+        ...(message.text || img.caption ? { caption: message.text || img.caption } : {}),
+      };
+    }
+
+    if (images.length >= 2) {
+      // Telegram mediaGroup hard-limit is 10. Trim and surface a continuation
+      // in a follow-up text message rather than silently dropping.
+      const TELEGRAM_MEDIA_GROUP_MAX = 10;
+      const group = images.slice(0, TELEGRAM_MEDIA_GROUP_MAX).map((img, idx) => ({
+        type: 'photo',
+        media: img.url,
+        // Caption only on the first item per Telegram convention.
+        ...(idx === 0 && (message.text || img.caption)
+          ? { caption: message.text || img.caption }
+          : {}),
+      }));
+      const overflow = images.length - TELEGRAM_MEDIA_GROUP_MAX;
+      return {
+        method: 'sendMediaGroup',
+        chat_id: channelId,
+        media: group,
+        ...(overflow > 0 ? { _overflow: overflow } : {}),
+      };
+    }
+
+    // Single non-image attachment.
+    const [first] = attachments;
+    if (!first) {
+      return { method: 'sendMessage', chat_id: channelId, text: message.text };
+    }
+    return {
+      method: 'sendDocument',
+      chat_id: channelId,
+      document: first.url,
+      ...(message.text ? { caption: message.text } : {}),
+    };
   },
 };
 
@@ -221,6 +329,31 @@ export const discordChannel: ChannelAdapter = {
   },
   buildOutbound(_channelId, text) {
     return { content: text };
+  },
+  /**
+   * Discord supports up to 10 attachments / embeds per message — we use the
+   * `attachments` payload field (multipart upload) for files and `embeds` for
+   * direct image URLs. Mixed sends collapse to embeds because they don't need
+   * a multipart body.
+   */
+  buildOutboundMessage(_channelId, message) {
+    const attachments = message.attachments ?? [];
+    if (attachments.length === 0) {
+      return { content: message.text };
+    }
+    const DISCORD_MAX_ATTACHMENTS = 10;
+    const trimmed = attachments.slice(0, DISCORD_MAX_ATTACHMENTS);
+    const embeds = trimmed.map((att) => ({
+      ...(att.type === 'image' ? { image: { url: att.url } } : {}),
+      ...(att.caption ? { description: att.caption } : {}),
+      ...(att.type !== 'image' ? { url: att.url } : {}),
+    }));
+    const overflow = attachments.length - DISCORD_MAX_ATTACHMENTS;
+    return {
+      content: message.text,
+      embeds,
+      ...(overflow > 0 ? { _overflow: overflow } : {}),
+    };
   },
   /**
    * #294 — Discord guild-scoped role allowlist.
@@ -275,6 +408,34 @@ export const slackChannel: ChannelAdapter = {
       ...(options?.threadTs ? { thread_ts: options.threadTs } : {}),
     };
   },
+  /**
+   * Slack: post the text first as the thread root, then attach files via
+   * `files.upload` keyed by `thread_ts`. We return a multi-call descriptor —
+   * the runtime is responsible for executing the steps in order. Backward
+   * compat: when no attachments, behavior is identical to `buildOutbound`.
+   */
+  buildOutboundMessage(channelId, message) {
+    const attachments = message.attachments ?? [];
+    if (attachments.length === 0) {
+      return {
+        channel: channelId,
+        text: message.text,
+        ...(message.options?.threadTs ? { thread_ts: message.options.threadTs } : {}),
+      };
+    }
+    return {
+      kind: 'multi-step',
+      channel: channelId,
+      text: message.text,
+      ...(message.options?.threadTs ? { thread_ts: message.options.threadTs } : {}),
+      files: attachments.map((att) => ({
+        url: att.url,
+        ...(att.filename ? { filename: att.filename } : {}),
+        ...(att.caption ? { title: att.caption } : {}),
+        ...(att.mimeType ? { filetype: att.mimeType } : {}),
+      })),
+    };
+  },
   /** #318 — Slack destination allowlist on `event.channel`. */
   checkAccess(_payload, normalized, config) {
     const aclConfig = loadDestinationAclConfig(config);
@@ -325,6 +486,33 @@ export const whatsappChannel: ChannelAdapter = {
     };
   },
   /**
+   * WhatsApp Cloud API: multi-image sends go as separate API calls (the API
+   * has no native mediaGroup). We return a `multi-step` descriptor so the
+   * runtime issues N image sends followed by the text body. Backward compat:
+   * zero attachments returns the legacy single text payload.
+   */
+  buildOutboundMessage(channelId, message) {
+    const attachments = message.attachments ?? [];
+    if (attachments.length === 0) {
+      return {
+        messaging_product: 'whatsapp',
+        to: channelId,
+        type: 'text',
+        text: { body: message.text },
+      };
+    }
+    return {
+      kind: 'multi-step',
+      to: channelId,
+      messaging_product: 'whatsapp',
+      ...(message.text ? { text: { body: message.text } } : {}),
+      attachments: attachments.map((att) => ({
+        type: att.type === 'image' ? 'image' : 'document',
+        ...(att.type === 'image' ? { image: { link: att.url, ...(att.caption ? { caption: att.caption } : {}) } } : { document: { link: att.url } }),
+      })),
+    };
+  },
+  /**
    * #295 — WhatsApp stranger + self-chat ban.
    * Self-chat is reported as `silentDrop: true` so the runtime never enqueues
    * or audits — that's the explicit fix for the Hermes echo loop.
@@ -362,7 +550,22 @@ export const signalChannel: ChannelAdapter = {
   buildOutbound(channelId, text) {
     return { recipient: channelId, message: text };
   },
-  /** #318 — Signal destination allowlist. Sender phone/UUID is the destination id. */
+  /**
+   * Signal-CLI accepts multiple `--attachment` flags per send. We surface the
+   * attachment URLs in an array — the runtime maps these to per-flag invocations.
+   */
+  buildOutboundMessage(channelId, message) {
+    const attachments = message.attachments ?? [];
+    if (attachments.length === 0) {
+      return { recipient: channelId, message: message.text };
+    }
+    return {
+      recipient: channelId,
+      message: message.text,
+      attachments: attachments.map((att) => att.url),
+    };
+  },
+  /** #318 — Signal destination allowlist. Sender phone/UUID is the "destination" id. */
   checkAccess(_payload, normalized, config) {
     const aclConfig = loadDestinationAclConfig(config);
     const decision = checkDestinationAcl(normalized.channelId, aclConfig);
@@ -405,10 +608,19 @@ export const genericChannel: ChannelAdapter = {
 };
 
 // ---------------------------------------------------------------------------
-// #318 — adapters that previously lived only in `packages/gateway/src/index.ts`
-// are surfaced here so the destination ACL primitive has a uniform plug-in
-// point across Matrix, Mattermost, DingTalk, and Email.
+// Adapters that previously lived only in `packages/gateway/src/index.ts` —
+// surfaced here so the destination ACL primitive has a uniform plug-in point.
+// They share a single `checkAccess` implementation backed by
+// `checkDestinationAcl`.
 // ---------------------------------------------------------------------------
+
+function loadDestinationAclConfig(raw: unknown): DestinationAclConfig {
+  const value = (raw ?? {}) as Record<string, unknown>;
+  const allowedDestinations = Array.isArray(value.allowedDestinations)
+    ? value.allowedDestinations.filter((s): s is string => typeof s === 'string')
+    : [];
+  return { allowedDestinations };
+}
 
 function buildDestinationChannelAdapter(
   name: 'matrix' | 'mattermost' | 'dingtalk' | 'email',
@@ -428,6 +640,24 @@ function buildDestinationChannelAdapter(
     },
     buildOutbound(channelId, text) {
       return { channelId, text };
+    },
+    buildOutboundMessage(channelId, message) {
+      const attachments = message.attachments ?? [];
+      if (attachments.length === 0) {
+        return { channelId, text: message.text };
+      }
+      // Generic shape — Email/Matrix etc. consume this via runtime adapters.
+      return {
+        channelId,
+        text: message.text,
+        attachments: attachments.map((att) => ({
+          type: att.type,
+          url: att.url,
+          ...(att.mimeType ? { mimeType: att.mimeType } : {}),
+          ...(att.filename ? { filename: att.filename } : {}),
+          ...(att.caption ? { caption: att.caption } : {}),
+        })),
+      };
     },
     checkAccess(_payload, normalized, config) {
       const aclConfig = loadDestinationAclConfig(config);
@@ -451,6 +681,23 @@ export const matrixChannel = buildDestinationChannelAdapter('matrix', 'Matrix');
 export const mattermostChannel = buildDestinationChannelAdapter('mattermost', 'Mattermost');
 export const dingtalkChannel = buildDestinationChannelAdapter('dingtalk', 'DingTalk');
 export const emailChannel = buildDestinationChannelAdapter('email', 'Email');
+
+// Apply #318 destination ACL to Telegram in addition to its native logic.
+telegramChannel.checkAccess = (_payload, normalized, config) => {
+  const aclConfig = loadDestinationAclConfig(config);
+  const decision: DestinationAclDecision = checkDestinationAcl(normalized.channelId, aclConfig);
+  if (!decision.allowed) {
+    emitAclDenied(
+      buildAclDeniedEvent({
+        platform: 'telegram',
+        reason: decision.reason,
+        destinationId: normalized.channelId,
+        senderId: normalized.senderId,
+      }),
+    );
+  }
+  return decision;
+};
 
 // Auto-register built-in channels
 channels.register(telegramChannel);

@@ -2300,6 +2300,8 @@ export {
   type ChannelAdapter,
   type ChannelAccessResult,
   type NormalizedChannelMessage,
+  type Attachment,
+  type OutgoingMessage,
   telegramChannel,
   discordChannel,
   slackChannel,
@@ -2310,7 +2312,7 @@ export {
   dingtalkChannel,
   emailChannel,
   genericChannel,
-  // #318 — cross-platform destination ACL primitive
+  // ACL primitives (#294, #295, #318)
   checkDestinationAcl,
   buildAclDeniedEvent,
   emitAclDenied,
@@ -2320,7 +2322,6 @@ export {
   type DestinationAclReason,
   type AclDeniedEvent,
   type AclEventSink,
-  // #294 — Discord guild-scoped role allowlist (CVSS 8.1)
   checkDiscordAcl,
   loadDiscordAclConfig,
   isLegacyAllowedRolesShape,
@@ -2331,7 +2332,6 @@ export {
   type DiscordAclInput,
   type DiscordAclReason,
   type DiscordGuildRoleEntry,
-  // #295 — WhatsApp stranger + self-chat ban
   checkWhatsAppAcl,
   loadWhatsAppAclConfig,
   emitWhatsAppAclDenied,
