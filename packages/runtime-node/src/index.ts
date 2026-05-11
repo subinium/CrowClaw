@@ -4,7 +4,7 @@ import { createLogger, type Logger } from './logger.js';
 import { installOpenTelemetryBridge, observeRuntimeTelemetryEvent } from './otel.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
-import { InMemoryGatewayIdempotencyStore, WsAuthRateLimiter } from '@crowclaw/gateway';
+import { InMemoryGatewayIdempotencyStore, WsAuthRateLimiter, setAclEventSink } from '@crowclaw/gateway';
 import { LearningPipeline, InMemorySkillStore, SkillRegistry, createLlmSkillExtractor } from '@crowclaw/learning';
 import { McpClient, McpHttpTransport } from '@crowclaw/mcp';
 import { MemoryService, InMemoryMemoryProvider, memoryProviderFromPluginRegistry, type MemoryProvider } from '@crowclaw/memory';
@@ -174,6 +174,13 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
   const sessionMutex = new SessionMutex();
   const eventBus = new EventBus();
+  // v0.9.0 (#294/#295/#318): forward gateway:acl_denied audit events from
+  // adapter-level ACL primitives (Discord guild-scoped, WhatsApp stranger
+  // filter, cross-platform allowlist) onto the runtime event bus so the
+  // dashboard + observability bridges see denials.
+  setAclEventSink((event) => {
+    eventBus.emit('gateway:acl_denied', event as unknown as Record<string, unknown>);
+  });
   let lastHeartbeatAt: string | null = null;
   const unsubscribeRuntimeTelemetryMetrics = eventBus.subscribe((event) => {
     observeRuntimeTelemetryEvent(event);

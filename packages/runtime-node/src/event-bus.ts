@@ -13,6 +13,7 @@ export type RuntimeEventType =
   | 'gateway:outbound'
   | 'gateway:error'
   | 'gateway:policy_denied'
+  | 'gateway:acl_denied'
   | 'gateway:status'
   | 'job:start'
   | 'job:complete'

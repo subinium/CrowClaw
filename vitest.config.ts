@@ -10,10 +10,6 @@ export default defineConfig({
   resolve: {
     alias: {
       '@cloudflare/sandbox': path.resolve(__dirname, 'tests/stubs/cloudflare-sandbox.ts'),
-      // v0.9.0 worktree: route the packages we edit to source so vitest sees
-      // worktree changes without a separate `tsc -b` step.
-      '@crowclaw/tools': path.resolve(__dirname, 'packages/tools/src/index.ts'),
-      '@crowclaw/core': path.resolve(__dirname, 'packages/core/src/index.ts'),
     }
   },
   // Mirror Wrangler's `define` so `__CROWCLAW_TEST_MODE__` / `__CROWCLAW_VERSION__`
