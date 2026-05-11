@@ -82,6 +82,16 @@ export {
   type XaiVoiceCloneProviderOptions,
   type VoiceCloneToolOptions,
 } from './voice-clone.js';
+
+// v0.9.0 (#329) — `[[as_document]]` skill directive. The detector lives
+// here so Agent C's `packages/core/skill-manifest.ts` is untouched; the
+// directive is read from the existing ParsedSkillFile shape.
+export {
+  detectSkillDeliveryDirective,
+  applyDeliveryDirective,
+  type DeliveryMode,
+  type SkillDeliveryDirective,
+} from './skill-directives.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
 // v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
 // not registered by `registerCoreTools` and not in the default agent toolset.
