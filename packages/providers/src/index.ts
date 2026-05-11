@@ -94,6 +94,24 @@ export interface OpenAICompatibleConfig {
    * pay no cost.
    */
   onArgsRepaired?: (info: { toolName: string; originalLength: number; repairedLength: number; reason: string }) => void;
+  /**
+   * v0.9.0 (#330): OpenRouter response-cache opt-out. When the configured
+   * `baseUrl` points at OpenRouter (`openrouter.ai/api/v1`) and this flag is
+   * `true` (default), the provider attaches a top-level
+   * `cache_control: { type: 'ephemeral' }` field on every request body so
+   * OpenRouter's prompt-cache layer can reuse identical conversation prefixes.
+   * Non-OpenRouter endpoints ignore this field. Set to `false` to suppress the
+   * header (useful for backends that 400 on unknown fields).
+   */
+  openRouterResponseCache?: boolean;
+  /**
+   * v0.9.0 (#330): Audit hook fired after each OpenRouter request so the
+   * runtime can record cache hits / misses. The provider extracts
+   * `usage.prompt_tokens_details.cached_tokens` and `cache_write_tokens` from
+   * the response — both are part of OpenRouter's documented `ResponseUsage`
+   * schema. Optional; non-OpenRouter providers never fire this callback.
+   */
+  onCacheTelemetry?: (info: ProviderCacheTelemetry) => void;
 }
 
 export interface AnthropicConfig {
@@ -108,6 +126,45 @@ export interface AnthropicConfig {
   manifestCache?: ManifestCache;
   /** v0.8.0 (#232): see {@link OpenAICompatibleConfig.onArgsRepaired}. */
   onArgsRepaired?: (info: { toolName: string; originalLength: number; repairedLength: number; reason: string }) => void;
+  /**
+   * v0.9.0 (#336): Prompt-cache breakpoint TTL. Anthropic supports `5m`
+   * (default) and `1h` on every `cache_control` block. Selecting `1h` adds the
+   * `extended-cache-ttl-2025-04-11` beta header in addition to the existing
+   * `prompt-caching-2024-07-31` flag. Only takes effect when
+   * `promptCaching: true`.
+   */
+  cacheTtl?: '5m' | '1h';
+  /**
+   * v0.9.0 (#336): Audit hook fired after each Anthropic request. Includes the
+   * TTL actually used for the breakpoints plus the cache_creation /
+   * cache_read token counts surfaced by Anthropic's response so callers can
+   * track real cache hits. Optional.
+   */
+  onCacheTelemetry?: (info: ProviderCacheTelemetry) => void;
+}
+
+/**
+ * v0.9.0 (#330 / #336): Shared telemetry shape emitted by both the
+ * Anthropic and OpenAI-compatible (OpenRouter) providers when a cache-related
+ * request lands. Counts are best-effort — providers omit fields the upstream
+ * did not surface. The runtime forwards this to its audit log so the dashboard
+ * can show per-provider hit rates and TTL distribution.
+ */
+export interface ProviderCacheTelemetry {
+  provider: 'anthropic' | 'openrouter';
+  /** Anthropic only: TTL the request was configured with ('5m' | '1h'). */
+  ttl?: '5m' | '1h';
+  /** Tokens read from cache (cache hit). Maps to:
+   *   - Anthropic: `usage.cache_read_input_tokens`
+   *   - OpenRouter: `usage.prompt_tokens_details.cached_tokens` */
+  cacheReadTokens: number;
+  /** Tokens written to a fresh cache entry (cache miss / first warm-up). Maps to:
+   *   - Anthropic: `usage.cache_creation_input_tokens`
+   *   - OpenRouter: `usage.prompt_tokens_details.cache_write_tokens` */
+  cacheWriteTokens: number;
+  /** Whether the upstream response reported a cache hit. Convenience flag:
+   *   true when `cacheReadTokens > 0`. */
+  hit: boolean;
 }
 
 export interface ModelMetadata {
@@ -166,6 +223,11 @@ interface ChatCompletionsResponse {
     total_tokens?: number;
     prompt_tokens_details?: {
       cached_tokens?: number;
+      /** v0.9.0 (#330): OpenRouter reports a `cache_write_tokens` count
+       * alongside `cached_tokens` so callers can distinguish first-warmup
+       * (write) from steady-state hits (read). Other OpenAI-compatible
+       * backends usually omit it. */
+      cache_write_tokens?: number;
     };
   };
 }
@@ -187,6 +249,18 @@ interface ChatCompletionsRequestTool {
 // Anthropic API types
 // ---------------------------------------------------------------------------
 
+/**
+ * v0.9.0 (#336): Anthropic's `cache_control` breakpoint marker. The same shape
+ * is accepted on every cacheable content block (tools, system content, user /
+ * assistant content blocks). `ttl` defaults to `5m` upstream; selecting `1h`
+ * requires the `extended-cache-ttl-2025-04-11` beta header (added in the
+ * fetch caller below).
+ */
+interface AnthropicCacheControl {
+  type: 'ephemeral';
+  ttl?: '5m' | '1h';
+}
+
 interface AnthropicTool {
   name: string;
   description: string;
@@ -194,6 +268,8 @@ interface AnthropicTool {
     type: 'object';
     properties: Record<string, unknown>;
   };
+  /** v0.9.0 (#336): present on the last tool when prompt-cache breakpoints are enabled. */
+  cache_control?: AnthropicCacheControl;
 }
 
 interface AnthropicContentBlock {
@@ -574,6 +650,100 @@ function buildAnthropicTools(availableTools: ToolManifest[]): AnthropicTool[] {
   }));
 }
 
+/**
+ * v0.9.0 (#336): Resolve the cache_control breakpoint for an Anthropic
+ * request. Returns `undefined` (no caching at all) when `promptCaching` is
+ * false or omitted; otherwise returns `{ type: 'ephemeral', ttl }` with TTL
+ * defaulting to `'5m'` and `'1h'` available as an opt-in. Centralised so the
+ * generate / generateStream / structured-output paths all share the same
+ * resolution rule.
+ */
+function resolveAnthropicCacheControl(
+  config: AnthropicConfig,
+): AnthropicCacheControl | undefined {
+  if (!config.promptCaching) return undefined;
+  const ttl = config.cacheTtl ?? '5m';
+  return { type: 'ephemeral', ttl };
+}
+
+/**
+ * v0.9.0 (#336): Stamp the last tool entry with a cache_control breakpoint so
+ * Anthropic caches the (model, system, tools) prefix. Mutates in place because
+ * the calling convention is `body.tools = buildAnthropicTools(...)` and the
+ * builder already returns a fresh array — no aliasing risk. No-op when the
+ * tools array is empty.
+ */
+function applyAnthropicCacheControlToTools(
+  tools: AnthropicTool[],
+  cacheControl: AnthropicCacheControl,
+): void {
+  if (tools.length === 0) return;
+  const last = tools[tools.length - 1]!;
+  last.cache_control = cacheControl;
+}
+
+/**
+ * v0.9.0 (#336): Convert a `system` string into the array-of-content-blocks
+ * form so the trailing block can carry a `cache_control` breakpoint. Anthropic
+ * accepts both shapes for `system`; the array form is required for cache
+ * markers because the breakpoint attaches to a content block, not a string.
+ */
+function buildCachedAnthropicSystem(
+  systemPrompt: string,
+  cacheControl: AnthropicCacheControl,
+): Array<{ type: 'text'; text: string; cache_control: AnthropicCacheControl }> {
+  return [
+    {
+      type: 'text',
+      text: systemPrompt,
+      cache_control: cacheControl,
+    },
+  ];
+}
+
+/**
+ * v0.9.0 (#336): Compose the `anthropic-beta` request header. We always keep
+ * the `prompt-caching-2024-07-31` flag whenever `promptCaching` is enabled,
+ * and additionally enable `extended-cache-ttl-2025-04-11` when the caller
+ * opted into the 1-hour TTL. Returns the joined comma-separated value (or
+ * `undefined` if no beta features are needed).
+ */
+function buildAnthropicBetaHeader(config: AnthropicConfig): string | undefined {
+  if (!config.promptCaching) return undefined;
+  const flags = ['prompt-caching-2024-07-31'];
+  if (config.cacheTtl === '1h') {
+    flags.push('extended-cache-ttl-2025-04-11');
+  }
+  return flags.join(',');
+}
+
+/**
+ * v0.9.0 (#336): Forward Anthropic cache-hit / -miss counts to the configured
+ * audit hook. Defensive: never throws. Includes the TTL the request was
+ * configured with so the dashboard can show TTL distribution and confirm
+ * `1h` requests actually carried the right header.
+ */
+function emitAnthropicCacheTelemetry(
+  config: AnthropicConfig,
+  usage: AnthropicMessagesResponse['usage'] | undefined,
+): void {
+  if (!config.onCacheTelemetry) return;
+  if (!config.promptCaching) return;
+  const cacheReadTokens = usage?.cache_read_input_tokens ?? 0;
+  const cacheWriteTokens = usage?.cache_creation_input_tokens ?? 0;
+  try {
+    config.onCacheTelemetry({
+      provider: 'anthropic',
+      ttl: config.cacheTtl ?? '5m',
+      cacheReadTokens,
+      cacheWriteTokens,
+      hit: cacheReadTokens > 0,
+    });
+  } catch {
+    // Swallow — telemetry is best-effort.
+  }
+}
+
 function parseAnthropicToolCalls(contentBlocks: AnthropicContentBlock[] | undefined): ToolCall[] | undefined {
   if (!contentBlocks) {
     return undefined;
@@ -874,6 +1044,86 @@ function applyPromptCacheFields(
   body.prompt_cache_key = (config.promptCacheKey ?? `crowclaw-${stablePrefixHash(staticPrefix)}`).slice(0, 512);
   if (config.promptCacheRetention) {
     body.prompt_cache_retention = config.promptCacheRetention;
+  }
+}
+
+/**
+ * v0.9.0 (#330): Detect whether the configured baseUrl is OpenRouter. The
+ * canonical host is `openrouter.ai`; we match the host portion of the URL so
+ * port / path variants (e.g. behind a corporate proxy mapped to the same
+ * upstream) are caught too. Returns false on any parse failure so a malformed
+ * `baseUrl` cannot accidentally enable OpenRouter-specific code paths.
+ */
+function isOpenRouterEndpoint(baseUrl: string): boolean {
+  try {
+    const u = new URL(baseUrl);
+    return /(^|\.)openrouter\.ai$/i.test(u.host);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * v0.9.0 (#330): Attach OpenRouter's automatic prompt-cache header on the
+ * request body. Documented at
+ * https://openrouter.ai/docs/guides/best-practices/prompt-caching — when set,
+ * OpenRouter caches the maximal-prefix up to the last cacheable block, with
+ * the breakpoint advancing automatically as the conversation grows. Costs
+ * nothing on a cache miss; saves real money on hot prefixes. Skipped for
+ * non-OpenRouter endpoints so other OpenAI-compatible backends (NVIDIA, xAI,
+ * etc.) don't see an unknown field.
+ *
+ * We also opt the request into OpenRouter's usage-accounting so the final SSE
+ * chunk surfaces `prompt_tokens_details.cached_tokens` — required for the
+ * cache-hit / -miss telemetry surfaced via {@link onCacheTelemetry}.
+ */
+function applyOpenRouterCacheFields(
+  body: Record<string, unknown>,
+  config: OpenAICompatibleConfig,
+): void {
+  if (!isOpenRouterEndpoint(config.baseUrl)) return;
+  // Default is opt-in: callers explicitly setting `false` suppress the field.
+  if (config.openRouterResponseCache === false) return;
+  body.cache_control = { type: 'ephemeral' };
+  // Streaming variants need `stream_options.include_usage` to receive the
+  // final usage chunk that carries cached-tokens telemetry. Non-streaming
+  // calls already get usage by default and ignore this field.
+  if (body.stream === true) {
+    const existing = (body.stream_options as Record<string, unknown> | undefined) ?? {};
+    body.stream_options = { ...existing, include_usage: true };
+    // OpenRouter follows OpenAI's `usage` extra in `extra_body` semantics too;
+    // include the top-level `usage` accounting flag for parity with the
+    // documented usage-accounting cookbook.
+    body.usage = { include: true };
+  }
+}
+
+/**
+ * v0.9.0 (#330): Pull cache-hit/-miss counts out of an OpenAI-compatible
+ * usage payload and forward them to the configured telemetry hook. The
+ * function is host-gated so non-OpenRouter responses never produce a
+ * `provider: 'openrouter'` telemetry event. Defensive: never throws — a
+ * broken telemetry hook must not crash the request.
+ */
+function emitOpenRouterCacheTelemetry(
+  config: OpenAICompatibleConfig,
+  usage: ChatCompletionsResponse['usage'] | undefined,
+): void {
+  if (!config.onCacheTelemetry) return;
+  if (!isOpenRouterEndpoint(config.baseUrl)) return;
+  if (config.openRouterResponseCache === false) return;
+  const details = usage?.prompt_tokens_details;
+  const cacheReadTokens = details?.cached_tokens ?? 0;
+  const cacheWriteTokens = details?.cache_write_tokens ?? 0;
+  try {
+    config.onCacheTelemetry({
+      provider: 'openrouter',
+      cacheReadTokens,
+      cacheWriteTokens,
+      hit: cacheReadTokens > 0,
+    });
+  } catch {
+    // Swallow — telemetry is best-effort.
   }
 }
 
@@ -1344,6 +1594,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       reasoningEffort: this.config.reasoningEffort,
     });
     applyPromptCacheFields(body, this.config, request);
+    applyOpenRouterCacheFields(body, this.config);
 
     if (isResponsesApi) {
       const useInstructions = !!this.config.systemPromptAsInstructions;
@@ -1466,6 +1717,9 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
     const assistantMessage = normalizeOpenAIMessageContent(message?.content, message?.refusal);
     let parsedToolCalls = parseOpenAIToolCalls(message?.tool_calls, request.availableTools, this.config.onArgsRepaired) ?? parseOpenAIFunctionCall(message?.function_call, this.config.onArgsRepaired);
     const usage = extractOpenAIUsage(payload);
+    // v0.9.0 (#330): forward OpenRouter cache-hit / -miss counts to the audit
+    // log so the dashboard can show real cost savings on hot prefixes.
+    emitOpenRouterCacheTelemetry(this.config, payload.usage);
 
     // v0.8.0 (#231): extract reasoning blocks from the assistant turn before
     // the slash-tool fallback so the slash-call regex doesn't see inner-tag text.
@@ -1546,6 +1800,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       reasoningEffort: this.config.reasoningEffort,
     });
     applyPromptCacheFields(body, this.config, request);
+    applyOpenRouterCacheFields(body, this.config);
 
     if (isResponsesApi) {
       const useInstructions = !!this.config.systemPromptAsInstructions;
@@ -1725,6 +1980,15 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
           const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
           const finishReason = choices?.[0]?.finish_reason as string | undefined;
 
+          // v0.9.0 (#330): OpenRouter (and OpenAI when `stream_options.include_usage`
+          // is set) emits a trailing chunk whose `choices` array is empty but
+          // whose top-level `usage` carries the cache-hit accounting. Forward
+          // those numbers to the telemetry hook so the dashboard can show
+          // hit / miss totals on streaming requests too.
+          if (parsed.usage && (!choices || choices.length === 0)) {
+            emitOpenRouterCacheTelemetry(this.config, parsed.usage as ChatCompletionsResponse['usage']);
+          }
+
           if (delta?.content && typeof delta.content === 'string') {
             // v0.8.0 (#231): route every text delta through the reasoning
             // parser so `<plan>...</plan>` regions are emitted as
@@ -1864,6 +2128,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter, StreamingProvi
       systemPrompt: req.messages.find((message) => message.role === 'system')?.content,
       availableTools: [],
     });
+    // v0.9.0 (#330): structured-output path may also target OpenRouter; the
+    // request body still goes through the same OpenAI-compatible surface and
+    // benefits from the same cache breakpoint.
+    applyOpenRouterCacheFields(body, this.config);
 
     if (isResponsesApi) {
       body.input = mappedMessages;
@@ -1965,6 +2233,10 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     const sanitizedMessages = stripStaleBudgetWarnings(request.messages);
     const anthropicMessages = buildAnthropicMessages(sanitizedMessages);
 
+    // v0.9.0 (#336): Resolve the cache_control breakpoint once so the system
+    // block and the trailing tool both carry an identical TTL marker.
+    const cacheControl = resolveAnthropicCacheControl(this.config);
+
     const body: Record<string, unknown> = {
       model: this.config.model,
       max_tokens: 4096,
@@ -1972,20 +2244,25 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     };
 
     if (request.systemPrompt) {
-      body.system = request.systemPrompt;
+      body.system = cacheControl
+        ? buildCachedAnthropicSystem(request.systemPrompt, cacheControl)
+        : request.systemPrompt;
     }
 
     if (request.availableTools.length > 0) {
-      body.tools = buildAnthropicTools(request.availableTools);
+      const tools = buildAnthropicTools(request.availableTools);
+      if (cacheControl) applyAnthropicCacheControlToTools(tools, cacheControl);
+      body.tools = tools;
     }
 
+    const anthropicBeta = buildAnthropicBetaHeader(this.config);
     const response = await fetch(`${this.config.baseUrl.replace(/\/$/, '')}/messages`, {
       method: 'POST',
       headers: {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
-        ...(this.config.promptCaching ? { 'anthropic-beta': 'prompt-caching-2024-07-31' } : {})
+        ...(anthropicBeta ? { 'anthropic-beta': anthropicBeta } : {})
       },
       body: JSON.stringify(body),
       signal: request.signal
@@ -2005,6 +2282,8 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
 
     const payload = (await response.json()) as AnthropicMessagesResponse;
     const usage = extractAnthropicUsage(payload);
+    // v0.9.0 (#336): forward TTL-tagged cache hit / miss counts.
+    emitAnthropicCacheTelemetry(this.config, payload.usage);
 
     // Extract text content
     const assistantMessage = payload.content
@@ -2098,6 +2377,11 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     const sanitizedMessages = stripStaleBudgetWarnings(request.messages);
     const anthropicMessages = buildAnthropicMessages(sanitizedMessages);
 
+    // v0.9.0 (#336): mirror the cache_control + beta-header resolution from
+    // the non-streaming path so streaming calls benefit from the same
+    // prompt-cache breakpoints.
+    const cacheControl = resolveAnthropicCacheControl(this.config);
+
     const body: Record<string, unknown> = {
       model: this.config.model,
       max_tokens: 4096,
@@ -2106,21 +2390,26 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
     };
 
     if (request.systemPrompt) {
-      body.system = request.systemPrompt;
+      body.system = cacheControl
+        ? buildCachedAnthropicSystem(request.systemPrompt, cacheControl)
+        : request.systemPrompt;
     }
 
     if (request.availableTools.length > 0) {
-      body.tools = buildAnthropicTools(request.availableTools);
+      const tools = buildAnthropicTools(request.availableTools);
+      if (cacheControl) applyAnthropicCacheControlToTools(tools, cacheControl);
+      body.tools = tools;
     }
 
     const url = `${this.config.baseUrl.replace(/\/$/, '')}/messages`;
+    const anthropicBeta = buildAnthropicBetaHeader(this.config);
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
-        ...(this.config.promptCaching ? { 'anthropic-beta': 'prompt-caching-2024-07-31' } : {})
+        ...(anthropicBeta ? { 'anthropic-beta': anthropicBeta } : {})
       },
       body: JSON.stringify(body),
       signal: request.signal
@@ -2247,6 +2536,16 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
               break;
             }
 
+            case 'message_start': {
+              // v0.9.0 (#336): Anthropic delivers cache_creation /
+              // cache_read counts on the `message_start` event for streaming
+              // requests. Forward to telemetry once per stream so the
+              // dashboard can record per-request TTL + hit metadata.
+              const startMsg = parsed.message as { usage?: AnthropicMessagesResponse['usage'] } | undefined;
+              emitAnthropicCacheTelemetry(this.config, startMsg?.usage);
+              break;
+            }
+
             case 'message_stop': {
               yield { type: 'done' };
               return;
@@ -2259,7 +2558,7 @@ export class AnthropicProvider implements ProviderAdapter, StreamingProviderAdap
             }
 
             default:
-              // message_start, message_delta, ping — skip
+              // message_delta, ping — skip
               break;
           }
 
