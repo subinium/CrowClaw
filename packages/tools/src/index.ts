@@ -63,6 +63,25 @@ export {
   type TTSProviderHealth,
 } from './tts-registry.js';
 export { createPiperProvider, type PiperProviderOptions } from './tts-piper.js';
+
+// v0.9.0 (#324) — xAI Custom Voices TTS + voice cloning. Registers as a
+// TTSProvider via the #325 registry; the multi-provider `voice.tts` tool
+// dispatches across all registered providers.
+export {
+  createXaiTtsProvider,
+  createMultiProviderTtsTool,
+  type XaiTtsProviderOptions,
+  type MultiProviderTtsToolOptions,
+} from './voice-tts.js';
+export {
+  createXaiVoiceCloneProvider,
+  createVoiceCloneTool,
+  type VoiceCloneProvider,
+  type VoiceCloneInput,
+  type VoiceCloneResult,
+  type XaiVoiceCloneProviderOptions,
+  type VoiceCloneToolOptions,
+} from './voice-clone.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
 // v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
 // not registered by `registerCoreTools` and not in the default agent toolset.
