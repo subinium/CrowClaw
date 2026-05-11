@@ -19,6 +19,12 @@ import {
   loadDiscordAclConfig,
   type DiscordAclConfig,
 } from './discord-acl.js';
+import {
+  checkWhatsAppAcl,
+  emitWhatsAppAclDenied,
+  loadWhatsAppAclConfig,
+  type WhatsAppAclConfig,
+} from './whatsapp-acl.js';
 
 export interface ChannelAdapter {
   /** Unique channel identifier */
@@ -318,6 +324,19 @@ export const whatsappChannel: ChannelAdapter = {
       text: { body: text },
     };
   },
+  /**
+   * #295 — WhatsApp stranger + self-chat ban.
+   * Self-chat is reported as `silentDrop: true` so the runtime never enqueues
+   * or audits — that's the explicit fix for the Hermes echo loop.
+   */
+  checkAccess(_payload, normalized, config) {
+    const aclConfig: WhatsAppAclConfig = loadWhatsAppAclConfig(config);
+    const decision = checkWhatsAppAcl({ senderWaId: normalized.senderId }, aclConfig);
+    if (!decision.allowed && !decision.silentDrop) {
+      emitWhatsAppAclDenied({ reason: decision.reason, senderId: normalized.senderId });
+    }
+    return decision;
+  },
 };
 
 export const signalChannel: ChannelAdapter = {
@@ -469,3 +488,12 @@ export {
   type DiscordAclReason,
   type DiscordGuildRoleEntry,
 } from './discord-acl.js';
+export {
+  checkWhatsAppAcl,
+  loadWhatsAppAclConfig,
+  emitWhatsAppAclDenied,
+  type WhatsAppAclConfig,
+  type WhatsAppAclDecision,
+  type WhatsAppAclInput,
+  type WhatsAppAclReason,
+} from './whatsapp-acl.js';

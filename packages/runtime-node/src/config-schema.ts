@@ -378,6 +378,33 @@ function channelsSection(): ConfigSectionSchema {
         default: [],
         section: 'channels',
       },
+      // --- WhatsApp (#295) --------------------------------------------------
+      {
+        key: 'whatsapp.allowedContacts',
+        type: 'array',
+        label: 'WhatsApp Allowed Contacts',
+        description: 'wa_ids permitted to message the bot. Empty + allowStrangers=false → all inbound rejected.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'whatsapp.allowStrangers',
+        type: 'boolean',
+        label: 'WhatsApp Allow Strangers',
+        description: 'Pre-v0.9.0 behavior — bot responds to any sender. Default false; flipping to true logs an audit warning.',
+        required: false,
+        default: false,
+        section: 'channels',
+      },
+      {
+        key: 'whatsapp.botWaId',
+        type: 'string',
+        label: 'WhatsApp Bot Phone Number ID',
+        description: 'Bot phone-number-id used to silently drop self-chat (echo loop). Required to enforce self-chat ban.',
+        required: false,
+        section: 'channels',
+      },
       // --- Cross-platform destination ACL (#318) ---------------------------
       {
         key: 'slack.allowedDestinations',

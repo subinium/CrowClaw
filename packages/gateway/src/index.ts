@@ -2331,6 +2331,14 @@ export {
   type DiscordAclInput,
   type DiscordAclReason,
   type DiscordGuildRoleEntry,
+  // #295 — WhatsApp stranger + self-chat ban
+  checkWhatsAppAcl,
+  loadWhatsAppAclConfig,
+  emitWhatsAppAclDenied,
+  type WhatsAppAclConfig,
+  type WhatsAppAclDecision,
+  type WhatsAppAclInput,
+  type WhatsAppAclReason,
 } from './channel-registry.js';
 
 export async function normalizeGatewayRequest(platform: GatewayPlatform, request: Request): Promise<NormalizedInboundMessage | null> {
