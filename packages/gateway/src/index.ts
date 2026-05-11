@@ -2295,7 +2295,32 @@ export async function getTelegramWebhookInfo(
 
 export const normalizeTelegramUpdate = normalizeTelegramWebhook;
 
-export { channels, type ChannelAdapter, type NormalizedChannelMessage, telegramChannel, discordChannel, slackChannel, whatsappChannel, signalChannel, genericChannel } from './channel-registry.js';
+export {
+  channels,
+  type ChannelAdapter,
+  type ChannelAccessResult,
+  type NormalizedChannelMessage,
+  telegramChannel,
+  discordChannel,
+  slackChannel,
+  whatsappChannel,
+  signalChannel,
+  matrixChannel,
+  mattermostChannel,
+  dingtalkChannel,
+  emailChannel,
+  genericChannel,
+  // #318 — cross-platform destination ACL primitive
+  checkDestinationAcl,
+  buildAclDeniedEvent,
+  emitAclDenied,
+  setAclEventSink,
+  type DestinationAclConfig,
+  type DestinationAclDecision,
+  type DestinationAclReason,
+  type AclDeniedEvent,
+  type AclEventSink,
+} from './channel-registry.js';
 
 export async function normalizeGatewayRequest(platform: GatewayPlatform, request: Request): Promise<NormalizedInboundMessage | null> {
   const payload = await request.json();

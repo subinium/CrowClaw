@@ -5,6 +5,14 @@
  * Adding a new channel is a single-file change — no core modifications needed.
  */
 
+import {
+  checkDestinationAcl,
+  emitAclDenied,
+  buildAclDeniedEvent,
+  type DestinationAclConfig,
+  type DestinationAclDecision,
+} from './destination-acl.js';
+
 export interface ChannelAdapter {
   /** Unique channel identifier */
   name: string;
@@ -24,6 +32,34 @@ export interface ChannelAdapter {
     headers: Record<string, string>,
     secret: string
   ): boolean;
+  /**
+   * Per-channel access gate. Runs **after** `normalizeInbound` returns a
+   * non-null message and **before** the agent loop receives it.
+   *
+   * Returning `{ allowed: false }` causes the runtime to drop the inbound
+   * (silently for `silentDrop`, otherwise with a `gateway:acl_denied` audit
+   * event already emitted by the adapter implementation).
+   *
+   * The `config` parameter is the per-channel slice of the runtime config —
+   * adapters interpret it according to their own ACL primitive.
+   */
+  checkAccess?(
+    payload: unknown,
+    normalized: NormalizedChannelMessage,
+    config: unknown,
+  ): ChannelAccessResult;
+}
+
+/** Generic ACL result a channel adapter returns. */
+export interface ChannelAccessResult {
+  allowed: boolean;
+  reason: string;
+  /**
+   * True when the runtime should drop the message without audit-emitting
+   * (reserved for self-chat suppression — see whatsapp-acl). Adapters return
+   * this directly from the underlying ACL primitive.
+   */
+  silentDrop?: boolean;
 }
 
 export interface NormalizedChannelMessage {
@@ -94,6 +130,18 @@ class ChannelRegistry {
 /** Global channel registry singleton */
 export const channels = new ChannelRegistry();
 
+// ---------------------------------------------------------------------------
+// Helpers shared by the per-channel ACL wiring.
+// ---------------------------------------------------------------------------
+
+function loadDestinationAclConfig(raw: unknown): DestinationAclConfig {
+  const value = (raw ?? {}) as Record<string, unknown>;
+  const allowedDestinations = Array.isArray(value.allowedDestinations)
+    ? value.allowedDestinations.filter((s): s is string => typeof s === 'string')
+    : [];
+  return { allowedDestinations };
+}
+
 // --- Built-in channel adapters ---
 
 export const telegramChannel: ChannelAdapter = {
@@ -120,6 +168,22 @@ export const telegramChannel: ChannelAdapter = {
   },
   buildOutbound(channelId, text) {
     return { method: 'sendMessage', chat_id: channelId, text };
+  },
+  /** #318 — Telegram destination allowlist on `chat.id`. */
+  checkAccess(_payload, normalized, config) {
+    const aclConfig = loadDestinationAclConfig(config);
+    const decision: DestinationAclDecision = checkDestinationAcl(normalized.channelId, aclConfig);
+    if (!decision.allowed) {
+      emitAclDenied(
+        buildAclDeniedEvent({
+          platform: 'telegram',
+          reason: decision.reason,
+          destinationId: normalized.channelId,
+          senderId: normalized.senderId,
+        }),
+      );
+    }
+    return decision;
   },
 };
 
@@ -171,6 +235,22 @@ export const slackChannel: ChannelAdapter = {
       text,
       ...(options?.threadTs ? { thread_ts: options.threadTs } : {}),
     };
+  },
+  /** #318 — Slack destination allowlist on `event.channel`. */
+  checkAccess(_payload, normalized, config) {
+    const aclConfig = loadDestinationAclConfig(config);
+    const decision = checkDestinationAcl(normalized.channelId, aclConfig);
+    if (!decision.allowed) {
+      emitAclDenied(
+        buildAclDeniedEvent({
+          platform: 'slack',
+          reason: decision.reason,
+          destinationId: normalized.channelId,
+          senderId: normalized.senderId,
+        }),
+      );
+    }
+    return decision;
   },
 };
 
@@ -230,6 +310,22 @@ export const signalChannel: ChannelAdapter = {
   buildOutbound(channelId, text) {
     return { recipient: channelId, message: text };
   },
+  /** #318 — Signal destination allowlist. Sender phone/UUID is the destination id. */
+  checkAccess(_payload, normalized, config) {
+    const aclConfig = loadDestinationAclConfig(config);
+    const decision = checkDestinationAcl(normalized.channelId, aclConfig);
+    if (!decision.allowed) {
+      emitAclDenied(
+        buildAclDeniedEvent({
+          platform: 'signal',
+          reason: decision.reason,
+          destinationId: normalized.channelId,
+          senderId: normalized.senderId,
+        }),
+      );
+    }
+    return decision;
+  },
 };
 
 export const genericChannel: ChannelAdapter = {
@@ -256,10 +352,75 @@ export const genericChannel: ChannelAdapter = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// #318 — adapters that previously lived only in `packages/gateway/src/index.ts`
+// are surfaced here so the destination ACL primitive has a uniform plug-in
+// point across Matrix, Mattermost, DingTalk, and Email.
+// ---------------------------------------------------------------------------
+
+function buildDestinationChannelAdapter(
+  name: 'matrix' | 'mattermost' | 'dingtalk' | 'email',
+  displayName: string,
+): ChannelAdapter {
+  return {
+    name,
+    displayName,
+    /**
+     * These adapters intentionally return null — the existing dedicated
+     * `normalize<X>Webhook` helpers in `index.ts` handle their platform
+     * shape. They are registered here so the `checkAccess` hook is
+     * discoverable through `channels.get(name)?.checkAccess(...)`.
+     */
+    normalizeInbound() {
+      return null;
+    },
+    buildOutbound(channelId, text) {
+      return { channelId, text };
+    },
+    checkAccess(_payload, normalized, config) {
+      const aclConfig = loadDestinationAclConfig(config);
+      const decision = checkDestinationAcl(normalized.channelId, aclConfig);
+      if (!decision.allowed) {
+        emitAclDenied(
+          buildAclDeniedEvent({
+            platform: name,
+            reason: decision.reason,
+            destinationId: normalized.channelId,
+            senderId: normalized.senderId,
+          }),
+        );
+      }
+      return decision;
+    },
+  };
+}
+
+export const matrixChannel = buildDestinationChannelAdapter('matrix', 'Matrix');
+export const mattermostChannel = buildDestinationChannelAdapter('mattermost', 'Mattermost');
+export const dingtalkChannel = buildDestinationChannelAdapter('dingtalk', 'DingTalk');
+export const emailChannel = buildDestinationChannelAdapter('email', 'Email');
+
 // Auto-register built-in channels
 channels.register(telegramChannel);
 channels.register(discordChannel);
 channels.register(slackChannel);
 channels.register(whatsappChannel);
 channels.register(signalChannel);
+channels.register(matrixChannel);
+channels.register(mattermostChannel);
+channels.register(dingtalkChannel);
+channels.register(emailChannel);
 channels.register(genericChannel);
+
+// Re-export ACL primitives so consumers can import from `@crowclaw/gateway`.
+export {
+  checkDestinationAcl,
+  buildAclDeniedEvent,
+  emitAclDenied,
+  setAclEventSink,
+  type DestinationAclConfig,
+  type DestinationAclDecision,
+  type DestinationAclReason,
+  type AclDeniedEvent,
+  type AclEventSink,
+} from './destination-acl.js';

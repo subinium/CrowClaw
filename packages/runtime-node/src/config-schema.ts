@@ -335,6 +335,89 @@ function gatewaySection(): ConfigSectionSchema {
   };
 }
 
+/**
+ * `channels` section — per-platform ACLs introduced in v0.9.0 to close the
+ * Hermes v0.13 parity gap. Initially scopes the cross-platform destination
+ * allowlist (#318); subsequent commits add Discord (#294) and WhatsApp
+ * (#295) entries.
+ *
+ * Field keys use dot-notation (`slack.allowedDestinations`, …) to stay
+ * consistent with the existing `provider.<slot>.<field>` style.
+ */
+function channelsSection(): ConfigSectionSchema {
+  return {
+    id: 'channels',
+    label: 'Channel ACLs',
+    description: 'Per-platform allowlists for inbound messages (Slack/Telegram/Matrix/Mattermost/DingTalk/Email/Signal destinations).',
+    fields: [
+      // --- Cross-platform destination ACL (#318) ---------------------------
+      {
+        key: 'slack.allowedDestinations',
+        type: 'array',
+        label: 'Slack Allowed Channels',
+        description: 'Slack channel IDs allowed to dispatch messages to the agent. Empty = allow all (backward compat).',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'telegram.allowedDestinations',
+        type: 'array',
+        label: 'Telegram Allowed Chats',
+        description: 'Telegram chat IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'matrix.allowedDestinations',
+        type: 'array',
+        label: 'Matrix Allowed Rooms',
+        description: 'Matrix room IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'mattermost.allowedDestinations',
+        type: 'array',
+        label: 'Mattermost Allowed Channels',
+        description: 'Mattermost channel IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'dingtalk.allowedDestinations',
+        type: 'array',
+        label: 'DingTalk Allowed Conversations',
+        description: 'DingTalk conversation IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'email.allowedDestinations',
+        type: 'array',
+        label: 'Email Allowed Mailboxes',
+        description: 'Email mailbox/inbox identifiers allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'signal.allowedDestinations',
+        type: 'array',
+        label: 'Signal Allowed Senders',
+        description: 'Signal phone numbers / UUIDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+    ],
+  };
+}
+
 function presetsSection(): ConfigSectionSchema {
   return {
     id: 'presets',
@@ -427,6 +510,7 @@ export function generateConfigSchema(): FullConfigSchema {
       securitySection(),
       providerSection(),
       gatewaySection(),
+      channelsSection(),
       presetsSection(),
     ],
   };

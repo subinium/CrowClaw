@@ -18,13 +18,14 @@ describe('Config Schema', () => {
   describe('generateConfigSchema', () => {
     const schema = generateConfigSchema();
 
-    it('returns all 5 sections', () => {
-      expect(schema.sections).toHaveLength(5);
+    it('returns all 6 sections', () => {
+      expect(schema.sections).toHaveLength(6);
       const ids = schema.sections.map((s) => s.id);
       expect(ids).toContain('agent');
       expect(ids).toContain('security');
       expect(ids).toContain('provider');
       expect(ids).toContain('gateway');
+      expect(ids).toContain('channels');
       expect(ids).toContain('presets');
     });
 
