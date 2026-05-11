@@ -39,6 +39,7 @@ import {
   directToolAliases,
   formatSseFrame,
   getRequestLocale,
+  getRequestSessionKey,
   normalizeCheckpointTrigger,
   releaseIdempotency,
   renderBrowserBackResult,
@@ -77,7 +78,7 @@ import {
 import { createRuntimeShutdown } from './runtime-lifecycle.js';
 import { createDefaultPluginManager, createRuntimePluginCatalog } from './runtime-plugins.js';
 import { createRuntimeScheduler } from './runtime-scheduler.js';
-import { configureTelegramWebhookStartup, warnWhenDashboardTokenMissing } from './runtime-startup.js';
+import { configureTelegramWebhookStartup, pruneCheckpointStartup, warnWhenDashboardTokenMissing } from './runtime-startup.js';
 
 export { SecretChain, envSource, filesSource, systemdCredsSource, sopsSource, onePasswordSource, createDefaultSecretChain, resolveSecret } from './secret-loader.js';
 export {
@@ -488,6 +489,20 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   });
   const publicUrl = configureTelegramWebhookStartup({ options, runtimeEnv, configStore, log });
 
+  // #338 (v0.9.0 Hermes parity): one-shot orphan/stale checkpoint sweep at
+  // startup. Reads the known session ids out of the live store so anything
+  // not in the index gets moved to .trash/ (recoverable for one cycle).
+  // Fire-and-forget — failures are logged inside the helper and never
+  // abort startup.
+  void pruneCheckpointStartup({
+    options,
+    knownSessionIds: async () => {
+      const sessions = await store.list();
+      return new Set(sessions.map((s) => s.sessionId));
+    },
+    log,
+  });
+
   const shutdown = createRuntimeShutdown({
     sseSubscribers,
     wsManager,
@@ -604,6 +619,7 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
       releaseCheckCache,
       trackLearning,
       getRequestLocale,
+      getRequestSessionKey,
       normalizeCheckpointTrigger,
       directToolAliases,
       summarizeDirectTools,
