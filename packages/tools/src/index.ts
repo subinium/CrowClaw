@@ -51,6 +51,18 @@ import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision
 export { createImageGenerateTool, type ImageGenerationOptions } from './image-gen.js';
 import { createImageGenerateTool as createImageGenerateToolImpl } from './image-gen.js';
 export { createTtsTool, createTranscriptionTool, createSttTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
+
+// v0.9.0 (#325) — TTS provider registry surface. Piper local provider lives
+// in tts-piper.ts. xAI Custom Voices (#324) plugs in via the same registry.
+export {
+  TTSProviderRegistry,
+  type TTSProvider,
+  type TTSSynthesisOptions,
+  type TTSSynthesisResult,
+  type TTSVoiceDescriptor,
+  type TTSProviderHealth,
+} from './tts-registry.js';
+export { createPiperProvider, type PiperProviderOptions } from './tts-piper.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
 // v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
 // not registered by `registerCoreTools` and not in the default agent toolset.
