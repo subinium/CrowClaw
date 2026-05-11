@@ -348,8 +348,36 @@ function channelsSection(): ConfigSectionSchema {
   return {
     id: 'channels',
     label: 'Channel ACLs',
-    description: 'Per-platform allowlists for inbound messages (Slack/Telegram/Matrix/Mattermost/DingTalk/Email/Signal destinations).',
+    description: 'Per-platform allowlists for inbound messages (Discord guild roles, Slack/Telegram/Matrix/Mattermost/DingTalk/Email/Signal destinations).',
     fields: [
+      // --- Discord (#294, CVSS 8.1) -----------------------------------------
+      {
+        key: 'discord.allowedRoles',
+        type: 'array',
+        label: 'Discord Allowed Roles',
+        description: 'Array of `{ guildId, roleIds }` tuples. Role IDs are matched ONLY within the originating guild — the legacy `string[]` (role name) shape is detected and forced to deny-all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'discord.allowDirectMessages',
+        type: 'boolean',
+        label: 'Discord Allow Direct Messages',
+        description: 'Allow DMs (messages with no guild_id). Defaults to false — required to mitigate the CVSS 8.1 cross-guild bypass.',
+        required: false,
+        default: false,
+        section: 'channels',
+      },
+      {
+        key: 'discord.dmAllowlist',
+        type: 'array',
+        label: 'Discord DM Allowlist',
+        description: 'Discord user IDs allowed to DM the bot when `allowDirectMessages` is true.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
       // --- Cross-platform destination ACL (#318) ---------------------------
       {
         key: 'slack.allowedDestinations',

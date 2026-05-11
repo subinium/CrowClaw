@@ -12,6 +12,13 @@ import {
   type DestinationAclConfig,
   type DestinationAclDecision,
 } from './destination-acl.js';
+import {
+  checkDiscordAcl,
+  emitDiscordAclDenied,
+  extractDiscordAclInput,
+  loadDiscordAclConfig,
+  type DiscordAclConfig,
+} from './discord-acl.js';
 
 export interface ChannelAdapter {
   /** Unique channel identifier */
@@ -208,6 +215,32 @@ export const discordChannel: ChannelAdapter = {
   },
   buildOutbound(_channelId, text) {
     return { content: text };
+  },
+  /**
+   * #294 — Discord guild-scoped role allowlist.
+   * `config` is the raw `channels.discord` slice. We normalize via
+   * `loadDiscordAclConfig` (which also handles the legacy string[] migration),
+   * extract `(guild_id, member.roles, sender)` from the webhook payload, and
+   * delegate to `checkDiscordAcl`. Denials emit `gateway:acl_denied`.
+   */
+  checkAccess(payload, normalized, config) {
+    const aclConfig: DiscordAclConfig = loadDiscordAclConfig(config);
+    const input = extractDiscordAclInput(payload);
+    if (!input) {
+      // No usable signal — fail closed to keep parity with Hermes' guarded fix.
+      emitDiscordAclDenied({ reason: 'missing-roles', senderId: normalized.senderId });
+      return { allowed: false, reason: 'missing-roles' };
+    }
+    const decision = checkDiscordAcl(input, aclConfig);
+    if (!decision.allowed) {
+      emitDiscordAclDenied({
+        reason: decision.reason,
+        guildId: decision.guildId ?? input.guildId,
+        senderId: input.senderId,
+        destinationId: normalized.channelId,
+      });
+    }
+    return { allowed: decision.allowed, reason: decision.reason };
   },
 };
 
@@ -424,3 +457,15 @@ export {
   type AclDeniedEvent,
   type AclEventSink,
 } from './destination-acl.js';
+export {
+  checkDiscordAcl,
+  loadDiscordAclConfig,
+  isLegacyAllowedRolesShape,
+  extractDiscordAclInput,
+  emitDiscordAclDenied,
+  type DiscordAclConfig,
+  type DiscordAclDecision,
+  type DiscordAclInput,
+  type DiscordAclReason,
+  type DiscordGuildRoleEntry,
+} from './discord-acl.js';

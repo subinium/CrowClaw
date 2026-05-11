@@ -2320,6 +2320,17 @@ export {
   type DestinationAclReason,
   type AclDeniedEvent,
   type AclEventSink,
+  // #294 — Discord guild-scoped role allowlist (CVSS 8.1)
+  checkDiscordAcl,
+  loadDiscordAclConfig,
+  isLegacyAllowedRolesShape,
+  extractDiscordAclInput,
+  emitDiscordAclDenied,
+  type DiscordAclConfig,
+  type DiscordAclDecision,
+  type DiscordAclInput,
+  type DiscordAclReason,
+  type DiscordGuildRoleEntry,
 } from './channel-registry.js';
 
 export async function normalizeGatewayRequest(platform: GatewayPlatform, request: Request): Promise<NormalizedInboundMessage | null> {
