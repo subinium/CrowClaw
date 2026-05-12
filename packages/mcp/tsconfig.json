@@ -11,6 +11,9 @@
   "references": [
     {
       "path": "../sandbox-executor"
+    },
+    {
+      "path": "../shared"
     }
   ]
 }

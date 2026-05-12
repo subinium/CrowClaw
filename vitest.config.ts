@@ -9,7 +9,7 @@ const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'ut
 export default defineConfig({
   resolve: {
     alias: {
-      '@cloudflare/sandbox': path.resolve(__dirname, 'tests/stubs/cloudflare-sandbox.ts')
+      '@cloudflare/sandbox': path.resolve(__dirname, 'tests/stubs/cloudflare-sandbox.ts'),
     }
   },
   // Mirror Wrangler's `define` so `__CROWCLAW_TEST_MODE__` / `__CROWCLAW_VERSION__`

@@ -19,6 +19,36 @@ export {
   clearSafeTimer,
 } from './safe-timer.js';
 
+// #299 — assembled-prompt injection scan (cron security)
+export {
+  type PromptPart,
+  type InjectionFinding,
+  type SecurityScanner,
+  type InjectionPolicy,
+  ASSEMBLY_SEPARATOR,
+  assemblePrompt,
+  scanAssembledPrompt,
+  applyInjectionPolicy,
+} from './injection-scan.js';
+
+// #309 — no-agent cron runner (script-only watchdog jobs)
+export {
+  type NoAgentSandboxClient,
+  type NoAgentRunResult,
+  type NoAgentRunnerOptions,
+  type NoAgentFailureEvent,
+  DEFAULT_NO_AGENT_TIMEOUT_MS,
+  NoAgentRunner,
+} from './no-agent-runner.js';
+
+import type { PromptPart, SecurityScanner, InjectionPolicy } from './injection-scan.js';
+import {
+  scanAssembledPrompt,
+  applyInjectionPolicy,
+} from './injection-scan.js';
+import type { NoAgentSandboxClient, NoAgentFailureEvent } from './no-agent-runner.js';
+import { NoAgentRunner, DEFAULT_NO_AGENT_TIMEOUT_MS } from './no-agent-runner.js';
+
 import {
   parseCron,
   nextCronOccurrence,
@@ -86,6 +116,45 @@ export interface CronJobDefinition {
   enabled: boolean;
   nextRunAt?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * #309 — cron job execution mode. Default `'agent'` preserves the existing
+   * agent-loop dispatch. `'no_agent'` skips the agent entirely and runs
+   * `command` via the configured sandbox executor, delivering stdout
+   * verbatim. Empty stdout → silent; non-zero exit → emit
+   * `cron:no_agent_failed`. Use-cases: certificate-expiry watchdog, disk
+   * usage alerts, log tailing.
+   */
+  mode?: 'agent' | 'no_agent';
+  /**
+   * #309 — shell command to execute when `mode === 'no_agent'`. Ignored for
+   * agent-mode jobs. The command runs through the host's sandbox executor
+   * (same path as agent terminal calls), so resource limits and env
+   * sanitization apply automatically.
+   */
+  command?: string;
+  /**
+   * #309 — per-job command timeout in ms. Falls back to
+   * `DEFAULT_NO_AGENT_TIMEOUT_MS` (60s) when unset. Only used when
+   * `mode === 'no_agent'`. Resource limits beyond timeout (CPU, memory) are
+   * enforced by the sandbox executor itself.
+   */
+  commandTimeoutMs?: number;
+  /**
+   * #309 — what to deliver on non-zero exit when `mode === 'no_agent'`.
+   *  - `'silent'` (default) — record the failure event, deliver nothing.
+   *  - `'notify'`           — deliver a one-line failure notice (cron id,
+   *                           exit code, stderr summary) to the configured
+   *                           `deliverTo` target.
+   */
+  noAgentFailurePolicy?: 'silent' | 'notify';
+  /**
+   * #299 — per-cron injection policy applied to the assembled prompt
+   * (cron config + injected skills + memory). Default `'block'` refuses
+   * dispatch on any detected injection. `'warn'` logs but proceeds. `'off'`
+   * skips the scan entirely (escape hatch for trusted hosts running their
+   * own pre-validation). Has no effect on `mode: 'no_agent'` jobs.
+   */
+  injectionPolicy?: InjectionPolicy;
   // Agent execution fields
   skillSlugs?: string[];
   toolsetPreset?: string;
@@ -575,6 +644,53 @@ export async function markJobRun(
 // Scheduler executor
 // ---------------------------------------------------------------------------
 
+/**
+ * #299 — Probe used by the executor to build the assembled prompt for a job
+ * before dispatch. Hosts supply the same `[cronConfig, ...skills, ...memory]`
+ * parts that the agent loop will eventually see, so the scan covers the
+ * exact byte stream that reaches the model.
+ *
+ * Returning `null` skips the assembled-prompt scan entirely — useful for
+ * hosts that haven't wired skill resolution yet (graceful degradation:
+ * the cron config part still gets scanned by `scanForEnhancedInjection`
+ * inside the agent loop on dispatch).
+ */
+export interface AssembledPromptProbe {
+  (job: CronJobDefinition): Promise<PromptPart[] | null> | PromptPart[] | null;
+}
+
+/**
+ * #299 — Audit event recorded when injection-scan policy blocks or warns
+ * on a cron job. Distinct from the per-cron policy decision so hosts can
+ * route blocks to the security audit log and the operator-notification
+ * channel independently.
+ */
+export interface CronInjectionAuditEvent {
+  type: 'cron:cron_injection_blocked' | 'cron:cron_injection_warning';
+  severity: 'critical' | 'warning';
+  jobId: string;
+  detail: string;
+  findings: Array<{
+    type: string;
+    description: string;
+    severity: 'low' | 'medium' | 'high';
+    partName: string;
+    offsetInPart: number;
+    offsetInAssembled: number;
+  }>;
+}
+
+/**
+ * #299 — Operator-notification sink. Invoked when an injection scan
+ * blocks dispatch so the cron's configured channel can still surface the
+ * abort to the owner (telemetry-only is not enough — operator has to know
+ * the job did not run). Failure to deliver here MUST NOT propagate into a
+ * job failure — the dispatch is already aborted.
+ */
+export interface InjectionOwnerNotifier {
+  (event: CronInjectionAuditEvent, job: CronJobDefinition): Promise<void> | void;
+}
+
 export interface SchedulerExecutorOptions {
   /**
    * Optional probe that returns the most recent tool-activity timestamp for a
@@ -583,6 +699,48 @@ export interface SchedulerExecutorOptions {
    * Hosts read this from `SessionState.lastToolActivityAt`.
    */
   activityProbe?: SessionActivityProbe;
+  /**
+   * #299 — Injection scanner used to scan the assembled prompt. Hosts wire
+   * this to `scanForEnhancedInjection` from @crowclaw/core. Required when
+   * `assembledPromptProbe` is set; otherwise no scan runs.
+   */
+  injectionScanner?: SecurityScanner;
+  /**
+   * #299 — Resolves the assembled prompt parts for a job at dispatch time.
+   * The scheduler scans the assembled buffer (not each part independently)
+   * to catch threats that only manifest after concatenation.
+   */
+  assembledPromptProbe?: AssembledPromptProbe;
+  /**
+   * #299 — Default injection policy when a job omits `injectionPolicy`.
+   * Defaults to `'block'`.
+   */
+  defaultInjectionPolicy?: InjectionPolicy;
+  /**
+   * #299 — Audit sink for injection events. Failures inside the sink are
+   * swallowed; the scheduler still applies the policy regardless.
+   */
+  onInjectionEvent?: (event: CronInjectionAuditEvent) => void;
+  /**
+   * #299 — Owner-notification channel. Called when an injection blocks
+   * dispatch so the operator hears about it even when they don't tail the
+   * audit log. Best-effort; never escalates into a job failure.
+   */
+  notifyInjectionOwner?: InjectionOwnerNotifier;
+  /**
+   * #309 — Sandbox client used to run `no_agent` cron jobs. Hosts wire
+   * this to a `LocalProcessExecutor`, `DockerExecutor`, or any other
+   * `SandboxClient`. When unset, `mode: 'no_agent'` jobs fail with a
+   * configuration error.
+   */
+  sandboxClient?: NoAgentSandboxClient;
+  /**
+   * #309 — Sink for `cron:no_agent_failed` events. Hosts wire this to the
+   * security audit log. The runner emits the event when a no-agent
+   * command exits non-zero or times out, regardless of whether the
+   * delivery channel surfaces the failure.
+   */
+  onNoAgentFailure?: (event: NoAgentFailureEvent) => void;
   /**
    * Default inactivity timeout in ms applied when a job omits
    * `inactivityTimeoutMs`. Overridable per-job.
@@ -747,6 +905,32 @@ export class SchedulerExecutor {
 
   private async executeJob(job: CronJobDefinition): Promise<SchedulerTickResult> {
     const sessionId = `sched-${job.id}-${Date.now()}`;
+
+    // #309 — no-agent mode: skip the agent loop and the prompt-injection scan
+    // (no LLM-bound prompt is assembled) and run the configured shell
+    // command via the host's sandbox executor.
+    if (job.mode === 'no_agent') {
+      return this.executeNoAgentJob(job, sessionId);
+    }
+
+    // #299 — Assembled-prompt injection scan. Runs BEFORE the watchdog so
+    // a blocked dispatch doesn't waste a session id or fire the activity
+    // probe. The scan is best-effort: if `assembledPromptProbe` returns
+    // null (host hasn't wired skill resolution) the agent loop still runs
+    // its own scanner against the user message — we just lose multi-source
+    // coverage. Errors inside the scanner / probe are caught and logged,
+    // never propagated, so a buggy host can't bring down the cron tick.
+    const injectionDecision = await this.runAssembledPromptScan(job);
+    if (!injectionDecision.shouldDispatch) {
+      return {
+        jobId: job.id,
+        sessionId,
+        ok: false,
+        error: injectionDecision.errorMessage ?? 'Cron dispatch blocked by injection policy',
+        executedAt: new Date().toISOString(),
+      };
+    }
+
     const startMs = Date.now();
     // Resolve effective timeouts. Backward compatibility:
     //   - Legacy `timeoutMs` is honoured as the inactivity window when the
@@ -883,6 +1067,164 @@ export class SchedulerExecutor {
       return Number.isFinite(parsed) ? parsed : fallbackMs;
     } catch {
       return fallbackMs;
+    }
+  }
+
+  /**
+   * #299 — Run the assembled-prompt injection scan and apply the per-cron
+   * policy. Returns whether dispatch should proceed and (when blocked) the
+   * error message to surface. Audit events and owner notifications are
+   * fired here as side effects so the call site stays small.
+   *
+   * Failure modes are all soft: a missing scanner / missing probe / probe
+   * throw all degrade to "skip the scan and proceed", because hosts that
+   * haven't wired skill resolution should not see cron jobs silently
+   * break. The blocking path is reserved for actual injection findings.
+   */
+  private async runAssembledPromptScan(
+    job: CronJobDefinition,
+  ): Promise<{ shouldDispatch: boolean; errorMessage?: string }> {
+    const policy: InjectionPolicy =
+      job.injectionPolicy
+      ?? this.options.defaultInjectionPolicy
+      ?? 'block';
+    if (policy === 'off') return { shouldDispatch: true };
+
+    const scanner = this.options.injectionScanner;
+    const probe = this.options.assembledPromptProbe;
+    if (!scanner || !probe) {
+      // Host hasn't wired the multi-source scan path. The agent loop still
+      // runs `scanForEnhancedInjection` against the user message on
+      // dispatch, so the cron config string itself is still covered.
+      return { shouldDispatch: true };
+    }
+
+    let parts: PromptPart[] | null;
+    try {
+      parts = await probe(job);
+    } catch {
+      // Probe failure must not bring down the cron tick.
+      return { shouldDispatch: true };
+    }
+    if (!parts || parts.length === 0) return { shouldDispatch: true };
+
+    const findings = scanAssembledPrompt(parts, scanner);
+    const decision = applyInjectionPolicy(findings, policy);
+
+    if (decision.auditEvent) {
+      const event: CronInjectionAuditEvent = {
+        type: decision.auditEvent.type,
+        severity: decision.auditEvent.severity,
+        jobId: job.id,
+        detail: decision.auditEvent.detail,
+        findings: findings.map((f) => ({
+          type: f.type,
+          description: f.description,
+          severity: f.severity,
+          partName: f.partName,
+          offsetInPart: f.offsetInPart,
+          offsetInAssembled: f.offsetInAssembled,
+        })),
+      };
+      try {
+        this.options.onInjectionEvent?.(event);
+      } catch {
+        // Audit-sink errors never propagate into job state.
+      }
+      if (!decision.shouldDispatch && this.options.notifyInjectionOwner) {
+        // Owner notification is best-effort — we already decided to abort
+        // dispatch, the run will be marked as failed regardless of whether
+        // the notification reaches the operator.
+        try {
+          await this.options.notifyInjectionOwner(event, job);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (!decision.shouldDispatch) {
+      return {
+        shouldDispatch: false,
+        errorMessage: `Cron dispatch blocked: prompt injection detected (${findings.length} finding${findings.length === 1 ? '' : 's'}). See audit log for details.`,
+      };
+    }
+    return { shouldDispatch: true };
+  }
+
+  /**
+   * #309 — Run a `mode: 'no_agent'` cron job. Skips the agent loop entirely
+   * and runs the configured shell command through the host's sandbox client.
+   * Empty stdout → silent (no delivery). Non-zero exit emits
+   * `cron:no_agent_failed` and, when `noAgentFailurePolicy === 'notify'`,
+   * delivers a one-line failure notice through the configured channel.
+   */
+  private async executeNoAgentJob(
+    job: CronJobDefinition,
+    sessionId: string,
+  ): Promise<SchedulerTickResult> {
+    if (!job.command || !job.command.trim()) {
+      return {
+        jobId: job.id,
+        sessionId,
+        ok: false,
+        error: 'no_agent job missing command',
+        executedAt: new Date().toISOString(),
+      };
+    }
+    const client = this.options.sandboxClient;
+    if (!client) {
+      return {
+        jobId: job.id,
+        sessionId,
+        ok: false,
+        error: 'no_agent mode requires a sandboxClient on SchedulerExecutorOptions',
+        executedAt: new Date().toISOString(),
+      };
+    }
+    try {
+      const runner = new NoAgentRunner(client);
+      const onFailure: ((event: NoAgentFailureEvent) => void) | undefined =
+        this.options.onNoAgentFailure;
+      const result = await runner.run(job.command, {
+        jobId: job.id,
+        timeoutMs: job.commandTimeoutMs ?? DEFAULT_NO_AGENT_TIMEOUT_MS,
+        failurePolicy: job.noAgentFailurePolicy ?? 'silent',
+        ...(onFailure ? { onFailureEvent: onFailure } : {}),
+      });
+
+      let deliveryResult: { ok: boolean; error?: string } | undefined;
+      if (result.shouldDeliver && result.deliveryContent && job.deliverTo && this.deliver) {
+        deliveryResult = await this.deliver(job.deliverTo, result.deliveryContent);
+      }
+
+      return {
+        jobId: job.id,
+        sessionId,
+        ok: result.ok,
+        response: result.stdout,
+        // Surface a synthetic tool-result row so audit / dashboard views
+        // can show what the no-agent run did without inventing a new
+        // shape. `toolName: 'no_agent'` is reserved for this purpose.
+        toolResults: [
+          {
+            toolName: 'no_agent',
+            ok: result.ok,
+            output: result.stdout || (result.shouldDeliver ? '' : '(silent)'),
+          },
+        ],
+        delivery: deliveryResult,
+        error: result.ok ? undefined : `no_agent exit ${result.exitCode}${result.timedOut ? ' (timeout)' : ''}`,
+        executedAt: new Date().toISOString(),
+      };
+    } catch (err: unknown) {
+      return {
+        jobId: job.id,
+        sessionId,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        executedAt: new Date().toISOString(),
+      };
     }
   }
 }

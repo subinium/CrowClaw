@@ -161,15 +161,18 @@ export class MemoryService {
     return record;
   }
 
-  async recall(sessionId: string, query: string, limit = 10, scope?: MemoryScope, scopeKey?: string): Promise<MemoryRecord[]> {
+  async recall(sessionId: string, query: string, limit = 10, scope?: MemoryScope, scopeKey?: string, options?: { sessionKey?: string }): Promise<MemoryRecord[]> {
     if (this.provider) {
-      return this.provider.recall(sessionId, query, limit, scope, scopeKey);
+      return this.provider.recall(sessionId, query, limit, scope, scopeKey, options);
     }
     if (!this.store) {
       return [];
     }
 
-    const results = await this.store.search(sessionId, query, limit * 2);
+    // #304 (v0.9.0): respect the stable sessionKey when no provider is set —
+    // search the namespace the caller actually keyed memory under.
+    const searchSessionId = options?.sessionKey ?? sessionId;
+    const results = await this.store.search(searchSessionId, query, limit * 2);
     return results.filter((r) => !isExpired(r)).slice(0, limit);
   }
 
@@ -177,12 +180,15 @@ export class MemoryService {
    * v0.8 `MemoryProvider.prefetch` — exposed on the facade so the runtime can
    * call `memoryService.prefetch?.(...)` uniformly. Defers to the underlying
    * provider when present so adapters with caches can pre-warm.
+   *
+   * #304 (v0.9.0): forwards the stable client `sessionKey` so cross-/new/
+   * pre-fetch lands in the right namespace.
    */
-  async prefetch(sessionId: string, query: string, limit: number): Promise<MemoryRecord[]> {
+  async prefetch(sessionId: string, query: string, limit: number, options?: { sessionKey?: string }): Promise<MemoryRecord[]> {
     if (this.provider?.prefetch) {
-      return this.provider.prefetch(sessionId, query, limit);
+      return this.provider.prefetch(sessionId, query, limit, options);
     }
-    return this.recall(sessionId, query, limit);
+    return this.recall(sessionId, query, limit, undefined, undefined, options);
   }
 
   async recallByScope(scope: MemoryRecord['scope'], query: string, limit = 10, scopeKey?: string): Promise<MemoryRecord[]> {
@@ -393,7 +399,7 @@ export {
 } from './dream-memory.js';
 
 // v0.8.0 Hermes parity (#233) — pluggable MemoryProvider ABC.
-export type { MemoryProvider } from './provider.js';
+export type { MemoryProvider, MemoryProviderOptions } from './provider.js';
 export type { MemoryScope } from './types.js';
 export { InMemoryMemoryProvider, PluginMemoryProvider, memoryProviderFromPluginRegistry } from './provider.js';
 export type { MemoryRecord as ProviderMemoryRecord, ConversationMessage as ProviderConversationMessage } from './types.js';

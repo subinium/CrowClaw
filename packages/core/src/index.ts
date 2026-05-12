@@ -12,6 +12,10 @@ export type {
   PluginInvocationPayloads,
   PreToolCallVeto,
   ToolResultTransform,
+  AssistantMessage,
+  LLMOutputTransform,
+  LLMOutputTurn,
+  LLMOutputDroppedOutcome,
 } from './plugins.js';
 import { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
 import { matchSkillManifests, filterAndBudgetSkills, checkSkillGates, localizeSkillFile, type ParsedSkillFile, type SkillManifest } from './skill-manifest.js';
@@ -23,6 +27,22 @@ import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanC
 import { splitWithPairPreservation, extractPreflightFacts } from './compression-utils.js';
 import { isHardlineBlocked, HARDLINE_BLOCKLIST } from './hardline-blocklist.js';
 import { stripReasoningContent } from './provider-switch.js';
+// #314 — per-session pending-queue primitive. Used by ACP `acp.queue`, the
+// REST/WS handlers, and the iteration-end drain in this file.
+import {
+  type PendingQueueStore,
+  type QueuedUserMessage,
+  type SerializedQueueEntry,
+  createPendingQueueStore,
+  enqueueMessage,
+  drainPendingQueue,
+  pendingQueueLength,
+  peekPendingQueue,
+  buildQueueAnnotation,
+  serializeQueue,
+  restoreQueue,
+  OPERATOR_QUEUE_SEPARATOR,
+} from './queue.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -195,6 +215,24 @@ export interface SessionState {
   /** #187: total UTF-8 byte size of the memory record summaries bound to
    *  this session. Same lifecycle/semantics as `memoryEntryCount`. */
   memoryBytes?: number;
+  /**
+   * #314 — Pending `/queue` messages awaiting drain into the next user turn.
+   * Persisted alongside the session so a host restart preserves operator
+   * follow-up messages. The AgentLoop drains this at iteration-end (after
+   * the model produces text) and concatenates the entries into the next
+   * user-turn message with `OPERATOR_QUEUE_SEPARATOR`. Empty when no
+   * follow-ups are queued — storage adapters MAY omit the field.
+   */
+  pendingQueue?: import('./queue.js').QueuedUserMessage[];
+  /**
+   * #314 — Per-iteration reasoning blocks preserved across session restore
+   * (companion to v0.6.0 reasoning-content scrub). When the provider
+   * surfaces `<plan>`, `<reasoning>`, `<reflection>` blocks the AgentLoop
+   * appends a trimmed record here so a restored session still sees the
+   * planning context that produced its current state. Treated as
+   * append-only metadata — never re-fed into the model on its own.
+   */
+  reasoningHistory?: import('./reasoning-blocks.js').ReasoningBlock[];
 }
 
 export interface SessionStore {
@@ -217,6 +255,23 @@ export interface AgentRunInput {
   memories?: string[];
   /** Preferred UI/user locale for dynamic system prompt language. */
   locale?: SupportedLocale;
+  /**
+   * #304 (v0.9.0 Hermes parity): stable per-client memory namespace key.
+   * Propagated through `MemoryProvider.recall / store / prefetch` so adapters
+   * can bind long-term memory to a client-supplied identifier (Telegram
+   * chat_id, desktop install ID, browser fingerprint) that survives
+   * `/new`-style sessionId rotation.
+   *
+   * Sourced (in order of precedence) from:
+   *   1. `X-CrowClaw-Session-Key` request header
+   *   2. `body.sessionKey` on the inbound HTTP/WS payload
+   *   3. undefined — providers fall back to sessionId/userId as today
+   *
+   * Adapters that don't recognise `sessionKey` keep working unchanged
+   * (backward compatible). See `getRequestSessionKey` in
+   * `packages/runtime-node/src/runtime-support.ts` for the wire extractor.
+   */
+  sessionKey?: string;
 }
 
 /**
@@ -360,6 +415,12 @@ export interface AgentLoopOptions {
   /** #235 (v0.8.0): consecutive identical (toolName, errorCode) failures that
    *  trigger a terminal exit. Default: 3 (Hermes pattern). */
   toolFailureStreakLimit?: number;
+  /** #302 (v0.9.0 Hermes parity): how many times the loop will re-fetch the
+   *  LLM output after a plugin in the `transformLLMOutput` chain returns
+   *  `null` (drop). Default: 2. Each drop emits
+   *  `plugin:llm_output_dropped`; after the cap the loop falls through with
+   *  the last received message. */
+  maxLLMOutputRetries?: number;
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -646,6 +707,12 @@ export class AgentLoop {
    *  every loop iteration and prepended as a one-shot system message — never
    *  written to session.messages, so the same nudge isn't replayed on restore. */
   private readonly pendingSteers = new Map<string, string[]>();
+  /** #314: queue of pending /queue follow-up user messages per session. Distinct
+   *  from `pendingSteers`: queue entries are drained at iteration *end* and
+   *  concatenated into the next user-turn message via `OPERATOR_QUEUE_SEPARATOR`.
+   *  Persisted with the session (atomic-rename) so a host restart preserves
+   *  operator follow-ups. ACP `acp.queue`, REST, and WS handlers all push here. */
+  private readonly pendingQueue: PendingQueueStore = createPendingQueueStore();
   /** #53: extra hardline patterns supplied by the operator at construction
    *  time (e.g., loaded from env config). Merged with the static defaults. */
   private readonly hardlineBlocklist: ReadonlyArray<{ pattern: RegExp; description: string }>;
@@ -659,6 +726,9 @@ export class AgentLoop {
   private readonly eventBus?: AgentEventEmitter;
   /** #235 (v0.8.0): consecutive identical (toolName, errorCode) cap. */
   private readonly toolFailureStreakLimit: number;
+  /** #302 (v0.9.0): how many times `applyLLMOutputPipeline` will refetch when
+   *  a plugin in the chain returns null. */
+  private readonly maxLLMOutputRetries: number;
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -713,6 +783,7 @@ export class AgentLoop {
     this.fallbackProviderNames = options.fallbackProviderNames ?? [];
     this.eventBus = options.eventBus;
     this.toolFailureStreakLimit = options.toolFailureStreakLimit ?? 3;
+    this.maxLLMOutputRetries = options.maxLLMOutputRetries ?? 2;
   }
 
   private auditProvenance(input?: { agentId?: string; sessionId?: string }): {
@@ -759,6 +830,77 @@ export class AgentLoop {
     if (!queue || queue.length === 0) return [];
     this.pendingSteers.delete(sessionId);
     return queue;
+  }
+
+  // -------------------------------------------------------------------------
+  // #314 — `/queue` follow-up messages
+  //
+  // Distinct from `/steer`:
+  //  - `/steer` fires at iteration *start* as a one-shot system nudge.
+  //  - `/queue` fires at iteration *end* and concatenates into the *next*
+  //    user-turn message so the model sees the follow-up as part of the
+  //    user conversation, not as an out-of-band override.
+  //
+  // The queue MUST be persisted with the session so a host restart preserves
+  // operator follow-ups. Storage adapters call `serializePendingQueue` /
+  // `restorePendingQueue` at the same boundary they persist session state.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Queue a follow-up user message for the next iteration. Mirrors `steer`
+   * but the entry lands in the next *user-turn* content, not as a system
+   * nudge. Empty content is dropped; returns `true` when the message was
+   * actually queued.
+   */
+  queue(sessionId: string, message: string, options?: { source?: string; id?: string }): boolean {
+    return enqueueMessage(this.pendingQueue, sessionId, {
+      content: message,
+      queuedAt: nowIso(),
+      ...(options?.source ? { source: options.source } : {}),
+      ...(options?.id ? { id: options.id } : {}),
+    });
+  }
+
+  /**
+   * Peek at the current pending queue for a session without draining. Used
+   * by the dashboard "in-flight session" view and the ACP `acp.queue.list`
+   * method.
+   */
+  peekQueue(sessionId: string): QueuedUserMessage[] {
+    return peekPendingQueue(this.pendingQueue, sessionId);
+  }
+
+  /** Number of pending queue messages for the session. O(1) check. */
+  queueLength(sessionId: string): number {
+    return pendingQueueLength(this.pendingQueue, sessionId);
+  }
+
+  /**
+   * Drain and return the current pending queue for `sessionId`. Called from
+   * the iteration-end drain block in `run`/`runStream` — exposed publicly so
+   * the ACP server can also drain on operator request (`acp.queue.flush`).
+   */
+  drainQueue(sessionId: string): QueuedUserMessage[] {
+    return drainPendingQueue(this.pendingQueue, sessionId);
+  }
+
+  /**
+   * Serialize the pending queue across all sessions. Storage adapters call
+   * this when snapshotting state to disk / Durable Object storage. Pairs
+   * with `restorePendingQueue` on rehydrate.
+   */
+  serializePendingQueue(): SerializedQueueEntry[] {
+    return serializeQueue(this.pendingQueue);
+  }
+
+  /**
+   * Restore the pending queue from a previously serialized snapshot. Called
+   * on session-store rehydrate. Idempotent — existing in-memory entries for
+   * a session ARE overwritten, so callers should restore before any new
+   * `queue()` call lands.
+   */
+  restorePendingQueue(data: SerializedQueueEntry[] | null | undefined): void {
+    restoreQueue(this.pendingQueue, data);
   }
 
   /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
@@ -1361,6 +1503,141 @@ export class AgentLoop {
     };
   }
 
+  // ───────────────────────────────────────────────────────────────────────
+  // #302 (v0.9.0) BEGIN — applyLLMOutputPipeline / response-merge section.
+  // This block wires the new `transformLLMOutput` plugin hook into the
+  // agent loop. Agent D (steer/queue) should not touch the helpers below;
+  // they live deliberately adjacent to `applyResultPipeline` so the two
+  // pipelines stay symmetric.
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * #302 (v0.9.0 Hermes parity): sibling of `applyResultPipeline` for the
+   * LLM response stream. Order is:
+   *
+   *   1. Plugin `transformLLMOutput` chain — registration-order, exception-
+   *      resilient. Plugins may rewrite the message, drop the turn, or pass
+   *      through. Drops trigger a refetch up to `maxLLMOutputRetries`.
+   *   2. Core redaction (credentials/PII + indirect-injection wrap) of the
+   *      final assistant text — guarantees plugins cannot un-redact or
+   *      smuggle credentials into the prompt history.
+   *
+   * The refetch loop calls `regenerate` (passed in by the caller) to obtain
+   * a fresh `ProviderResponse` after a drop. Returning `null` from the
+   * pipeline means we exhausted retries with the final attempt also
+   * dropped — the caller falls through to the most recent non-dropped
+   * message (legacy behaviour) and the loop continues so the user still
+   * sees a response.
+   */
+  private async applyLLMOutputPipeline(
+    initial: ProviderResponse,
+    turn: { sessionId: string; agentId: string; iteration: number; messages: ConversationMessage[] },
+    regenerate: () => Promise<ProviderResponse>,
+  ): Promise<ProviderResponse> {
+    let current = initial;
+    let attempt = 0;
+    const maxRetries = this.maxLLMOutputRetries;
+
+    while (true) {
+      // Plugin chain. Run only when plugins are wired AND at least one plugin
+      // exposes `transformLLMOutput`. Avoids the per-iteration object alloc
+      // for the common case of no LLM-output plugins.
+      if (this.plugins) {
+        const hasTransform = this.plugins.list().some((p) => typeof p.transformLLMOutput === 'function');
+        if (hasTransform) {
+          const result = await this.plugins.transformLLMOutput(
+            {
+              turn: {
+                sessionId: turn.sessionId,
+                agentId: turn.agentId,
+                iteration: turn.iteration,
+                messages: turn.messages.map((m) => ({ role: m.role, content: m.content })),
+              },
+              raw: {
+                assistantMessage: current.assistantMessage,
+                toolCalls: current.toolCalls,
+                reasoningBlocks: current.reasoningBlocks,
+              },
+            },
+            { runtime: this.runtimeName, sessionId: turn.sessionId, agentId: turn.agentId },
+          );
+
+          // Discriminate via `dropped`. The manager guarantees that field is
+          // ONLY set on the drop outcome — narrow with an explicit cast so
+          // TS resolves the two arms without us writing a user-defined
+          // type guard (the field name is unique enough).
+          const isDropped = (value: typeof result): value is { dropped: true; pluginName: string; reason?: string } =>
+            (value as { dropped?: unknown }).dropped === true;
+          if (isDropped(result)) {
+            // Emit observer hook so operators can audit dropped turns.
+            await this.plugins.emit(
+              'plugin:llm_output_dropped',
+              {
+                sessionId: turn.sessionId,
+                agentId: turn.agentId,
+                iteration: turn.iteration,
+                pluginName: result.pluginName,
+                reason: result.reason,
+              },
+              { runtime: this.runtimeName, sessionId: turn.sessionId, agentId: turn.agentId },
+            );
+            this.eventBus?.emit('plugin:llm_output_dropped', {
+              sessionId: turn.sessionId,
+              agentId: turn.agentId,
+              iteration: turn.iteration,
+              pluginName: result.pluginName,
+              reason: result.reason ?? '',
+              attempt,
+            });
+
+            if (attempt < maxRetries) {
+              attempt += 1;
+              current = await regenerate();
+              continue;
+            }
+            // Exhausted: fall through with the most recent message body so
+            // the agent can still produce something. Plugins that need a
+            // hard fail should throw, not drop.
+            break;
+          }
+
+          // Plugin chain produced a (possibly rewritten) message. Carry over
+          // the usage/reasoning fields that the plugins don't own.
+          current = {
+            ...current,
+            assistantMessage: result.assistantMessage,
+            toolCalls: result.toolCalls ?? current.toolCalls,
+            reasoningBlocks: (result.reasoningBlocks as ProviderResponse['reasoningBlocks']) ?? current.reasoningBlocks,
+          };
+        }
+      }
+      break;
+    }
+
+    // Redaction pass. Plugins are intentionally never trusted to scrub
+    // secrets — this guarantees that even a plugin that injects a fake API
+    // key into the assistant text gets the credential redacted before it
+    // reaches the conversation history or the next provider call.
+    if (this.securityPolicy.redactToolOutput && current.assistantMessage) {
+      const redacted = redactToolOutputFn(current.assistantMessage);
+      if (redacted !== current.assistantMessage) {
+        this.securityAuditLog?.record({
+          type: 'credential_redacted',
+          severity: 'info',
+          detail: `Credentials/PII redacted in assistant message (plugin transform pipeline)`,
+          ...this.auditProvenance({ agentId: turn.agentId, sessionId: turn.sessionId }),
+        });
+        current = { ...current, assistantMessage: redacted };
+      }
+    }
+
+    return current;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // #302 (v0.9.0) END — applyLLMOutputPipeline / response-merge section.
+  // ───────────────────────────────────────────────────────────────────────
+
   /**
    * #235 (v0.8.0): execute a single tool call, but FIRST validate its input
    * against the tool's `inputSchema` (if declared). On validation failure,
@@ -1503,6 +1780,21 @@ export class AgentLoop {
         compressionCount: 0
       }
     } satisfies SessionState;
+
+    // #314: rehydrate the in-memory pending queue from the persisted session.
+    // Skipped when in-memory entries already exist for this session — runtime
+    // calls (`acp.queue`, REST, WS) that landed before `run()` was invoked
+    // must not be clobbered by the stored snapshot. We only seed when the
+    // in-memory store is empty for this session.
+    if (
+      session.pendingQueue
+      && session.pendingQueue.length > 0
+      && pendingQueueLength(this.pendingQueue, input.sessionId) === 0
+    ) {
+      for (const queued of session.pendingQueue) {
+        enqueueMessage(this.pendingQueue, input.sessionId, queued);
+      }
+    }
 
     // Inject recalled memories as untrusted context prefix (not in system prompt)
     const memoryPrefix = buildMemoryPrefix(input.memories ?? []);
@@ -1687,6 +1979,16 @@ export class AgentLoop {
         throw error;
       }
     }
+
+    // #302 (v0.9.0): plugin transformLLMOutput chain + redaction.
+    // Runs once per generated message before tool extraction / history
+    // append. A plugin that returns null forces a refetch up to
+    // `maxLLMOutputRetries`.
+    currentResponse = await this.applyLLMOutputPipeline(
+      currentResponse,
+      { sessionId: input.sessionId, agentId: input.agentId, iteration: 0, messages: nextMessages },
+      () => this.generateWithFallbacks(buildRequest(nextMessages), pluginCtx),
+    );
 
     // Track 1.2: Record usage from initial provider call
     let totalTokensConsumed = this.recordUsage(currentResponse);
@@ -1986,17 +2288,65 @@ export class AgentLoop {
         nextMessages.push({ role: 'system', content: budgetHint, createdAt: nowIso(), metadata: { budgetHint: true } });
       }
 
+      // #314: iteration-end drain of `/queue` follow-up messages. Distinct
+      // from the steer drain (line ~1730) which fires at iteration START as
+      // a one-shot system nudge. Queue entries land in the *next user turn*
+      // so the model sees them as conversational follow-ups, not as
+      // out-of-band overrides. The drain happens AFTER the budget hint so
+      // the operator's queued text appears closest to the next LLM call.
+      // Section boundary — Agent A owns redactToolOutput, Agent C owns the
+      // applyResultPipeline / response-merge section further below.
+      const drainedQueueMessages = this.drainQueue(input.sessionId);
+      if (drainedQueueMessages.length > 0) {
+        const annotation = buildQueueAnnotation(drainedQueueMessages);
+        if (annotation) nextMessages.push(annotation);
+        nextMessages.push({
+          role: 'user',
+          content: drainedQueueMessages
+            .map((m) => `${OPERATOR_QUEUE_SEPARATOR}${m.content.trim()}`)
+            .join('')
+            .trimStart(),
+          createdAt: nowIso(),
+          metadata: {
+            kind: 'queue-drain',
+            count: drainedQueueMessages.length,
+          },
+        });
+      }
+
       // #43/#44 perf: reuse cachedSystemPrompt + toolList instead of rebuilding.
       // #54: prepend any drained steer messages for *this turn only*.
-      currentResponse = await this.generateWithFallbacks({
+      const iterationMessages = turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages;
+      const fetchIterationResponse = () => this.generateWithFallbacks({
         systemPrompt: cachedSystemPrompt,
-        messages: turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages,
+        messages: iterationMessages,
         availableTools: toolList,
-        signal: input.signal
+        signal: input.signal,
       }, {
         sessionId: input.sessionId,
-        agentId: input.agentId
+        agentId: input.agentId,
       });
+      currentResponse = await fetchIterationResponse();
+
+      // #302 (v0.9.0): rerun the plugin transformLLMOutput chain + redaction
+      // on every iteration's fresh response. Drops trigger a regenerate
+      // bounded by `maxLLMOutputRetries`; the supplied closure rebuilds the
+      // exact same request the loop just issued so retries see the same
+      // context.
+      currentResponse = await this.applyLLMOutputPipeline(
+        currentResponse,
+        { sessionId: input.sessionId, agentId: input.agentId, iteration: iteration + 1, messages: iterationMessages },
+        fetchIterationResponse,
+      );
+
+      // #314: preserve reasoning metadata across restore. Append to the
+      // session's `reasoningHistory` so a host restart can still surface
+      // the planning blocks that led to the current state. Append-only;
+      // we never re-feed history into the model on its own.
+      if (currentResponse.reasoningBlocks && currentResponse.reasoningBlocks.length > 0) {
+        if (!session.reasoningHistory) session.reasoningHistory = [];
+        session.reasoningHistory.push(...currentResponse.reasoningBlocks);
+      }
 
       // Track 1.2: Record usage from subsequent provider calls
       totalTokensConsumed = this.recordUsage(currentResponse);
@@ -2029,7 +2379,7 @@ export class AgentLoop {
           createdAt: nowIso(),
           metadata: { ephemeral: true, kind: 'budget-exhausted', reason },
         });
-        const synthesisResponse = await this.generateWithFallbacks({
+        const synthesisRequest = {
           systemPrompt: this.buildSystemPromptForRequest({
             basePrompt: input.systemPrompt, runtimeName: this.runtimeName,
             sessionId: input.sessionId, availableTools: [],
@@ -2038,7 +2388,16 @@ export class AgentLoop {
           messages: nextMessages,
           availableTools: [], // No tools — force text response
           signal: input.signal,
-        }, { sessionId: input.sessionId, agentId: input.agentId });
+        };
+        const fetchSynthesis = () => this.generateWithFallbacks(synthesisRequest, { sessionId: input.sessionId, agentId: input.agentId });
+        let synthesisResponse = await fetchSynthesis();
+        // #302 (v0.9.0): apply plugin LLM-output pipeline + redaction to the
+        // synthesis turn so it stays symmetric with regular iterations.
+        synthesisResponse = await this.applyLLMOutputPipeline(
+          synthesisResponse,
+          { sessionId: input.sessionId, agentId: input.agentId, iteration: iterationsCompleted + 1, messages: nextMessages },
+          fetchSynthesis,
+        );
         finalResponse = synthesisResponse.assistantMessage ?? finalResponse ?? 'Reached maximum tool iterations.';
         terminationReason = 'budget_exhausted_with_synthesis';
       } else {
@@ -2082,6 +2441,13 @@ export class AgentLoop {
       compressionCount: 0
     };
 
+    // #314: snapshot the still-pending queue (after the iteration-end drain,
+    // any messages arriving during the *current* turn remain unprocessed).
+    // The atomic SessionStore put pairs the queue snapshot with the rest of
+    // session state so a host restart cannot drop or duplicate queued
+    // messages — same atomic-rename pattern as checkpoint persistence.
+    const persistedPendingQueue = peekPendingQueue(this.pendingQueue, input.sessionId);
+
     const nextSession: SessionState = {
       ...session,
       userId: input.userId ?? session.userId,
@@ -2091,6 +2457,13 @@ export class AgentLoop {
       // #57: forward lastToolActivityAt so persisted session reflects when
       // the agent last did real tool work (not just when it last responded).
       lastToolActivityAt: session.lastToolActivityAt,
+      // #314: persist pending queue + reasoning history across restore.
+      // The queue field is omitted entirely when empty so storage adapters
+      // don't have to special-case empty arrays vs absent fields.
+      ...(persistedPendingQueue.length > 0 ? { pendingQueue: persistedPendingQueue } : {}),
+      ...(session.reasoningHistory && session.reasoningHistory.length > 0
+        ? { reasoningHistory: session.reasoningHistory }
+        : {}),
       lineage: compression.compressedCount > 0
         ? {
             ...baseLineage,
@@ -2947,6 +3320,23 @@ export function isToolAllowedForFork(session: SessionState, toolName: string): b
 
 export { buildSystemPrompt, buildMemoryPrefix, normalizeLocale, type MatchedSkill, type PromptBuilderInput, type SupportedLocale } from './prompt-builder.js';
 
+// #314 — pending-queue primitive (ACP `acp.queue`, REST, WS, dashboard share it).
+export {
+  type QueuedUserMessage,
+  type SerializedQueueEntry,
+  type PendingQueueStore,
+  OPERATOR_QUEUE_SEPARATOR,
+  createPendingQueueStore,
+  enqueueMessage,
+  drainPendingQueue,
+  peekPendingQueue,
+  pendingQueueLength,
+  assembleNextUserMessage,
+  buildQueueAnnotation,
+  serializeQueue,
+  restoreQueue,
+} from './queue.js';
+
 export {
   isPrivateUrl,
   isPrivateIpAddress,
@@ -2960,6 +3350,12 @@ export {
   redactToolOutput,
   redactStructuredData,
   scanForEnhancedInjection,
+  // #299 — assembled-prompt injection scan with per-part attribution.
+  // Used by the cron runner to catch poisoned skill content even when the
+  // cron config itself is clean. Sibling to `scanForEnhancedInjection`.
+  scanAssembledPrompt,
+  type AssembledPromptPart,
+  type AssembledInjectionFinding,
   scanCommand,
   type InjectionScanResult,
   type RedactionResult,
@@ -2979,6 +3375,12 @@ export {
   // a runaway sandbox can't suppress its own audit row.
   recordCodeExecuteAudit,
   type CodeExecuteAuditPayload,
+  // v0.9.0 (#293) — Hermes v0.13 parity: secret redaction default re-asserted
+  // to ON. Helper records the migration audit row when a persisted config
+  // omits `redactToolOutput` and we apply the secure default. Wired from
+  // the runtime config-store on first load.
+  recordRedactionDefaultApplied,
+  type RedactionDefaultAppliedPayload,
 } from './security.js';
 
 export { UsageTracker, type TokenUsage, type UsageRecord, type SessionUsageSummary } from './usage.js';

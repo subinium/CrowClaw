@@ -1,6 +1,49 @@
 import type { ParsedSkillFile, SkillManifest, ToolCatalog, ToolDefinition, ToolExecutionContext, ToolExecutionResult, ToolExecutor, ToolManifest } from '@crowclaw/core';
 import { parseSkillFile } from '@crowclaw/core';
-import { resolveAndValidateUrl, validateFetchUrl } from '@crowclaw/core';
+// v0.9.0 (#298) — single SSRF preflight choke point. `safeFetchPreflight`
+// below now delegates to `assertSafeUrl` so every web tool gets the
+// cloud-metadata floor for free. The legacy `validateFetchUrl` /
+// `resolveAndValidateUrl` primitives still live in `@crowclaw/core/security`
+// and are consumed inside `ssrf-blocklist.ts`; this barrel doesn't need them.
+import {
+  CLOUD_METADATA_HOSTS,
+  assertSafeUrl,
+  ssrfDenialMessage,
+  type AssertSafeUrlResult,
+  type SsrfDeniedResult,
+  type SsrfKind,
+} from './ssrf-blocklist.js';
+
+export {
+  CLOUD_METADATA_HOSTS,
+  assertSafeUrl,
+  ssrfDenialMessage,
+  ssrfAuditDetail,
+  type SsrfKind,
+  type AssertSafeUrlResult,
+  type AssertSafeUrlOptions,
+  type SsrfDeniedResult,
+  type SsrfAllowedResult,
+} from './ssrf-blocklist.js';
+
+// v0.9.0 (#310) — post-write syntax validators are exported so consumers can
+// reuse them outside workspace.write (e.g. text.patch could call them too).
+export {
+  validateJson,
+  validateYaml,
+  validateToml,
+  validatePython,
+  validateSyntax,
+  pickValidator,
+  type PostWriteValidationMode,
+  type SyntaxErrorDetail,
+  type SupportedSyntaxLanguage,
+  type ValidatorResult,
+} from './syntax-validators.js';
+import {
+  validateSyntax,
+  type PostWriteValidationMode,
+} from './syntax-validators.js';
 
 export { createDelegateTool, type DelegateToolOptions, type DelegateTaskResult, type DelegationResult } from './delegate.js';
 export { createVisionAnalyzeTool, type VisionAnalysisOptions } from './vision.js';
@@ -8,6 +51,47 @@ import { createVisionAnalyzeTool as createVisionAnalyzeToolImpl } from './vision
 export { createImageGenerateTool, type ImageGenerationOptions } from './image-gen.js';
 import { createImageGenerateTool as createImageGenerateToolImpl } from './image-gen.js';
 export { createTtsTool, createTranscriptionTool, createSttTool, type TtsToolOptions, type TranscriptionToolOptions } from './voice.js';
+
+// v0.9.0 (#325) — TTS provider registry surface. Piper local provider lives
+// in tts-piper.ts. xAI Custom Voices (#324) plugs in via the same registry.
+export {
+  TTSProviderRegistry,
+  type TTSProvider,
+  type TTSSynthesisOptions,
+  type TTSSynthesisResult,
+  type TTSVoiceDescriptor,
+  type TTSProviderHealth,
+} from './tts-registry.js';
+export { createPiperProvider, type PiperProviderOptions } from './tts-piper.js';
+
+// v0.9.0 (#324) — xAI Custom Voices TTS + voice cloning. Registers as a
+// TTSProvider via the #325 registry; the multi-provider `voice.tts` tool
+// dispatches across all registered providers.
+export {
+  createXaiTtsProvider,
+  createMultiProviderTtsTool,
+  type XaiTtsProviderOptions,
+  type MultiProviderTtsToolOptions,
+} from './voice-tts.js';
+export {
+  createXaiVoiceCloneProvider,
+  createVoiceCloneTool,
+  type VoiceCloneProvider,
+  type VoiceCloneInput,
+  type VoiceCloneResult,
+  type XaiVoiceCloneProviderOptions,
+  type VoiceCloneToolOptions,
+} from './voice-clone.js';
+
+// v0.9.0 (#329) — `[[as_document]]` skill directive. The detector lives
+// here so Agent C's `packages/core/skill-manifest.ts` is untouched; the
+// directive is read from the existing ParsedSkillFile shape.
+export {
+  detectSkillDeliveryDirective,
+  applyDeliveryDirective,
+  type DeliveryMode,
+  type SkillDeliveryDirective,
+} from './skill-directives.js';
 export { executePipeline, createPipelineTool, BUILT_IN_PIPELINES, type PipelineDefinition, type PipelineStep, type PipelineResult } from './pipeline.js';
 // v0.8.0 (#234) — Hermes-parity `code.execute` pipeline tool. Opt-in only:
 // not registered by `registerCoreTools` and not in the default agent toolset.
@@ -436,13 +520,21 @@ async function loadDnsLookup(): Promise<((hostname: string) => Promise<string[]>
  * Run validateFetchUrl + (when available) DNS-rebinding-aware re-validation.
  * Callers should pair with `redirect: 'manual'` so the resolved IP can't be
  * bypassed via a 30x to a private host.
+ *
+ * v0.9.0 (#298) — now routes through the central `assertSafeUrl` so cloud-
+ * metadata hosts are blocked even when the legacy private-network regex
+ * misses them (e.g. `metadata.google.internal`). The boolean-shaped return
+ * is preserved so existing call sites (web.fetch, web.search, web.crawl,
+ * web.extract*) don't have to change today.
  */
-async function safeFetchPreflight(url: string): Promise<{ safe: boolean; reason?: string }> {
+async function safeFetchPreflight(
+  url: string,
+  kind: SsrfKind = 'fetch',
+): Promise<{ safe: boolean; reason?: string; ssrf?: SsrfDeniedResult }> {
   const lookup = await loadDnsLookup();
-  if (!lookup) {
-    return validateFetchUrl(url);
-  }
-  return resolveAndValidateUrl(url, lookup);
+  const result = await assertSafeUrl(url, { kind, dnsLookup: lookup });
+  if (result.safe) return { safe: true };
+  return { safe: false, reason: result.reason, ssrf: result };
 }
 
 // #128 — Defensive in-tool approval gate. AgentLoop already checks
@@ -2147,7 +2239,22 @@ export function createWorkspaceSearchFilesTool(workspace: WorkspaceStore): ToolD
   };
 }
 
-export function createWorkspaceWriteTool(workspace: WorkspaceStore): ToolDefinition {
+/**
+ * Per-`createWorkspaceWriteTool` options. v0.9.0 (#310) adds opt-in post-write
+ * syntax validation. Defaults to `'warn'` per the issue spec — broken content
+ * is *not* rolled back regardless of mode (the agent sees the diff to fix it).
+ */
+export interface WorkspaceWriteToolOptions {
+  /** `'block'` → SYNTAX_ERROR envelope (`ok: false`). `'warn'` → ok:true with
+   *  metadata.syntaxWarning. `'off'` → skip validation entirely. */
+  postWriteValidation?: PostWriteValidationMode;
+}
+
+export function createWorkspaceWriteTool(
+  workspace: WorkspaceStore,
+  options?: WorkspaceWriteToolOptions,
+): ToolDefinition {
+  const mode: PostWriteValidationMode = options?.postWriteValidation ?? 'warn';
   return {
     manifest: {
       name: 'workspace.write',
@@ -2164,12 +2271,75 @@ export function createWorkspaceWriteTool(workspace: WorkspaceStore): ToolDefinit
       const path = typeof input.path === 'string' ? input.path : '';
       const content = typeof input.content === 'string' ? input.content : '';
       const file = await workspace.write(path, content);
+
+      // v0.9.0 (#310) — post-write syntax validation. Runs *after* the
+      // bytes are persisted (issue spec: don't roll back). On failure with
+      // mode='block', the envelope flips to ok:false with a SYNTAX_ERROR
+      // shape so the agent's retry path activates. Mode='warn' surfaces
+      // the same shape under metadata.syntaxWarning while keeping ok:true.
+      const baseMetadata: Record<string, unknown> = { path: file.path, updatedAt: file.updatedAt };
+      if (mode === 'off') {
+        return {
+          toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
+        };
+      }
+      const validation = await validateSyntax(path, content);
+      if (validation.language === null) {
+        // No validator registered — emit unchanged envelope.
+        return {
+          toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
+        };
+      }
+      baseMetadata.postWriteValidation = mode;
+      baseMetadata.validatedAs = validation.language;
+      if (validation.skipped) {
+        baseMetadata.syntaxValidatorSkipped = true;
+        baseMetadata.syntaxValidatorSkipReason = validation.skipReason;
+        return {
+          toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
+        };
+      }
+      if (!validation.ok && validation.error) {
+        const err = validation.error;
+        if (mode === 'block') {
+          return {
+            toolName: 'workspace.write',
+            runtime: 'worker',
+            ok: false,
+            output: err.message,
+            metadata: {
+              ...baseMetadata,
+              error: {
+                code: err.code,
+                message: err.message,
+                line: err.line,
+                col: err.col,
+                validator: err.validator,
+              },
+              retry_instruction: 'fix the syntax error and re-write',
+            },
+          };
+        }
+        // mode === 'warn' (default): ok stays true; caller learns from metadata.
+        return {
+          toolName: 'workspace.write',
+          runtime: 'worker',
+          ok: true,
+          output: file.content,
+          metadata: {
+            ...baseMetadata,
+            syntaxWarning: {
+              code: err.code,
+              message: err.message,
+              line: err.line,
+              col: err.col,
+              validator: err.validator,
+            },
+          },
+        };
+      }
       return {
-        toolName: 'workspace.write',
-        runtime: 'worker',
-        ok: true,
-        output: file.content,
-        metadata: { path: file.path, updatedAt: file.updatedAt }
+        toolName: 'workspace.write', runtime: 'worker', ok: true, output: file.content, metadata: baseMetadata,
       };
     }
   };

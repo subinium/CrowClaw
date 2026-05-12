@@ -22,6 +22,18 @@
 
 import type { MemoryRecord, MemoryScope, ConversationMessage } from './types.js';
 
+/**
+ * #304 (v0.9.0 Hermes parity): per-call options carrying the stable client
+ * memory key. Adapters that namespace by `sessionKey` (Telegram chat_id,
+ * desktop install ID, etc.) use this to keep long-term memory bound across
+ * `/new`-style sessionId rotations. The field is optional — adapters that
+ * don't recognise it remain backward-compatible.
+ */
+export interface MemoryProviderOptions {
+  /** Stable client-supplied namespace key, when present. */
+  sessionKey?: string;
+}
+
 export interface MemoryProvider {
   /** Init with adapter-specific config. Called once at runtime construction. */
   init?(config?: Record<string, unknown>): Promise<void>;
@@ -30,8 +42,13 @@ export interface MemoryProvider {
    * Pre-fetch step: called before the agent turn with the user message.
    * Returns candidate memories. The agent loop may further filter.
    * Adapters can use this to pre-warm caches / batch-read.
+   *
+   * #304 (v0.9.0): accepts an optional `options.sessionKey` so adapters
+   * that namespace by stable client key (instead of rotating sessionId)
+   * can bind the pre-fetch to the right bucket. Backward-compatible — the
+   * extra argument is optional and providers may ignore it.
    */
-  prefetch?(sessionId: string, query: string, limit: number): Promise<MemoryRecord[]>;
+  prefetch?(sessionId: string, query: string, limit: number, options?: MemoryProviderOptions): Promise<MemoryRecord[]>;
 
   /**
    * Final recall: called from the agent loop. Returns the memories that
@@ -39,13 +56,18 @@ export interface MemoryProvider {
    *
    * Ordering contract: relevance-desc then recency-desc. Default 5-record
    * cap is enforced by the agent-loop call site, not the provider.
+   *
+   * #304 (v0.9.0): accepts an optional `options.sessionKey` so adapters
+   * can scope the recall to a stable client namespace. Existing adapters
+   * that don't read the extra arg keep working as before.
    */
   recall(
     sessionId: string,
     query: string,
     limit: number,
     scope?: MemoryScope,
-    scopeKey?: string
+    scopeKey?: string,
+    options?: MemoryProviderOptions
   ): Promise<MemoryRecord[]>;
 
   /**
@@ -65,8 +87,12 @@ export interface MemoryProvider {
    * The omit list includes `lastAccessedAt` (per the v0.8 spec) for
    * forward-compat with adapters that track read-recency, even though the
    * canonical storage `MemoryRecord` doesn't yet carry the field.
+   *
+   * #304 (v0.9.0): accepts an optional `options.sessionKey` so the
+   * adapter can persist the record under a stable client namespace.
+   * Adapters that don't recognise it keep working unchanged.
    */
-  store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>): Promise<MemoryRecord>;
+  store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>, options?: MemoryProviderOptions): Promise<MemoryRecord>;
 
   /** Hard delete by id. Returns true if a record was deleted. */
   delete(id: string): Promise<boolean>;
@@ -154,11 +180,15 @@ export class PluginMemoryProvider implements MemoryProvider {
     await this.backend.init?.(config);
   }
 
-  async prefetch(sessionId: string, query: string, limit: number): Promise<MemoryRecord[]> {
+  async prefetch(sessionId: string, query: string, limit: number, options?: MemoryProviderOptions): Promise<MemoryRecord[]> {
     if (!this.backend.prefetch) {
-      return this.recall(sessionId, query, limit);
+      return this.recall(sessionId, query, limit, undefined, undefined, options);
     }
-    return this.backend.prefetch(sessionId, query, limit) as Promise<MemoryRecord[]>;
+    // #304 (v0.9.0): use the stable sessionKey as the search namespace when
+    // the backend doesn't know to read it directly — keeps cross-/new/
+    // recall working even for older third-party memory backends.
+    const effectiveSessionId = options?.sessionKey ?? sessionId;
+    return this.backend.prefetch(effectiveSessionId, query, limit) as Promise<MemoryRecord[]>;
   }
 
   async recall(
@@ -166,17 +196,29 @@ export class PluginMemoryProvider implements MemoryProvider {
     query: string,
     limit: number,
     scope?: MemoryScope,
-    scopeKey?: string
+    scopeKey?: string,
+    options?: MemoryProviderOptions
   ): Promise<MemoryRecord[]> {
-    return this.backend.recall(sessionId, query, limit, scope, scopeKey) as Promise<MemoryRecord[]>;
+    // #304 (v0.9.0): same namespacing rule as `prefetch` above. Adapters
+    // that DO understand `sessionKey` natively still receive the original
+    // arguments via the unchanged backend contract — they can extract the
+    // key from request context themselves.
+    const effectiveSessionId = options?.sessionKey ?? sessionId;
+    return this.backend.recall(effectiveSessionId, query, limit, scope, scopeKey) as Promise<MemoryRecord[]>;
   }
 
   async sync_turn(sessionId: string, summary: string, metadata?: Record<string, unknown>): Promise<void> {
     await this.backend.sync_turn?.(sessionId, summary, metadata);
   }
 
-  async store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>): Promise<MemoryRecord> {
-    const stored = await this.backend.store(record as Record<string, unknown>);
+  async store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>, options?: MemoryProviderOptions): Promise<MemoryRecord> {
+    // #304 (v0.9.0): override the sessionId field with the stable
+    // sessionKey when supplied so the backing plugin persists into the
+    // right namespace even if it doesn't know about sessionKey directly.
+    const payload = options?.sessionKey
+      ? { ...record, sessionId: options.sessionKey }
+      : record;
+    const stored = await this.backend.store(payload as unknown as Record<string, unknown>);
     return stored as MemoryRecord;
   }
 
@@ -278,24 +320,30 @@ export class InMemoryMemoryProvider implements MemoryProvider {
     query: string,
     limit: number,
     scope?: MemoryScope,
-    scopeKey?: string
+    scopeKey?: string,
+    options?: MemoryProviderOptions
   ): Promise<MemoryRecord[]> {
-    // Branch on whether the caller is asking session-scoped (default) or
-    // a specific scope. Storage exposes two distinct search methods so we
-    // don't conflate session-search with scope-search.
+    // #304 (v0.9.0): when the caller supplies a stable `sessionKey`, prefer
+    // it as the search namespace so cross-/new/ recall keeps finding the
+    // same memories. Adapters that don't know about sessionKey continue to
+    // search the rotating sessionId bucket — this provider opts in.
+    // The fallback to `sessionId` keeps existing behaviour intact when the
+    // caller doesn't (yet) plumb a sessionKey.
+    const searchSessionId = options?.sessionKey ?? sessionId;
     const results = scope
       ? await this.memoryStore.searchByScope(scope, query, limit * 2, scopeKey)
-      : await this.memoryStore.search(sessionId, query, limit * 2);
+      : await this.memoryStore.search(searchSessionId, query, limit * 2);
     return results.filter((r) => !isExpired(r)).slice(0, limit);
   }
 
   async prefetch(
     sessionId: string,
     query: string,
-    limit: number
+    limit: number,
+    options?: MemoryProviderOptions
   ): Promise<MemoryRecord[]> {
     // Default prefetch == recall. Adapters with caches/embeddings override.
-    return this.recall(sessionId, query, limit);
+    return this.recall(sessionId, query, limit, undefined, undefined, options);
   }
 
   /**
@@ -325,9 +373,20 @@ export class InMemoryMemoryProvider implements MemoryProvider {
     return work;
   }
 
-  async store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>): Promise<MemoryRecord> {
+  async store(record: Omit<MemoryRecord, 'id' | 'createdAt' | 'lastAccessedAt'>, options?: MemoryProviderOptions): Promise<MemoryRecord> {
+    // #304 (v0.9.0): when a stable `sessionKey` is supplied, persist the
+    // record under that namespace so a future recall keyed by the same
+    // `sessionKey` (with a possibly rotated `sessionId`) still finds it.
+    // The original record.sessionId is preserved in metadata for audit so
+    // dashboards can still see which conversation produced the memory.
+    const sessionId = options?.sessionKey ?? record.sessionId;
+    const metadata = options?.sessionKey && record.sessionId && record.sessionId !== options.sessionKey
+      ? { ...(record.metadata ?? {}), originalSessionId: record.sessionId }
+      : record.metadata;
     const full: MemoryRecord = {
       ...record,
+      sessionId,
+      metadata,
       id: crypto.randomUUID(),
       tags: uniqueTags(record.tags ?? []),
       createdAt: new Date().toISOString(),

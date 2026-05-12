@@ -162,7 +162,11 @@ export type CliCommandName =
   | 'providers'
   | 'skill'
   | 'migrate'
-  | 'batch';
+  | 'batch'
+  // v0.9.0 Hermes parity:
+  | 'oneshot'      // #332: crowclaw -z "<prompt>"
+  | 'update'       // #332: crowclaw update [--check] [--backup]
+  | 'debug-share'; // sibling Agent A — registered here so the dispatch table is complete
 
 export interface ParsedCliCommand {
   command: CliCommandName;
@@ -199,6 +203,28 @@ export interface ParsedCliCommand {
   batchMaxTurns?: number;
   batchTimeoutMs?: number;
   batchResumeFromId?: string;
+  // v0.9.0 Hermes parity (#332): `-z` one-shot mode.
+  /** Prompt for `crowclaw -z "<prompt>"`. When undefined, reads stdin. */
+  oneshotPrompt?: string;
+  /** `--model <name>` override for the one-shot run. */
+  oneshotModel?: string;
+  /** `--provider <key>` override for the one-shot run. */
+  oneshotProvider?: string;
+  // v0.9.0 Hermes parity (#332): `crowclaw update` flags.
+  /** `--check`: preflight, do not apply update. */
+  updateCheck?: boolean;
+  /** `--backup`: tar.gz ~/.crowclaw to backups dir before update. */
+  updateBackup?: boolean;
+  // v0.9.0 Hermes parity (#333): `crowclaw skills install <url-or-path>`.
+  /** `install` (currently the only subcommand) or empty for the legacy list. */
+  skillsSubcommand?: string;
+  skillsArgs?: string[];
+  // v0.9.0 Hermes parity (#297): `crowclaw doctor fix-perms`.
+  doctorSubcommand?: string;
+  doctorArgs?: string[];
+  // Agent A sibling (#293): `crowclaw debug-share`. Parsed here so dispatch
+  // is unified; the actual handler lives in `commands/debug-share.ts`.
+  debugShareArgs?: string[];
 }
 
 export interface CliRuntimeLike {
@@ -405,6 +431,9 @@ export const builtInCliSlashCommands = [
   '/mcp-add',
   '/mcp-list',
   '/mcp-remove',
+  // v0.9.0 Hermes parity:
+  '/reload-skills', // #333: rebuild in-memory skill index without restart
+  '/fix-perms',     // #297: chmod ~/.crowclaw credential files to 0600
 ] as const;
 
 async function lazyCreateRuntime(options?: NodeRuntimeOptions): Promise<CliRuntimeLike> {
@@ -589,22 +618,114 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     return { command: 'help', noResume };
   }
 
+  // v0.9.0 Hermes parity (#332): `-z [prompt]` one-shot mode. Detected before
+  // the simple-command table so `-z` works as a top-level flag.
+  // - `-z "hello"`     → one-shot with literal prompt
+  // - `-z` (no arg)    → reads stdin
+  // - `--model`/`--provider` follow as in `chat -q` and override the
+  //   session-default provider/model for THIS turn only.
+  if (filtered.includes('-z')) {
+    let oneshotPrompt: string | undefined;
+    let oneshotModel: string | undefined;
+    let oneshotProvider: string | undefined;
+    for (let i = 0; i < filtered.length; i += 1) {
+      const value = filtered[i]!;
+      if (value === '-z') {
+        const next = filtered[i + 1];
+        if (next !== undefined && !next.startsWith('-')) {
+          oneshotPrompt = next;
+          i += 1;
+        }
+        continue;
+      }
+      if (value === '--model' && filtered[i + 1] !== undefined) {
+        oneshotModel = filtered[i + 1];
+        i += 1;
+        continue;
+      }
+      if (value === '--provider' && filtered[i + 1] !== undefined) {
+        oneshotProvider = filtered[i + 1];
+        i += 1;
+        continue;
+      }
+    }
+    return {
+      command: 'oneshot',
+      ...(oneshotPrompt !== undefined ? { oneshotPrompt } : {}),
+      ...(oneshotModel !== undefined ? { oneshotModel } : {}),
+      ...(oneshotProvider !== undefined ? { oneshotProvider } : {}),
+      noOnboarding,
+      noResume,
+    };
+  }
+
   const [first, ...rest] = filtered;
 
   // Simple noun subcommands (no extra args)
   const simpleCommands: Record<string, CliCommandName> = {
     help: 'help',
     init: 'init',
-    doctor: 'doctor',
     status: 'status',
     sessions: 'sessions',
-    skills: 'skills',
     tools: 'tools',
     jobs: 'jobs',
   };
 
   if (first !== undefined && first in simpleCommands) {
     return { command: simpleCommands[first]!, noOnboarding, noResume };
+  }
+
+  // v0.9.0 Hermes parity (#297): `doctor [fix-perms]` — accepts a subcommand.
+  // Bare `doctor` keeps the legacy behavior (health-check report).
+  if (first === 'doctor') {
+    const doctorSubcommand = rest[0];
+    const doctorArgs = rest.slice(1);
+    return {
+      command: 'doctor',
+      ...(doctorSubcommand ? { doctorSubcommand } : {}),
+      doctorArgs,
+      noOnboarding,
+      noResume,
+    };
+  }
+
+  // v0.9.0 Hermes parity (#333): `skills install <url-or-path>` extends the
+  // legacy `skills` (list) command. Bare `skills` still lists.
+  if (first === 'skills') {
+    const skillsSubcommand = rest[0];
+    const skillsArgs = rest.slice(1);
+    return {
+      command: 'skills',
+      ...(skillsSubcommand ? { skillsSubcommand } : {}),
+      skillsArgs,
+      noOnboarding,
+      noResume,
+    };
+  }
+
+  // v0.9.0 Hermes parity (#332): `update [--check] [--backup]`.
+  if (first === 'update') {
+    const updateCheck = rest.includes('--check');
+    const updateBackup = rest.includes('--backup');
+    return {
+      command: 'update',
+      updateCheck,
+      updateBackup,
+      noOnboarding,
+      noResume,
+    };
+  }
+
+  // Agent A sibling (#293): `debug-share` collects a redacted runtime
+  // snapshot for bug reports. Parse-only here; handler lives in
+  // `commands/debug-share.ts`.
+  if (first === 'debug-share') {
+    return {
+      command: 'debug-share',
+      debugShareArgs: rest,
+      noOnboarding,
+      noResume,
+    };
   }
 
   // gateway — supports subcommands: status, connect <platform>
@@ -825,10 +946,18 @@ export function renderCliHelp(): string {
     '  tools               List registered tools',
     '  jobs                List scheduled jobs',
     '  batch <file.jsonl>  Replay JSONL prompts (--eval --threshold N for accuracy gating)',
+    '  skills install <u>  Install a skill from an http(s) URL or local SKILL.md path (#333)',
+    '  doctor fix-perms    chmod ~/.crowclaw credential files to 0600 (#297)',
+    '  update --check      Show available updates without applying (#332)',
+    '  update --backup     tar.gz ~/.crowclaw to backups/<ts>.tgz before an upgrade (#332)',
     '  help                Show this help',
     '',
     'Options:',
     '  -q "msg"            One-shot chat (alias for chat)',
+    '  -z "msg"            One-shot agent run, prints final response (#332)',
+    '  -z                  Read prompt from stdin (echo "..." | crowclaw -z)',
+    '  --model <name>      Override model for `-z` run (#332)',
+    '  --provider <key>    Override provider for `-z` run (#332)',
     '  --no-onboarding     Skip first-run wizard',
     '  --no-resume         Disable startup auto-resume from in-progress checkpoints',
     '  --port N            Server port (default: 3117)',
@@ -919,6 +1048,8 @@ export function renderCliHelp(): string {
     '  /mcp-add <url>                 Add a custom MCP server',
     '  /mcp-list                      List connected MCP servers',
     '  /mcp-remove <name>             Remove an MCP server',
+    '  /reload-skills                 Rebuild in-memory skill index without restart (#333)',
+    '  /fix-perms                     chmod ~/.crowclaw credential files to 0600 (#297)',
     '  /quit, /exit                   Exit the REPL',
   ].join('\n');
 }
@@ -2520,6 +2651,26 @@ export async function runCliInputLine(
     };
   }
 
+  // v0.9.0 Hermes parity (#333): rebuild in-memory skill index without restart.
+  if (trimmed === '/reload-skills') {
+    const { reloadSkills, formatReloadSkillsResult } = await import('./commands/skills.js');
+    const result = await reloadSkills(runtime);
+    return {
+      output: formatReloadSkillsResult(result),
+      state,
+    };
+  }
+
+  // v0.9.0 Hermes parity (#297): inline `crowclaw doctor fix-perms`.
+  if (trimmed === '/fix-perms') {
+    const { runFixPerms, formatFixPermsResult } = await import('./commands/doctor.js');
+    const result = await runFixPerms();
+    return {
+      output: formatFixPermsResult(result),
+      state,
+    };
+  }
+
   if (trimmed === '/drafts') {
     const response = await runtime.fetch(cliRequest(localRoute(cliRoutePaths.learning.drafts)));
     return {
@@ -2857,15 +3008,90 @@ export async function runCli(argv: string[], options: CliRunOptions = {}): Promi
     case 'chat':
       return runChat(runtime, parsed);
     case 'doctor': {
+      // v0.9.0 #297: `doctor fix-perms` repairs ~/.crowclaw mode bits.
+      if (parsed.doctorSubcommand === 'fix-perms') {
+        const { runFixPerms, formatFixPermsResult } = await import('./commands/doctor.js');
+        const result = await runFixPerms();
+        return formatFixPermsResult(result);
+      }
       const report = await runDoctor(runtime);
       return formatDoctorReport(report);
     }
     case 'sessions':
       return runSessions(runtime);
-    case 'skills':
+    case 'skills': {
+      // v0.9.0 #333: `skills install <url-or-path>` adds direct URL install.
+      // Bare `skills` keeps the legacy list behavior.
+      if (parsed.skillsSubcommand === 'install') {
+        const source = parsed.skillsArgs?.[0];
+        if (!source) {
+          return 'usage: crowclaw skills install <url-or-path>';
+        }
+        const { skillsInstallFromUrl } = await import('./commands/skills.js');
+        const result = await skillsInstallFromUrl(source, { log: () => {} });
+        if (!result.ok) {
+          return `INSTALL_FAILED (${result.code ?? 'UNKNOWN'}): ${result.error ?? 'unknown error'}`;
+        }
+        return `Installed "${result.slug}" -> ${result.destinationPath}`;
+      }
       return runSkillsList(runtime);
+    }
     case 'jobs':
       return runJobsList(runtime);
+    case 'oneshot': {
+      // v0.9.0 #332: handled here so tests can drive it without spinning up main().
+      const { runOneshot } = await import('./commands/oneshot.js');
+      const result = await runOneshot(runtime, {
+        ...(parsed.oneshotPrompt !== undefined ? { prompt: parsed.oneshotPrompt } : {}),
+        ...(parsed.oneshotModel !== undefined ? { model: parsed.oneshotModel } : {}),
+        ...(parsed.oneshotProvider !== undefined ? { provider: parsed.oneshotProvider } : {}),
+      });
+      if (result.exitCode !== 0) {
+        process.exitCode = result.exitCode;
+      }
+      return result.output;
+    }
+    case 'update': {
+      // v0.9.0 #332: --check is a preflight (no mutation); --backup snapshots
+      // ~/.crowclaw to backups/<ts>.tgz before the operator runs their installer.
+      const { runUpdateCheck, formatUpdateCheck, runUpdateBackup, formatUpdateBackup } = await import('./commands/update.js');
+      const parts: string[] = [];
+      if (parsed.updateCheck) {
+        const check = await runUpdateCheck({ currentVersion: CLI_VERSION.replace(/^v/, '') });
+        parts.push(formatUpdateCheck(check));
+      }
+      if (parsed.updateBackup) {
+        const backup = await runUpdateBackup();
+        parts.push(formatUpdateBackup(backup));
+        if (!backup.ok) process.exitCode = 1;
+      }
+      if (!parsed.updateCheck && !parsed.updateBackup) {
+        return 'usage: crowclaw update [--check] [--backup]\n  --check   show available updates without applying\n  --backup  tar.gz ~/.crowclaw before an upgrade';
+      }
+      return parts.join('\n\n');
+    }
+    case 'debug-share': {
+      // Agent A sibling (#293): handler module created on Agent A's branch.
+      // The dispatch is wired here so registration is unified; the actual
+      // file lives on Agent A's branch and will resolve at integration time.
+      // We use a guarded dynamic import via runtime path string so TypeScript
+      // does not try to type-resolve a file that does not yet exist on this
+      // branch — when integration merges, the import resolves normally.
+      const modPath = './commands/debug-share.js';
+      try {
+        const mod = (await import(/* @vite-ignore */ modPath)) as {
+          runDebugShare?: (args: string[]) => Promise<string> | string;
+        };
+        if (typeof mod.runDebugShare === 'function') {
+          const output = await mod.runDebugShare(parsed.debugShareArgs ?? []);
+          return typeof output === 'string' ? output : 'debug-share completed.';
+        }
+        return 'debug-share handler not exported (commands/debug-share.ts missing runDebugShare).';
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return `debug-share unavailable (waiting on Agent A integration): ${msg}`;
+      }
+    }
     case 'init':
       // init is handled in main() because it needs interactive I/O
       return 'Run `crowclaw init` directly (not via runCli).';
@@ -3028,9 +3254,15 @@ export async function loadConfig(): Promise<CrowClawConfig | null> {
 }
 
 export async function saveConfig(config: CrowClawConfig): Promise<void> {
+  // v0.9.0 Hermes parity (#297): close TOCTOU window. Atomic temp-write +
+  // O_NOFOLLOW + fchmod 0600, then atomic rename. Replaces the direct
+  // `writeFile(..., { mode: 0o600 })` which only sets mode on creation
+  // (so a pre-existing world-readable file would silently stay that way),
+  // and follows symlinks placed by an attacker on a shared host.
+  const { writeSecretAtomic } = await import('./commands/secret-write.js');
   await mkdir(CROWCLAW_CONFIG_DIR, { recursive: true });
   const data = JSON.stringify(config, null, 2);
-  await writeFile(CROWCLAW_CONFIG_PATH, data, { mode: 0o600 });
+  await writeSecretAtomic(CROWCLAW_CONFIG_PATH, data, { mode: 0o600 });
 }
 
 export function shouldRunOnboarding(argv: string[]): boolean {
@@ -3595,6 +3827,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   const parsed = parseCliArgs(argv);
   const runtimeOptions = runtimeOptionsForParsed(parsed);
 
+  // v0.9.0 Hermes parity (#297): warn on world/group-readable credentials
+  // before any command runs. Suppressed for `help` so `--help` stays quiet.
+  // The check itself is read-only — it does NOT mutate file modes.
+  if (parsed.command !== 'help') {
+    try {
+      const { checkSecretPerms } = await import('./commands/doctor.js');
+      await checkSecretPerms();
+    } catch {
+      // Permission check is best-effort. Never block startup on it.
+    }
+  }
+
   switch (parsed.command) {
     case 'help':
       stdout.write(renderCliHelp() + '\n');
@@ -3681,8 +3925,104 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       return;
     }
 
+    case 'oneshot': {
+      // v0.9.0 Hermes parity (#332): `-z "<prompt>"` runs the agent loop
+      // once. We must:
+      //   1. Apply onboarding-or-config so the provider key is in env.
+      //   2. Create the runtime (which builds the provider stack).
+      //   3. Apply model/provider overrides BEFORE the request so the
+      //      session uses the requested config.
+      //   4. POST the prompt, print the final response, exit.
+      // We handle this in main() so runtime.close() runs and the process
+      // exits cleanly without waiting on the server timers.
+      await applyConfigToEnv(argv);
+      const { runOneshot } = await import('./commands/oneshot.js');
+      const runtime = await lazyCreateRuntime(runtimeOptions);
+      const result = await runOneshot(runtime, {
+        ...(parsed.oneshotPrompt !== undefined ? { prompt: parsed.oneshotPrompt } : {}),
+        ...(parsed.oneshotModel !== undefined ? { model: parsed.oneshotModel } : {}),
+        ...(parsed.oneshotProvider !== undefined ? { provider: parsed.oneshotProvider } : {}),
+      });
+      if (result.output) stdout.write(result.output + '\n');
+      if (result.exitCode !== 0) {
+        process.exitCode = result.exitCode;
+      }
+      try {
+        await runtime.close?.();
+      } catch {
+        // best-effort cleanup
+      }
+      return;
+    }
+
+    case 'update': {
+      // v0.9.0 Hermes parity (#332): preflight + backup. Both subflags can
+      // run together; without either, print usage and exit non-zero.
+      const { runUpdateCheck, formatUpdateCheck, runUpdateBackup, formatUpdateBackup } = await import('./commands/update.js');
+      let printed = false;
+      if (parsed.updateCheck) {
+        const check = await runUpdateCheck({ currentVersion: CLI_VERSION.replace(/^v/, '') });
+        stdout.write(formatUpdateCheck(check) + '\n');
+        printed = true;
+        if (!check.ok) process.exitCode = 1;
+      }
+      if (parsed.updateBackup) {
+        const backup = await runUpdateBackup();
+        stdout.write(formatUpdateBackup(backup) + '\n');
+        printed = true;
+        if (!backup.ok) process.exitCode = 1;
+      }
+      if (!printed) {
+        stdout.write('usage: crowclaw update [--check] [--backup]\n');
+        stdout.write('  --check   show available updates without applying\n');
+        stdout.write('  --backup  tar.gz ~/.crowclaw before an upgrade\n');
+        process.exitCode = 1;
+      }
+      return;
+    }
+
+    case 'doctor': {
+      // v0.9.0 Hermes parity (#297): `doctor fix-perms` repairs ~/.crowclaw
+      // mode bits. Bare `doctor` keeps the health-check report (handled by
+      // the runCli default branch below).
+      if (parsed.doctorSubcommand === 'fix-perms') {
+        const { runFixPerms, formatFixPermsResult } = await import('./commands/doctor.js');
+        const result = await runFixPerms();
+        stdout.write(formatFixPermsResult(result) + '\n');
+        if (!result.ok) process.exitCode = 1;
+        return;
+      }
+      // Bare doctor → fall through to runCli (health report).
+      const output = await runCli(argv);
+      stdout.write(output + '\n');
+      return;
+    }
+
+    case 'skills': {
+      // v0.9.0 Hermes parity (#333): `skills install <url-or-path>`.
+      if (parsed.skillsSubcommand === 'install') {
+        const source = parsed.skillsArgs?.[0];
+        if (!source) {
+          stdout.write('usage: crowclaw skills install <url-or-path>\n');
+          process.exitCode = 1;
+          return;
+        }
+        const { skillsInstallFromUrl } = await import('./commands/skills.js');
+        const result = await skillsInstallFromUrl(source);
+        if (!result.ok) {
+          stdout.write(`INSTALL_FAILED (${result.code ?? 'UNKNOWN'}): ${result.error ?? 'unknown error'}\n`);
+          process.exitCode = 1;
+        }
+        return;
+      }
+      // Bare skills → fall through to runCli (list).
+      const output = await runCli(argv);
+      stdout.write(output + '\n');
+      return;
+    }
+
     default: {
-      // One-shot commands: doctor, status, tools, chat, sessions, skills, jobs
+      // One-shot commands: status, tools, chat, sessions, jobs
       const output = await runCli(argv);
       stdout.write(output + '\n');
     }
@@ -3712,6 +4052,55 @@ export { skillInstall } from './commands/skill-install.js';
 export type { SkillInstallOptions, SkillInstallResult } from './commands/skill-install.js';
 export { skillPublish } from './commands/skill-publish.js';
 export type { SkillPublishOptions, SkillPublishResult } from './commands/skill-publish.js';
+
+// ---------------------------------------------------------------------------
+// v0.9.0 Hermes parity — CLI surfaces for #297 #332 #333.
+// ---------------------------------------------------------------------------
+
+export { runOneshot } from './commands/oneshot.js';
+export type { OneshotOptions, OneshotResult } from './commands/oneshot.js';
+
+export {
+  runUpdateCheck,
+  runUpdateBackup,
+  formatUpdateCheck,
+  formatUpdateBackup,
+  compareSemver,
+} from './commands/update.js';
+export type {
+  UpdateCheckOptions,
+  UpdateCheckResult,
+  UpdateBackupOptions,
+  UpdateBackupResult,
+} from './commands/update.js';
+
+export {
+  skillsInstallFromUrl,
+  reloadSkills,
+  formatReloadSkillsResult,
+  BUNDLED_SKILL_SLUGS,
+} from './commands/skills.js';
+export type {
+  SkillsInstallOptions,
+  SkillsInstallResult,
+  ReloadSkillsResult,
+} from './commands/skills.js';
+
+export {
+  runFixPerms,
+  formatFixPermsResult,
+  checkSecretPerms,
+  SECRET_FILE_BASENAMES,
+} from './commands/doctor.js';
+export type {
+  FixPermsOptions,
+  FixPermsResult,
+  CheckSecretPermsOptions,
+  CheckSecretPermsResult,
+} from './commands/doctor.js';
+
+export { writeSecretAtomic } from './commands/secret-write.js';
+export type { WriteSecretAtomicOptions } from './commands/secret-write.js';
 
 import { skillInstall as _skillInstall } from './commands/skill-install.js';
 import { skillPublish as _skillPublish } from './commands/skill-publish.js';

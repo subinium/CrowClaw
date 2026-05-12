@@ -1,7 +1,7 @@
 // Standalone ACP server — not auto-started by runtime
 
 import { createInterface } from 'node:readline';
-import type { ToolCatalog } from '@crowclaw/core';
+import type { ToolCatalog, QueuedUserMessage } from '@crowclaw/core';
 
 // ---------------------------------------------------------------------------
 // ACP message types (JSON-RPC 2.0 over stdio)
@@ -76,6 +76,33 @@ export interface AcpAgentLoop {
     finalResponse: string;
     toolResults: Array<{ toolName: string; ok: boolean; output: string }>;
   }>;
+  /**
+   * #314 — `acp.steer` over JSON-RPC. Mirrors the v0.5.0 #54 WS handler:
+   * inject operator guidance at the next iteration as a one-shot system
+   * nudge. Implementations should delegate to `AgentLoop.steer`. Optional
+   * because legacy ACP loops without steer support still satisfy the
+   * interface — the server returns `METHOD_NOT_FOUND` when the loop omits
+   * this hook.
+   */
+  steer?(sessionId: string, guidance: string): void | Promise<void>;
+  /**
+   * #314 — `acp.queue` over JSON-RPC. Append a follow-up user message to
+   * the per-session pending queue. The AgentLoop drains the queue at
+   * iteration-end and concatenates entries into the next user-turn
+   * message. Returns `true` when the message was enqueued, `false` when
+   * the content was empty / whitespace-only and dropped.
+   */
+  queue?(
+    sessionId: string,
+    message: string,
+    options?: { source?: string; id?: string },
+  ): boolean | Promise<boolean>;
+  /**
+   * #314 — Peek at the current pending queue without draining. Used by
+   * `acp.queue.list` for the IDE-plugin "show pending messages" view.
+   * Implementations typically delegate to `AgentLoop.peekQueue`.
+   */
+  peekQueue?(sessionId: string): QueuedUserMessage[] | Promise<QueuedUserMessage[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +228,115 @@ export class AcpServer {
             response: result.finalResponse,
             toolResults: result.toolResults,
           });
+        }
+
+        case 'acp.steer':
+        case 'session/steer': {
+          // #314 — mid-run course correction. Mirrors the v0.5.0 #54 WS
+          // handler: inject operator guidance at the next iteration. The
+          // text is never written to session.messages so restore replay
+          // doesn't re-apply the same nudge against historical state.
+          const sessionId = request.params?.['sessionId'];
+          const guidance = request.params?.['guidance'] ?? request.params?.['message'];
+          if (typeof sessionId !== 'string' || typeof guidance !== 'string') {
+            return this.respondError(
+              id,
+              INVALID_REQUEST,
+              'Missing sessionId or guidance',
+            );
+          }
+          const session = this.sessions.get(sessionId);
+          if (!session) {
+            return this.respondError(
+              id,
+              INVALID_REQUEST,
+              `Session not found: ${sessionId}`,
+            );
+          }
+          if (!this.agentLoop.steer) {
+            return this.respondError(
+              id,
+              METHOD_NOT_FOUND,
+              'Agent loop does not support steer',
+            );
+          }
+          await this.agentLoop.steer(sessionId, guidance);
+          session.updatedAt = new Date().toISOString();
+          return this.respondOk(id, {
+            ok: true,
+            sessionId,
+            // Mirror Hermes — return the guidance the operator submitted so
+            // the IDE can show "queued: <text>" without round-tripping.
+            applied: guidance,
+          });
+        }
+
+        case 'acp.queue':
+        case 'session/queue': {
+          // #314 — append a follow-up user message to the per-session
+          // pending queue. AgentLoop drains at iteration-end and
+          // concatenates into the next user-turn message.
+          const sessionId = request.params?.['sessionId'];
+          const message = request.params?.['message'];
+          const source = request.params?.['source'];
+          const queueId = request.params?.['id'];
+          if (typeof sessionId !== 'string' || typeof message !== 'string') {
+            return this.respondError(
+              id,
+              INVALID_REQUEST,
+              'Missing sessionId or message',
+            );
+          }
+          const session = this.sessions.get(sessionId);
+          if (!session) {
+            return this.respondError(
+              id,
+              INVALID_REQUEST,
+              `Session not found: ${sessionId}`,
+            );
+          }
+          if (!this.agentLoop.queue) {
+            return this.respondError(
+              id,
+              METHOD_NOT_FOUND,
+              'Agent loop does not support queue',
+            );
+          }
+          const options: { source?: string; id?: string } = {};
+          if (typeof source === 'string') options.source = source;
+          else options.source = 'acp.queue';
+          if (typeof queueId === 'string') options.id = queueId;
+          const queued = await this.agentLoop.queue(sessionId, message, options);
+          session.updatedAt = new Date().toISOString();
+          return this.respondOk(id, {
+            ok: true,
+            queued,
+            sessionId,
+            // ACK with the assigned id (or `undefined` when the caller
+            // didn't supply one) so IDE plugins can correlate later flush
+            // notifications.
+            ...(options.id ? { id: options.id } : {}),
+          });
+        }
+
+        case 'acp.queue.list':
+        case 'session/queue/list': {
+          // #314 — return the pending queue without draining. IDE plugins
+          // use this for the "show pending messages" view.
+          const sessionId = request.params?.['sessionId'];
+          if (typeof sessionId !== 'string') {
+            return this.respondError(id, INVALID_REQUEST, 'Missing sessionId');
+          }
+          if (!this.agentLoop.peekQueue) {
+            return this.respondOk(id, { messages: [], available: false });
+          }
+          try {
+            const messages = await this.agentLoop.peekQueue(sessionId);
+            return this.respondOk(id, { messages, available: true });
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            return this.respondOk(id, { messages: [], available: false, error: message });
+          }
         }
 
         case 'tools/list': {

@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/web",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/tools",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,16 +17,16 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.8.4",
-    "@crowclaw/gateway": "0.8.4",
-    "@crowclaw/memory": "0.8.4",
-    "@crowclaw/mcp": "0.8.4",
-    "@crowclaw/scheduler": "0.8.4",
-    "@crowclaw/storage": "0.8.4",
-    "@crowclaw/workspace": "0.8.4"
+    "@crowclaw/core": "0.9.0",
+    "@crowclaw/gateway": "0.9.0",
+    "@crowclaw/memory": "0.9.0",
+    "@crowclaw/mcp": "0.9.0",
+    "@crowclaw/scheduler": "0.9.0",
+    "@crowclaw/storage": "0.9.0",
+    "@crowclaw/workspace": "0.9.0"
   },
   "peerDependencies": {
-    "@crowclaw/sandbox-executor": "0.8.4"
+    "@crowclaw/sandbox-executor": "0.9.0"
   },
   "peerDependenciesMeta": {
     "@crowclaw/sandbox-executor": {

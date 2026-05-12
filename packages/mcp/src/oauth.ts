@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { writeSecretAtomic } from '@crowclaw/shared';
 
 const CROWCLAW_DIR = join(homedir(), '.crowclaw');
 const RUNTIME_CONFIG_PATH = join(CROWCLAW_DIR, 'runtime-config.json');
@@ -79,9 +80,15 @@ function loadRuntimeConfig(): RuntimeTokenStore {
   return { tokens: {} };
 }
 
-function writeRuntimeConfig(store: RuntimeTokenStore): void {
-  mkdirSync(CROWCLAW_DIR, { recursive: true });
-  writeFileSync(RUNTIME_CONFIG_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
+async function writeRuntimeConfig(store: RuntimeTokenStore): Promise<void> {
+  // #296 — Hermes parity: route OAuth token persistence through the atomic
+  // helper. `writeFileSync` followed `existsSync` with no `O_NOFOLLOW`
+  // protection; an attacker on a shared box could plant a symlink at
+  // RUNTIME_CONFIG_PATH between mkdir and write to redirect the secret
+  // (NousResearch/hermes-agent#21176). `writeSecretAtomic` opens with
+  // O_EXCL|O_NOFOLLOW or atomic temp-rename and enforces 0o600 perms.
+  mkdirSync(CROWCLAW_DIR, { recursive: true, mode: 0o700 });
+  await writeSecretAtomic(RUNTIME_CONFIG_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
 }
 
 /** Request a device code from GitHub's OAuth device flow endpoint */
@@ -226,7 +233,7 @@ export async function saveOAuthToken(
     expiresAt,
     savedAt: new Date().toISOString(),
   };
-  writeRuntimeConfig(store);
+  await writeRuntimeConfig(store);
 }
 
 /** Check if a provider has a valid (non-expired) token stored */
@@ -256,11 +263,11 @@ export function getStoredToken(provider: string): string | undefined {
 }
 
 /** Remove a stored token for a provider */
-export function removeToken(provider: string): boolean {
+export async function removeToken(provider: string): Promise<boolean> {
   const store = loadRuntimeConfig();
   if (provider in store.tokens) {
     delete store.tokens[provider];
-    writeRuntimeConfig(store);
+    await writeRuntimeConfig(store);
     return true;
   }
   return false;

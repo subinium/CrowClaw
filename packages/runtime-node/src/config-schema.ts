@@ -121,13 +121,24 @@ function securitySection(): ConfigSectionSchema {
   return {
     id: 'security',
     label: 'Security Policy',
-    description: 'Security and privacy controls for tool execution and data handling.',
+    description:
+      'Security and privacy controls for tool execution and data handling. ' +
+      'Defaults are tuned for safety; opt out per field only if your workflow needs raw output.',
     fields: [
       {
         key: 'redactToolOutput',
         type: 'boolean',
         label: 'Redact Tool Output',
-        description: 'Redact sensitive patterns from tool output before displaying.',
+        description:
+          'Redact API keys, OAuth tokens, JWTs, AWS keys, and other credential-shaped strings ' +
+          'from tool output before it reaches the LLM, dashboard, or transcript. ' +
+          // v0.9.0 (#293, Hermes v0.13 parity) — surface the corruption risk so an
+          // operator who flips this off knows the tradeoff. Hermes #16794 made the
+          // default off in v0.12 specifically because key-shaped substrings inside
+          // patch tool outputs were being corrupted by the redactor.
+          'WARNING: may corrupt patch-tool outputs that legitimately contain ' +
+          'key-shaped substrings (e.g. base64 blobs in diff bodies). Turn off only ' +
+          'when the downstream consumer needs byte-exact tool output.',
         required: true,
         default: true,
         section: 'security',
@@ -335,6 +346,144 @@ function gatewaySection(): ConfigSectionSchema {
   };
 }
 
+/**
+ * `channels` section — per-platform ACLs introduced in v0.9.0 to close the
+ * Hermes v0.13 parity gap. Initially scopes the cross-platform destination
+ * allowlist (#318); subsequent commits add Discord (#294) and WhatsApp
+ * (#295) entries.
+ *
+ * Field keys use dot-notation (`slack.allowedDestinations`, …) to stay
+ * consistent with the existing `provider.<slot>.<field>` style.
+ */
+function channelsSection(): ConfigSectionSchema {
+  return {
+    id: 'channels',
+    label: 'Channel ACLs',
+    description: 'Per-platform allowlists for inbound messages (Discord guild roles, Slack/Telegram/Matrix/Mattermost/DingTalk/Email/Signal destinations).',
+    fields: [
+      // --- Discord (#294, CVSS 8.1) -----------------------------------------
+      {
+        key: 'discord.allowedRoles',
+        type: 'array',
+        label: 'Discord Allowed Roles',
+        description: 'Array of `{ guildId, roleIds }` tuples. Role IDs are matched ONLY within the originating guild — the legacy `string[]` (role name) shape is detected and forced to deny-all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'discord.allowDirectMessages',
+        type: 'boolean',
+        label: 'Discord Allow Direct Messages',
+        description: 'Allow DMs (messages with no guild_id). Defaults to false — required to mitigate the CVSS 8.1 cross-guild bypass.',
+        required: false,
+        default: false,
+        section: 'channels',
+      },
+      {
+        key: 'discord.dmAllowlist',
+        type: 'array',
+        label: 'Discord DM Allowlist',
+        description: 'Discord user IDs allowed to DM the bot when `allowDirectMessages` is true.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      // --- WhatsApp (#295) --------------------------------------------------
+      {
+        key: 'whatsapp.allowedContacts',
+        type: 'array',
+        label: 'WhatsApp Allowed Contacts',
+        description: 'wa_ids permitted to message the bot. Empty + allowStrangers=false → all inbound rejected.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'whatsapp.allowStrangers',
+        type: 'boolean',
+        label: 'WhatsApp Allow Strangers',
+        description: 'Pre-v0.9.0 behavior — bot responds to any sender. Default false; flipping to true logs an audit warning.',
+        required: false,
+        default: false,
+        section: 'channels',
+      },
+      {
+        key: 'whatsapp.botWaId',
+        type: 'string',
+        label: 'WhatsApp Bot Phone Number ID',
+        description: 'Bot phone-number-id used to silently drop self-chat (echo loop). Required to enforce self-chat ban.',
+        required: false,
+        section: 'channels',
+      },
+      // --- Cross-platform destination ACL (#318) ---------------------------
+      {
+        key: 'slack.allowedDestinations',
+        type: 'array',
+        label: 'Slack Allowed Channels',
+        description: 'Slack channel IDs allowed to dispatch messages to the agent. Empty = allow all (backward compat).',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'telegram.allowedDestinations',
+        type: 'array',
+        label: 'Telegram Allowed Chats',
+        description: 'Telegram chat IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'matrix.allowedDestinations',
+        type: 'array',
+        label: 'Matrix Allowed Rooms',
+        description: 'Matrix room IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'mattermost.allowedDestinations',
+        type: 'array',
+        label: 'Mattermost Allowed Channels',
+        description: 'Mattermost channel IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'dingtalk.allowedDestinations',
+        type: 'array',
+        label: 'DingTalk Allowed Conversations',
+        description: 'DingTalk conversation IDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'email.allowedDestinations',
+        type: 'array',
+        label: 'Email Allowed Mailboxes',
+        description: 'Email mailbox/inbox identifiers allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+      {
+        key: 'signal.allowedDestinations',
+        type: 'array',
+        label: 'Signal Allowed Senders',
+        description: 'Signal phone numbers / UUIDs allowed to dispatch messages to the agent. Empty = allow all.',
+        required: false,
+        default: [],
+        section: 'channels',
+      },
+    ],
+  };
+}
+
 function presetsSection(): ConfigSectionSchema {
   return {
     id: 'presets',
@@ -427,6 +576,7 @@ export function generateConfigSchema(): FullConfigSchema {
       securitySection(),
       providerSection(),
       gatewaySection(),
+      channelsSection(),
       presetsSection(),
     ],
   };
