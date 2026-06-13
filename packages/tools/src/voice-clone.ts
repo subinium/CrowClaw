@@ -15,9 +15,11 @@
  * Sample input:
  *  - `samplePath` (string) — local path on the agent's filesystem
  *  - `sampleUrl` (string)  — HTTP(S) URL. Validated through #298's
- *    `assertSafeUrl` so a cloud-metadata host can't be coerced into the
- *    upload. Per the cross-cut in the recovery prompt, this is a downstream
- *    consumer of the central SSRF floor.
+ *    `assertSafeUrl({ kind: 'image' })` (v0.9.1 migration) so a cloud-metadata
+ *    host can't be coerced into the upload. Per the cross-cut in the recovery
+ *    prompt, this is a downstream consumer of the central SSRF floor and now
+ *    reports the central SSRF_CLOUD_METADATA / SSRF_PRIVATE_NETWORK forensic
+ *    codes instead of a local stopgap check.
  */
 
 import type { ToolDefinition, ToolExecutionResult, ToolExecutionContext } from '@crowclaw/core';
@@ -215,9 +217,14 @@ export function createVoiceCloneTool(options: VoiceCloneToolOptions): ToolDefini
           sampleBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
           mime = guessMimeFromPath(samplePath);
         } else {
-          // SSRF preflight — required by the recovery cross-cut. Cloud-metadata
-          // hosts must not be reachable via voice.clone's sample fetch.
-          const safety = await assertSafeUrl(sampleUrl, { kind: 'fetch' });
+          // v0.9.1 (#298 migration) — SSRF preflight through the canonical
+          // `assertSafeUrl` helper with `kind: 'image'`. The sample is media
+          // fetched on the agent's behalf, so it routes through the same media
+          // SSRF discriminator as vision/image tools; this gets the central
+          // SSRF_CLOUD_METADATA / SSRF_PRIVATE_NETWORK forensic codes (no more
+          // local stopgap validateFetchUrl). Cloud-metadata hosts and private
+          // networks must not be reachable via voice.clone's sample fetch.
+          const safety = await assertSafeUrl(sampleUrl, { kind: 'image' });
           if (!safety.safe) {
             return {
               toolName,

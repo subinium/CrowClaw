@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/sandbox-executor",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -18,8 +18,8 @@
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.8.9",
-    "@crowclaw/core": "0.9.0",
-    "@crowclaw/tools": "0.9.0"
+    "@crowclaw/core": "0.9.1",
+    "@crowclaw/tools": "0.9.1"
   },
   "repository": {
     "type": "git",

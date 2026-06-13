@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "es",
+    "name": "Spanish",
+    "nativeName": "Español"
+  },
+  "language.name": "Spanish",
+  "prompt.responseLanguage.heading": "Idioma de respuesta:",
+  "prompt.responseLanguage.default": "- Responde en {language} de forma predeterminada.",
+  "prompt.responseLanguage.keepOriginal": "- Mantén el código, los comandos, las rutas de archivo, los identificadores, los nombres de API y el texto fuente citado en su idioma original.",
+  "prompt.responseLanguage.userOverride": "- Si el usuario solicita explícitamente otro idioma, sigue la petición del usuario para ese turno.",
+  "gateway.pairing.prompt": "Un dispositivo quiere vincularse con este agente. Apruébalo desde el panel de vinculación del tablero.",
+  "gateway.pairing.approved": "Dispositivo vinculado correctamente.",
+  "gateway.pairing.denied": "La solicitud de vinculación fue rechazada.",
+  "gateway.session.notFound": "Sesión no encontrada.",
+  "gateway.rateLimited": "Demasiadas solicitudes. Reduce el ritmo e inténtalo de nuevo en breve.",
+  "cli.welcome": "Bienvenido a CrowClaw.",
+  "cli.session.created": "Sesión creada.",
+  "cli.session.cleared": "Sesión borrada.",
+  "cli.error.generic": "Algo salió mal. Inténtalo de nuevo.",
+  "cli.error.providerMissing": "No hay ningún proveedor configurado. Configura uno antes de ejecutar el agente."
+}

@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "fr",
+    "name": "French",
+    "nativeName": "Français"
+  },
+  "language.name": "French",
+  "prompt.responseLanguage.heading": "Langue de réponse :",
+  "prompt.responseLanguage.default": "- Réponds en {language} par défaut.",
+  "prompt.responseLanguage.keepOriginal": "- Conserve le code, les commandes, les chemins de fichiers, les identifiants, les noms d'API et le texte source cité dans leur langue d'origine.",
+  "prompt.responseLanguage.userOverride": "- Si l'utilisateur demande explicitement une autre langue, suis la demande de l'utilisateur pour ce tour.",
+  "gateway.pairing.prompt": "Un appareil souhaite s'appairer avec cet agent. Approuve-le depuis le panneau d'appairage du tableau de bord.",
+  "gateway.pairing.approved": "Appareil appairé avec succès.",
+  "gateway.pairing.denied": "La demande d'appairage a été refusée.",
+  "gateway.session.notFound": "Session introuvable.",
+  "gateway.rateLimited": "Trop de requêtes. Ralentis et réessaie sous peu.",
+  "cli.welcome": "Bienvenue dans CrowClaw.",
+  "cli.session.created": "Session créée.",
+  "cli.session.cleared": "Session effacée.",
+  "cli.error.generic": "Une erreur s'est produite. Réessaie.",
+  "cli.error.providerMissing": "Aucun fournisseur configuré. Configures-en un avant d'exécuter l'agent."
+}

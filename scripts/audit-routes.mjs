@@ -101,6 +101,7 @@ const explicitWorkerUnsupported = [
   '/api/events',
   '/api/mcp/server/',
   '/api/metrics',
+  '/api/skills/reload', // node-only: hot-rebuild of the in-memory skill index; CF isolates reload per-request
   '/api/structured-output',
   '/api/terminal/',
   '/ws',

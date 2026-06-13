@@ -69,12 +69,12 @@ describe('writeSecretAtomic (#297)', () => {
     expect(ls.filter((n) => n.includes('.tmp.'))).toHaveLength(0);
   });
 
-  it('replaces a symlinked destination by writing a real file', async () => {
+  it('rejects a symlinked destination and leaves the victim untouched', async () => {
     // Attacker scenario: `auth.json` is a symlink pointing at a victim file.
-    // After our atomic write, the symlink should be replaced with a real
-    // regular file (the target file the attacker pointed at is NOT
-    // overwritten because we open via O_NOFOLLOW on the temp path and then
-    // rename — rename replaces the symlink, not its target).
+    // The canonical @crowclaw/shared writeSecretAtomic (Hermes #296) refuses
+    // to write through a symlinked destination — O_NOFOLLOW short-circuits the
+    // create, lstat classifies the EEXIST case, and a symlink target is
+    // rejected with ELOOP rather than replaced. The victim is never written.
     const victim = join(dir, 'victim');
     writeFileSync(victim, 'original', 'utf-8');
     const target = join(dir, 'auth.json');
@@ -82,14 +82,12 @@ describe('writeSecretAtomic (#297)', () => {
     // Sanity: pre-write, `target` is a symlink (lstat tells us so).
     expect(lstatSync(target).isSymbolicLink()).toBe(true);
 
-    await writeSecretAtomic(target, 'safe-payload');
+    await expect(writeSecretAtomic(target, 'safe-payload')).rejects.toThrow(/symbolic link|ELOOP/i);
 
-    // Victim untouched.
+    // Victim untouched — the write never followed the symlink.
     expect(readFileSync(victim, 'utf-8')).toBe('original');
-    // Target is now a real file (not a symlink anymore).
-    expect(lstatSync(target).isSymbolicLink()).toBe(false);
-    expect(readFileSync(target, 'utf-8')).toBe('safe-payload');
-    expect(statSync(target).mode & 0o077).toBe(0);
+    // Target is still the original symlink (not replaced with a real file).
+    expect(lstatSync(target).isSymbolicLink()).toBe(true);
   });
 
   it('honors custom mode', async () => {

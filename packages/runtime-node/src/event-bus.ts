@@ -90,13 +90,105 @@ export type RuntimeEventType =
   // matched skill names + triggers + reasons + tools so the dashboard can
   // render a "why this skill fired" chip row above the next assistant
   // message and aggregate per-skill activation counters.
-  | 'skill:matched';
+  | 'skill:matched'
+  // -- v0.9.1 Sentinel event types BEGIN --
+  // These are pre-added by the runtime agent so the consuming subsystems
+  // (promptware filter, exec-approval gate, goal tracker, checkpoint pruner,
+  // MCP SSE transport) can emit onto the bus the moment their code lands at
+  // integration. Payload shapes are documented per-event in `RuntimeEventPayloads`.
+  //
+  // #339 promptware (prompt-injection) detector. Fires when an inbound message
+  // or tool output is classified as a prompt-injection attempt and the
+  // configured policy ('block') drops it. Carries `{ source, score, snippet }`.
+  | 'security:promptware_blocked'
+  // #340 exec-approval timeout. Fires when a dangerous-tool approval prompt is
+  // not answered within `security.execApprovalTimeoutMs` and the configured
+  // `execApprovalOnTimeout` policy resolves the gate (default 'deny').
+  // Carries `{ callId, toolName, resolution: 'deny'|'allow', timeoutMs }`.
+  | 'security:exec_approval_denied'
+  // #293 first-run redaction default. Fires once when the loaded config omitted
+  // one or more secure-default-on security-policy keys (e.g. `redactToolOutput`)
+  // and the runtime applied the secure default. Carries `{ appliedKeys }`. An
+  // explicit operator opt-out (key set to false) does NOT fire this.
+  | 'security:redaction_default_applied'
+  // #341 goal tracking. `session:goal_set` fires when a session goal is
+  // registered; `session:goal_satisfied` when the agent reports the goal met;
+  // `session:goal_expired` when the per-session `goal.maxTurns` budget is
+  // exhausted before satisfaction. Carry `{ sessionId, goal?, turns? }`.
+  | 'session:goal_set'
+  | 'session:goal_satisfied'
+  | 'session:goal_expired'
+  // #338 checkpoint retention. Fires after a prune pass removes checkpoints
+  // that exceeded `checkpoints.retention` (age/count/disk). Carries
+  // `{ removed, reason: 'maxAgeDays'|'maxCount'|'maxDiskMB', remaining }`.
+  | 'checkpoint:pruned'
+  // #337 MCP SSE transport lifecycle. `mcp:sse_connected` fires when an SSE
+  // MCP server connection is established; `mcp:sse_disconnected` when it drops.
+  // Carry `{ server, url?, reason? }`.
+  | 'mcp:sse_connected'
+  | 'mcp:sse_disconnected';
+  // -- v0.9.1 Sentinel event types END --
 
 export interface RuntimeEvent {
   type: RuntimeEventType;
   timestamp: string;
   data: Record<string, unknown>;
 }
+
+// -- v0.9.1 Sentinel event payload contracts BEGIN --
+// Documentation-only payload shapes for the v0.9.1 events. `EventBus.emit`
+// keeps its `Record<string, unknown>` signature for backward compatibility;
+// consuming agents should construct payloads matching these interfaces so the
+// dashboard and observability bridges can render them without guessing keys.
+
+/** Payload for `security:promptware_blocked` (#339). */
+export interface PromptwareBlockedPayload {
+  /** Where the injection was detected: inbound user message or a tool result. */
+  source: 'user_input' | 'tool_output';
+  /** Heuristic confidence 0..1. */
+  score: number;
+  /** Truncated, redaction-safe excerpt of the offending content. */
+  snippet?: string;
+  sessionId?: string;
+}
+
+/** Payload for `security:exec_approval_denied` (#340). */
+export interface ExecApprovalDeniedPayload {
+  callId: string;
+  toolName: string;
+  /** How the gate resolved once the approval window elapsed. */
+  resolution: 'deny' | 'allow';
+  timeoutMs: number;
+  sessionId?: string;
+}
+
+/** Payload for the `session:goal_*` family (#341). */
+export interface SessionGoalPayload {
+  sessionId: string;
+  /** The goal text; present on `goal_set`, optional on satisfied/expired. */
+  goal?: string;
+  /** Turns consumed when the event fired (expired/satisfied). */
+  turns?: number;
+}
+
+/** Payload for `checkpoint:pruned` (#338). */
+export interface CheckpointPrunedPayload {
+  /** Number of checkpoints removed in this prune pass. */
+  removed: number;
+  /** Which retention bound triggered the prune. */
+  reason: 'maxAgeDays' | 'maxCount' | 'maxDiskMB';
+  /** Checkpoints remaining after the prune. */
+  remaining: number;
+}
+
+/** Payload for `mcp:sse_connected` / `mcp:sse_disconnected` (#337). */
+export interface McpSseLifecyclePayload {
+  server: string;
+  url?: string;
+  /** Disconnect reason, when known. */
+  reason?: string;
+}
+// -- v0.9.1 Sentinel event payload contracts END --
 
 type Listener = (event: RuntimeEvent) => void;
 

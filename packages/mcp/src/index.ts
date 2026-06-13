@@ -1,7 +1,14 @@
 import { McpJsonRpcStdioTransport, type McpStdioServerConfig } from './stdio-transport.js';
+import {
+  McpJsonRpcSseTransport,
+  type McpSseServerConfig,
+  type McpSseTransportOptions,
+} from './sse-transport.js';
 
 export { McpJsonRpcStdioTransport } from './stdio-transport.js';
 export type { McpStdioServerConfig, McpJsonRpcStdioTransportOptions } from './stdio-transport.js';
+export { McpJsonRpcSseTransport } from './sse-transport.js';
+export type { McpSseServerConfig, McpSseTransportOptions } from './sse-transport.js';
 export { mcpPresets, createMcpFromPreset, listMcpPresetNames, getMcpPresetDescription, verifyPresetAvailability } from './presets.js';
 export type {
   McpPresetName,
@@ -91,6 +98,126 @@ export interface McpCallResult {
   isError?: boolean;
 }
 
+// -- v0.9.1 MCP media (MEDIA tags) BEGIN --
+//
+// Issue #331 (Hermes v0.13 parity): MCP tool results may carry image content.
+// Previously these were dropped or stringified by consumers. We surface them as
+// MEDIA-tagged blocks so the agent context can render/inspect them rather than
+// losing the data.
+//
+// MCP content items follow the shape `{ type: 'image', data: <base64>,
+// mimeType: 'image/png' }` (and likewise `type: 'audio'`). We normalise those
+// into `McpMediaContent` and a serialisable `MEDIA[...]` tag string.
+
+export type McpMediaKind = 'image' | 'audio';
+
+export interface McpMediaContent {
+  kind: McpMediaKind;
+  /** Base64-encoded payload as returned by the MCP server. */
+  data: string;
+  /** IANA media type, e.g. `image/png`. */
+  mimeType: string;
+}
+
+interface McpRawContentItem {
+  type?: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+}
+
+const MEDIA_TYPES: Record<string, McpMediaKind> = {
+  image: 'image',
+  audio: 'audio',
+};
+
+/**
+ * Issue #331: Extract MEDIA (image/audio) content items from an MCP tool
+ * result. Accepts either an `McpCallResult` or a raw content array. Returns the
+ * normalised media blocks; non-media items are ignored.
+ */
+export function extractMcpMedia(result: McpCallResult | unknown): McpMediaContent[] {
+  const content = isCallResult(result) ? result.content : result;
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const media: McpMediaContent[] = [];
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const item = raw as McpRawContentItem;
+    const kind = item.type ? MEDIA_TYPES[item.type] : undefined;
+    if (!kind) continue;
+    if (typeof item.data !== 'string' || item.data.length === 0) continue;
+    media.push({
+      kind,
+      data: item.data,
+      mimeType: typeof item.mimeType === 'string' && item.mimeType.length > 0
+        ? item.mimeType
+        : kind === 'image'
+          ? 'image/png'
+          : 'audio/wav',
+    });
+  }
+  return media;
+}
+
+/**
+ * Issue #331: Render a media block as a `MEDIA[...]` tag for embedding in agent
+ * context. The data URI keeps the result self-describing and inline-renderable.
+ */
+export function toMediaTag(media: McpMediaContent): string {
+  return `MEDIA[data:${media.mimeType};base64,${media.data}]`;
+}
+
+/**
+ * Issue #331: Convert an MCP tool result's content array into a flat string,
+ * preserving text items verbatim and converting image/audio items into MEDIA
+ * tags instead of dropping them. Non-media, non-text items are JSON-stringified.
+ */
+export function renderMcpContentWithMedia(result: McpCallResult | unknown): string {
+  const content = isCallResult(result) ? result.content : result;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return content === undefined || content === null ? '' : JSON.stringify(content);
+  }
+  const parts: string[] = [];
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) {
+      parts.push(String(raw));
+      continue;
+    }
+    const item = raw as McpRawContentItem;
+    const kind = item.type ? MEDIA_TYPES[item.type] : undefined;
+    if (kind && typeof item.data === 'string' && item.data.length > 0) {
+      parts.push(
+        toMediaTag({
+          kind,
+          data: item.data,
+          mimeType: typeof item.mimeType === 'string' && item.mimeType.length > 0
+            ? item.mimeType
+            : kind === 'image'
+              ? 'image/png'
+              : 'audio/wav',
+        })
+      );
+    } else if (item.type === 'text' && typeof item.text === 'string') {
+      parts.push(item.text);
+    } else {
+      parts.push(JSON.stringify(raw));
+    }
+  }
+  return parts.join('\n');
+}
+
+const isCallResult = (value: unknown): value is McpCallResult =>
+  typeof value === 'object' &&
+  value !== null &&
+  'content' in value &&
+  'ok' in value;
+// -- v0.9.1 MCP media (MEDIA tags) END --
+
 export interface McpVerifyResult {
   ok: boolean;
   serverName?: string;
@@ -108,6 +235,59 @@ export interface McpTransport {
   listResources?(): Promise<McpResourceDefinition[]>;
   listPrompts?(): Promise<McpPromptDefinition[]>;
 }
+
+// -- v0.9.1 MCP transport kind selection BEGIN --
+//
+// Issue #331: A discriminated config the integrator builds from
+// `mcp.<server>.transport` config. `stdio` spawns a child process; `sse`
+// connects to an HTTP+SSE endpoint with OAuth bearer forwarding. Both expose a
+// `connect()`/`disconnect()` lifecycle (duck-typed; consumed by
+// `McpClient.dispose()` and by the manager's connect path).
+
+export type McpTransportKind = 'stdio' | 'sse';
+
+export interface McpStdioTransportSpec {
+  kind: 'stdio';
+  config: McpStdioServerConfig;
+}
+
+export interface McpSseTransportSpec {
+  kind: 'sse';
+  config: McpSseServerConfig;
+  options?: McpSseTransportOptions;
+}
+
+export type McpTransportSpec = McpStdioTransportSpec | McpSseTransportSpec;
+
+/**
+ * Issue #331: A transport with an explicit connect/disconnect lifecycle. Both
+ * the stdio and SSE transports satisfy this; `McpClient.dispose()` calls
+ * `disconnect()` when present.
+ */
+export interface ConnectableMcpTransport extends McpTransport {
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+}
+
+/**
+ * Issue #331: Build a transport from a kind-tagged spec. Lets the integrator
+ * select `stdio` vs `sse` from config without importing transport classes
+ * directly. The caller must `connect()` before first use.
+ */
+export function createMcpTransport(spec: McpTransportSpec): ConnectableMcpTransport {
+  switch (spec.kind) {
+    case 'stdio':
+      return new McpJsonRpcStdioTransport(spec.config);
+    case 'sse':
+      return new McpJsonRpcSseTransport(spec.config, spec.options);
+    default: {
+      // Exhaustiveness guard — a new kind must be handled above.
+      const exhaustive: never = spec;
+      throw new Error(`Unknown MCP transport kind: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+// -- v0.9.1 MCP transport kind selection END --
 
 export interface McpHttpTransportOptions {
   baseUrl: string;
@@ -216,6 +396,38 @@ export class McpClient {
     const transport = new McpJsonRpcStdioTransport(config);
     return new McpClient(transport, options);
   }
+
+  // -- v0.9.1 MCP SSE transport BEGIN --
+  /**
+   * Issue #331: Build a client over the SSE (HTTP + Server-Sent-Events)
+   * transport. The returned client's `dispose()` tears the SSE stream down via
+   * the transport's `disconnect()`. The caller must `connect()` the transport
+   * before first use — see {@link McpClient.connect}.
+   */
+  static fromSse(
+    config: McpSseServerConfig,
+    options?: McpClientOptions & { transport?: McpSseTransportOptions }
+  ): McpClient {
+    const { transport: transportOptions, ...clientOptions } = options ?? {};
+    const transport = new McpJsonRpcSseTransport(config, transportOptions);
+    return new McpClient(transport, clientOptions);
+  }
+  // -- v0.9.1 MCP SSE transport END --
+
+  // -- v0.9.1 MCP SSE transport BEGIN --
+  /**
+   * Issue #331: Connect the underlying transport if it exposes a `connect()`
+   * lifecycle (stdio + SSE do). No-op for connectionless transports (e.g.
+   * `McpHttpTransport`). Idempotent — safe to call before each use.
+   */
+  async connect(): Promise<void> {
+    this.ensureNotDisposed();
+    const transport = this.transport as { connect?: () => Promise<void> };
+    if (typeof transport.connect === 'function') {
+      await transport.connect();
+    }
+  }
+  // -- v0.9.1 MCP SSE transport END --
 
   private filterTool(tool: McpToolDefinition): boolean {
     if (this.options.allowTools?.length && !this.options.allowTools.includes(tool.name)) {

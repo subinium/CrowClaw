@@ -18,8 +18,8 @@ describe('Config Schema', () => {
   describe('generateConfigSchema', () => {
     const schema = generateConfigSchema();
 
-    it('returns all 6 sections', () => {
-      expect(schema.sections).toHaveLength(6);
+    it('returns all 11 sections', () => {
+      expect(schema.sections).toHaveLength(11);
       const ids = schema.sections.map((s) => s.id);
       expect(ids).toContain('agent');
       expect(ids).toContain('security');
@@ -27,6 +27,12 @@ describe('Config Schema', () => {
       expect(ids).toContain('gateway');
       expect(ids).toContain('channels');
       expect(ids).toContain('presets');
+      // v0.9.1 Sentinel additions
+      expect(ids).toContain('server'); // allowedHosts / allowedOrigins
+      expect(ids).toContain('goal'); // #301 Ralph-loop goal budget
+      expect(ids).toContain('checkpoints'); // #307 retention bounds
+      expect(ids).toContain('mcp'); // #331 SSE transport
+      expect(ids).toContain('i18n'); // #335 default locale
     });
 
     it('schema version is a semver string', () => {
@@ -101,10 +107,20 @@ describe('Config Schema', () => {
     describe('security section', () => {
       const section = schema.sections.find((s) => s.id === 'security') as ConfigSectionSchema;
 
-      it('has all boolean fields', () => {
+      it('has well-typed fields (booleans plus the v0.9.1 promptware/exec-approval controls)', () => {
         expect(section.fields.length).toBeGreaterThan(0);
+        const byKey = new Map(section.fields.map((f) => [f.key, f.type] as const));
+        // Original boolean toggles.
+        for (const key of ['redactToolOutput', 'scanUserInput', 'scanCommands', 'blockDangerousCommands', 'piiRedaction']) {
+          expect(byKey.get(key)).toBe('boolean');
+        }
+        // v0.9.1 Sentinel additions are intentionally non-boolean.
+        expect(byKey.get('promptware.policy')).toBe('enum'); // block | warn | off
+        expect(byKey.get('execApprovalOnTimeout')).toBe('enum'); // deny | allow
+        expect(byKey.get('execApprovalTimeoutMs')).toBe('number');
+        // Every field carries a recognized control type.
         for (const field of section.fields) {
-          expect(field.type).toBe('boolean');
+          expect(['boolean', 'enum', 'number', 'string']).toContain(field.type);
         }
       });
 

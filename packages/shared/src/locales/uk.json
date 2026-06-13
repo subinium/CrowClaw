@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "uk",
+    "name": "Ukrainian",
+    "nativeName": "Українська"
+  },
+  "language.name": "Ukrainian",
+  "prompt.responseLanguage.heading": "Мова відповіді:",
+  "prompt.responseLanguage.default": "- За замовчуванням відповідай {language}.",
+  "prompt.responseLanguage.keepOriginal": "- Залишай код, команди, шляхи до файлів, ідентифікатори, назви API та цитований вихідний текст їхньою оригінальною мовою.",
+  "prompt.responseLanguage.userOverride": "- Якщо користувач явно просить іншу мову, дотримуйся прохання користувача для цього ходу.",
+  "gateway.pairing.prompt": "Пристрій хоче з'єднатися з цим агентом. Підтвердьте це на панелі з'єднання інформаційної панелі.",
+  "gateway.pairing.approved": "Пристрій успішно з'єднано.",
+  "gateway.pairing.denied": "Запит на з'єднання відхилено.",
+  "gateway.session.notFound": "Сесію не знайдено.",
+  "gateway.rateLimited": "Забагато запитів. Будь ласка, зачекайте та повторіть спробу незабаром.",
+  "cli.welcome": "Ласкаво просимо до CrowClaw.",
+  "cli.session.created": "Сесію створено.",
+  "cli.session.cleared": "Сесію очищено.",
+  "cli.error.generic": "Щось пішло не так. Спробуйте ще раз.",
+  "cli.error.providerMissing": "Постачальника не налаштовано. Налаштуйте його перед запуском агента."
+}

@@ -1,6 +1,6 @@
 {
   "name": "@crowclaw/mcp-server",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "src/index.ts",
@@ -17,7 +17,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@crowclaw/core": "0.9.0"
+    "@crowclaw/core": "0.9.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

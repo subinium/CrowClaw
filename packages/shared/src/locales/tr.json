@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "tr",
+    "name": "Turkish",
+    "nativeName": "Türkçe"
+  },
+  "language.name": "Turkish",
+  "prompt.responseLanguage.heading": "Yanıt dili:",
+  "prompt.responseLanguage.default": "- Varsayılan olarak {language} yanıt ver.",
+  "prompt.responseLanguage.keepOriginal": "- Kodu, komutları, dosya yollarını, tanımlayıcıları, API adlarını ve alıntılanan kaynak metni orijinal dilinde bırak.",
+  "prompt.responseLanguage.userOverride": "- Kullanıcı açıkça başka bir dil isterse, o tur için kullanıcının isteğine uy.",
+  "gateway.pairing.prompt": "Bir cihaz bu aracıyla eşleşmek istiyor. Panodaki eşleştirme bölümünden onayla.",
+  "gateway.pairing.approved": "Cihaz başarıyla eşleştirildi.",
+  "gateway.pairing.denied": "Eşleştirme isteği reddedildi.",
+  "gateway.session.notFound": "Oturum bulunamadı.",
+  "gateway.rateLimited": "Çok fazla istek. Lütfen yavaşla ve kısa süre sonra tekrar dene.",
+  "cli.welcome": "CrowClaw'a hoş geldin.",
+  "cli.session.created": "Oturum oluşturuldu.",
+  "cli.session.cleared": "Oturum temizlendi.",
+  "cli.error.generic": "Bir şeyler ters gitti. Lütfen tekrar dene.",
+  "cli.error.providerMissing": "Yapılandırılmış sağlayıcı yok. Aracıyı çalıştırmadan önce bir tane ayarla."
+}

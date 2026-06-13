@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "zh",
+    "name": "Chinese (Simplified)",
+    "nativeName": "简体中文"
+  },
+  "language.name": "Chinese",
+  "prompt.responseLanguage.heading": "回复语言：",
+  "prompt.responseLanguage.default": "- 默认使用{language}回复。",
+  "prompt.responseLanguage.keepOriginal": "- 代码、命令、文件路径、标识符、API 名称以及引用的源文本保持其原始语言。",
+  "prompt.responseLanguage.userOverride": "- 如果用户明确要求使用其他语言，则在该轮对话中遵循用户的请求。",
+  "gateway.pairing.prompt": "有设备想要与此代理配对。请在仪表板配对面板中批准。",
+  "gateway.pairing.approved": "设备配对成功。",
+  "gateway.pairing.denied": "配对请求已被拒绝。",
+  "gateway.session.notFound": "未找到会话。",
+  "gateway.rateLimited": "请求过多。请稍后再试。",
+  "cli.welcome": "欢迎使用 CrowClaw。",
+  "cli.session.created": "会话已创建。",
+  "cli.session.cleared": "会话已清除。",
+  "cli.error.generic": "出现了一些问题。请重试。",
+  "cli.error.providerMissing": "未配置任何提供方。请在运行代理之前完成配置。"
+}

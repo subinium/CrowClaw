@@ -66,7 +66,25 @@ import {
   sendTelegramMessage,
   setTelegramWebhook,
   verifySlackSignature,
+  // -- v0.9.1 Sentinel (#342): channel ACL primitives wired at the webhook handlers --
+  checkDiscordAcl,
+  loadDiscordAclConfig,
+  extractDiscordAclInput,
+  emitDiscordAclDenied,
+  checkWhatsAppAcl,
+  loadWhatsAppAclConfig,
+  emitWhatsAppAclDenied,
+  checkDestinationAcl,
+  buildAclDeniedEvent,
+  emitAclDenied,
+  // #342: the self-registering channel registry + the per-channel access gate
+  // contract. Each adapter's `checkAccess(payload, normalized, config)` runs
+  // the platform's ACL primitive; we drive it from the webhook handlers below.
+  channels,
+  type ChannelAccessResult,
+  type NormalizedChannelMessage,
   type GatewayCallerScope,
+  type NormalizedInboundMessage,
 } from '@crowclaw/gateway';
 // v0.8.4 (#185) — derive learning-loop stages and per-skill metrics from
 // existing draft fields without changing the storage contract.
@@ -95,6 +113,8 @@ import { BUILTIN_MCP_CATALOG, BUILTIN_PLUGIN_CATALOG, buildMcpServerConfigFromCa
 import { routePaths } from './route-paths.js';
 import { isPrometheusMetricsEnabled, renderPrometheusMetrics } from './otel.js';
 import { handleWebSocketUpgrade } from './websocket.js';
+// v0.9.1 Sentinel: Host-header guard helpers (CVE-2026-48710 class).
+import { isHostAllowed, resolveAllowedHosts } from './config-schema.js';
 
 const BLOCKED_CONFIG_MUTATIONS = new Set([
   'apiKey',
@@ -484,6 +504,29 @@ export function getRouteCapture(match: RegExpMatchArray | null, index: number): 
   return typeof capture === 'string' ? capture : null;
 }
 
+/**
+ * #301 (v0.9.1 "Sentinel"): parse a leading `/goal` slash command out of a
+ * chat message. Returns `{ kind: 'clear' }` for `/goal clear`, `{ kind: 'set',
+ * text }` for `/goal <objective>`, or `null` when the message is not a goal
+ * command (and should be routed to the model normally).
+ *
+ * Matching is case-insensitive on the command token, tolerant of leading
+ * whitespace, and requires a word boundary after `goal` so `/goalkeeper ...`
+ * is NOT treated as a command. A bare `/goal` with no text is treated as a
+ * no-op set with empty text → null (drop-silently, like steer/queue).
+ */
+export function parseGoalSlashCommand(
+  message: string | undefined | null,
+): { kind: 'set'; text: string } | { kind: 'clear' } | null {
+  if (typeof message !== 'string') return null;
+  const match = message.trimStart().match(/^\/goal(?:\s+([\s\S]*))?$/i);
+  if (!match) return null;
+  const rest = (match[1] ?? '').trim();
+  if (rest.toLowerCase() === 'clear') return { kind: 'clear' };
+  if (!rest) return null;
+  return { kind: 'set', text: rest };
+}
+
 export function isLocalhostAddress(hostname: string): boolean {
   return hostname === '127.0.0.1' || hostname === '::1' || hostname === 'localhost';
 }
@@ -790,6 +833,92 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         return enforceDailyUsdCap('webhook', key, buildGatewaySessionKey(message));
       };
 
+      // -- v0.9.1 Sentinel (#342): channel ACL ingress enforcement BEGIN --
+      //
+      // CVSS 8.1 fix: the v0.9.0 ACL primitives (Discord guild-role allowlist,
+      // WhatsApp stranger/self-chat ban, cross-platform destination allowlist)
+      // were defined on each `ChannelAdapter.checkAccess` but never invoked at
+      // the inbound webhook surface — only the legacy `enforceGatewayAccess`
+      // (DM/group pairing policy) ran. An attacker outside the configured
+      // guild/allowlist could therefore drive the agent. This helper runs the
+      // adapter's `checkAccess` after secret-validation + normalization and
+      // before agent dispatch.
+      //
+      // Resolution rules:
+      //   - No adapter for the platform, or adapter without `checkAccess`
+      //     → no-op (returns null = allowed). Safe for platforms whose ACL
+      //       lives entirely in `enforceGatewayAccess`.
+      //   - `silentDrop` (WhatsApp self-chat) → silent 200 so the agent never
+      //     enqueues and we don't echo-loop; the adapter intentionally does NOT
+      //     audit-emit these (per `whatsapp-acl`'s contract).
+      //   - Any other denial → the adapter already emitted `gateway:acl_denied`
+      //     via the installed sink (wired in index.ts onto the runtime event
+      //     bus). We mirror an explicit `gateway:acl_denied` onto the event bus
+      //     here too (covers the fail-closed throw path, where the adapter never
+      //     reached its own emit) and return a 403 `ACL_DENIED` JSON response.
+      //     We do NOT call `securityAuditLog.record` — the `SecurityEventType`
+      //     union has no ACL member, and `gateway:acl_denied` on the event bus
+      //     is the canonical audit channel (consumed by the dashboard +
+      //     observability bridges via the sink wired in index.ts).
+      //
+      // `payload` is the raw webhook body (the same object the normalizer set
+      // as `message.raw`). Discord's `checkAccess` reads `guild_id` + member
+      // roles from it via `extractDiscordAclInput`, so it must be the original
+      // payload, not the normalized projection.
+      const enforceChannelAcl = (
+        platform: string,
+        payload: unknown,
+        message: NormalizedInboundMessage,
+      ): Response | null => {
+        const adapter = channels.get(platform);
+        if (!adapter?.checkAccess) {
+          // Platform has no ACL adapter (or it predates the checkAccess hook):
+          // fall through to the existing gateway-access + rate-limit gates.
+          return null;
+        }
+        // Project the gateway's NormalizedInboundMessage onto the channel
+        // registry's NormalizedChannelMessage shape. `senderId` prefers the
+        // platform user id; the destination ACL keys off `channelId`.
+        const senderId = message.userId ?? message.externalUserId ?? '';
+        const normalized: NormalizedChannelMessage = {
+          platform,
+          channelId: message.channelId,
+          senderId,
+          text: message.text,
+          messageId: message.deliveryId,
+          timestamp: message.receivedAt,
+          raw: payload,
+        };
+        const aclResponse = Response.json(
+          { error: { code: 'ACL_DENIED', message: 'Channel access denied' } },
+          { status: 403 },
+        );
+        let result: ChannelAccessResult;
+        try {
+          result = adapter.checkAccess(payload, normalized, configStore.getChannelConfig?.(platform) ?? {});
+        } catch (err: unknown) {
+          // A throwing ACL primitive must fail closed — a malformed config or
+          // payload should deny, not silently admit. The adapter never reached
+          // its own emit, so surface the denial onto the bus here.
+          eventBus.emit('gateway:acl_denied', buildAclDeniedEvent({
+            platform,
+            reason: 'check-error',
+            destinationId: message.channelId,
+            senderId,
+            detail: { error: err instanceof Error ? err.message : String(err) },
+          }) as unknown as Record<string, unknown>);
+          return aclResponse;
+        }
+        if (result.allowed) return null;
+        if (result.silentDrop) {
+          // Self-chat / loop guard: drop without audit-emitting (adapter
+          // contract) and ACK so the platform stops retrying.
+          return Response.json({ ok: true, dropped: true });
+        }
+        return aclResponse;
+      };
+      // -- v0.9.1 Sentinel (#342): channel ACL ingress enforcement END --
+
       const validWebhookSecrets = (platform: string, primary?: string): string[] => {
         const cfg = configStore.getGatewayConfig(platform);
         const secrets = [primary ?? cfg?.webhookSecret].filter((secret): secret is string => Boolean(secret));
@@ -836,6 +965,41 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           return cap;
         }
       }
+
+      // -- v0.9.1 Sentinel: Host-header validation (CVE-2026-48710 class) BEGIN --
+      // Reject requests whose Host header is not in the resolved allowlist.
+      // This blocks DNS-rebinding and Host-spoofing attacks that would let a
+      // malicious page reach the dashboard API via a victim's browser. The
+      // allowlist is always localhost/127.0.0.1/::1 + the configured bind host,
+      // extended by `server.allowedHosts` (wildcard `*.example.com` supported).
+      //
+      // Webhook routes are intentionally NOT exempt: they carry their own
+      // per-platform secret, but a forged Host should still be rejected at the
+      // perimeter rather than relied on downstream. The default allowlist is
+      // never empty, so this gate is always active.
+      {
+        const configuredHosts = configStore.getAllowedHosts?.() ?? [];
+        const allowedHosts = resolveAllowedHosts(bindHostname, configuredHosts);
+        const hostHeader = request.headers.get('host');
+        if (!isHostAllowed(hostHeader, allowedHosts)) {
+          log.warn('Rejected request with disallowed Host header', {
+            component: 'security',
+            path: url.pathname,
+            host: hostHeader ?? '(missing)',
+            clientIp: getClientIp(request),
+          });
+          securityAuditLog.record({
+            type: 'ssrf_blocked',
+            severity: 'warning',
+            detail: `BAD_HOST: rejected Host header "${hostHeader ?? '(missing)'}" path=${url.pathname}`,
+          });
+          return Response.json(
+            { error: { code: 'BAD_HOST', message: 'Host header not allowed' } },
+            { status: 400 },
+          );
+        }
+      }
+      // -- v0.9.1 Sentinel: Host-header validation END --
 
       // Stricter rate limit for credential-checking endpoints only.
       // /api/auth/check is a passive cookie/bearer status read that the dashboard
@@ -1028,6 +1192,72 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         }
         return Response.json({ ok: true, sessionId });
       }
+
+      // -- v0.9.1 Sentinel (#301): /goal REST endpoints BEGIN --
+      // Persistent cross-turn goal (Ralph loop). The AgentLoop owns the goal
+      // tracker, but each turn builds a fresh loop — so we route the operator
+      // request through `createConfiguredAgent().setGoal/getGoal/clearGoal`
+      // (which emits the canonical `session:goal_*` events) AND mirror the
+      // resulting `activeGoal` onto the persisted `SessionState` so the next
+      // real turn's loop rehydrates it (the documented persistence contract in
+      // @crowclaw/core goal.ts). POST sets/replaces, GET reads, DELETE clears.
+      const goalMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/goal$/);
+      if (goalMatch && (request.method === 'POST' || request.method === 'GET' || request.method === 'DELETE')) {
+        const sessionId = getRouteCapture(goalMatch, 1);
+        if (!sessionId) {
+          return Response.json({ error: { code: 'INVALID_SESSION_ID', message: 'Invalid session ID' } }, { status: 400 });
+        }
+
+        if (request.method === 'GET') {
+          const goal = createConfiguredAgent().getGoal(sessionId)
+            ?? (await store.get(sessionId))?.activeGoal
+            ?? null;
+          return Response.json({ ok: true, sessionId, goal });
+        }
+
+        if (request.method === 'DELETE') {
+          const session = await store.get(sessionId);
+          const persistedGoalText = session?.activeGoal?.text;
+          const cleared = createConfiguredAgent().clearGoal(sessionId);
+          if (session?.activeGoal) {
+            delete session.activeGoal;
+            session.updatedAt = new Date().toISOString();
+            await store.put(session);
+          }
+          // Operator explicitly cleared the goal — surface it as expired (the
+          // budget-exhaustion event) rather than satisfied, since the agent did
+          // not self-report completion.
+          eventBus.emit('session:goal_expired', { sessionId, goal: cleared?.text ?? persistedGoalText });
+          return Response.json({ ok: true, sessionId, cleared: cleared ?? null });
+        }
+
+        // POST — set or replace the goal.
+        const goalBody = (await request.json().catch(() => ({}))) as { text?: unknown; maxTurns?: unknown };
+        const text = typeof goalBody.text === 'string' ? goalBody.text.trim() : '';
+        if (!text) {
+          return Response.json({ error: { code: 'MISSING_GOAL_TEXT', message: 'text is required' } }, { status: 400 });
+        }
+        if (text.length > 2000) {
+          return Response.json({ error: { code: 'GOAL_TEXT_TOO_LONG', message: 'Goal text too long (max 2000 chars)' } }, { status: 400 });
+        }
+        const maxTurns = typeof goalBody.maxTurns === 'number' && Number.isFinite(goalBody.maxTurns)
+          ? Math.max(1, Math.floor(goalBody.maxTurns))
+          : undefined;
+        // setGoal emits `session:goal_set` and returns the canonical ActiveGoal.
+        const goal = createConfiguredAgent().setGoal(sessionId, text, maxTurns !== undefined ? { maxTurns } : undefined);
+        if (!goal) {
+          return Response.json({ error: { code: 'GOAL_REJECTED', message: 'Goal text was empty after trimming' } }, { status: 400 });
+        }
+        // Persist onto the session so the next turn's loop rehydrates the goal.
+        const session = await store.get(sessionId);
+        if (session) {
+          session.activeGoal = goal;
+          session.updatedAt = new Date().toISOString();
+          await store.put(session);
+        }
+        return Response.json({ ok: true, sessionId, goal });
+      }
+      // -- v0.9.1 Sentinel (#301): /goal REST endpoints END --
 
       // Memory delete
       const deleteMemoryMatch = url.pathname.match(/^\/api\/memories\/([^/]+)$/);
@@ -2652,6 +2882,11 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): generic-webhook ACL gate. No `checkAccess`
+        // adapter is registered for the generic channel today, so this no-ops
+        // (returns null) until one is wired — keeping the call site uniform. --
+        const aclResponse = enforceChannelAcl('webhook', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('webhook', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomically claim the idempotency key BEFORE running the agent.
@@ -2730,6 +2965,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): Discord guild-role ACL ingress gate --
+        const aclResponse = enforceChannelAcl('discord', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('discord', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         const dispatch = buildDiscordDispatch(payload as never)!;
@@ -2784,6 +3022,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): Telegram destination (chat-id) ACL gate --
+        const aclResponse = enforceChannelAcl('telegram', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('telegram', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic markIfAbsent claim before runAgent; unmark on failure.
@@ -2860,6 +3101,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): Slack destination (channel) ACL gate --
+        const aclResponse = enforceChannelAcl('slack', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('slack', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
@@ -2907,6 +3151,10 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): WhatsApp stranger/self-chat ACL ingress gate.
+        // Self-chat returns silentDrop (200) so the runtime never echo-loops. --
+        const aclResponse = enforceChannelAcl('whatsapp', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('whatsapp', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
@@ -2954,6 +3202,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): Signal destination ACL gate --
+        const aclResponse = enforceChannelAcl('signal', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('signal', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
@@ -3001,6 +3252,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): Email destination (mailbox) ACL gate --
+        const aclResponse = enforceChannelAcl('email', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('email', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
@@ -3048,6 +3302,9 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): Matrix destination (room) ACL gate --
+        const aclResponse = enforceChannelAcl('matrix', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('matrix', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
@@ -3095,6 +3352,10 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         if (accessResponse) {
           return accessResponse;
         }
+        // -- v0.9.1 Sentinel (#342): SMS ACL gate. No `checkAccess` adapter is
+        // registered for SMS today, so this no-ops until one is wired. --
+        const aclResponse = enforceChannelAcl('sms', payload, message);
+        if (aclResponse) return aclResponse;
         const rateLimitResponse = enforceWebhookRateLimit('sms', message, request);
         if (rateLimitResponse) return rateLimitResponse;
         // #29: atomic claim before runAgent; unmark on failure.
@@ -4671,6 +4932,35 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
           const body = (await request.json()) as { message: string; userId?: string; workspaceId?: string; locale?: unknown };
           const locale = getRequestLocale(request, body);
           if (!body.message) return Response.json({ error: 'Missing message' }, { status: 400 });
+
+          // -- v0.9.1 Sentinel (#301): /goal slash command (stream path) --
+          // Intercept `/goal <text>` / `/goal clear` before opening the SSE
+          // stream so an operator control message never reaches the model.
+          // Returns a plain JSON ack (not an event-stream) since no turn runs.
+          const streamGoalCommand = parseGoalSlashCommand(body.message);
+          if (streamGoalCommand) {
+            if (streamGoalCommand.kind === 'clear') {
+              const cleared = createConfiguredAgent().clearGoal(sessionId);
+              const session = await store.get(sessionId);
+              if (session?.activeGoal) {
+                delete session.activeGoal;
+                session.updatedAt = new Date().toISOString();
+                await store.put(session);
+              }
+              return Response.json({ ok: true, sessionId, goalCleared: cleared ?? null });
+            }
+            const goal = createConfiguredAgent().setGoal(sessionId, streamGoalCommand.text);
+            if (goal) {
+              const session = await store.get(sessionId);
+              if (session) {
+                session.activeGoal = goal;
+                session.updatedAt = new Date().toISOString();
+                await store.put(session);
+              }
+            }
+            return Response.json({ ok: true, sessionId, goal: goal ?? null });
+          }
+
           eventBus.emit('chat:stream', { sessionId, userMessage: body.message });
 
           // For stream actions, release the mutex inside the stream (not the outer finally)
@@ -4833,6 +5123,38 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         // from the X-CrowClaw-Session-Key header (or `body.sessionKey`) so
         // memory recall survives sessionId rotation.
         const sessionKey = getRequestSessionKey(request, body);
+
+        // -- v0.9.1 Sentinel (#301): /goal slash command BEGIN --
+        // A leading `/goal <text>` (or `/goal clear`) is an operator control
+        // message, not a turn for the model — route it to the goal tracker and
+        // return without invoking the agent. `setGoal`/`clearGoal` emit the
+        // canonical `session:goal_*` events; we mirror the goal onto the
+        // persisted session so the next real turn rehydrates it.
+        const goalCommand = parseGoalSlashCommand(body.userMessage);
+        if (goalCommand) {
+          if (goalCommand.kind === 'clear') {
+            const cleared = createConfiguredAgent().clearGoal(sessionId);
+            const session = await store.get(sessionId);
+            if (session?.activeGoal) {
+              delete session.activeGoal;
+              session.updatedAt = new Date().toISOString();
+              await store.put(session);
+            }
+            return Response.json({ ok: true, sessionId, goalCleared: cleared ?? null });
+          }
+          const goal = createConfiguredAgent().setGoal(sessionId, goalCommand.text);
+          if (goal) {
+            const session = await store.get(sessionId);
+            if (session) {
+              session.activeGoal = goal;
+              session.updatedAt = new Date().toISOString();
+              await store.put(session);
+            }
+          }
+          return Response.json({ ok: true, sessionId, goal: goal ?? null });
+        }
+        // -- v0.9.1 Sentinel (#301): /goal slash command END --
+
         eventBus.emit('chat:message', { sessionId, userMessage: body.userMessage });
         const result = await runConfiguredAgent({
           sessionId,
@@ -5887,7 +6209,14 @@ export function createRuntimeRouteHandler(ctx: RuntimeRouteHandlerContext): (req
         // tightening, any local process or malicious page could abort sessions
         // by ID via cross-site WebSocket on localhost dev deployments.
         const privileged = wsAuthenticated || (!dashToken && isLocalhost);
-        return handleWebSocketUpgrade(request, eventBus, wsManager, privileged);
+        // v0.9.1 Sentinel: reject cross-origin WS upgrades. Empty allowlist
+        // (the default) permits only same-origin / no-Origin upgrades, which
+        // closes the cross-site WebSocket-hijacking path on browser clients.
+        return handleWebSocketUpgrade(request, eventBus, wsManager, {
+          authenticated: privileged,
+          allowedOrigins: configStore.getAllowedOrigins?.() ?? [],
+          requestHost: request.headers.get('host'),
+        });
       }
 
       // --- Config schema routes ---

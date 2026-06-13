@@ -20,6 +20,17 @@ try {
 }
 import type { ToolDefinition, ToolExecutionContext, ToolExecutionResult } from '@crowclaw/core';
 import type { ToolRegistry } from '@crowclaw/tools';
+// v0.9.1 (Sentinel) — control-plane / credential guard enforced where file
+// paths cross into the sandbox. For the local-fallback fs path we can guard
+// fully (deny-list + traversal + realpath symlink). For the Cloudflare
+// sandbox RPC path (sandbox.readFile / writeFile / deleteFile) we run the
+// deny-list + traversal layers on the supplied path before the call leaves
+// the host; we can't realpath inside the remote container, so that layer is
+// best-effort there (noted in integrationNotes).
+import {
+  assertSafeWorkspacePath,
+  ControlPlaneDeniedError,
+} from '@crowclaw/tools';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readFile, writeFile, unlink, access, mkdir } from 'node:fs/promises';
 import { SshExecutor, type SshExecutorOptions } from './ssh.js';
@@ -711,7 +722,66 @@ export function createTerminalKillTool(executor: LocalProcessExecutor): ToolDefi
   };
 }
 
-export function createFileReadTool(executor: SandboxClient): ToolDefinition {
+// -- v0.9.1 control-plane guard (sandbox file ops) BEGIN --
+/**
+ * v0.9.1 (Sentinel) — guard config for the sandbox file.* tools. `workspaceRoot`
+ * is the sandbox's filesystem root (e.g. `/workspace`); when supplied the
+ * traversal + symlink-escape layers engage. The credential deny-list runs
+ * regardless so an absolute target like `/home/agent/.aws/credentials` or a
+ * `*.pem` is rejected even without a root.
+ */
+export interface SandboxFileGuardOptions {
+  workspaceRoot?: string;
+  extraDenyGlobs?: readonly string[];
+}
+
+/**
+ * Run the control-plane guard for a sandbox file op. Returns a denial
+ * `ToolExecutionResult` (runtime: 'sandbox') when blocked, or null when the
+ * path is allowed. On the Cloudflare RPC path we pass `realpath: null` so only
+ * the deny-list + traversal layers run (no remote realpath available).
+ */
+async function guardSandboxFilePath(
+  toolName: string,
+  path: string,
+  kind: 'read' | 'write' | 'list',
+  guard: SandboxFileGuardOptions | undefined,
+  options?: { skipRealpath?: boolean },
+): Promise<ToolExecutionResult | null> {
+  try {
+    await assertSafeWorkspacePath(path, {
+      kind,
+      workspaceRoot: guard?.workspaceRoot,
+      extraDenyGlobs: guard?.extraDenyGlobs,
+      ...(options?.skipRealpath ? { realpath: null } : {}),
+    });
+    return null;
+  } catch (error: unknown) {
+    if (error instanceof ControlPlaneDeniedError) {
+      return {
+        toolName,
+        runtime: 'sandbox',
+        ok: false,
+        output: `Access denied: ${error.message}`,
+        metadata: {
+          path,
+          controlPlaneDenied: true,
+          forensicCode: error.code,
+          denialRule: error.rule,
+          accessKind: error.kind,
+          ...(error.resolvedPath ? { resolvedPath: error.resolvedPath } : {}),
+        },
+      };
+    }
+    throw new Error(`Control-plane guard failed for ${toolName}`, { cause: error });
+  }
+}
+// -- v0.9.1 control-plane guard (sandbox file ops) END --
+
+export function createFileReadTool(
+  executor: SandboxClient,
+  guard?: SandboxFileGuardOptions,
+): ToolDefinition {
   return {
     manifest: {
       name: 'file.read',
@@ -726,6 +796,15 @@ export function createFileReadTool(executor: SandboxClient): ToolDefinition {
     async execute(input, context) {
       const path = typeof input.path === 'string' ? input.path : '/workspace/README.md';
       const sandbox = resolveSandbox(context);
+
+      // v0.9.1 — control-plane / credential guard. On the remote sandbox path
+      // we can't realpath inside the container, so skip that layer there; the
+      // deny-list + traversal still run before the RPC.
+      const denied = await guardSandboxFilePath('file.read', path, 'read', guard, {
+        skipRealpath: Boolean(sandbox),
+      });
+      if (denied) return denied;
+
       if (sandbox) {
         const result = await sandbox.readFile(path);
         return {
@@ -761,7 +840,10 @@ export function createFileReadTool(executor: SandboxClient): ToolDefinition {
   };
 }
 
-export function createFileWriteTool(executor: SandboxClient): ToolDefinition {
+export function createFileWriteTool(
+  executor: SandboxClient,
+  guard?: SandboxFileGuardOptions,
+): ToolDefinition {
   return {
     manifest: {
       name: 'file.write',
@@ -777,6 +859,13 @@ export function createFileWriteTool(executor: SandboxClient): ToolDefinition {
       const path = typeof input.path === 'string' ? input.path : '/workspace/output.txt';
       const content = typeof input.content === 'string' ? input.content : '';
       const sandbox = resolveSandbox(context);
+
+      // v0.9.1 — control-plane / credential guard before any write.
+      const denied = await guardSandboxFilePath('file.write', path, 'write', guard, {
+        skipRealpath: Boolean(sandbox),
+      });
+      if (denied) return denied;
+
       if (sandbox) {
         const result = await sandbox.writeFile(path, content);
         return {
@@ -863,7 +952,10 @@ export function createFileExistsTool(executor: SandboxClient): ToolDefinition {
   };
 }
 
-export function createFileDeleteTool(executor: SandboxClient): ToolDefinition {
+export function createFileDeleteTool(
+  executor: SandboxClient,
+  guard?: SandboxFileGuardOptions,
+): ToolDefinition {
   return {
     manifest: {
       name: 'file.delete',
@@ -878,6 +970,14 @@ export function createFileDeleteTool(executor: SandboxClient): ToolDefinition {
     async execute(input, context) {
       const path = typeof input.path === 'string' ? input.path : '/workspace/output.txt';
       const sandbox = resolveSandbox(context);
+
+      // v0.9.1 — control-plane / credential guard. Delete is destructive, so
+      // it uses the 'write' access kind for forensic routing.
+      const denied = await guardSandboxFilePath('file.delete', path, 'write', guard, {
+        skipRealpath: Boolean(sandbox),
+      });
+      if (denied) return denied;
+
       if (sandbox) {
         const dynamicSandbox = sandbox as unknown as {
           deleteFile?: (filePath: string) => Promise<{ success: boolean }>;
@@ -2031,13 +2131,25 @@ export function createBrowserClickRefTool(): ToolDefinition {
 // Registry helper
 // ---------------------------------------------------------------------------
 
-export function registerSandboxTools(registry: ToolRegistry, executor: SandboxClient): ToolRegistry {
+export interface RegisterSandboxToolsOptions {
+  /** v0.9.1 — control-plane / credential guard config for the file.* tools.
+   *  Pass the sandbox filesystem root (e.g. `/workspace`) as `workspaceRoot`
+   *  so traversal / symlink-escape layers engage. */
+  controlPlaneGuard?: SandboxFileGuardOptions;
+}
+
+export function registerSandboxTools(
+  registry: ToolRegistry,
+  executor: SandboxClient,
+  options?: RegisterSandboxToolsOptions,
+): ToolRegistry {
+  const guard = options?.controlPlaneGuard;
   return registry
     .register(createTerminalTool(executor))
-    .register(createFileReadTool(executor))
-    .register(createFileWriteTool(executor))
+    .register(createFileReadTool(executor, guard))
+    .register(createFileWriteTool(executor, guard))
     .register(createFileExistsTool(executor))
-    .register(createFileDeleteTool(executor))
+    .register(createFileDeleteTool(executor, guard))
     .register(createCodeExecTool(executor))
     .register(createNodeExecTool(executor))
     .register(createPythonExecTool(executor))

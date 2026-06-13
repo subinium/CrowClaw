@@ -26,6 +26,26 @@ export {
   type SsrfAllowedResult,
 } from './ssrf-blocklist.js';
 
+// -- v0.9.1 control-plane guard exports BEGIN --
+// v0.9.1 (Sentinel) — control-plane / credential file protection. The guard
+// itself lives in control-plane-guard.ts (no dependency on the workspace
+// package) and is wired into the workspace.read / .write / .list handlers
+// below via the optional `controlPlaneGuard` create-tool option.
+export {
+  assertSafeWorkspacePath,
+  controlPlaneAuditDetail,
+  ControlPlaneDeniedError,
+  CONTROL_PLANE_DENIED,
+  type AssertSafeWorkspacePathOptions,
+  type ControlPlaneDenialRule,
+  type WorkspaceAccessKind,
+} from './control-plane-guard.js';
+import {
+  assertSafeWorkspacePath,
+  ControlPlaneDeniedError,
+} from './control-plane-guard.js';
+// -- v0.9.1 control-plane guard exports END --
+
 // v0.9.0 (#310) — post-write syntax validators are exported so consumers can
 // reuse them outside workspace.write (e.g. text.patch could call them too).
 export {
@@ -2052,7 +2072,68 @@ export function getWorkspaceReadDedupCount(
   return workspaceReadCounts.get(workspaceReadDedupKey(sessionId, path)) ?? 0;
 }
 
-export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefinition {
+// -- v0.9.1 control-plane guard wiring BEGIN --
+/**
+ * v0.9.1 (Sentinel) — options threaded into the workspace.read / .write /
+ * .list tools so the control-plane / credential guard runs before the store
+ * op. `workspaceRoot` should be the FileWorkspaceStore's resolved rootDir so
+ * traversal / symlink-escape layers engage; the credential deny-list runs
+ * even when it's omitted. `extraDenyGlobs` is operator config (project-
+ * specific secret files). When the whole options object is omitted the tools
+ * behave exactly as before (deny-list still applies on the logical path
+ * segments, which is the no-root protection).
+ */
+export interface ControlPlaneGuardOptions {
+  workspaceRoot?: string;
+  extraDenyGlobs?: readonly string[];
+}
+
+/**
+ * Run the control-plane guard for a workspace op and convert a thrown
+ * `ControlPlaneDeniedError` into an `ok:false` tool envelope. Returns the
+ * envelope on denial, or `null` when the path is allowed (caller proceeds).
+ */
+async function guardWorkspacePath(
+  toolName: string,
+  path: string,
+  kind: 'read' | 'write' | 'list',
+  guard: ControlPlaneGuardOptions | undefined,
+): Promise<ToolExecutionResult | null> {
+  try {
+    await assertSafeWorkspacePath(path, {
+      kind,
+      workspaceRoot: guard?.workspaceRoot,
+      extraDenyGlobs: guard?.extraDenyGlobs,
+    });
+    return null;
+  } catch (error: unknown) {
+    if (error instanceof ControlPlaneDeniedError) {
+      return {
+        toolName,
+        runtime: 'worker',
+        ok: false,
+        output: `Access denied: ${error.message}`,
+        metadata: {
+          path,
+          controlPlaneDenied: true,
+          forensicCode: error.code,
+          denialRule: error.rule,
+          accessKind: error.kind,
+          ...(error.resolvedPath ? { resolvedPath: error.resolvedPath } : {}),
+        },
+      };
+    }
+    // Unknown error from the guard — propagate with context rather than
+    // silently allowing the op.
+    throw new Error(`Control-plane guard failed for ${toolName}`, { cause: error });
+  }
+}
+// -- v0.9.1 control-plane guard wiring END --
+
+export function createWorkspaceReadTool(
+  workspace: WorkspaceStore,
+  guard?: ControlPlaneGuardOptions,
+): ToolDefinition {
   return {
     manifest: {
       name: 'workspace.read',
@@ -2076,6 +2157,10 @@ export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefiniti
           metadata: { path }
         };
       }
+
+      // v0.9.1 — control-plane / credential guard before any read.
+      const denied = await guardWorkspacePath('workspace.read', path, 'read', guard);
+      if (denied) return denied;
 
       // #88 — Dedup escalation. Bump *before* the read so a runaway loop is
       // blocked on the third re-issue, not the fourth. The first
@@ -2117,7 +2202,10 @@ export function createWorkspaceReadTool(workspace: WorkspaceStore): ToolDefiniti
   };
 }
 
-export function createWorkspaceListTool(workspace: WorkspaceStore): ToolDefinition {
+export function createWorkspaceListTool(
+  workspace: WorkspaceStore,
+  guard?: ControlPlaneGuardOptions,
+): ToolDefinition {
   return {
     manifest: {
       name: 'workspace.list',
@@ -2132,6 +2220,16 @@ export function createWorkspaceListTool(workspace: WorkspaceStore): ToolDefiniti
     },
     async execute(input) {
       const prefix = typeof input.prefix === 'string' ? input.prefix : '';
+
+      // v0.9.1 — guard the listing prefix when one is supplied so a caller
+      // can't enumerate a control-plane / credential directory (e.g. an
+      // out-of-root prefix or a `.ssh` segment). An empty prefix lists the
+      // workspace root and is always allowed.
+      if (prefix) {
+        const denied = await guardWorkspacePath('workspace.list', prefix, 'list', guard);
+        if (denied) return denied;
+      }
+
       const files = await workspace.list(prefix);
       return {
         toolName: 'workspace.list',
@@ -2248,6 +2346,10 @@ export interface WorkspaceWriteToolOptions {
   /** `'block'` → SYNTAX_ERROR envelope (`ok: false`). `'warn'` → ok:true with
    *  metadata.syntaxWarning. `'off'` → skip validation entirely. */
   postWriteValidation?: PostWriteValidationMode;
+  /** v0.9.1 — control-plane / credential guard config (workspaceRoot +
+   *  extra deny globs). Omit to apply the deny-list on logical path segments
+   *  only. */
+  controlPlaneGuard?: ControlPlaneGuardOptions;
 }
 
 export function createWorkspaceWriteTool(
@@ -2255,6 +2357,7 @@ export function createWorkspaceWriteTool(
   options?: WorkspaceWriteToolOptions,
 ): ToolDefinition {
   const mode: PostWriteValidationMode = options?.postWriteValidation ?? 'warn';
+  const guard = options?.controlPlaneGuard;
   return {
     manifest: {
       name: 'workspace.write',
@@ -2270,6 +2373,14 @@ export function createWorkspaceWriteTool(
     async execute(input) {
       const path = typeof input.path === 'string' ? input.path : '';
       const content = typeof input.content === 'string' ? input.content : '';
+
+      // v0.9.1 — control-plane / credential guard. A write to auth.json /
+      // .env / a key file is the highest-impact escape, so this runs before
+      // the store op (which itself blocks symlink escape, but not the
+      // credential-name deny-list).
+      const denied = await guardWorkspacePath('workspace.write', path, 'write', guard);
+      if (denied) return denied;
+
       const file = await workspace.write(path, content);
 
       // v0.9.0 (#310) — post-write syntax validation. Runs *after* the
@@ -3803,11 +3914,23 @@ export function registerMcpTools(registry: ToolRegistry, client: McpClient): Too
   return registry;
 }
 
-export function registerWorkspaceTools(registry: ToolRegistry, workspace: WorkspaceStore): ToolRegistry {
-  registry.register(createWorkspaceReadTool(workspace));
-  registry.register(createWorkspaceListTool(workspace));
+export interface RegisterWorkspaceToolsOptions {
+  /** v0.9.1 — control-plane / credential guard config applied to the
+   *  read / write / list tools. The runtime should pass the workspace store's
+   *  resolved rootDir as `workspaceRoot` plus any operator deny globs. */
+  controlPlaneGuard?: ControlPlaneGuardOptions;
+}
+
+export function registerWorkspaceTools(
+  registry: ToolRegistry,
+  workspace: WorkspaceStore,
+  options?: RegisterWorkspaceToolsOptions,
+): ToolRegistry {
+  const guard = options?.controlPlaneGuard;
+  registry.register(createWorkspaceReadTool(workspace, guard));
+  registry.register(createWorkspaceListTool(workspace, guard));
   registry.register(createWorkspaceSearchFilesTool(workspace));
-  registry.register(createWorkspaceWriteTool(workspace));
+  registry.register(createWorkspaceWriteTool(workspace, { controlPlaneGuard: guard }));
   registry.register(createWorkspaceExistsTool(workspace));
   registry.register(createWorkspacePatchTool(workspace));
   registry.register(createWorkspacePatchTextTool(workspace));

@@ -11,11 +11,15 @@
  *   2. `/reload-skills` slash command — rebuilds the in-memory skill index
  *      without restarting. Dispatched in the CLI REPL.
  *
- * SSRF protection: HTTP(S) URLs are validated via `validateFetchUrl`
- * (`@crowclaw/core/security`). This blocks private IPs, link-local
- * addresses, and non-http(s) protocols. The richer `assertSafeUrl` helper
- * from `@crowclaw/tools/ssrf-blocklist` (Agent E, #333 sibling) will be a
- * drop-in replacement once available — the contract is identical.
+ * SSRF protection: HTTP(S) URLs are validated via `assertSafeUrl({ kind:
+ * 'fetch' })` from `@crowclaw/tools` (ssrf-blocklist). This is the central
+ * SSRF choke point (#298) — it blocks private IPs, link-local addresses,
+ * cloud-metadata hosts, and non-http(s) protocols, and is DNS-aware so a
+ * public-looking hostname that resolves into a private/metadata range is
+ * also rejected. v0.9.1 (#333 debt-closure) switched off the local
+ * `validateFetchUrl` call so skill install emits the same structured
+ * forensic codes (`SSRF_CLOUD_METADATA` / `SSRF_PRIVATE_NETWORK` /
+ * `SSRF_INVALID_URL`) as every other outbound-fetch surface.
  *
  * sha256 manifest verification: relies on `parseSkillFile` +
  * `verifySkillContentHash` from `@crowclaw/core/skill-manifest`. Reused
@@ -26,11 +30,8 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, isAbsolute, resolve } from 'node:path';
-import {
-  parseSkillFile,
-  validateSkillManifest,
-  validateFetchUrl,
-} from '@crowclaw/core';
+import { parseSkillFile, validateSkillManifest } from '@crowclaw/core';
+import { assertSafeUrl } from '@crowclaw/tools';
 import type { CliRuntimeLike } from '../runtime-types.js';
 
 /**
@@ -189,21 +190,18 @@ async function fetchSource(source: string, fetchImpl: typeof fetch): Promise<str
   }
 
   if (source.startsWith('http://') || source.startsWith('https://')) {
-    // SSRF guard: refuse private IPs, link-local, file://, etc.
-    const safety = validateFetchUrl(source);
-    if (!safety.safe) {
-      throw new Error(`SSRF: ${safety.reason ?? 'unsafe URL'}`);
-    }
+    // -- v0.9.1 #298/#333 central SSRF guard BEGIN --
+    // SSRF guard: refuse private IPs, link-local, cloud-metadata hosts,
+    // file://, etc. Routed through the central `assertSafeUrl` choke point so
+    // skill install shares the same forensic codes as every other web tool.
+    await assertSafeSkillUrl(source, 'fetch source');
     // Manual redirect so we re-validate on each hop. fetch() default would
     // silently follow into a private network.
     const res = await fetchImpl(source, { redirect: 'manual' });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
       if (loc) {
-        const next = validateFetchUrl(loc);
-        if (!next.safe) {
-          throw new Error(`SSRF: redirect to ${next.reason ?? 'unsafe URL'}`);
-        }
+        await assertSafeSkillUrl(loc, 'redirect target');
         const followed = await fetchImpl(loc);
         if (!followed.ok) {
           throw new Error(`HTTP ${followed.status} ${followed.statusText} for ${loc}`);
@@ -211,6 +209,7 @@ async function fetchSource(source: string, fetchImpl: typeof fetch): Promise<str
         return await followed.text();
       }
     }
+    // -- v0.9.1 #298/#333 central SSRF guard END --
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${res.statusText} for ${source}`);
     }
@@ -222,6 +221,25 @@ async function fetchSource(source: string, fetchImpl: typeof fetch): Promise<str
     throw new Error(`Local path does not exist: ${path}`);
   }
   return await readFile(path, 'utf-8');
+}
+
+/**
+ * Run the central SSRF preflight (`assertSafeUrl`) on a skill-install URL.
+ * On denial, throws an `SSRF:`-prefixed error whose message embeds the
+ * structured forensic code (e.g. `SSRF_CLOUD_METADATA`,
+ * `SSRF_PRIVATE_NETWORK`, `SSRF_INVALID_URL`). The `SSRF:` prefix is the
+ * existing contract `skillsInstallFromUrl` uses to map the failure to
+ * `code: 'SSRF'`; embedding the central code keeps the forensic signal in
+ * the user-facing error and lets callers/tests assert on it.
+ *
+ * `context` distinguishes the originating URL from a redirect hop in the
+ * thrown message without changing the `SSRF:` contract.
+ */
+async function assertSafeSkillUrl(url: string, context: string): Promise<void> {
+  const verdict = await assertSafeUrl(url, { kind: 'fetch' });
+  if (!verdict.safe) {
+    throw new Error(`SSRF: ${context} blocked [${verdict.code}]: ${verdict.reason}`);
+  }
 }
 
 /**

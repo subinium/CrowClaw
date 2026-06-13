@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "en",
+    "name": "English",
+    "nativeName": "English"
+  },
+  "language.name": "English",
+  "prompt.responseLanguage.heading": "Response language:",
+  "prompt.responseLanguage.default": "- Respond in {language} by default.",
+  "prompt.responseLanguage.keepOriginal": "- Keep code, commands, file paths, identifiers, API names, and quoted source text in their original language.",
+  "prompt.responseLanguage.userOverride": "- If the user explicitly asks for another language, follow the user request for that turn.",
+  "gateway.pairing.prompt": "A device wants to pair with this agent. Approve it from the dashboard pairing panel.",
+  "gateway.pairing.approved": "Device paired successfully.",
+  "gateway.pairing.denied": "Pairing request was denied.",
+  "gateway.session.notFound": "Session not found.",
+  "gateway.rateLimited": "Too many requests. Please slow down and try again shortly.",
+  "cli.welcome": "Welcome to CrowClaw.",
+  "cli.session.created": "Session created.",
+  "cli.session.cleared": "Session cleared.",
+  "cli.error.generic": "Something went wrong. Please try again.",
+  "cli.error.providerMissing": "No provider configured. Set one up before running the agent."
+}

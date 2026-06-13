@@ -753,7 +753,18 @@ export type SecurityEventType =
   // Hermes #21193 reverted the default to ON after #16794 made it off in
   // v0.12; this event surfaces the migration so operators see the flip
   // (and can audit that no plaintext-output workflow regressed).
-  | 'security:redaction_default_applied';
+  | 'security:redaction_default_applied'
+  // v0.9.1 "Sentinel" — exec/command approval gate FAILED CLOSED: the operator
+  // did not respond within the approval window (or explicitly denied) so the
+  // tool call was rejected. The runtime maps this to the audited
+  // `security:exec_approval_denied` channel. The detail string carries the
+  // tool name + the reason ('timeout' | 'denied' | 'error').
+  | 'security:exec_approval_denied'
+  // v0.9.1 "Sentinel" — promptware / indirect prompt-injection neutralized in
+  // an untrusted segment (tool result or recalled memory) before it reached
+  // the model. The runtime maps this to `security:promptware_blocked`. Detail
+  // carries the segment kind + detected threat types.
+  | 'security:promptware_blocked';
 
 export type SecurityEventSeverity = 'info' | 'warning' | 'critical';
 
@@ -1086,5 +1097,220 @@ export function recordRedactionDefaultApplied(
       `Set the key explicitly in runtime-config.json to silence this event. ` +
       `Note: redactToolOutput may corrupt patch-tool outputs that embed key-shaped substrings; ` +
       `opt out per-deployment if needed.`,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.1 "Sentinel" — exec / command approval gate: FAIL CLOSED on timeout
+//
+// CRITICAL hardening. The agent loop's approval gate calls an operator-supplied
+// decider that returns a boolean (approve/deny). The danger: if the operator
+// never responds — the approval UI is closed, the WS channel dropped, the
+// approver is asleep — a decider that hangs would stall the run, and a decider
+// that defaults to `true` on timeout would auto-approve a destructive call.
+//
+// This primitive wraps any decider so that:
+//   * the gate ALWAYS resolves within `timeoutMs` (default 120 000),
+//   * a timeout DENIES by default (`approvalOnTimeout: 'deny'`), and
+//   * an explicit opt-in (`approvalOnTimeout: 'allow'`) is required to
+//     auto-approve on timeout — never the implicit behaviour.
+//
+// Operator-approves-before-timeout returns the decider's verdict unchanged.
+// A decider that throws is treated as a DENY (fail closed) with reason
+// 'error'. The caller emits the `security:exec_approval_denied` audit event
+// from the returned outcome.
+// ---------------------------------------------------------------------------
+
+export type ApprovalOnTimeout = 'deny' | 'allow';
+
+/** Default approval window before the gate fails closed (2 minutes). */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 120_000;
+
+export interface ApprovalGateOptions {
+  /** Milliseconds to wait for the decider before falling back to the
+   *  fail-closed default. Defaults to `DEFAULT_APPROVAL_TIMEOUT_MS`. Values
+   *  <= 0 are treated as "no wait" — the decider is raced against an already-
+   *  resolved timeout, which deterministically yields the timeout outcome. */
+  timeoutMs?: number;
+  /** What to do when the decider does not resolve within `timeoutMs`.
+   *  Defaults to 'deny' (fail closed). Set 'allow' to opt into auto-approve
+   *  on timeout — strongly discouraged for high-danger tools. */
+  approvalOnTimeout?: ApprovalOnTimeout;
+  /** Optional abort signal. When it fires before the decider resolves, the
+   *  gate fails closed with reason 'aborted'. */
+  signal?: AbortSignal;
+}
+
+export type ApprovalDenyReason = 'timeout' | 'denied' | 'error' | 'aborted';
+
+export interface ApprovalGateOutcome {
+  /** Final verdict the caller must honour. */
+  approved: boolean;
+  /** Why the gate resolved the way it did. 'approved' on a clean approve,
+   *  otherwise the deny reason. */
+  reason: 'approved' | ApprovalDenyReason;
+  /** True when the decider did not resolve in time (regardless of the
+   *  configured timeout policy). Lets the caller distinguish a real operator
+   *  deny from a no-response timeout in the audit log. */
+  timedOut: boolean;
+}
+
+/**
+ * A pending unique value used to detect that the decider lost the race against
+ * the timeout. We cannot rely on the decider's boolean because `false` is a
+ * legitimate (operator-denied) value distinct from "no response".
+ */
+const TIMEOUT_SENTINEL = Symbol('approval-timeout');
+const ABORT_SENTINEL = Symbol('approval-aborted');
+
+/**
+ * Run an approval decision with a hard timeout and a fail-closed default.
+ * Returns a structured outcome the caller uses to honour the verdict and emit
+ * the `security:exec_approval_denied` audit event when `approved === false`.
+ *
+ * The decider is raced against a timer (and optional abort). The timer/abort
+ * always resolve to a sentinel so a hung decider can never block the gate. A
+ * decider that throws fails closed with reason 'error'.
+ */
+export async function runApprovalGate(
+  decider: () => Promise<boolean> | boolean,
+  options: ApprovalGateOptions = {},
+): Promise<ApprovalGateOutcome> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
+  const onTimeout: ApprovalOnTimeout = options.approvalOnTimeout ?? 'deny';
+
+  // Already aborted before we even start: fail closed immediately.
+  if (options.signal?.aborted) {
+    return { approved: false, reason: 'aborted', timedOut: false };
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+
+  const deciderPromise = (async (): Promise<boolean | typeof ABORT_SENTINEL> => {
+    return await decider();
+  })();
+
+  const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+    // <= 0 resolves on the next tick so the decider still gets a chance only
+    // if it is synchronous/already-resolved; for an async decider the timeout
+    // wins deterministically. Non-zero schedules the real timer.
+    timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), Math.max(0, timeoutMs));
+    // Node's unref keeps the timer from holding the event loop open; guarded
+    // for non-Node runtimes that lack it.
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+
+  const abortPromise = new Promise<typeof ABORT_SENTINEL>((resolve) => {
+    if (!options.signal) return; // never resolves → no effect on the race
+    onAbort = () => resolve(ABORT_SENTINEL);
+    options.signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+  try {
+    const winner = await Promise.race([deciderPromise, timeoutPromise, abortPromise]);
+
+    if (winner === TIMEOUT_SENTINEL) {
+      return {
+        approved: onTimeout === 'allow',
+        reason: onTimeout === 'allow' ? 'approved' : 'timeout',
+        timedOut: true,
+      };
+    }
+    if (winner === ABORT_SENTINEL) {
+      return { approved: false, reason: 'aborted', timedOut: false };
+    }
+    // Decider resolved with a boolean.
+    const approved = winner === true;
+    return {
+      approved,
+      reason: approved ? 'approved' : 'denied',
+      timedOut: false,
+    };
+  } catch {
+    // Decider threw — fail closed.
+    return { approved: false, reason: 'error', timedOut: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (options.signal && onAbort) {
+      options.signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
+/**
+ * Record a fail-closed approval denial on the audit log. Called by the agent
+ * loop when `runApprovalGate` returns `approved: false`. The runtime maps the
+ * `security:exec_approval_denied` event onto its observability channel.
+ */
+export interface ExecApprovalDeniedPayload {
+  toolName: string;
+  reason: ApprovalDenyReason;
+  /** True when the denial was a no-response timeout (vs an explicit deny). */
+  timedOut: boolean;
+  timeoutMs?: number;
+  sessionId?: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  presetId?: string;
+}
+
+export function recordExecApprovalDenied(
+  log: SecurityAuditLog,
+  payload: ExecApprovalDeniedPayload,
+): SecurityEvent {
+  const windowNote = payload.timedOut
+    ? ` after ${payload.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS}ms with no operator response (fail-closed)`
+    : '';
+  return log.record({
+    type: 'security:exec_approval_denied',
+    severity: 'critical',
+    ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    ...(payload.agentId ? { agentId: payload.agentId } : {}),
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.provider ? { provider: payload.provider } : {}),
+    ...(payload.presetId ? { presetId: payload.presetId } : {}),
+    detail: `Approval ${payload.reason} for tool "${payload.toolName}"${windowNote}.`,
+  });
+}
+
+/**
+ * Record a promptware-neutralized event. Called by the agent loop when the
+ * promptware policy blocks/neutralizes an untrusted segment (tool result or
+ * recalled memory). The runtime maps `security:promptware_blocked`.
+ */
+export interface PromptwareBlockedPayload {
+  /** 'tool-result' | 'recalled-memory'. */
+  kind: string;
+  /** Detected threat type identifiers. */
+  threatTypes: ReadonlyArray<string>;
+  /** True when content was neutralized/dropped (block policy) vs annotated. */
+  neutralized: boolean;
+  /** Optional source label, e.g. the originating tool name. */
+  source?: string;
+  sessionId?: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  presetId?: string;
+}
+
+export function recordPromptwareBlocked(
+  log: SecurityAuditLog,
+  payload: PromptwareBlockedPayload,
+): SecurityEvent {
+  const types = payload.threatTypes.length > 0 ? payload.threatTypes.join(', ') : '(none)';
+  const src = payload.source ? ` source="${payload.source}"` : '';
+  const action = payload.neutralized ? 'neutralized' : 'annotated';
+  return log.record({
+    type: 'security:promptware_blocked',
+    severity: payload.neutralized ? 'critical' : 'warning',
+    ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    ...(payload.agentId ? { agentId: payload.agentId } : {}),
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.provider ? { provider: payload.provider } : {}),
+    ...(payload.presetId ? { presetId: payload.presetId } : {}),
+    detail: `Promptware ${action} in ${payload.kind}${src} (threats: ${types}).`,
   });
 }

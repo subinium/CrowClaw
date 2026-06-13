@@ -897,6 +897,17 @@ export {
   type OrphanPrunerOptions,
   type OrphanPruneResult,
 } from './orphan-pruner.js';
+export {
+  pruneCheckpoints,
+  formatCheckpointPruneSummary,
+  type CheckpointPruneStore,
+  type CheckpointTrash,
+  type CheckpointRetention,
+  type CheckpointPruneOptions,
+  type CheckpointPruneReason,
+  type CheckpointEviction,
+  type PruneResult,
+} from './checkpoint-pruner.js';
 
 // ---------------------------------------------------------------------------
 // #337 (v0.9.0 Hermes parity) — FTS5 trigram migration
