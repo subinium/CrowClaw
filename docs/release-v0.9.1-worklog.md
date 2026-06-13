@@ -69,6 +69,19 @@ because they are L/XL refactors or need separate design sessions:
   brute-force detection, Bitwarden secrets backend, plugin-surface expansion,
   `/undo`, security posture tiers, ServiceManager abstraction.
 
-## Verification gate
-`npm run build` + `npm run typecheck` + `npm test` must all pass before the PR
-is opened. Target: 3,575 baseline tests + new wave-2 tests, all green.
+## Verification gate (RESULT)
+- `npm run build` — clean
+- `npm run typecheck` — clean (0 errors)
+- `npm test` — **3,752 tests passing** across 293 files (+177 over the 3,575
+  baseline), 0 failures.
+
+### Integration notes (gaps the parallel agents left, fixed during integration)
+- 4 of 7 wave agents (W-RUNTIME/W-CORE/W-TOOLS/W-I18N) wrote their source but
+  stalled before emitting manifests; a 2-agent completion pass finished #342 ACL
+  enforcement, #293 redaction-audit call, and the #301 goal loop.
+- Integration fixes: `shared/tsconfig.json` JSON include; `SupportedLocale` vs
+  `SkillLocale` narrowing; persona `getActivePrompt` locale widening; the
+  control-plane guard's over-broad basename ban (config.json/auth.json) corrected
+  to location-based; Host-header validation now allows a missing Host (embedded /
+  in-process path); WhatsApp stranger-gating made opt-in. Config-schema +
+  control-plane + cli-toctou tests updated to match the corrected behavior.

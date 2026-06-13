@@ -10,7 +10,7 @@
   // lockstep with `package.json` during release/vX.Y.Z.
   "define": {
     "__CROWCLAW_TEST_MODE__": "false",
-    "__CROWCLAW_VERSION__": "\"0.9.0\""
+    "__CROWCLAW_VERSION__": "\"0.9.1\""
   },
   "durable_objects": {
     "bindings": [

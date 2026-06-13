@@ -5,6 +5,149 @@ All notable changes to CrowClaw will be documented in this file.
 > Releases v0.2.0 through v0.3.4 were tracked in GitHub Releases. See
 > https://github.com/subinium/hermes-agent-typescript/releases for details.
 
+## [0.9.1] — 2026-06-13 — "Sentinel": security hardening + v0.9.0 debt closure + bounded feature wave 2
+
+Driven by a full audit of the v0.9.0 codebase plus an upstream sweep across
+NousResearch/hermes-agent (v0.14–v0.16, post-"Tenacity"), OpenClaw, and NVIDIA
+NemoClaw / NanoClaw. The audit found 10 of the 39 open issues had actually
+shipped in v0.9.0 (closed in this release with evidence), 4 were partial, and 25
+were never started; the upstream sweep surfaced ~25 net-new patterns, several
+security CRITICAL, now filed as the v0.9.2+ backlog (#345–#369).
+
+This release ships the **security-led wave 2**: the critical ACL-enforcement gap
+left open in v0.9.0, three net-new CRITICAL upstream security defenses, the full
+v0.9.0 "Caveats" debt list, and four bounded features (/goal, Checkpoints v2,
+MCP SSE, 9-locale i18n). Implemented across 9 parallel Opus sub-agents under
+strict per-package file ownership, then integrated + verified. **3,752 tests
+passing** (up from 3,575 — +177 new), typecheck clean, full build green.
+
+### Security (CRITICAL)
+
+- **#342 — ACL enforcement wired at webhook ingress (closes the CVSS 8.1 gap).**
+  v0.9.0 shipped the Discord/WhatsApp/cross-platform ACL primitives (#294/#295/#318)
+  but never called them at the webhook handlers, so built-in webhook routes were
+  NOT actually gated. New `enforceChannelAcl(platform, payload, normalized)` helper
+  in `packages/runtime-node/src/route-handlers.ts` resolves the adapter from the
+  channel registry and calls `adapter.checkAccess()` in ALL 9 inbound webhook
+  handlers (Discord first) — after secret-validation + `enforceGatewayAccess`, before
+  agent dispatch. Self-chat → silent `200`; other denials → `403 ACL_DENIED`;
+  fail-closed on throw with a `gateway:acl_denied` emit. **Closes #294, #295, #318.**
+  - **WhatsApp stranger-gating is opt-in.** Self-chat (echo-loop) suppression is
+    always on when `botWaId` is set, but stranger-rejection engages only once the
+    operator configures `allowedContacts` or sets `allowStrangers` — an unconfigured
+    channel stays open so an upgrade does not silently brick every WhatsApp
+    deployment (`packages/gateway/src/channel-registry.ts:whatsappChannel.checkAccess`).
+
+- **Promptware / "brainworm" defense at the untrusted-context chokepoints** (Hermes
+  v0.15 parity, #357). New `packages/core/src/promptware-defense.ts`: a threat-pattern
+  table (imperative-override, role-switch, exfiltration-directive, hidden-instruction
+  markers, invisible/bidi unicode) + `scanUntrustedSegment`, `wrapUntrustedSegment`,
+  `neutralizeSegment`, `applyPromptwarePolicy`. The agent loop now scans + delimits
+  tool results and recalled memory **before** injection (`packages/core/src/index.ts`,
+  `applyPromptwarePolicy` at the tool-result and memory-recall boundaries), policy
+  `block | warn | off` (default `warn`), emitting `security:promptware_blocked`. Core
+  redaction still runs after the pipeline (invariant preserved).
+
+- **exec-approval fails CLOSED on timeout** (OpenClaw parity, #365). `runApprovalGate`
+  in `packages/core/src/security.ts` now denies when no operator responds within
+  `timeoutMs` (default 120s); `approvalOnTimeout: 'allow'` is an explicit opt-in. A
+  thrown or aborted decider also fails closed. Emits `security:exec_approval_denied`.
+
+- **WebSocket Origin validation** (OpenClaw parity, #365). `packages/runtime-node/src/websocket.ts`
+  rejects a present-but-disallowed `Origin` on the WS upgrade against
+  `server.allowedOrigins`; missing Origin (same-origin / native client) is allowed.
+
+- **Host-header / BadHost validation** (Hermes v0.15, CVE-2026-48710 class, #361).
+  `route-handlers.ts` validates the `Host` header against `resolveAllowedHosts(bind, server.allowedHosts)`
+  (wildcard `*.example.com` supported); a present-but-disallowed Host → `400 BAD_HOST`.
+  A **missing** Host is allowed — only a browser (which always sends Host) can mount
+  DNS-rebinding, so the in-process/embedded path is unaffected.
+
+- **Control-plane / credential file protection** (Hermes parity, #359). New
+  `packages/tools/src/control-plane-guard.ts` `assertSafeWorkspacePath()` wired into
+  `workspace.read/write/list` (+ sandbox-executor): rejects credential **directories**
+  (`.ssh`, `.aws`, `.gnupg`, `.crowclaw`, `.docker`, `.config/gcloud`, …), `.env`/key
+  files, path traversal, and symlink escape — forensic code `CONTROL_PLANE_DENIED`.
+  Protection is **location-based**, not basename-based: a workspace file named
+  `config.json`/`auth.json` is legitimate and writable; the runtime's own copies under
+  `~/.crowclaw` stay blocked by their directory segment.
+
+### Debt closure (the v0.9.0 "Caveats", now actioned)
+
+- **#293** — the first-run redaction-default audit event is now actually emitted:
+  `recordRedactionDefaultApplied` + `security:redaction_default_applied` fire via a
+  `RuntimeConfigStore` hook wired in `packages/runtime-node/src/index.ts` (was a
+  dangling helper in v0.9.0).
+- **#297** — the duplicated local `writeSecretAtomic` in
+  `packages/cli/src/commands/secret-write.ts` is now a thin re-export of the canonical
+  `@crowclaw/shared` helper (which also rejects symlinked destinations — stricter,
+  safer Hermes #296 semantics; `tests/cli-auth-toctou.test.ts` updated accordingly).
+- **#298/#333** — CLI skills-install (`skills.ts`) and `voice-clone.ts` now use the
+  central `assertSafeUrl({ kind })` for SSRF forensic codes instead of `validateFetchUrl`.
+- The corrupted local `node_modules/decimal.js` symlink that failed the jsdom
+  `markdown-renderer` test was a local install artifact (reinstall fixes it); no
+  committed-code change needed.
+- README prose test count corrected to 3,752.
+
+### Features (bounded)
+
+- **#301 — `/goal` persistent cross-turn goals (Ralph loop).** New
+  `packages/core/src/goal.ts` (`GoalTracker` + `buildGoalReminder` +
+  `evaluateGoalSatisfaction`). The loop injects an ephemeral `[GOAL]` reminder each
+  iteration (never persisted in the transcript), ticks a turn budget
+  (`goal.maxTurns`, default 50), evaluates satisfaction (heuristic + optional
+  classifier), and persists `SessionState.activeGoal` across restarts. `AgentLoop`
+  exposes `setGoal/getGoal/clearGoal`; runtime adds `POST/GET/DELETE /api/sessions/:id/goal`
+  + a `/goal <text>` / `/goal clear` slash command. Events `session:goal_set|satisfied|expired`.
+
+- **#307 — Checkpoints v2 retention pruner.** `packages/storage/src/checkpoint-pruner.ts`
+  `pruneCheckpoints(store, retention, options)` — pure, options-taking: evicts by age
+  (`maxAgeDays`, default 30), count (`maxCount`, 1000), and on-disk budget (`maxDiskMB`,
+  500), skips pinned checkpoints, crash-safe two-cycle sweep. Wired at startup behind
+  a guard; emits `checkpoint:pruned`.
+
+- **#331 — MCP SSE transport.** `packages/mcp/src/sse-transport.ts` alongside stdio:
+  `POST {endpoint}/messages` + `GET {endpoint}/events`, OAuth bearer forwarding,
+  stale-pipe exponential-backoff reconnect, 30s keepalive, `MEDIA[...]` image-result
+  parsing. Selected via `createMcpTransport({ kind: 'sse' })` / `McpClient.fromSse`
+  with an explicit `connect()` lifecycle. Config `mcp.sse.*`.
+
+- **#335 — 9-locale i18n.** `SupportedLocale` widened to en, ko, zh, ja, de, es, fr,
+  uk, tr; `packages/shared/src/locales/*.json` + `t(key, locale)` with English
+  fallback + missing-key audit warning. en/ko output unchanged; skill localization
+  narrows non-en/ko locales to the skill's base content.
+
+### Cross-package contracts (added this release)
+
+- `enforceChannelAcl`, `whatsappChannel.checkAccess` opt-in gating — `@crowclaw/runtime-node` + `@crowclaw/gateway`
+- `scanUntrustedSegment`, `wrapUntrustedSegment`, `neutralizeSegment`, `applyPromptwarePolicy`, `PromptwarePolicy`, `PROMPTWARE_NEUTRALIZED_MARKER` — `@crowclaw/core`
+- `runApprovalGate`, `ApprovalGateOutcome`, `ApprovalOnTimeout`, `DEFAULT_APPROVAL_TIMEOUT_MS`, `recordExecApprovalDenied` — `@crowclaw/core`
+- `resolveAllowedHosts`, `isHostAllowed`, `isOriginAllowed` — `@crowclaw/runtime-node`
+- `assertSafeWorkspacePath`, `ControlPlaneDeniedError`, `CONTROL_PLANE_DENIED`, `controlPlaneAuditDetail` — `@crowclaw/tools`
+- `GoalTracker`, `buildGoalReminder`, `heuristicGoalSatisfied`, `evaluateGoalSatisfaction`, `GOAL_EVENTS`, `ActiveGoal`, `AgentLoop.setGoal/getGoal/clearGoal` — `@crowclaw/core`
+- `pruneCheckpoints`, `formatCheckpointPruneSummary`, `CheckpointRetention`, `CheckpointPruneStore`, `PruneResult` — `@crowclaw/storage`
+- `createMcpTransport`, `McpClient.fromSse`, `McpSseTransportOptions`, `extractMcpMedia`, `renderMcpContentWithMedia` — `@crowclaw/mcp`
+- `t(key, locale)` + 9 locale resources — `@crowclaw/shared`
+- new config sections `server.{allowedHosts,allowedOrigins}`, `security.{promptware.policy,execApprovalTimeoutMs,execApprovalOnTimeout}`, `goal`, `checkpoints.retention`, `mcp.sse`, `i18n` — `@crowclaw/runtime-node`
+- event-bus types `security:promptware_blocked`, `security:exec_approval_denied`, `security:redaction_default_applied`, `session:goal_set|satisfied|expired`, `checkpoint:pruned`, `mcp:sse_connected|disconnected` — `@crowclaw/runtime-node`
+
+### Verification
+- `npm run typecheck` — clean (exit 0)
+- `npm test` — **3,752 tests passing** across 293 files (+177 new), 0 failures
+- `npm run build` — clean
+
+### Caveats
+- The checkpoint-pruner + MCP-SSE startup wiring reads retention/SSE config defensively
+  via `options` with secure defaults (pruner active; SSE off, stdio/HTTP unchanged)
+  until first-class `NodeRuntimeOptions` config fields + `configStore` getters land.
+- Stranger-gating opt-in (WhatsApp) is the deliberate default — see Security above.
+
+### Sources
+- Internal audit of the v0.9.0 codebase (issue-state, residual debt, architecture landing zones).
+- NousResearch/hermes-agent v0.14 "Foundation" / v0.15 "Velocity" / v0.16 — promptware defense, BadHost CVE-2026-48710, control-plane file protection.
+- OpenClaw — exec-approval fail-closed, WebSocket Origin validation.
+- The remaining ~25 upstream patterns (sudo-bypass detection, no-LLM session_search, LSP-on-write, mTLS MCP, SkillSpector skill-risk scan, kernel egress policy, inference-time credential broker, …) are filed as #345–#369 for v0.9.2+.
+
 ## [0.9.0] — 2026-05-11 — Hermes v0.12/v0.13 parity wave 1: 24-issue sweep
 
 The first wave of the 49-issue Hermes v0.12 ("Curator") + v0.13 ("Tenacity") parity
