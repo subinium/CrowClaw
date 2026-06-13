@@ -1,7 +1,35 @@
 import type { ToolManifest } from './index.js';
 import type { SkillManifest } from './skill-manifest.js';
 
-export type SupportedLocale = 'en' | 'ko';
+// -- v0.9.1 i18n locale expansion (#335) BEGIN --
+//
+// Hermes v0.13 parity: the model-facing locale directive now supports 9
+// locales — English, Korean, Chinese (Simplified), Japanese, German, Spanish,
+// French, Ukrainian, Turkish. The widening is purely additive: `en` / `ko`
+// output is byte-identical to v0.9.0, and any unrecognized value still
+// normalizes to `en` (see `normalizeLocale`).
+//
+// The directive table below is intentionally self-contained (not imported from
+// `@crowclaw/shared`) so `@crowclaw/core` takes no build-time dependency on the
+// shared resource package and the system prompt stays prefix-cache stable. The
+// canonical user-facing resource bundle (CLI / gateway / dashboard strings)
+// lives in `@crowclaw/shared` (`locales/*.json`, `t()`); the `prompt.*` keys
+// there mirror these strings. Keep the two in sync.
+export type SupportedLocale = 'en' | 'ko' | 'zh' | 'ja' | 'de' | 'es' | 'fr' | 'uk' | 'tr';
+
+/** All locales the prompt builder can emit a directive for. `en` is first (the fallback). */
+export const SUPPORTED_LOCALES: readonly SupportedLocale[] = [
+  'en',
+  'ko',
+  'zh',
+  'ja',
+  'de',
+  'es',
+  'fr',
+  'uk',
+  'tr',
+] as const;
+// -- v0.9.1 i18n locale expansion (#335) END --
 
 export interface MatchedSkill {
   name: string;
@@ -95,18 +123,137 @@ export function buildSystemPrompt(input: PromptBuilderInput): string | undefined
 }
 
 export function normalizeLocale(locale: unknown): SupportedLocale {
-  return locale === 'ko' ? 'ko' : 'en';
+  // Exact match against a known locale passes through; an `Accept-Language`
+  // style tag (e.g. `zh-Hans`, `en-US`) is matched on its leading subtag.
+  // Anything else falls back to `en` — preserving the v0.9.0 behavior where
+  // unrecognized values normalized to English.
+  if (typeof locale === 'string') {
+    if ((SUPPORTED_LOCALES as readonly string[]).includes(locale)) {
+      return locale as SupportedLocale;
+    }
+    const subtag = locale.toLowerCase().split(/[-_]/)[0];
+    if (subtag && (SUPPORTED_LOCALES as readonly string[]).includes(subtag)) {
+      return subtag as SupportedLocale;
+    }
+  }
+  return 'en';
 }
 
+// -- v0.9.1 i18n locale expansion (#335) BEGIN --
+//
+// Self-contained directive table. For `en` / `ko` the directive lines stay in
+// English (byte-identical to v0.9.0) and only the language name is localized,
+// so existing prompt-cache hits and snapshot expectations are preserved. The 7
+// new locales receive fully translated directive lines. `{language}` in the
+// `default` line is interpolated with the locale's English language name (the
+// model resolves the named language regardless of the surrounding script).
+interface LocaleDirectiveStrings {
+  /** English name of the language, interpolated into `{language}`. */
+  languageName: string;
+  /** Header line, e.g. `Response language:`. */
+  heading: string;
+  /** Template for the default-language line; must contain `{language}`. */
+  defaultLine: string;
+  keepOriginalLine: string;
+  userOverrideLine: string;
+}
+
+// English directive lines, reused verbatim for `en` and `ko` to keep their
+// output byte-identical to v0.9.0.
+const EN_HEADING = 'Response language:';
+const EN_DEFAULT = '- Respond in {language} by default.';
+const EN_KEEP_ORIGINAL =
+  '- Keep code, commands, file paths, identifiers, API names, and quoted source text in their original language.';
+const EN_USER_OVERRIDE =
+  '- If the user explicitly asks for another language, follow the user request for that turn.';
+
+const LOCALE_DIRECTIVES: Record<SupportedLocale, LocaleDirectiveStrings> = {
+  en: {
+    languageName: 'English',
+    heading: EN_HEADING,
+    defaultLine: EN_DEFAULT,
+    keepOriginalLine: EN_KEEP_ORIGINAL,
+    userOverrideLine: EN_USER_OVERRIDE,
+  },
+  ko: {
+    // Korean keeps the English directive lines (matches v0.9.0) — only the
+    // language name differs.
+    languageName: 'Korean',
+    heading: EN_HEADING,
+    defaultLine: EN_DEFAULT,
+    keepOriginalLine: EN_KEEP_ORIGINAL,
+    userOverrideLine: EN_USER_OVERRIDE,
+  },
+  zh: {
+    languageName: 'Chinese',
+    heading: '回复语言：',
+    defaultLine: '- 默认使用{language}回复。',
+    keepOriginalLine: '- 代码、命令、文件路径、标识符、API 名称以及引用的源文本保持其原始语言。',
+    userOverrideLine: '- 如果用户明确要求使用其他语言，则在该轮对话中遵循用户的请求。',
+  },
+  ja: {
+    languageName: 'Japanese',
+    heading: '応答言語:',
+    defaultLine: '- 既定では{language}で応答してください。',
+    keepOriginalLine: '- コード、コマンド、ファイルパス、識別子、API 名、引用元のテキストは元の言語のままにしてください。',
+    userOverrideLine: '- ユーザーが明示的に別の言語を求めた場合は、そのターンではユーザーの要求に従ってください。',
+  },
+  de: {
+    languageName: 'German',
+    heading: 'Antwortsprache:',
+    defaultLine: '- Antworte standardmäßig auf {language}.',
+    keepOriginalLine:
+      '- Belasse Code, Befehle, Dateipfade, Bezeichner, API-Namen und zitierten Quelltext in ihrer Originalsprache.',
+    userOverrideLine:
+      '- Wenn der Nutzer ausdrücklich eine andere Sprache verlangt, folge für diese Antwort der Anfrage des Nutzers.',
+  },
+  es: {
+    languageName: 'Spanish',
+    heading: 'Idioma de respuesta:',
+    defaultLine: '- Responde en {language} de forma predeterminada.',
+    keepOriginalLine:
+      '- Mantén el código, los comandos, las rutas de archivo, los identificadores, los nombres de API y el texto fuente citado en su idioma original.',
+    userOverrideLine:
+      '- Si el usuario solicita explícitamente otro idioma, sigue la petición del usuario para ese turno.',
+  },
+  fr: {
+    languageName: 'French',
+    heading: 'Langue de réponse :',
+    defaultLine: '- Réponds en {language} par défaut.',
+    keepOriginalLine:
+      "- Conserve le code, les commandes, les chemins de fichiers, les identifiants, les noms d'API et le texte source cité dans leur langue d'origine.",
+    userOverrideLine:
+      "- Si l'utilisateur demande explicitement une autre langue, suis la demande de l'utilisateur pour ce tour.",
+  },
+  uk: {
+    languageName: 'Ukrainian',
+    heading: 'Мова відповіді:',
+    defaultLine: '- За замовчуванням відповідай {language}.',
+    keepOriginalLine:
+      '- Залишай код, команди, шляхи до файлів, ідентифікатори, назви API та цитований вихідний текст їхньою оригінальною мовою.',
+    userOverrideLine:
+      '- Якщо користувач явно просить іншу мову, дотримуйся прохання користувача для цього ходу.',
+  },
+  tr: {
+    languageName: 'Turkish',
+    heading: 'Yanıt dili:',
+    defaultLine: '- Varsayılan olarak {language} yanıt ver.',
+    keepOriginalLine:
+      '- Kodu, komutları, dosya yollarını, tanımlayıcıları, API adlarını ve alıntılanan kaynak metni orijinal dilinde bırak.',
+    userOverrideLine: '- Kullanıcı açıkça başka bir dil isterse, o tur için kullanıcının isteğine uy.',
+  },
+};
+
 function buildLocaleDirective(locale: SupportedLocale): string {
-  const defaultLanguage = locale === 'ko' ? 'Korean' : 'English';
+  const strings = LOCALE_DIRECTIVES[locale] ?? LOCALE_DIRECTIVES.en;
   return [
-    'Response language:',
-    `- Respond in ${defaultLanguage} by default.`,
-    '- Keep code, commands, file paths, identifiers, API names, and quoted source text in their original language.',
-    '- If the user explicitly asks for another language, follow the user request for that turn.',
+    strings.heading,
+    strings.defaultLine.replaceAll('{language}', strings.languageName),
+    strings.keepOriginalLine,
+    strings.userOverrideLine,
   ].join('\n');
 }
+// -- v0.9.1 i18n locale expansion (#335) END --
 
 function buildReasoningGuidance(tools: ToolManifest[]): string {
   const hasWebTools = tools.some((t) => t.name.startsWith('web.'));

@@ -2,6 +2,7 @@
 // WebSocketManager — WebSocket transport for real-time dashboard events
 // ---------------------------------------------------------------------------
 
+import { isOriginAllowed } from './config-schema.js';
 import type { EventBus, RuntimeEvent, RuntimeEventType } from './event-bus.js';
 import type { Logger } from './logger.js';
 
@@ -289,6 +290,55 @@ export class WebSocketManager {
   }
 }
 
+// -- v0.9.1 Sentinel: WebSocket Origin validation BEGIN --
+/**
+ * Options for the WS upgrade handlers. Kept optional so existing call sites
+ * that pass only `authenticated` continue to compile and behave identically.
+ */
+export interface WebSocketUpgradeOptions {
+  /**
+   * Origin allowlist (from `server.allowedOrigins`). Empty / omitted is the
+   * safe default: only same-origin and no-Origin upgrades are accepted. A
+   * present-but-disallowed Origin is rejected — this is the cross-site
+   * WebSocket-hijacking abuse case. Supports `*.example.com` wildcards.
+   */
+  allowedOrigins?: readonly string[];
+  /**
+   * The request Host (used only when `allowedOrigins` is empty, to evaluate the
+   * same-origin condition). Defaults to the request's own Host header.
+   */
+  requestHost?: string | null;
+}
+
+/** WS close code for a policy violation (disallowed Origin). RFC 6455 §7.4.1. */
+const WS_CLOSE_POLICY_VIOLATION = 1008;
+
+/** Normalize the legacy `authenticated` boolean / new options object. */
+function normalizeUpgradeOptions(
+  arg: boolean | WebSocketUpgradeOptions | undefined,
+): { authenticated: boolean; options: WebSocketUpgradeOptions } {
+  if (typeof arg === 'boolean') return { authenticated: arg, options: {} };
+  return { authenticated: false, options: arg ?? {} };
+}
+
+/**
+ * Validate the upgrade Origin against the configured allowlist. Returns a
+ * rejection `Response` (403) when the Origin is disallowed, or `null` when the
+ * upgrade may proceed. Centralized so both upgrade entry points share it.
+ */
+function rejectDisallowedOrigin(
+  request: Request,
+  options: WebSocketUpgradeOptions,
+): Response | null {
+  const origin = request.headers.get('Origin');
+  const requestHost = options.requestHost ?? request.headers.get('Host');
+  if (isOriginAllowed(origin, options.allowedOrigins ?? [], requestHost)) {
+    return null;
+  }
+  return new Response('WebSocket origin not allowed', { status: 403 });
+}
+// -- v0.9.1 Sentinel: WebSocket Origin validation END --
+
 /**
  * Handle WebSocket upgrade using the WebSocketPair API (Cloudflare Workers / WinterCG).
  * For Node.js HTTP servers, the upgrade must be handled at the HTTP server level
@@ -297,12 +347,18 @@ export class WebSocketManager {
 export const createWebSocketResponse = (
   request: Request,
   manager: WebSocketManager,
-  authenticated = false,
+  authenticatedOrOptions: boolean | WebSocketUpgradeOptions = false,
 ): Response => {
+  const { authenticated, options } = normalizeUpgradeOptions(authenticatedOrOptions);
+
   const upgradeHeader = request.headers.get('Upgrade');
   if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
     return new Response('Expected WebSocket upgrade', { status: 426 });
   }
+
+  // v0.9.1: reject cross-origin upgrades before allocating a socket pair.
+  const originRejection = rejectDisallowedOrigin(request, options);
+  if (originRejection) return originRejection;
 
   // WebSocketPair is available in Cloudflare Workers and Bun
   if (typeof (globalThis as Record<string, unknown>).WebSocketPair === 'undefined') {
@@ -315,6 +371,10 @@ export const createWebSocketResponse = (
   server.accept();
   const added = manager.addConnection(server, authenticated);
   if (!added) {
+    // The pair is already accepted; close the server side with the
+    // policy-violation code so the client sees a deterministic reason rather
+    // than a bare 503 on an already-upgraded socket.
+    try { server.close(WS_CLOSE_POLICY_VIOLATION, 'max connections reached'); } catch { /* already closed */ }
     return new Response('Too many connections', { status: 503 });
   }
 
@@ -328,7 +388,7 @@ export const handleWebSocketUpgrade = (
   request: Request,
   _eventBus: EventBus,
   manager: WebSocketManager,
-  authenticated = false,
+  authenticatedOrOptions: boolean | WebSocketUpgradeOptions = false,
 ): Response => {
-  return createWebSocketResponse(request, manager, authenticated);
+  return createWebSocketResponse(request, manager, authenticatedOrOptions);
 };

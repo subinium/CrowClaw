@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "de",
+    "name": "German",
+    "nativeName": "Deutsch"
+  },
+  "language.name": "German",
+  "prompt.responseLanguage.heading": "Antwortsprache:",
+  "prompt.responseLanguage.default": "- Antworte standardmäßig auf {language}.",
+  "prompt.responseLanguage.keepOriginal": "- Belasse Code, Befehle, Dateipfade, Bezeichner, API-Namen und zitierten Quelltext in ihrer Originalsprache.",
+  "prompt.responseLanguage.userOverride": "- Wenn der Nutzer ausdrücklich eine andere Sprache verlangt, folge für diese Antwort der Anfrage des Nutzers.",
+  "gateway.pairing.prompt": "Ein Gerät möchte sich mit diesem Agenten koppeln. Genehmige es im Kopplungsbereich des Dashboards.",
+  "gateway.pairing.approved": "Gerät erfolgreich gekoppelt.",
+  "gateway.pairing.denied": "Kopplungsanfrage wurde abgelehnt.",
+  "gateway.session.notFound": "Sitzung nicht gefunden.",
+  "gateway.rateLimited": "Zu viele Anfragen. Bitte verlangsame und versuche es in Kürze erneut.",
+  "cli.welcome": "Willkommen bei CrowClaw.",
+  "cli.session.created": "Sitzung erstellt.",
+  "cli.session.cleared": "Sitzung gelöscht.",
+  "cli.error.generic": "Etwas ist schiefgelaufen. Bitte versuche es erneut.",
+  "cli.error.providerMissing": "Kein Anbieter konfiguriert. Richte einen ein, bevor du den Agenten ausführst."
+}

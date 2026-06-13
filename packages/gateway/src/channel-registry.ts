@@ -519,6 +519,21 @@ export const whatsappChannel: ChannelAdapter = {
    */
   checkAccess(_payload, normalized, config) {
     const aclConfig: WhatsAppAclConfig = loadWhatsAppAclConfig(config);
+    // Self-chat (echo-loop) suppression is ALWAYS enforced when botWaId is
+    // known — pure safety, no downside.
+    if (aclConfig.botWaId && normalized.senderId === aclConfig.botWaId) {
+      return { allowed: false, reason: 'self-chat', silentDrop: true };
+    }
+    // Stranger-gating is OPT-IN. An unconfigured channel (no allowlist, no
+    // explicit allowStrangers) stays open so a fresh install / upgrade does
+    // not silently reject every inbound message. Enforcement engages once the
+    // operator configures `allowedContacts` or sets `allowStrangers`.
+    const raw = (config ?? {}) as Record<string, unknown>;
+    const gatingConfigured =
+      aclConfig.allowedContacts.length > 0 || typeof raw.allowStrangers === 'boolean';
+    if (!gatingConfigured) {
+      return { allowed: true, reason: 'unconfigured-open' };
+    }
     const decision = checkWhatsAppAcl({ senderWaId: normalized.senderId }, aclConfig);
     if (!decision.allowed && !decision.silentDrop) {
       emitWhatsAppAclDenied({ reason: decision.reason, senderId: normalized.senderId });

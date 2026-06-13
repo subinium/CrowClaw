@@ -1,0 +1,22 @@
+{
+  "$meta": {
+    "locale": "ja",
+    "name": "Japanese",
+    "nativeName": "日本語"
+  },
+  "language.name": "Japanese",
+  "prompt.responseLanguage.heading": "応答言語:",
+  "prompt.responseLanguage.default": "- 既定では{language}で応答してください。",
+  "prompt.responseLanguage.keepOriginal": "- コード、コマンド、ファイルパス、識別子、API 名、引用元のテキストは元の言語のままにしてください。",
+  "prompt.responseLanguage.userOverride": "- ユーザーが明示的に別の言語を求めた場合は、そのターンではユーザーの要求に従ってください。",
+  "gateway.pairing.prompt": "デバイスがこのエージェントとのペアリングを要求しています。ダッシュボードのペアリングパネルで承認してください。",
+  "gateway.pairing.approved": "デバイスのペアリングが完了しました。",
+  "gateway.pairing.denied": "ペアリング要求は拒否されました。",
+  "gateway.session.notFound": "セッションが見つかりません。",
+  "gateway.rateLimited": "リクエストが多すぎます。少し時間をおいて再試行してください。",
+  "cli.welcome": "CrowClaw へようこそ。",
+  "cli.session.created": "セッションを作成しました。",
+  "cli.session.cleared": "セッションをクリアしました。",
+  "cli.error.generic": "問題が発生しました。もう一度お試しください。",
+  "cli.error.providerMissing": "プロバイダーが設定されていません。エージェントを実行する前に設定してください。"
+}

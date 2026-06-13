@@ -40,3 +40,21 @@ export interface R2BucketLike {
 }
 
 export { writeSecretAtomic, type WriteSecretAtomicOptions } from './atomic-secret-write.js';
+
+// -- v0.9.1 i18n locale resources (#335) BEGIN --
+export {
+  t,
+  useI18n,
+  isI18nLocale,
+  normalizeI18nLocale,
+  setI18nAuditSink,
+  getLocaleResource,
+  localeCoverage,
+  I18N_LOCALES,
+  type I18nLocale,
+  type LocaleResource,
+  type I18nAuditEvent,
+  type I18nAuditSink,
+  type TranslateOptions,
+} from './i18n.js';
+// -- v0.9.1 i18n locale resources (#335) END --

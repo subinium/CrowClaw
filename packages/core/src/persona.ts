@@ -1,3 +1,5 @@
+import type { SupportedLocale } from './prompt-builder';
+
 export interface PersonaFiles {
   soul?: string;
   identity?: string;
@@ -177,9 +179,11 @@ export class PersonaRegistry {
   }
 
   /** Get the currently active persona prompt for a locale. */
-  getActivePrompt(locale: 'en' | 'ko' = 'en'): string {
+  getActivePrompt(locale: SupportedLocale = 'en'): string {
     const profile = this.getActive();
-    return profile.prompts?.[locale] ?? profile.prompt;
+    // Persona prompts are authored for en/ko only; other locales fall back to en.
+    const key = locale === 'ko' ? 'ko' : 'en';
+    return profile.prompts?.[key] ?? profile.prompt;
   }
 
   /** List all registered personas with active indicator */

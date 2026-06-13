@@ -117,6 +117,37 @@ export interface SecurityPolicyConfig {
   piiRedaction: boolean;
 }
 
+// -- v0.9.1 Sentinel config shapes BEGIN --
+
+/**
+ * Per-platform inbound ACL config (v0.9.0 primitives, wired at the webhook
+ * handlers in v0.9.1 #342). Stored as a loose blob per platform — the gateway
+ * `load*AclConfig` helpers normalize each platform's raw shape, so this store
+ * keeps the values verbatim and does not validate them here.
+ */
+export interface ChannelsConfig {
+  discord?: Record<string, unknown>;
+  whatsapp?: Record<string, unknown>;
+  slack?: Record<string, unknown>;
+  telegram?: Record<string, unknown>;
+  matrix?: Record<string, unknown>;
+  mattermost?: Record<string, unknown>;
+  dingtalk?: Record<string, unknown>;
+  email?: Record<string, unknown>;
+  signal?: Record<string, unknown>;
+}
+
+/**
+ * Server ingress config (v0.9.1 #BadHost / WS-origin). Both default to empty;
+ * the route handler / websocket guard fall back to the secure defaults in
+ * `config-schema.ts` (`DEFAULT_ALLOWED_HOSTS`, same-origin-only) when unset.
+ */
+export interface ServerIngressConfig {
+  allowedHosts?: string[];
+  allowedOrigins?: string[];
+}
+// -- v0.9.1 Sentinel config shapes END --
+
 export interface AgentConfig {
   maxToolIterations: number;
   concurrentToolCalls: boolean;
@@ -185,14 +216,49 @@ export interface RuntimeConfig {
   // Remote access
   publicUrl: string | null;
   trustProxy: boolean;
+
+  // -- v0.9.1 Sentinel --
+  // Per-platform inbound ACL config (#342). Empty by default → channel
+  // adapters retain backward-compatible open-policy until configured.
+  channelsConfig: ChannelsConfig;
+  // HTTP/WS ingress allowlists (#BadHost / WS-origin). Empty by default →
+  // route handler / WS guard fall back to the secure defaults.
+  serverConfig: ServerIngressConfig;
 }
 
 type ConfigChangeListener = (key: string, value: unknown) => void;
+
+// -- v0.9.1 Sentinel: redaction-default audit hook (#293) BEGIN --
+/**
+ * Invoked exactly once, on first-run, when one or more security-policy keys
+ * were missing from the loaded config and therefore received their secure
+ * default. The integrator wires this in `runtime-init.ts` (the `.load()` call
+ * site) to call `recordRedactionDefaultApplied(securityAuditLog, ...)` AND
+ * `eventBus.emit('security:redaction_default_applied', ...)`.
+ *
+ * `appliedKeys` lists the security-policy keys that defaulted (e.g.
+ * `['redactToolOutput', 'piiRedaction']`). It is never empty when the hook
+ * fires — the store suppresses the call when every key was explicitly set.
+ */
+export type RedactionDefaultHook = (info: { appliedKeys: string[] }) => void;
+
+/**
+ * Security-policy keys whose secure default is "on". When a loaded config omits
+ * one of these, the secure default is applied and the omission is reported.
+ */
+const SECURITY_DEFAULT_ON_KEYS: ReadonlyArray<keyof SecurityPolicyConfig> = [
+  'redactToolOutput',
+  'piiRedaction',
+];
+// -- v0.9.1 Sentinel: redaction-default audit hook (#293) END --
 
 export class RuntimeConfigStore {
   protected config: RuntimeConfig;
   private listeners: ConfigChangeListener[] = [];
   private disabledToolNames: Set<string> = new Set();
+  // -- v0.9.1 Sentinel (#293): first-run redaction-default audit hook. --
+  protected redactionDefaultHook: RedactionDefaultHook | null = null;
+  protected redactionDefaultFired = false;
 
   constructor() {
     const defaultPresets = new Map<string, ConfigPreset>();
@@ -218,6 +284,8 @@ export class RuntimeConfigStore {
       agentConfig: { ...DEFAULT_AGENT_CONFIG },
       publicUrl: null,
       trustProxy: false,
+      channelsConfig: {},
+      serverConfig: {},
     };
   }
 
@@ -242,6 +310,43 @@ export class RuntimeConfigStore {
     this.config.publicUrl = publicUrl;
     this.config.trustProxy = trustProxy;
     this.emit('remoteAccess', { publicUrl, trustProxy });
+  }
+
+  // -- v0.9.1 Sentinel: channels ACL config (#342) --
+  /** Full per-platform channels ACL config blob (deep-cloned on read). */
+  getChannelsConfig(): ChannelsConfig {
+    return JSON.parse(JSON.stringify(this.config.channelsConfig)) as ChannelsConfig;
+  }
+  /** Raw config blob for a single platform (e.g. 'discord'), or {} if unset. */
+  getChannelConfig(platform: string): Record<string, unknown> {
+    const entry = (this.config.channelsConfig as Record<string, unknown>)[platform];
+    return entry && typeof entry === 'object' && !Array.isArray(entry)
+      ? (JSON.parse(JSON.stringify(entry)) as Record<string, unknown>)
+      : {};
+  }
+  /** Replace the channels ACL config for a single platform. */
+  setChannelConfig(platform: string, config: Record<string, unknown>): void {
+    (this.config.channelsConfig as Record<string, unknown>)[platform] = config;
+    this.emit('channelsConfig', { platform, config });
+  }
+
+  // -- v0.9.1 Sentinel: server ingress config (Host / WS-Origin) --
+  getServerConfig(): ServerIngressConfig {
+    return { ...this.config.serverConfig };
+  }
+  getAllowedHosts(): string[] {
+    return Array.isArray(this.config.serverConfig.allowedHosts)
+      ? [...this.config.serverConfig.allowedHosts]
+      : [];
+  }
+  getAllowedOrigins(): string[] {
+    return Array.isArray(this.config.serverConfig.allowedOrigins)
+      ? [...this.config.serverConfig.allowedOrigins]
+      : [];
+  }
+  setServerConfig(config: Partial<ServerIngressConfig>): void {
+    this.config.serverConfig = { ...this.config.serverConfig, ...config };
+    this.emit('serverConfig', this.config.serverConfig);
   }
   // --- Provider Config ---
   getProviderConfig(): ProviderConfig | null { return this.config.providerConfig; }
@@ -455,6 +560,9 @@ export class RuntimeConfigStore {
       activeConfigPreset: this.config.activeConfigPreset,
       securityPolicy: this.config.securityPolicy,
       agentConfig: this.config.agentConfig,
+      // -- v0.9.1 Sentinel --
+      channelsConfig: this.config.channelsConfig,
+      serverConfig: this.config.serverConfig,
     };
   }
 
@@ -462,6 +570,49 @@ export class RuntimeConfigStore {
   onChange(listener: ConfigChangeListener): () => void {
     this.listeners.push(listener);
     return () => { this.listeners = this.listeners.filter((l) => l !== listener); };
+  }
+
+  // -- v0.9.1 Sentinel (#293): redaction-default audit hook --
+  /**
+   * Register the first-run redaction-default audit hook. The hook fires at
+   * most once for the lifetime of the store (the first time the secure default
+   * is applied for an unset key). Registering after the flip already happened
+   * is a no-op for that flip — wire this BEFORE calling `load()`.
+   */
+  setRedactionDefaultHook(hook: RedactionDefaultHook | null): void {
+    this.redactionDefaultHook = hook;
+  }
+
+  /**
+   * Fire the redaction-default hook for the supplied applied keys. Idempotent:
+   * only the first invocation with a non-empty key list triggers the hook.
+   * Exposed as `protected` so `FileConfigStore.hydrateFrom`/`load` can call it.
+   */
+  protected fireRedactionDefaultApplied(appliedKeys: string[]): void {
+    if (this.redactionDefaultFired) return;
+    if (appliedKeys.length === 0) return;
+    this.redactionDefaultFired = true;
+    try {
+      this.redactionDefaultHook?.({ appliedKeys });
+    } catch {
+      // The audit/event sink must never break config load.
+    }
+  }
+
+  /**
+   * Given the security-policy blob loaded from disk (possibly undefined),
+   * return the secure-default-on keys that were absent and therefore defaulted.
+   */
+  protected computeAppliedRedactionDefaults(
+    loaded: Partial<SecurityPolicyConfig> | undefined,
+  ): string[] {
+    const applied: string[] = [];
+    for (const key of SECURITY_DEFAULT_ON_KEYS) {
+      if (!loaded || loaded[key] === undefined) {
+        applied.push(key);
+      }
+    }
+    return applied;
   }
 
   private emit(key: string, value: unknown): void {
@@ -496,6 +647,9 @@ interface SerializedConfig {
   publicUrl?: string | null;
   trustProxy?: boolean;
   disabledTools?: string[];
+  // -- v0.9.1 Sentinel --
+  channelsConfig?: ChannelsConfig;
+  serverConfig?: ServerIngressConfig;
 }
 
 /** Build a clone of a ProviderConfig with every slot's apiKey stripped. */
@@ -552,7 +706,13 @@ export class FileConfigStore extends RuntimeConfigStore {
       const data = JSON.parse(raw) as Partial<SerializedConfig>;
       this.hydrateFrom(data);
     } catch {
-      // File doesn't exist or is invalid — start with defaults (already set by super())
+      // File doesn't exist or is invalid — start with defaults (already set by
+      // super()). This is the canonical "fresh install" path: every
+      // secure-default-on key is being applied because nothing was persisted,
+      // so fire the redaction-default audit hook (#293). The in-memory store
+      // already holds the secure defaults; this surfaces the flip for operators
+      // upgrading from a config-less or corrupted install.
+      this.fireRedactionDefaultApplied(this.computeAppliedRedactionDefaults(undefined));
     }
   }
 
@@ -608,11 +768,33 @@ export class FileConfigStore extends RuntimeConfigStore {
         // Preset may not exist — ignore
       }
     }
-    if (data.securityPolicy) {
-      super.setSecurityPolicy(data.securityPolicy);
+    // -- v0.9.1 Sentinel (#293): first-run redaction-default audit --
+    // Apply the persisted security policy as a PARTIAL merge over the secure
+    // defaults so an upgrade from a config that omitted `redactToolOutput`
+    // gets the on-default (and an explicit `false` is honored). Any
+    // secure-default-on key absent from the loaded blob is reported via the
+    // audit hook exactly once.
+    {
+      const loaded = data.securityPolicy as Partial<SecurityPolicyConfig> | undefined;
+      const applied = this.computeAppliedRedactionDefaults(loaded);
+      if (loaded) {
+        super.setSecurityPolicy(loaded);
+      }
+      this.fireRedactionDefaultApplied(applied);
     }
     if (data.agentConfig) {
       super.setAgentConfig(data.agentConfig);
+    }
+    // -- v0.9.1 Sentinel: channels ACL + server ingress config --
+    if (data.channelsConfig && typeof data.channelsConfig === 'object') {
+      for (const [platform, cfg] of Object.entries(data.channelsConfig)) {
+        if (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) {
+          super.setChannelConfig(platform, cfg as Record<string, unknown>);
+        }
+      }
+    }
+    if (data.serverConfig && typeof data.serverConfig === 'object') {
+      super.setServerConfig(data.serverConfig);
     }
     if (data.publicUrl !== undefined || data.trustProxy !== undefined) {
       super.setRemoteAccess(data.publicUrl ?? null, data.trustProxy ?? false);
@@ -676,6 +858,9 @@ export class FileConfigStore extends RuntimeConfigStore {
       publicUrl: cfg.publicUrl,
       trustProxy: cfg.trustProxy,
       disabledTools: this.getDisabledTools(),
+      // -- v0.9.1 Sentinel --
+      channelsConfig: cfg.channelsConfig,
+      serverConfig: cfg.serverConfig,
     };
   }
 
@@ -815,6 +1000,17 @@ export class FileConfigStore extends RuntimeConfigStore {
 
   override setToolDisabled(name: string, disabled: boolean): void {
     super.setToolDisabled(name, disabled);
+    void this.persistToDisk();
+  }
+
+  // -- v0.9.1 Sentinel: persist channels ACL + server ingress config --
+  override setChannelConfig(platform: string, config: Record<string, unknown>): void {
+    super.setChannelConfig(platform, config);
+    void this.persistToDisk();
+  }
+
+  override setServerConfig(config: Partial<ServerIngressConfig>): void {
+    super.setServerConfig(config);
     void this.persistToDisk();
   }
 

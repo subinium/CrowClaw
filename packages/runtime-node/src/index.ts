@@ -1,16 +1,16 @@
 import { join as joinPath } from 'node:path';
-import { InMemoryCheckpointStore, PersonaRegistry, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, restoreFromCheckpoint, type ToolExecutionContext } from '@crowclaw/core';
+import { InMemoryCheckpointStore, PersonaRegistry, DetailedUsageTracker, SecurityAuditLog, FileSecurityAuditLog, restoreFromCheckpoint, recordRedactionDefaultApplied, type ToolExecutionContext } from '@crowclaw/core';
 import { createLogger, type Logger } from './logger.js';
 import { installOpenTelemetryBridge, observeRuntimeTelemetryEvent } from './otel.js';
 import { SessionMutex } from './session-mutex.js';
 import { EventBus } from './event-bus.js';
 import { InMemoryGatewayIdempotencyStore, WsAuthRateLimiter, setAclEventSink } from '@crowclaw/gateway';
 import { LearningPipeline, InMemorySkillStore, SkillRegistry, createLlmSkillExtractor } from '@crowclaw/learning';
-import { McpClient, McpHttpTransport } from '@crowclaw/mcp';
+import { McpClient, McpHttpTransport, createMcpTransport, type McpSseServerConfig } from '@crowclaw/mcp';
 import { MemoryService, InMemoryMemoryProvider, memoryProviderFromPluginRegistry, type MemoryProvider } from '@crowclaw/memory';
 import { UserModelService } from '@crowclaw/memory';
 import { EchoProvider } from '@crowclaw/providers';
-import { InMemorySessionStore } from '@crowclaw/storage';
+import { InMemorySessionStore, pruneCheckpoints, formatCheckpointPruneSummary, type CheckpointPruneStore, type CheckpointRetention } from '@crowclaw/storage';
 import { ToolRegistry, createDefaultWorkerRegistry, listToolsetPresets, registerSchedulerTools, createFrozenMemorySetTool, createFrozenMemoryRemoveTool } from '@crowclaw/tools';
 import { FileConfigStore } from './config-store.js';
 import type { CodeBridgeSession } from './bridge-state.js';
@@ -79,6 +79,7 @@ import { createRuntimeShutdown } from './runtime-lifecycle.js';
 import { createDefaultPluginManager, createRuntimePluginCatalog } from './runtime-plugins.js';
 import { createRuntimeScheduler } from './runtime-scheduler.js';
 import { configureTelegramWebhookStartup, pruneCheckpointStartup, warnWhenDashboardTokenMissing } from './runtime-startup.js';
+import { DEFAULT_CHECKPOINT_RETENTION, DEFAULT_MCP_SSE_KEEPALIVE_MS } from './config-schema.js';
 
 export { SecretChain, envSource, filesSource, systemdCredsSource, sopsSource, onePasswordSource, createDefaultSecretChain, resolveSecret } from './secret-loader.js';
 export {
@@ -181,6 +182,21 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   setAclEventSink((event) => {
     eventBus.emit('gateway:acl_denied', event as unknown as Record<string, unknown>);
   });
+  // -- v0.9.1 Sentinel (#293): first-run redaction-default audit BEGIN --
+  // The config store fires this hook exactly once, on first-run, when one or
+  // more security-policy keys were missing from the loaded config and therefore
+  // received their secure default (e.g. a fresh install, or an upgrade from a
+  // pre-v0.8 config that omitted `redactToolOutput`). We register it here —
+  // synchronously, before the store's fire-and-forget async `load()` reaches
+  // the flip on the microtask queue — so the very first load is captured.
+  // An explicit `redaction.enabled=false` set by the operator does NOT trigger
+  // the hook: `computeAppliedRedactionDefaults` only reports keys that were
+  // absent, so an explicit opt-out is honored silently (no audit, no event).
+  configStore.setRedactionDefaultHook(({ appliedKeys }) => {
+    recordRedactionDefaultApplied(securityAuditLog, { appliedKeys });
+    eventBus.emit('security:redaction_default_applied', { appliedKeys });
+  });
+  // -- v0.9.1 Sentinel (#293): first-run redaction-default audit END --
   let lastHeartbeatAt: string | null = null;
   const unsubscribeRuntimeTelemetryMetrics = eventBus.subscribe((event) => {
     observeRuntimeTelemetryEvent(event);
@@ -264,7 +280,60 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
   }
   const memoryService = new MemoryService(memoryStore, undefined, memoryProvider);
   const userModelService = new UserModelService(memoryStore);
-  const mcpClient = options.mcpClient ?? new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
+  // -- v0.9.1 Sentinel (#331): MCP SSE transport selection BEGIN --
+  // Default transport is the connectionless HTTP transport (unchanged). When
+  // the integrator enables the SSE transport in config (`mcp.sse.enabled` with
+  // a `mcp.sse.endpoint`), build the client over the HTTP+SSE transport via the
+  // kind-tagged `createMcpTransport` and open the long-lived stream with
+  // `connect()` before any `refreshTools`/`callTool`. The connect is idempotent
+  // and fired guarded so a connection failure never aborts startup; the route
+  // handlers (`/api/mcp/*`) run later on the async path, after this resolves.
+  //
+  // Config is read defensively from `options.mcp` (the integrator may not have
+  // wired a config getter yet) — `stdio`/HTTP behavior is untouched when SSE
+  // is absent or disabled.
+  const mcpSseConfig = (options as Record<string, unknown>).mcp as
+    | { sse?: { enabled?: boolean; endpoint?: string; keepaliveMs?: number; bearerToken?: string; headers?: Record<string, string> } }
+    | undefined;
+  const sseEnabled = mcpSseConfig?.sse?.enabled === true && typeof mcpSseConfig.sse?.endpoint === 'string';
+  let mcpClient: McpClient;
+  if (options.mcpClient) {
+    mcpClient = options.mcpClient;
+  } else if (sseEnabled) {
+    const sse = mcpSseConfig!.sse!;
+    const sseServerConfig: McpSseServerConfig = {
+      endpoint: sse.endpoint as string,
+      ...(sse.bearerToken ? { bearerToken: sse.bearerToken } : {}),
+      ...(sse.headers ? { headers: sse.headers } : {}),
+    };
+    const sseTransport = createMcpTransport({
+      kind: 'sse',
+      config: sseServerConfig,
+      options: { keepaliveMs: sse.keepaliveMs ?? DEFAULT_MCP_SSE_KEEPALIVE_MS },
+    });
+    mcpClient = new McpClient(sseTransport);
+    // Open the SSE stream before first use. Idempotent; guarded so a transport
+    // failure surfaces as a degraded client rather than a crashed runtime.
+    void mcpClient.connect()
+      .then(() => {
+        eventBus.emit('mcp:sse_connected', { server: 'default', url: sse.endpoint });
+      })
+      .catch((err: unknown) => {
+        eventBus.emit('mcp:sse_disconnected', {
+          server: 'default',
+          url: sse.endpoint,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+        log.warn('MCP SSE connect failed', {
+          component: 'mcp',
+          endpoint: sse.endpoint,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  } else {
+    mcpClient = new McpClient(new McpHttpTransport({ baseUrl: options.mcpBaseUrl ?? 'https://mcp.example.com' }));
+  }
+  // -- v0.9.1 Sentinel (#331): MCP SSE transport selection END --
   const { installedPluginConfigs, createCatalogPlugin, listInstalledPlugins } = createRuntimePluginCatalog(plugins);
   const tools = options.tools ?? createDefaultWorkerRegistry({
     sessionSearchStore: store,
@@ -509,6 +578,67 @@ export function createNodeRuntime(options: NodeRuntimeOptions = {}) {
     },
     log,
   });
+
+  // -- v0.9.1 Sentinel (#307): content-level checkpoint retention sweep BEGIN --
+  // Distinct from the #338 orphan-pruner above (which removes whole dead/stale
+  // session directories): this bounds a single long-lived auto-checkpointing
+  // session by age/count/disk. Pure pruner from @crowclaw/storage — we adapt
+  // the runtime's CheckpointStore into the `CheckpointPruneStore` surface it
+  // wants (enumerate-all + delete-by-id) and feed retention from config.
+  //
+  // Retention resolution: prefer an explicit `options.checkpointRetention`
+  // (the integrator may add this field to NodeRuntimeOptions later — read
+  // defensively so this compiles + runs against the current shape), else the
+  // secure defaults from config-schema. Guarded end-to-end: any failure is
+  // logged and never aborts startup.
+  void (async () => {
+    try {
+      const retention: CheckpointRetention =
+        (options as Record<string, unknown>).checkpointRetention as CheckpointRetention | undefined
+        ?? { ...DEFAULT_CHECKPOINT_RETENTION };
+      const pruneStore: CheckpointPruneStore = {
+        listAll: async () => {
+          const sessions = await store.list();
+          const perSession = await Promise.all(
+            sessions.map((s) => checkpointStore.listBySession(s.sessionId).catch(() => [])),
+          );
+          return perSession.flat();
+        },
+        delete: (id: string) => checkpointStore.delete(id),
+      };
+      const result = await pruneCheckpoints(pruneStore, retention);
+      if (result.scanned > 0) {
+        log.info(`Checkpoint retention sweep: ${formatCheckpointPruneSummary(result)}`, {
+          component: 'checkpoints',
+          scanned: result.scanned,
+          evicted: result.agedOut + result.countEvicted + result.diskEvicted,
+        });
+      }
+      const removed = result.agedOut + result.countEvicted + result.diskEvicted;
+      if (removed > 0) {
+        // Surface the dominant eviction axis for the `checkpoint:pruned`
+        // payload (`{ removed, reason, remaining }`). Age wins ties because it
+        // is the first axis applied.
+        const reason: 'maxAgeDays' | 'maxCount' | 'maxDiskMB' =
+          result.agedOut >= result.countEvicted && result.agedOut >= result.diskEvicted
+            ? 'maxAgeDays'
+            : result.countEvicted >= result.diskEvicted
+              ? 'maxCount'
+              : 'maxDiskMB';
+        eventBus.emit('checkpoint:pruned', {
+          removed,
+          reason,
+          remaining: Math.max(0, result.scanned - removed),
+        });
+      }
+    } catch (err: unknown) {
+      log.warn('Checkpoint retention sweep failed', {
+        component: 'checkpoints',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+  // -- v0.9.1 Sentinel (#307): content-level checkpoint retention sweep END --
 
   const shutdown = createRuntimeShutdown({
     sseSubscribers,

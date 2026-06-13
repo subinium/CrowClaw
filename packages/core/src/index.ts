@@ -23,7 +23,35 @@ import type { MatchedSkill } from './prompt-builder.js';
 import type { StreamChunk, StreamingProviderAdapter } from './streaming.js';
 import { createCheckpoint, type CheckpointStore, type SessionCheckpoint } from './checkpoint.js';
 import type { DetailedUsageTracker } from './usage-tracker.js';
-import { redactToolOutput as redactToolOutputFn, scanForEnhancedInjection, scanCommand, SecurityAuditLog } from './security.js';
+import {
+  redactToolOutput as redactToolOutputFn,
+  scanForEnhancedInjection,
+  scanCommand,
+  SecurityAuditLog,
+  runApprovalGate,
+  recordExecApprovalDenied,
+  recordPromptwareBlocked,
+  DEFAULT_APPROVAL_TIMEOUT_MS,
+  type ApprovalOnTimeout,
+} from './security.js';
+// -- v0.9.1 Sentinel core wiring BEGIN --
+// #301 — persistent cross-turn goals (Ralph loop).
+import {
+  GoalTracker,
+  buildGoalReminder,
+  evaluateGoalSatisfaction,
+  GOAL_EVENTS,
+  DEFAULT_GOAL_MAX_TURNS,
+  type ActiveGoal,
+  type GoalSatisfactionClassifier,
+} from './goal.js';
+// Promptware / brainworm defense for untrusted tool-result + recalled-memory
+// segments injected into the next model context.
+import {
+  applyPromptwarePolicy,
+  type PromptwarePolicy,
+} from './promptware-defense.js';
+// -- v0.9.1 Sentinel core wiring END --
 import { splitWithPairPreservation, extractPreflightFacts } from './compression-utils.js';
 import { isHardlineBlocked, HARDLINE_BLOCKLIST } from './hardline-blocklist.js';
 import { stripReasoningContent } from './provider-switch.js';
@@ -43,6 +71,53 @@ import {
   restoreQueue,
   OPERATOR_QUEUE_SEPARATOR,
 } from './queue.js';
+
+// -- v0.9.1 Sentinel public re-exports BEGIN --
+// Re-export the new primitives from the package barrel so tests and the
+// runtime/integration layer can `import { GoalTracker, ... } from '@crowclaw/core'`
+// without reaching into source sub-paths (matches the queue.ts re-export style).
+export {
+  GoalTracker,
+  buildGoalReminder,
+  heuristicGoalSatisfied,
+  evaluateGoalSatisfaction,
+  GOAL_EVENTS,
+  DEFAULT_GOAL_MAX_TURNS,
+} from './goal.js';
+export type {
+  ActiveGoal,
+  GoalEventName,
+  GoalSatisfactionClassifier,
+  SetGoalOptions,
+} from './goal.js';
+export {
+  scanUntrustedSegment,
+  wrapUntrustedSegment,
+  neutralizeSegment,
+  stripInvisibleUnicode,
+  applyPromptwarePolicy,
+  PROMPTWARE_NEUTRALIZED_MARKER,
+} from './promptware-defense.js';
+export type {
+  PromptwarePolicy,
+  UntrustedSegmentKind,
+  PromptwareThreat,
+  PromptwareScanResult,
+  PromptwarePolicyOutcome,
+} from './promptware-defense.js';
+export {
+  runApprovalGate,
+  recordExecApprovalDenied,
+  recordPromptwareBlocked,
+  DEFAULT_APPROVAL_TIMEOUT_MS,
+} from './security.js';
+export type {
+  ApprovalOnTimeout,
+  ApprovalGateOptions,
+  ApprovalGateOutcome,
+  ApprovalDenyReason,
+} from './security.js';
+// -- v0.9.1 Sentinel public re-exports END --
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export type ToolRuntime = 'worker' | 'sandbox' | 'either';
@@ -233,6 +308,18 @@ export interface SessionState {
    * append-only metadata — never re-fed into the model on its own.
    */
   reasoningHistory?: import('./reasoning-blocks.js').ReasoningBlock[];
+  /**
+   * #301 (v0.9.1 "Sentinel") — persistent cross-turn goal (Ralph loop). When
+   * set, the AgentLoop re-injects a `[GOAL]` system reminder at the top of
+   * every iteration (NOT into the saved transcript), decrements the turn
+   * budget each iteration, and clears the goal on satisfaction or budget
+   * exhaustion. Persisted alongside the session so a host restart preserves an
+   * in-flight goal. Absent when no goal is active — storage adapters MAY omit
+   * the field. The `/goal` slash command + REST endpoints (POST/DELETE
+   * /api/sessions/:id/goal) are wired by the runtime via `AgentLoop.setGoal` /
+   * `AgentLoop.clearGoal`.
+   */
+  activeGoal?: ActiveGoal;
 }
 
 export interface SessionStore {
@@ -421,6 +508,44 @@ export interface AgentLoopOptions {
    *  `plugin:llm_output_dropped`; after the cap the loop falls through with
    *  the last received message. */
   maxLLMOutputRetries?: number;
+  // -- v0.9.1 Sentinel options BEGIN --
+  /**
+   * v0.9.1 "Sentinel" (CRITICAL): policy for promptware / indirect prompt
+   * injection riding in on untrusted segments (tool results, recalled memory)
+   * before they are re-injected into the next model context.
+   *  - 'off'   : no scan/wrap (legacy behaviour for the new code path; the
+   *              pre-existing `redactToolOutput` injection-wrap still runs).
+   *  - 'warn'  : wrap + annotate detected threats; content still reaches the
+   *              model. Default.
+   *  - 'block' : neutralize high-severity threat-bearing lines and wrap.
+   * Default: 'warn'.
+   */
+  promptwarePolicy?: PromptwarePolicy;
+  /**
+   * v0.9.1 "Sentinel" (CRITICAL): exec/command approval gate timeout in ms.
+   * When the operator-supplied `approvalDecider` does not resolve within this
+   * window the gate fails closed (see `approvalOnTimeout`). Default: 120000.
+   */
+  approvalTimeoutMs?: number;
+  /**
+   * v0.9.1 "Sentinel" (CRITICAL): what the approval gate does on timeout.
+   *  - 'deny'  : fail closed (default — destructive call is rejected).
+   *  - 'allow' : auto-approve on timeout (explicit opt-in; discouraged).
+   */
+  approvalOnTimeout?: ApprovalOnTimeout;
+  /**
+   * #301 (v0.9.1 "Sentinel"): default turn budget for a `/goal`-set objective.
+   * Per-set overrides take precedence. Default: 50.
+   */
+  goalMaxTurns?: number;
+  /**
+   * #301: optional model-classification hook for goal satisfaction. Runs after
+   * the cheap heuristic returns false. Returning true clears the goal + emits
+   * `session:goal_satisfied`. Errors are swallowed (treated as "not
+   * satisfied"). The runtime wires a real classifier; tests pass a fake.
+   */
+  goalSatisfactionClassifier?: GoalSatisfactionClassifier;
+  // -- v0.9.1 Sentinel options END --
 }
 
 export function parseSlashToolCall(input: string): ToolCall | null {
@@ -729,6 +854,21 @@ export class AgentLoop {
   /** #302 (v0.9.0): how many times `applyLLMOutputPipeline` will refetch when
    *  a plugin in the chain returns null. */
   private readonly maxLLMOutputRetries: number;
+  // -- v0.9.1 Sentinel fields BEGIN --
+  /** v0.9.1: promptware policy for untrusted tool-result + recalled-memory. */
+  private readonly promptwarePolicy: PromptwarePolicy;
+  /** v0.9.1: exec-approval gate timeout (ms) before failing closed. */
+  private readonly approvalTimeoutMs: number;
+  /** v0.9.1: approval gate behaviour on timeout ('deny' = fail closed). */
+  private readonly approvalOnTimeout: ApprovalOnTimeout;
+  /** #301: default goal turn budget. */
+  private readonly goalMaxTurns: number;
+  /** #301: optional model satisfaction classifier. */
+  private readonly goalSatisfactionClassifier?: GoalSatisfactionClassifier;
+  /** #301: per-session active-goal tracker. Isolated by sessionId; mirrored
+   *  into `SessionState.activeGoal` for persistence. */
+  private readonly goals = new GoalTracker();
+  // -- v0.9.1 Sentinel fields END --
 
   constructor(
     private readonly provider: ProviderAdapter,
@@ -784,6 +924,13 @@ export class AgentLoop {
     this.eventBus = options.eventBus;
     this.toolFailureStreakLimit = options.toolFailureStreakLimit ?? 3;
     this.maxLLMOutputRetries = options.maxLLMOutputRetries ?? 2;
+    // -- v0.9.1 Sentinel constructor BEGIN --
+    this.promptwarePolicy = options.promptwarePolicy ?? 'warn';
+    this.approvalTimeoutMs = options.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
+    this.approvalOnTimeout = options.approvalOnTimeout ?? 'deny';
+    this.goalMaxTurns = options.goalMaxTurns ?? DEFAULT_GOAL_MAX_TURNS;
+    this.goalSatisfactionClassifier = options.goalSatisfactionClassifier;
+    // -- v0.9.1 Sentinel constructor END --
   }
 
   private auditProvenance(input?: { agentId?: string; sessionId?: string }): {
@@ -902,6 +1049,72 @@ export class AgentLoop {
   restorePendingQueue(data: SerializedQueueEntry[] | null | undefined): void {
     restoreQueue(this.pendingQueue, data);
   }
+
+  // -------------------------------------------------------------------------
+  // #301 (v0.9.1 "Sentinel") — persistent cross-turn goals (Ralph loop)
+  //
+  // The `/goal <text>` slash command + REST endpoints (POST/DELETE
+  // /api/sessions/:id/goal) call these. The active goal is mirrored into
+  // `SessionState.activeGoal` inside `run()` for persistence; these methods
+  // touch only the in-memory tracker so a control-channel `setGoal` that lands
+  // before the next `run()` is honoured (same pattern as `steer`/`queue`).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Set (or replace) the persistent goal for a session. Empty text is dropped
+   * (returns null). The goal is re-injected as a `[GOAL]` system reminder each
+   * iteration and survives across turns until satisfied or budget-exhausted.
+   * Emits `session:goal_set` so the dashboard can surface the active objective.
+   */
+  setGoal(sessionId: string, text: string, options?: { maxTurns?: number }): ActiveGoal | null {
+    const goal = this.goals.set(sessionId, text, { maxTurns: options?.maxTurns ?? this.goalMaxTurns });
+    if (goal) {
+      this.eventBus?.emit(GOAL_EVENTS.set, {
+        sessionId,
+        goal: goal.text,
+        maxTurns: goal.maxTurns,
+        turnsRemaining: goal.turnsRemaining,
+      });
+    }
+    return goal;
+  }
+
+  /** Return the active goal for a session, or null. Used by the REST GET and
+   *  the dashboard "active objective" chip. */
+  getGoal(sessionId: string): ActiveGoal | null {
+    return this.goals.get(sessionId);
+  }
+
+  /** Clear a session's goal (operator `/goal clear` or DELETE endpoint).
+   *  Idempotent. Returns the cleared goal for the caller's response payload. */
+  clearGoal(sessionId: string): ActiveGoal | null {
+    return this.goals.clear(sessionId);
+  }
+
+  // -- v0.9.1 goal session-api aliases BEGIN --
+  // #301: explicit `*SessionGoal` names for the runtime driver (slash command +
+  // REST POST/DELETE /api/sessions/:id/goal). Thin aliases over the
+  // set/get/clearGoal methods above so callers can use whichever name reads
+  // clearer at the call site; both share the single GoalTracker so multi-session
+  // isolation (keyed by sessionId) is preserved.
+
+  /** Alias of {@link setGoal}. Set (or replace) a session's persistent goal and
+   *  emit `session:goal_set`. Empty text is dropped (returns null). */
+  setSessionGoal(sessionId: string, text: string, opts?: { maxTurns?: number }): ActiveGoal | null {
+    return this.setGoal(sessionId, text, opts);
+  }
+
+  /** Alias of {@link getGoal}. Return the active goal for a session, or null. */
+  getSessionGoal(sessionId: string): ActiveGoal | null {
+    return this.getGoal(sessionId);
+  }
+
+  /** Alias of {@link clearGoal}. Clear a session's goal; returns the cleared goal
+   *  (for audit / response payloads) or null when nothing was set. */
+  clearSessionGoal(sessionId: string): ActiveGoal | null {
+    return this.clearGoal(sessionId);
+  }
+  // -- v0.9.1 goal session-api aliases END --
 
   /** Tiered budget hints (Hermes pattern) — returns an ephemeral message at 50%, 75%, and last iteration */
   private getBudgetHint(iteration: number, maxIterations: number): string | null {
@@ -1258,26 +1471,75 @@ export class AgentLoop {
         ...this.auditProvenance(input),
       });
     }
-    // Second-order prompt-injection scan. Indirect injection (malicious HTML
-    // in a fetched page, poisoned file contents) is the #1 mitigation gap in
-    // agent frameworks — before v0.4.1 tool output flowed back into the LLM
-    // unchecked. When we detect it, wrap the output in <untrusted-content>
-    // tags so the LLM is primed to treat it as data, not instructions.
-    const injectionScan = scanForEnhancedInjection(output);
-    if (injectionScan.detected) {
-      const threatCount = injectionScan.threats.length;
-      output = `<untrusted-content source="tool:${result.toolName}" reason="prompt-injection-detected:threats=${threatCount}">\n${output}\n</untrusted-content>`;
-      mutated = true;
-      const topThreats = injectionScan.threats
-        .slice(0, 2)
-        .map((t) => (typeof t === 'string' ? t : (t as { description?: string }).description ?? 'unknown'))
-        .join('; ');
-      this.securityAuditLog?.record({
-        type: 'injection_detected',
-        severity: threatCount >= 3 ? 'critical' : 'warning',
-        detail: `Prompt injection in output from tool "${result.toolName}" (threats=${threatCount}: ${topThreats})`,
-        ...this.auditProvenance(input),
+    // v0.9.1 "Sentinel" — promptware / indirect prompt-injection defense.
+    // Indirect injection (malicious HTML in a fetched page, poisoned file
+    // contents, exfiltration directives) is the #1 mitigation gap in agent
+    // frameworks. Tool output flows back into the next model context; this is
+    // the boundary where we scan + wrap it. The policy engine reuses the
+    // shared enhanced-injection scanner plus a promptware-specific threat
+    // table, so it is a strict superset of the legacy <untrusted-content>
+    // wrap. Credential/PII redaction above runs FIRST (the redaction-after-
+    // pipeline invariant): the scanner never sees raw secrets, and plugins
+    // downstream (applyResultPipeline) only ever see redacted + wrapped bytes.
+    if (this.promptwarePolicy !== 'off') {
+      const outcome = applyPromptwarePolicy(output, 'tool-result', this.promptwarePolicy, {
+        source: result.toolName,
       });
+      if (outcome.mutated) {
+        output = outcome.text;
+        mutated = true;
+        const threatTypes = outcome.scan.threats.map((t) => t.type);
+        const topThreats = outcome.scan.threats
+          .slice(0, 2)
+          .map((t) => t.description)
+          .join('; ');
+        // Preserve the existing `injection_detected` audit event so dashboards
+        // and tests keyed on it keep working.
+        this.securityAuditLog?.record({
+          type: 'injection_detected',
+          severity: outcome.scan.threats.length >= 3 || outcome.scan.highestSeverity === 'high' ? 'critical' : 'warning',
+          detail: `Prompt injection in output from tool "${result.toolName}" (threats=${outcome.scan.threats.length}: ${topThreats})`,
+          ...this.auditProvenance(input),
+        });
+        // New v0.9.1 event — the runtime maps it to `security:promptware_blocked`.
+        if (outcome.scan.detected && this.securityAuditLog) {
+          recordPromptwareBlocked(this.securityAuditLog, {
+            kind: 'tool-result',
+            threatTypes,
+            neutralized: outcome.blocked,
+            source: result.toolName,
+            ...this.auditProvenance(input),
+          });
+          this.eventBus?.emit('security:promptware_blocked', {
+            sessionId: input?.sessionId,
+            agentId: input?.agentId,
+            kind: 'tool-result',
+            source: result.toolName,
+            threatTypes,
+            neutralized: outcome.blocked,
+          });
+        }
+      }
+    } else {
+      // Legacy path preserved for `promptwarePolicy: 'off'` — keep the prior
+      // <untrusted-content> wrap so opting out of the new engine does not also
+      // disable the original v0.4.1 injection mitigation.
+      const injectionScan = scanForEnhancedInjection(output);
+      if (injectionScan.detected) {
+        const threatCount = injectionScan.threats.length;
+        output = `<untrusted-content source="tool:${result.toolName}" reason="prompt-injection-detected:threats=${threatCount}">\n${output}\n</untrusted-content>`;
+        mutated = true;
+        const topThreats = injectionScan.threats
+          .slice(0, 2)
+          .map((t) => (typeof t === 'string' ? t : (t as { description?: string }).description ?? 'unknown'))
+          .join('; ');
+        this.securityAuditLog?.record({
+          type: 'injection_detected',
+          severity: threatCount >= 3 ? 'critical' : 'warning',
+          detail: `Prompt injection in output from tool "${result.toolName}" (threats=${threatCount}: ${topThreats})`,
+          ...this.auditProvenance(input),
+        });
+      }
     }
     if (!mutated) return result;
     return { ...result, output, metadata: { ...result.metadata, securityRedacted: true } };
@@ -1422,23 +1684,51 @@ export class AgentLoop {
         detail: `Approval required for tool "${definition.manifest.name}" (danger: ${definition.manifest.dangerLevel})`,
         ...this.auditProvenance(input),
       });
-      const approved = this.approvalDecider
-        ? await this.approvalDecider(definition, toolCall.input, context)
-        : false;
+      // v0.9.1 "Sentinel": fail-closed approval. The decider is raced against a
+      // hard timeout; a no-response timeout DENIES by default
+      // (`approvalOnTimeout: 'deny'`). A missing decider is an immediate deny.
+      const outcome = await runApprovalGate(
+        () => (this.approvalDecider
+          ? this.approvalDecider(definition, toolCall.input, context)
+          : Promise.resolve(false)),
+        {
+          timeoutMs: this.approvalTimeoutMs,
+          approvalOnTimeout: this.approvalOnTimeout,
+          ...(input.signal ? { signal: input.signal } : {}),
+        },
+      );
 
-      if (!approved) {
-        this.securityAuditLog?.record({
-          type: 'approval_denied',
-          severity: 'critical',
-          detail: `Approval denied for tool "${definition.manifest.name}"`,
-          ...this.auditProvenance(input),
+      if (!outcome.approved) {
+        if (this.securityAuditLog) {
+          // Maps to `security:exec_approval_denied` in the runtime.
+          recordExecApprovalDenied(this.securityAuditLog, {
+            toolName: definition.manifest.name,
+            reason: outcome.reason === 'approved' ? 'denied' : outcome.reason,
+            timedOut: outcome.timedOut,
+            timeoutMs: this.approvalTimeoutMs,
+            ...this.auditProvenance(input),
+          });
+        }
+        this.eventBus?.emit('security:exec_approval_denied', {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          toolName: definition.manifest.name,
+          reason: outcome.reason === 'approved' ? 'denied' : outcome.reason,
+          timedOut: outcome.timedOut,
         });
         return {
           toolName: definition.manifest.name,
           runtime: definition.manifest.runtime === 'sandbox' ? 'sandbox' : 'worker',
           ok: false,
-          output: `Tool requires approval: ${definition.manifest.name}`,
-          metadata: { blockedByApproval: true, dangerousSignals }
+          output: outcome.timedOut
+            ? `Tool approval timed out (fail-closed): ${definition.manifest.name}`
+            : `Tool requires approval: ${definition.manifest.name}`,
+          metadata: {
+            blockedByApproval: true,
+            approvalReason: outcome.reason,
+            approvalTimedOut: outcome.timedOut,
+            dangerousSignals,
+          },
         };
       }
     }
@@ -1796,10 +2086,81 @@ export class AgentLoop {
       }
     }
 
+    // #301 (v0.9.1): rehydrate the active goal from the restored session so an
+    // in-flight goal survives a host restart. Skipped when an in-memory goal
+    // already exists (a control-channel `setGoal` that landed before this run
+    // must win over the stored snapshot).
+    this.goals.rehydrate(input.sessionId, session.activeGoal);
+
+    // -- v0.9.1 goal reminder BEGIN --
+    // #301 (Ralph loop): build the ephemeral `[GOAL]` system reminder for THIS
+    // run only. Mirrors the `/steer` one-shot pattern — the reminder is NEVER
+    // pushed into `nextMessages` (the persisted transcript). Instead it is
+    // prepended to every provider request issued this run (initial call below +
+    // each in-loop iteration), then dropped. On restore the goal text is
+    // rebuilt fresh from `SessionState.activeGoal`, so the reminder is never
+    // replayed against historical state. `flagged ephemeral` keeps it symmetric
+    // with steer/budget-hint transient messages.
+    const goalReminderMessages: ConversationMessage[] = [];
+    {
+      const activeGoal = this.goals.get(input.sessionId);
+      const reminder = buildGoalReminder(activeGoal);
+      if (reminder) {
+        goalReminderMessages.push({
+          role: 'system',
+          content: reminder,
+          createdAt: nowIso(),
+          metadata: { ephemeral: true, kind: 'goal-reminder' },
+        });
+      }
+    }
+    // Prepend the goal reminder to a provider request's message list without
+    // mutating the saved transcript. Returns the original array untouched when
+    // no goal is active so the no-goal path pays nothing.
+    const withGoalReminder = (msgs: ConversationMessage[]): ConversationMessage[] =>
+      goalReminderMessages.length > 0 ? [...goalReminderMessages, ...msgs] : msgs;
+    // -- v0.9.1 goal reminder END --
+
     // Inject recalled memories as untrusted context prefix (not in system prompt)
     const memoryPrefix = buildMemoryPrefix(input.memories ?? []);
-    const memoryMessages: ConversationMessage[] = memoryPrefix
-      ? [{ role: 'system', content: memoryPrefix, createdAt: nowIso() }]
+    let memoryContent = memoryPrefix;
+    // v0.9.1 "Sentinel" — promptware defense on recalled memory. Poisoned
+    // long-term memory is the second indirect-injection vector (alongside tool
+    // results): an attacker who can write a memory record can smuggle an
+    // override/exfiltration directive that gets auto-recalled on a later turn.
+    // The `<recalled-context trust="low">` wrapper already primes the model,
+    // but we additionally scan the assembled memories and, on a high-severity
+    // hit under the block policy, neutralize the offending lines.
+    if (memoryPrefix && this.promptwarePolicy !== 'off' && (input.memories?.length ?? 0) > 0) {
+      const memOutcome = applyPromptwarePolicy(memoryPrefix, 'recalled-memory', this.promptwarePolicy, {
+        source: 'memory',
+      });
+      if (memOutcome.scan.detected) {
+        // Use the policy-processed text (wrapped/neutralized) for the injected
+        // segment; the original `<recalled-context>` block stays inside it.
+        memoryContent = memOutcome.text;
+        const threatTypes = memOutcome.scan.threats.map((t) => t.type);
+        if (this.securityAuditLog) {
+          recordPromptwareBlocked(this.securityAuditLog, {
+            kind: 'recalled-memory',
+            threatTypes,
+            neutralized: memOutcome.blocked,
+            source: 'memory',
+            ...this.auditProvenance(input),
+          });
+        }
+        this.eventBus?.emit('security:promptware_blocked', {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          kind: 'recalled-memory',
+          source: 'memory',
+          threatTypes,
+          neutralized: memOutcome.blocked,
+        });
+      }
+    }
+    const memoryMessages: ConversationMessage[] = memoryContent
+      ? [{ role: 'system', content: memoryContent, createdAt: nowIso() }]
       : [];
 
     // Strip out [session-meta] dashboard markers so they never reach the LLM.
@@ -1856,7 +2217,7 @@ export class AgentLoop {
       const skillMatches = matchSkillManifests(input.userMessage, this.skills, 3);
       if (skillMatches.length > 0) {
         matchedSkills = skillMatches.map(({ skill }) => {
-          const localized = localizeSkillFile(skill, normalizeLocale(input.locale));
+          const localized = localizeSkillFile(skill, normalizeLocale(input.locale) === 'ko' ? 'ko' : 'en');
           return {
             name: localized.name,
             description: localized.description,
@@ -1963,11 +2324,14 @@ export class AgentLoop {
     const pluginCtx = { sessionId: input.sessionId, agentId: input.agentId };
     let currentResponse: ProviderResponse;
     try {
-      currentResponse = await this.generateWithFallbacks(buildRequest(nextMessages), pluginCtx);
+      // -- v0.9.1 goal reminder BEGIN --
+      // #301: prepend the one-shot `[GOAL]` reminder to the initial request.
+      currentResponse = await this.generateWithFallbacks(buildRequest(withGoalReminder(nextMessages)), pluginCtx);
+      // -- v0.9.1 goal reminder END --
     } catch (error: unknown) {
       // Context overflow recovery: compact and retry once
       if (this.isContextOverflowError(error)) {
-        const recovery = await this.recoverFromContextOverflow(buildRequest(nextMessages), pluginCtx);
+        const recovery = await this.recoverFromContextOverflow(buildRequest(withGoalReminder(nextMessages)), pluginCtx);
         if (recovery) {
           currentResponse = recovery.response;
           nextMessages.length = 0;
@@ -1987,7 +2351,8 @@ export class AgentLoop {
     currentResponse = await this.applyLLMOutputPipeline(
       currentResponse,
       { sessionId: input.sessionId, agentId: input.agentId, iteration: 0, messages: nextMessages },
-      () => this.generateWithFallbacks(buildRequest(nextMessages), pluginCtx),
+      // #301: refetch closure must carry the same one-shot goal reminder.
+      () => this.generateWithFallbacks(buildRequest(withGoalReminder(nextMessages)), pluginCtx),
     );
 
     // Track 1.2: Record usage from initial provider call
@@ -2316,7 +2681,12 @@ export class AgentLoop {
 
       // #43/#44 perf: reuse cachedSystemPrompt + toolList instead of rebuilding.
       // #54: prepend any drained steer messages for *this turn only*.
-      const iterationMessages = turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages;
+      // #301: re-inject the one-shot `[GOAL]` reminder ahead of the steer
+      // nudges so the persistent objective leads every in-loop provider call
+      // too (it is never persisted — see `goalReminderMessages`).
+      const iterationMessages = withGoalReminder(
+        turnExtraMessages.length > 0 ? [...turnExtraMessages, ...nextMessages] : nextMessages,
+      );
       const fetchIterationResponse = () => this.generateWithFallbacks({
         systemPrompt: cachedSystemPrompt,
         messages: iterationMessages,
@@ -2420,6 +2790,73 @@ export class AgentLoop {
       metadata: toolResults.length > 0 ? { toolCount: toolResults.length } : undefined
     });
 
+    // -- v0.9.1 goal satisfaction BEGIN --
+    // #301 (Ralph loop): the assistant turn for this run is complete. Charge
+    // one turn against the goal budget, then evaluate satisfaction against the
+    // turn's final assistant message. The lifecycle is intentionally split:
+    //   - satisfied  -> clear + emit `session:goal_satisfied`
+    //   - budget hit  -> clear + emit `session:goal_expired`
+    //   - otherwise   -> the (decremented) goal survives into the persisted
+    //                    session and drives the next turn.
+    // Evaluation runs only when a goal was actually active this turn (tick
+    // returns null when none is set) so the no-goal path is untouched.
+    const tickedGoal = this.goals.tick(input.sessionId);
+    if (tickedGoal) {
+      let goalSatisfied = false;
+      try {
+        const evaluation = await evaluateGoalSatisfaction({
+          goal: tickedGoal,
+          assistantMessage: finalResponse,
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          classifier: this.goalSatisfactionClassifier,
+        });
+        goalSatisfied = evaluation.satisfied;
+        if (evaluation.classifierError) {
+          // A flaky classifier is treated as "not satisfied" (see goal.ts) —
+          // surface the error for observability without crashing the run.
+          this.eventBus?.emit('session:goal_classifier_error', {
+            sessionId: input.sessionId,
+            agentId: input.agentId,
+            error:
+              evaluation.classifierError instanceof Error
+                ? evaluation.classifierError.message
+                : String(evaluation.classifierError),
+          });
+        }
+      } catch (error: unknown) {
+        // Defensive: evaluateGoalSatisfaction already swallows classifier
+        // throws, but never let goal evaluation take down the run.
+        this.eventBus?.emit('session:goal_classifier_error', {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        goalSatisfied = false;
+      }
+
+      if (goalSatisfied) {
+        const cleared = this.goals.clear(input.sessionId);
+        this.eventBus?.emit(GOAL_EVENTS.satisfied, {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          goal: (cleared ?? tickedGoal).text,
+          maxTurns: (cleared ?? tickedGoal).maxTurns,
+          turnsRemaining: tickedGoal.turnsRemaining,
+        });
+      } else if (tickedGoal.turnsRemaining <= 0) {
+        const cleared = this.goals.clear(input.sessionId);
+        this.eventBus?.emit(GOAL_EVENTS.expired, {
+          sessionId: input.sessionId,
+          agentId: input.agentId,
+          goal: (cleared ?? tickedGoal).text,
+          maxTurns: (cleared ?? tickedGoal).maxTurns,
+          turnsRemaining: 0,
+        });
+      }
+    }
+    // -- v0.9.1 goal satisfaction END --
+
     // Strip transient messages before persisting session.
     //  - Memory-prefix system messages: re-injected fresh each turn from the
     //    memory service.
@@ -2464,6 +2901,15 @@ export class AgentLoop {
       ...(session.reasoningHistory && session.reasoningHistory.length > 0
         ? { reasoningHistory: session.reasoningHistory }
         : {}),
+      // -- v0.9.1 goal persistence BEGIN --
+      // #301: mirror the live tracker state into the persisted session so an
+      // in-flight goal (with its decremented budget) survives a host restart.
+      // Explicitly set to `undefined` when cleared (satisfied/expired) so the
+      // `...session` spread's stale snapshot is overwritten rather than carried
+      // forward. The atomic SessionStore.put pairs this with the rest of
+      // session state — same restore guarantee as the pending queue.
+      activeGoal: this.goals.get(input.sessionId) ?? undefined,
+      // -- v0.9.1 goal persistence END --
       lineage: compression.compressedCount > 0
         ? {
             ...baseLineage,
@@ -2575,7 +3021,7 @@ export class AgentLoop {
       const skillMatches = matchSkillManifests(userMessage, this.skills, 3);
       if (skillMatches.length > 0) {
         matchedSkills = skillMatches.map(({ skill }) => {
-          const localized = localizeSkillFile(skill, normalizeLocale(input.locale));
+          const localized = localizeSkillFile(skill, normalizeLocale(input.locale) === 'ko' ? 'ko' : 'en');
           return {
             name: localized.name,
             description: localized.description,
@@ -2670,9 +3116,30 @@ export class AgentLoop {
           metadata: { steer: true },
         }));
 
+        // -- v0.9.1 goal reminder BEGIN --
+        // #301 (streaming): prepend the one-shot `[GOAL]` reminder ahead of the
+        // steer nudges so a persistent objective drives the streamed turn too.
+        // The streaming path is transient — it does NOT persist the session
+        // (`runStreaming` never calls `sessions.put`), so it does NOT tick the
+        // budget, evaluate satisfaction, or clear the goal. The authoritative
+        // Ralph-loop lifecycle (tick/evaluate/clear/persist) lives in `run()`;
+        // ticking here would decrement a budget that is never saved and would
+        // double-charge whenever the runtime also drives the goal via `run()`.
+        const streamGoalReminder = buildGoalReminder(this.goals.get(session.sessionId));
+        const streamGoalExtra: ConversationMessage[] = streamGoalReminder
+          ? [{
+              role: 'system' as Role,
+              content: streamGoalReminder,
+              createdAt: nowIso(),
+              metadata: { ephemeral: true, kind: 'goal-reminder' },
+            }]
+          : [];
+        const streamPrefix = [...streamGoalExtra, ...streamTurnExtra];
+        // -- v0.9.1 goal reminder END --
+
         const request: ProviderRequest = {
           systemPrompt: cachedStreamSystemPrompt,
-          messages: streamTurnExtra.length > 0 ? [...streamTurnExtra, ...nextMessages] : nextMessages,
+          messages: streamPrefix.length > 0 ? [...streamPrefix, ...nextMessages] : nextMessages,
           availableTools: streamToolList,
           signal,
         };
@@ -2952,16 +3419,47 @@ export class AgentLoop {
                 delegateDepth: normalizeDelegateDepth(input.delegateDepth),
                 signal,
               };
-              const approved = this.approvalDecider
-                ? await this.approvalDecider(def!, tc.input, context)
-                : false;
+              // v0.9.1 "Sentinel": fail-closed approval in the streaming path.
+              const outcome = await runApprovalGate(
+                () => (this.approvalDecider
+                  ? this.approvalDecider(def!, tc.input, context)
+                  : Promise.resolve(false)),
+                {
+                  timeoutMs: this.approvalTimeoutMs,
+                  approvalOnTimeout: this.approvalOnTimeout,
+                  ...(signal ? { signal } : {}),
+                },
+              );
 
-              if (!approved) {
+              if (!outcome.approved) {
+                if (this.securityAuditLog) {
+                  recordExecApprovalDenied(this.securityAuditLog, {
+                    toolName: tc.name,
+                    reason: outcome.reason === 'approved' ? 'denied' : outcome.reason,
+                    timedOut: outcome.timedOut,
+                    timeoutMs: this.approvalTimeoutMs,
+                    ...this.auditProvenance(session),
+                  });
+                }
+                this.eventBus?.emit('security:exec_approval_denied', {
+                  sessionId: session.sessionId,
+                  agentId: session.agentId,
+                  toolName: tc.name,
+                  reason: outcome.reason === 'approved' ? 'denied' : outcome.reason,
+                  timedOut: outcome.timedOut,
+                });
                 const blockedResult: ToolExecutionResult = {
                   toolName: tc.name,
                   runtime: 'worker',
                   ok: false,
-                  output: `Tool requires approval: ${tc.name}`,
+                  output: outcome.timedOut
+                    ? `Tool approval timed out (fail-closed): ${tc.name}`
+                    : `Tool requires approval: ${tc.name}`,
+                  metadata: {
+                    blockedByApproval: true,
+                    approvalReason: outcome.reason,
+                    approvalTimedOut: outcome.timedOut,
+                  },
                 };
                 toolResults.push(blockedResult);
                 nextMessages.push(toolMessage(blockedResult, this.maxToolResultLength));
